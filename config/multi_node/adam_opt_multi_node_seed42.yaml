@@ -58,13 +58,13 @@ model:
   mlp_hidden_dim: 4096
 
 fsdp:
-  sharding_strategy: hybrid_shard
+  sharding_strategy: full_shard
   backward_prefetch: BACKWARD_PRE
   use_orig_params: true
   limit_all_gathers: true
   forward_prefetch: true
-  sync_module_states: true
-  param_init_device: meta
+  sync_module_states: false
+  #param_init_device: meta
 
 distributed:
   backend: nccl

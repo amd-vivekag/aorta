@@ -2,11 +2,30 @@
 # Global NCCL/RCCL environment variables for multi-node training
 # Configured for MI350X cluster
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODE_LIST_FILE="${SCRIPT_DIR}/node_ip_list.txt"
+
+# Check if USE_TCP is set (for non-interactive use)
+if [[ -n "$USE_TCP" ]]; then
+    use_tcp="$USE_TCP"
+else
+    read -p "Use TCP transport? [y/N]: " use_tcp
+fi
+
+if [[ "$use_tcp" =~ ^[Yy]$|^true$ ]]; then
+    echo "[OK] Using TCP transport"
+    export NCCL_IB_DISABLE=1
+    export NCCL_NET=Socket
+else
+    echo "[OK] Using RDMA transport"
+    export NCCL_IB_DISABLE=0
+fi
+
 # NCCL Debug Settings (enabled to track NaN/Inf failures)
 export NCCL_DEBUG=WARN
 #export NCCL_DEBUG_SUBSYS=ALL
 
-# IB/RNIC Configuration for MI350X
+# IB/RNIC Configuration for MI350X (used when RoCE is available)
 export NCCL_IB_HCA=bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re6,bnxt_re7
 export NCCL_IB_GID_INDEX=3
 export NCCL_NCHANNELS_PER_NET_PEER=8

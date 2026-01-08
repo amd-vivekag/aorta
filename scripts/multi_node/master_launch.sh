@@ -16,6 +16,7 @@ usage() {
     echo "  -m, --stats                 Enable rocprof stats (CU utilization, occupancy)"
     echo "      --rocprof-input FILE    Use rocprofv3 input yaml/json"
     echo "      --master-port PORT      Master port (default: auto-select)"
+    echo "      --tcp                   Use TCP transport instead of RDMA/RoCE"
     echo "  -h, --help                  Show this help message"
     echo ""
     echo "Examples:"
@@ -46,6 +47,7 @@ ENABLE_ROCPROF="${ENABLE_ROCPROF:-false}"
 ROCPROF_STATS="${ROCPROF_STATS:-false}"
 ROCPROF_INPUT="${ROCPROF_INPUT:-}"
 MASTER_PORT="${MASTER_PORT:-}"
+USE_TCP="${USE_TCP:-false}"
 
 # Parse command-line arguments (override env vars)
 while [[ $# -gt 0 ]]; do
@@ -93,6 +95,10 @@ while [[ $# -gt 0 ]]; do
         --master-port)
             MASTER_PORT="$2"
             shift 2
+            ;;
+        --tcp)
+            USE_TCP="true"
+            shift
             ;;
         -h|--help)
             usage
@@ -174,6 +180,7 @@ Configuration:
 - Docker container: $DOCKER_CONTAINER
 - AMD_OCL_WAIT_COMMAND: $AMD_WAIT
 - rocprof enabled: $ENABLE_ROCPROF
+- TCP transport: $USE_TCP
 
 Git Info:
 - Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "not-a-git-repo")
@@ -197,6 +204,7 @@ echo "Processes per node: $NPROC_PER_NODE"
 echo "Custom label: ${LABEL:-none}"
 echo "AMD_OCL_WAIT_COMMAND: $AMD_WAIT"
 echo "rocprof enabled: $ENABLE_ROCPROF"
+echo "TCP transport: $USE_TCP"
 
 NUM_NODES=$(awk 'NF' "$MACHINE_IP_FILE" | wc -l)
 WORLD_SIZE=$((NPROC_PER_NODE * NUM_NODES))
@@ -223,14 +231,14 @@ while IFS= read -r HOST || [[ -n "$HOST" ]]; do  # HOST can be hostname or IP
       echo "Master node: $MASTER_ADDR"
       echo ""
 
-      ./scripts/multi_node/config_node.sh "$node" "$HOST" "$MASTER_ADDR" "$MASTER_PORT" "$NNODES" "$WORLD_SIZE" "$AORTA_ROOT" "$EXPERIMENT_DIR" \
+      USE_TCP="$USE_TCP" ./scripts/multi_node/config_node.sh "$node" "$HOST" "$MASTER_ADDR" "$MASTER_PORT" "$NNODES" "$WORLD_SIZE" "$AORTA_ROOT" "$EXPERIMENT_DIR" \
         "$CONFIG_FILE" "$NPROC_PER_NODE" "$CHANNELS" "$THREADS" "$ENABLE_ROCPROF" "$ROCPROF_STATS" "$ROCPROF_INPUT" "$DOCKER_CONTAINER" "$AMD_WAIT" \
         > "$LOG_FILE" 2>&1 &
 
   else
       # Note: stdin explicitly redirected from config_node.sh, so -n flag not needed
       ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          "$USER"@"$HOST" "DOCKER_CONTAINER='$DOCKER_CONTAINER' bash -s -- '$node' '$HOST' '$MASTER_ADDR' '$MASTER_PORT' '$NNODES' '$WORLD_SIZE' '$AORTA_ROOT' '$EXPERIMENT_DIR' \
+          "$USER"@"$HOST" "DOCKER_CONTAINER='$DOCKER_CONTAINER' USE_TCP='$USE_TCP' bash -s -- '$node' '$HOST' '$MASTER_ADDR' '$MASTER_PORT' '$NNODES' '$WORLD_SIZE' '$AORTA_ROOT' '$EXPERIMENT_DIR' \
           '$CONFIG_FILE' '$NPROC_PER_NODE' '$CHANNELS' '$THREADS' '$ENABLE_ROCPROF' '$ROCPROF_STATS' '$ROCPROF_INPUT' '$DOCKER_CONTAINER' '$AMD_WAIT'" \
         < ./scripts/multi_node/config_node.sh \
         > "$LOG_FILE" 2>&1 &

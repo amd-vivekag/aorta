@@ -1,24 +1,23 @@
 # Multi-Node Training
 
-Scripts for multi-node distributed GEMM training with custom NCCL channel and thread configurations.
+Scripts for multi-node distributed training with custom NCCL channel and thread configurations.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Using Shampoo Optimizer](#using-shampoo-optimizer)
+- [Slurm Setup](#slurm-setup)
 - [Usage](#usage)
-- [Setup](#setup) (one-time)
-  - [Conductor Setup](#conductor-setup-automated)
-  - [Slurm Cluster](#slurm-cluster-setup)
+- [Experiment Tracking](#experiment-tracking)
 - [Stopping Training](#stopping-training)
 - [Troubleshooting](#troubleshooting)
 - [NCCL Configuration](#nccl-configuration)
+- [Conductor Setup](#conductor-setup)
 
 ## Prerequisites
 
 - 2+ machines with ROCm GPUs, Docker, network connectivity (host mode)
 - Passwordless SSH between nodes
-- `scripts/multi_node/node_ip_list.txt` with node hostnames (Conductor) or IPs (Slurm) - master first
+- `scripts/multi_node/node_ip_list.txt` with node hostnames - master first
 - All nodes on same git branch
 
 ## File Structure
@@ -34,11 +33,10 @@ aorta/
 │   ├── set_env_variables.sh            # NCCL/RCCL config
 │   ├── experiment_list.sh              # List experiments
 │   ├── experiment_note.sh              # Add notes to experiments
-│   ├── EXPERIMENT_TRACKING.txt         # Experiment workflow guide
-│   └── node_ip_list.txt                # Hostnames (Conductor) or IPs (Slurm)
+│   └── node_ip_list.txt                # Node hostnames
 ├── docker/
-│   ├── docker-compose.rocm70_9-1.yaml         # Default Docker config
-│   └── docker-compose.rocm70_9-1-shampoo.yaml # Docker with Shampoo optimizer
+│   ├── docker-compose.rocm70_9-1.yaml         # Base Docker config
+│   └── docker-compose.rocm70_9-1-shampoo.yaml # Docker with Shampoo (supports both Adam and Shampoo)
 ├── config/
 │   ├── multi_node/
 │   │   └── distributed_multinode.yaml  # Default config
@@ -48,72 +46,82 @@ aorta/
 ## Quick Start
 
 ```bash
-# First time setup (once per machine allocation)
-./scripts/multi_node/setup_multi_node.sh
-./scripts/multi_node/start_docker_all_nodes.sh
-
-# Run training on nodes with 4 GPUs (repeat as needed)
-./scripts/multi_node/master_launch.sh --channels 28 --threads 256 --nproc 4
-
-# Subsequent runs (no Docker restart needed)
-./scripts/multi_node/master_launch.sh --channels 42 --threads 512 --nproc 2 --config config/multi_node/distributed_multinode.yaml
-```
-
-World size: `NPROC_PER_NODE × NUM_NODES` (e.g., 8 GPUs/node × 2 nodes = 16)
-
----
-
-## Using Shampoo Optimizer
-
-To use the Shampoo optimizer instead of AdamW:
-
-### Step 1: Start Shampoo Docker Container
-
-```bash
-# First time: builds Docker image with Shampoo pre-installed
+# First time setup (once per allocation)
+scontrol show hostnames $SLURM_NODELIST > scripts/multi_node/node_ip_list.txt
 ./scripts/multi_node/start_docker_all_nodes.sh \
     docker/docker-compose.rocm70_9-1-shampoo.yaml \
     training-overlap-bugs-rocm70_9-1-shampoo
+
+# Run training (change optimizer via config file)
+./scripts/multi_node/master_launch.sh --channels 28 --threads 256 --nproc 8 \
+    --config ./config/multi_node/adam_opt_multi_node_seed42.yaml \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --label adam_debug_run13
 ```
 
-### Step 2: Run Training with Shampoo Config
+Change optimizer by switching config: `adam_opt_multi_node_seed42.yaml` or `shampoo_opt_multi_node_seed42.yaml`.
 
-```bash
-./scripts/multi_node/master_launch.sh \
-    --channels 28 --threads 256 \
-    --config config/shampoo_opt.yaml \
-    --docker training-overlap-bugs-rocm70_9-1-shampoo
-```
-
-**What's different?** The Shampoo Docker image has the Facebook `distributed-shampoo` package pre-installed. The training code automatically uses Shampoo when `optimizer.name: shampoo` is set in the config file.
-
-**Verify Shampoo installation:**
-```bash
-docker exec training-overlap-bugs-rocm70_9-1-shampoo \
-    python -c "import distributed_shampoo; print('Shampoo OK')"
-```
 
 ---
 
-## Experiment Tracking
+## Slurm Setup
 
-Each run auto-logs: config, git commit hash, NCCL settings, and full command.
+### Step 1: Pull Base Docker Image
 
 ```bash
-# Use --label to identify experiments
-./scripts/multi_node/master_launch.sh --label baseline [options]
+docker pull rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly
 
-# List experiments
-./scripts/multi_node/experiment_list.sh
-
-# Add notes
-./scripts/multi_node/experiment_note.sh "your note"
-
-# View experiment info
-cat experiments/multinode_XXX/experiment_info.txt
+# If authentication required
+docker login
 ```
 
-See `EXPERIMENT_TRACKING.txt` for workflow patterns.
+### Step 2: Allocate Nodes
+
+```bash
+# From head node
+salloc -N 3 -p gpu_partition -t 4:00:00
+squeue -u $USER
+```
+
+### Step 3: Create node_ip_list.txt
+
+```bash
+cd /path/to/aorta/scripts/multi_node
+scontrol show hostnames $SLURM_NODELIST > node_ip_list.txt
+cat node_ip_list.txt
+```
+
+### Step 4: SSH to Master and Test Connectivity
+
+```bash
+ssh node1-hostname
+cd /path/to/aorta
+
+# Test worker connectivity
+ssh node2-hostname hostname
+ssh node3-hostname hostname
+```
+
+### Step 5: Pull Image on All Nodes
+
+```bash
+for HOST in $(cat scripts/multi_node/node_ip_list.txt); do
+  ssh $HOST "docker pull rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly"
+done
+```
+
+### Step 6: Start Docker and Run Training
+
+```bash
+./scripts/multi_node/start_docker_all_nodes.sh \
+    docker/docker-compose.rocm70_9-1-shampoo.yaml \
+    training-overlap-bugs-rocm70_9-1-shampoo
+
+./scripts/multi_node/master_launch.sh --channels 28 --threads 256 --nproc 8 \
+    --config ./config/multi_node/adam_opt_multi_node_seed42.yaml \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --label my_experiment
+```
 
 ---
 
@@ -126,8 +134,8 @@ See `EXPERIMENT_TRACKING.txt` for workflow patterns.
 # Custom parameters
 ./scripts/multi_node/master_launch.sh -c 28 -t 256 -p 4 -f config/custom.yaml
 
-# Enable AMD_OCL_WAIT_COMMAND=1 on all nodes
-./scripts/multi_node/master_launch.sh --amd-wait --label with_amd_wait
+# With experiment label
+./scripts/multi_node/master_launch.sh --label baseline --amd-wait
 ```
 
 ### Parameters
@@ -160,198 +168,102 @@ cat experiments/multinode_*/outputs/rank_00_metrics.jsonl | tail -n 5  # Metrics
 
 ---
 
-## Setup
+## Experiment Tracking
 
-One-time setup per machine allocation. Choose your environment:
-
----
-
-## Conductor Setup (Automated)
-
-### Step 1: SSH Key Setup
+Each run auto-logs: config, git commit hash, NCCL settings, and full command.
 
 ```bash
-# Generate and display key
-ssh-keygen -t rsa -b 4096 -C "conductor-multi-node" -f ~/.ssh/id_rsa_conductor -N ''
-cat ~/.ssh/id_rsa_conductor.pub
+./scripts/multi_node/master_launch.sh --label baseline [options]
+./scripts/multi_node/experiment_list.sh
+./scripts/multi_node/experiment_note.sh "your note"
+cat experiments/multinode_XXX/experiment_info.txt
 ```
 
-Register public key with your cluster's SSH key management system (wait 2-3 min for propagation)
+### Experiment Folder Structure
 
-```bash
-# Configure SSH
-cat >> ~/.ssh/config << 'EOF'
-Host *.dcgpu smci350-* *.zts-gtu.dcgpu
-    IdentityFile ~/.ssh/id_rsa_conductor
-    StrictHostKeyChecking no
-EOF
-chmod 600 ~/.ssh/config
+A complete experiment folder looks like:
 
-# Test
-ssh your-worker-node.zts-gtu.dcgpu hostname
+```
+experiments/multinode_28ch_256th_20251219_144717_adam_no_wait_aux/
+├── experiment_info.txt                    # Experiment metadata and notes
+├── logs/
+│   ├── node_0_20251219_144717.txt         # Node 0 (master) console output
+│   ├── node_1_20251219_144717.txt         # Node 1 console output
+│   └── node_2_20251219_144717.txt         # Node 2 console output
+└── 256thread_28channels/                  # Training outputs
+    ├── rank0.log ... rank23.log           # Per-rank training logs
+    ├── loss_rank0.log ... loss_rank23.log # Per-rank loss logs
+    ├── rank_00_metrics.jsonl ... rank_23_metrics.jsonl  # Per-rank metrics
+    └── nan_diagnostics/                   # NaN debugging (if enabled)
+        ├── nan_gradients_step22_rank5.json
+        └── param_evolution__*_rank*.jsonl
 ```
 
-### Step 2: Run Setup Script
-
-```bash
-./scripts/multi_node/setup_multi_node.sh
-```
-
-Creates `scripts/multi_node/node_ip_list.txt` with hostnames, detects network interfaces, verifies SSH and git branches.
-
-### Step 3: Start Docker
-
-```bash
-./scripts/multi_node/start_docker_all_nodes.sh  # Run once, containers persist
-```
-
-Script checks: git branches, Docker versions, SSH connectivity. Then starts containers on all nodes.
-
-Only restart Docker after reboot or manual stop. Containers stay running between experiments.
-
-**Debugging:** If script hangs, check the last [STAGE] message to identify where it's stuck (SSH connection, docker compose, etc).
-
----
-
-## Slurm Cluster Setup
-
-### Step 0: Pull Base Docker Image (Required)
-
-The Docker build requires a private base image. Pull it on all nodes first:
-
-```bash
-docker pull rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly
-```
-
-If authentication is required:
-```bash
-docker login
-```
-
-### Step 1: Allocate Nodes
-
-```bash
-# From head node
-salloc -N 3 -p gpu_partition -t 4:00:00
-
-# Check allocation
-squeue -u $USER
-```
-
-### Step 2: Create node_ip_list.txt
-
-```bash
-# Option A: Use hostnames (recommended)
-cd /path/to/aorta/scripts/multi_node
-scontrol show hostnames $SLURM_NODELIST > node_ip_list.txt
-
-# Option B: Manual entry
-cat > node_ip_list.txt << 'EOF'
-node1-hostname
-node2-hostname
-node3-hostname
-EOF
-
-# Verify
-cat node_ip_list.txt
-```
-
-### Step 3: SSH to Master Node
-
-```bash
-# SSH to first compute node (master)
-ssh node1-hostname
-
-# Navigate to code
-cd /path/to/aorta
-```
-
-### Step 4: Test SSH Connectivity
-
-```bash
-# Test SSH to worker nodes
-ssh node2-hostname hostname
-ssh node3-hostname hostname
-```
-
-### Step 5: Pull Base Image on All Nodes
-
-```bash
-# On each node, pull the private base image
-docker pull rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly
-
-# For worker nodes
-ssh node2-hostname "docker pull rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly"
-ssh node3-hostname "docker pull rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly"
-```
-
-### Step 6: Start Docker
-
-```bash
-./scripts/multi_node/start_docker_all_nodes.sh
-```
-
-### Step 7: Run Training
-
-```bash
-# For regular training (AdamW optimizer)
-./scripts/multi_node/master_launch.sh --channels 28 --threads 256 --nproc 8
-
-# For Shampoo optimizer
-./scripts/multi_node/master_launch.sh \
-    --channels 28 --threads 256 --nproc 8 \
-    --config config/shampoo_opt.yaml \
-    --docker training-overlap-bugs-rocm70_9-1-shampoo
-```
-
-### Notes
-
-- Run training from compute node, not head node
-- First line in `node_ip_list.txt` is master node
-- Use hostnames if SSH works with them, otherwise use IPs
-- Check GPU count per node: `rocm-smi --showid | wc -l`
-
----
-
-
+| File/Folder | Description |
+|-------------|-------------|
+| `experiment_info.txt` | Config, git hash, command, notes |
+| `logs/node_*.txt` | Raw console output per node |
+| `rank*.log` | Training logs (forward/backward, step times) |
+| `loss_rank*.log` | Loss values per step |
+| `rank_*_metrics.jsonl` | JSON metrics (loss, lr, throughput) |
+| `nan_diagnostics/` | NaN gradient dumps and param evolution |
 
 ---
 
 ## Stopping Training
 
-**Press `Ctrl+C`** - Stops monitoring but **training continues in background**
+`Ctrl+C` stops monitoring but training continues in background.
 
-**To actually stop training:**
-
+To stop training:
 ```bash
 for HOST in $(cat scripts/multi_node/node_ip_list.txt); do
-  ssh $HOST "docker exec training-overlap-bugs-rocm70_9-1-shampoo pkill -9 -f 'train.py|torchrun'"
+  ssh $HOST "docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f 'train.py|torchrun'"
 done
 ```
+
+---
 
 ## Troubleshooting
 
-**Script hangs:** Check last [STAGE] message to see where it's stuck. Common: SSH timeout, docker compose pulling images, container startup
+| Issue | Solution |
+|-------|----------|
+| Script hangs | Check last [STAGE] message |
+| SSH fails | `ssh-copy-id $USER@<host>` |
+| Docker version mismatch | `docker compose version` on each node |
+| NCCL timeout | Update `NCCL_SOCKET_IFNAME` in `set_env_variables.sh` |
+| World size mismatch | Check `rocm-smi --showid \| wc -l`, adjust `--nproc` |
 
-**SSH fails:** `ssh-copy-id $USER@<host>` for each node, test with `ssh $USER@<host> hostname`
+### Missing Loss/Metrics Files
 
-**SSH works manually but fails in scripts:** Check if `node_ip_list.txt` contains hostnames or IPs. Conductor requires hostnames (for SSH config matching), Slurm typically uses IPs. Match your environment.
+If experiment folder has no `loss_rank*.log` or `rank_*_metrics.jsonl`:
 
-**Docker version mismatch:** Install matching Docker version on all nodes. Check with `docker compose version` on each node.
-
-**NCCL timeout:** Check `ifconfig | grep -E "^(eth|ib|ens)"` and update `NCCL_SOCKET_IFNAME` in `set_env_variables.sh`
-
-**World size mismatch:** Check `rocm-smi --showid | wc -l` and adjust `--nproc`
-
-**Code sync:** `for HOST in $(cat scripts/multi_node/node_ip_list.txt); do ssh $USER@$HOST "cd ~/aorta && git pull"; done`
-
-**Branch mismatch:** Checkout same branch on all nodes:
+1. Check Docker is running on each node:
 ```bash
-TARGET_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-for HOST in $(cat scripts/multi_node/node_ip_list.txt | tail -n +2); do
-  ssh $USER@$HOST "cd ~/aorta && git checkout $TARGET_BRANCH && git pull"
+for HOST in $(cat scripts/multi_node/node_ip_list.txt); do
+  ssh $HOST "docker ps | grep training-overlap"
 done
 ```
+
+2. If not running, start manually on each node:
+```bash
+ssh $HOST "cd ~/aorta && docker compose -f docker/docker-compose.rocm70_9-1.yaml up -d"
+```
+
+3. Check RoCE connectivity between nodes:
+```bash
+# From master, ping worker
+ping <worker-ip>
+
+# Check RDMA interfaces
+ibstat
+```
+
+4. If RoCE fails, use TCP instead:
+```bash
+./scripts/multi_node/master_launch.sh --tcp [other options]
+```
+
+---
 
 ## NCCL Configuration
 
@@ -374,3 +286,36 @@ export NCCL_SOCKET_NTHREADS=2
 ```
 
 **Debug:** `export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ALL`
+
+---
+
+## Conductor Setup
+
+For Conductor environments with SSH key management:
+
+### SSH Key Setup
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "conductor-multi-node" -f ~/.ssh/id_rsa_conductor -N ''
+cat ~/.ssh/id_rsa_conductor.pub
+```
+
+Register public key with your cluster's SSH key management system.
+
+```bash
+cat >> ~/.ssh/config << 'EOF'
+Host *.dcgpu smci350-* *.zts-gtu.dcgpu
+    IdentityFile ~/.ssh/id_rsa_conductor
+    StrictHostKeyChecking no
+EOF
+chmod 600 ~/.ssh/config
+```
+
+### Run Setup and Start Docker
+
+```bash
+./scripts/multi_node/setup_multi_node.sh
+./scripts/multi_node/start_docker_all_nodes.sh
+```
+
+Creates `node_ip_list.txt` with hostnames, detects network interfaces, verifies SSH and git branches.
