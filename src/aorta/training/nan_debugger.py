@@ -182,19 +182,36 @@ class NaNDebugger:
         nan_grads = []
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                if not torch.isfinite(param.grad).all():
-                    # Count actual NaN/Inf before reporting
+                # Single atomic check - do NOT re-verify with isnan/isinf count
+                # In race condition scenarios, the second read may see different data
+                # than the first read (compute stream may have finished writing)
+                is_finite = torch.isfinite(param.grad).all().item()
+                if not is_finite:
+                    # Race-aware: trust the first check, compute stats from current state
+                    # The gradient may have changed between checks due to stream race
                     num_nan = torch.isnan(param.grad).sum().item()
                     num_inf = torch.isinf(param.grad).sum().item()
                     
-                    # Skip false positives: isfinite() can return False even when no NaN/Inf exist
-                    # This is a known PyTorch/CUDA backend issue
+                    # DO NOT skip even if num_nan==0 and num_inf==0
+                    # This indicates a stream race: isfinite saw garbage, but by the time
+                    # we count NaN/Inf, compute has finished and data is valid
                     if num_nan == 0 and num_inf == 0:
-                        log.warning(
-                            "[NaNDebugger] False positive: isfinite().all() returned False but num_nan=0 and num_inf=0 | "
+                        log.error(
+                            "[NaNDebugger] STREAM RACE DETECTED: isfinite().all() returned False but "
+                            "num_nan=0 and num_inf=0 (data changed between reads) | "
                             "rank=%d step=%d param=%s shape=%s",
                             self.rank, step, name, list(param.grad.shape)
                         )
+                        # Still report as NaN - this IS the race condition bug
+                        nan_grads.append({
+                            "name": name,
+                            "shape": list(param.grad.shape),
+                            "num_nan": num_nan,
+                            "num_inf": num_inf,
+                            "race_detected": True,
+                            "grad_norm": param.grad.norm().item(),
+                            "grad_stats": self._compute_gradient_stats(param.grad),
+                        })
                         continue
                     
                     # Compute detailed gradient statistics

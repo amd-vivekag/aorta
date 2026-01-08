@@ -66,6 +66,9 @@ class TrainingConfig:
     output_dir: Path = Path("artifacts")
     inject_allreduce_copies: bool = False  # Inject all_reduce + host-device copies to trigger hang
     allreduce_stress_level: int = 1  # Number of all_reduce ops per iteration (1-10)
+    # Extend race window: add extra compute on compute stream after backward to widen the
+    # timing window where aux can observe partially-written gradients (for race condition testing)
+    extend_backward_compute_ms: int = 0  # Milliseconds of extra compute after backward (0 = disabled)
     # Debug: detect potential stream race where "aux" touches gradients before "compute" backward is complete.
     # This is expected behavior on both CUDA and ROCm/HIP unless you explicitly synchronize streams.
     debug_stream_race_report: bool = False
@@ -604,6 +607,20 @@ def training_loop(
                         else:
                             loss.backward()
                     
+                    # Extend race window: add extra compute on compute stream to keep it busy
+                    # This widens the timing window where aux can observe partially-written gradients
+                    if training_cfg.extend_backward_compute_ms > 0 and device.type == "cuda":
+                        with profiler.range("compute", f"epoch{epoch}_step{step}_extend_race_window"):
+                            # Run matmuls on compute stream to keep it busy
+                            # Each iteration ~0.1-0.5ms depending on GPU
+                            iterations = training_cfg.extend_backward_compute_ms * 10  # rough calibration
+                            dummy_a = torch.randn(1024, 1024, device=device, dtype=torch.float32)
+                            dummy_b = torch.randn(1024, 1024, device=device, dtype=torch.float32)
+                            for _ in range(iterations):
+                                dummy_c = torch.mm(dummy_a, dummy_b)
+                                dummy_a = dummy_c  # chain to prevent optimization
+                            del dummy_a, dummy_b, dummy_c
+                    
                     # Optional debug: detect whether backward work on "compute" is still in flight when we are
                     # about to touch gradients on "aux". If this triggers, you must add a stream dependency
                     # (e.g., aux.wait_stream(compute)) or run grad ops on the compute stream.
@@ -624,6 +641,7 @@ def training_loop(
 
                     # Track parameter evolution before clipping (for debugging)
                     # Continue tracking until NaN is detected or step 20
+                    has_nan_grad = False
                     if nan_debugger is not None and not nan_debugger.nan_detected and global_step <= 20:
                         with profiler.range("aux", f"epoch{epoch}_step{step}_param_track_preclip"):
                             if backward_done_event is not None and not backward_done_event.query():
@@ -635,8 +653,28 @@ def training_loop(
                                 if training_cfg.debug_stream_race_report_wait:
                                     profiler.stream("aux").wait_stream(profiler.stream("compute"))
                             nan_debugger.track_parameter_evolution(global_step)
+                            
+                            # Check gradients IMMEDIATELY in the same race window (before clip_grad_norm_)
+                            # This catches stream race NaNs that would otherwise disappear after sync
+                            if nan_debugger.check_gradients(global_step):
+                                log.error("[NaNDebugger] NaN/Inf detected in gradients (pre-clip race window) - stopping training")
+                                has_nan_grad = True
+                                # Export profiler trace
+                                nan_debugger.export_profiler_trace(
+                                    torch_profiler, profiler_cfg, profiler_dir,
+                                    f"nan_gradients_race_step{global_step}.json"
+                                )
+                                # Signal other ranks best-effort
+                                if store is not None and not nan_failure_flag["detected"]:
+                                    nan_debugger.signal_nan_to_ranks(store, global_step)
                     
-                    # Clip gradients first to prevent extreme values
+                    # Synchronize NaN detection across all ranks (before clip to stop early)
+                    if nan_debugger is not None and has_nan_grad:
+                        if nan_debugger.broadcast_nan_stop_signal(has_nan_grad, device):
+                            stop_flag["stop"] = True
+                            break
+                    
+                    # Clip gradients to prevent extreme values
                     grad_norm = None
                     if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
                         with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
@@ -650,11 +688,10 @@ def training_loop(
                                     profiler.stream("aux").wait_stream(profiler.stream("compute"))
                             grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
                     
-                    # Check gradients for NaN/Inf with diagnostics (after clipping)
-                    has_nan_grad = False
-                    if nan_debugger is not None:
+                    # Check gradients for NaN/Inf again after clipping (catches real numerical issues)
+                    if nan_debugger is not None and not has_nan_grad:
                         if nan_debugger.check_gradients(global_step):
-                            log.error("[NaNDebugger] NaN/Inf detected in gradients - stopping training")
+                            log.error("[NaNDebugger] NaN/Inf detected in gradients (post-clip) - stopping training")
                             has_nan_grad = True
                             # Track parameter state at the moment of NaN detection
                             with profiler.range("aux", f"epoch{epoch}_step{step}_param_track_nan_grad"):
@@ -668,8 +705,8 @@ def training_loop(
                             if store is not None and not nan_failure_flag["detected"]:
                                 nan_debugger.signal_nan_to_ranks(store, global_step)
                     
-                    # Synchronize NaN detection across all ranks
-                    if nan_debugger is not None:
+                    # Synchronize NaN detection across all ranks (after clip for post-clip NaNs)
+                    if nan_debugger is not None and has_nan_grad:
                         if nan_debugger.broadcast_nan_stop_signal(has_nan_grad, device):
                             stop_flag["stop"] = True
                             break

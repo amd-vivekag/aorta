@@ -16,8 +16,11 @@ training:
   log_interval: 1
   additional_compute_streams: 2
   lightweight_op_waves: 3
-  inject_allreduce_copies: false
+  inject_allreduce_copies: false   # Not needed for race window (runs after optimizer step)
   allreduce_stress_level: 8
+  # Race window extension: add extra compute on compute stream after backward
+  # This keeps compute stream busy while aux tries to read gradients
+  extend_backward_compute_ms: 50   # 50ms of extra matmuls to widen race window
   # Stream/grad safety + diagnostics:
   # - debug_stream_race_report: logs if "aux" touches grads before "compute" backward completes.
   # - aux_wait_compute_after_backward: enforces correct ordering (recommended for correctness).
@@ -58,13 +61,13 @@ model:
   mlp_hidden_dim: 4096
 
 fsdp:
-  sharding_strategy: hybrid_shard
+  sharding_strategy: full_shard
   backward_prefetch: BACKWARD_PRE
   use_orig_params: true
   limit_all_gathers: true
   forward_prefetch: true
-  sync_module_states: true
-  param_init_device: meta
+  sync_module_states: false
+  #param_init_device: meta
 
 distributed:
   backend: nccl

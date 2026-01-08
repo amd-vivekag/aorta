@@ -166,6 +166,10 @@ EXPERIMENT_DIR="$AORTA_ROOT/experiments/multinode_${CHANNELS}ch_${THREADS}th_${T
 mkdir -p "$EXPERIMENT_DIR"
 mkdir -p "$EXPERIMENT_DIR/logs"
 
+# Copy config file to experiment directory for reproducibility
+cp "$AORTA_ROOT/$CONFIG_FILE" "$EXPERIMENT_DIR/config_used.yaml"
+echo "Saved config to: $EXPERIMENT_DIR/config_used.yaml"
+
 # Save experiment metadata
 cat > "$EXPERIMENT_DIR/experiment_info.txt" << EOF
 Experiment: ${LABEL:-unlabeled}
