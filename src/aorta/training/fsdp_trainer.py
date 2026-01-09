@@ -77,6 +77,9 @@ class TrainingConfig:
     # Correctness toggle: ensure "aux" stream does not touch gradients before "compute" backward finishes.
     # Recommended True when using multi-stream "aux" grad work (clipping/checks/etc.).
     aux_wait_compute_after_backward: bool = False
+    # Size of synthetic collective tensors in MB for extra streams (0 = disabled)
+    # Only used when num_streams > 4 (comm0, comm1, etc.)
+    synthetic_collective_size_mb: float = 2.0
 
 
 @dataclass
@@ -468,6 +471,29 @@ def setup_signal_handlers(stop_flag: Dict[str, bool]) -> None:
         signal.signal(sig, _handle)
 
 
+def _run_synthetic_collectives(
+    profiler: StreamProfiler,
+    device: torch.device,
+    epoch: int,
+    step: int,
+    tensor_size: int = 1024 * 512,  # 2MB in float32 elements
+) -> None:
+    """Run synthetic collectives on extra streams (comm0, comm1, etc.).
+    
+    This stresses hardware queue scheduling by running real NCCL/RCCL collectives
+    on additional streams. Only runs on streams whose names start with 'comm'.
+    """
+    for stream_name in profiler.streams.keys():
+        if stream_name.startswith("comm"):
+            with profiler.range(stream_name, f"epoch{epoch}_step{step}_synthetic"):
+                dummy = torch.randn(tensor_size, device=device, dtype=torch.float32)
+                if dist.is_initialized():
+                    dist.all_reduce(dummy, op=dist.ReduceOp.AVG)
+                # Also add device-to-device copies for memory stress
+                dummy_copy = dummy.clone()
+                del dummy, dummy_copy
+
+
 def training_loop(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -829,6 +855,12 @@ def training_loop(
                                 loss_cpu = loss_device_copy.cpu()
                                 _ = loss_cpu.to(device, non_blocking=False)
 
+                    # Run synthetic collectives on extra streams (comm0, comm1, etc.)
+                    # Placed AFTER all NaN checks and optimizer to avoid collective deadlock
+                    if len(profiler.streams) > 4 and training_cfg.synthetic_collective_size_mb > 0:
+                        tensor_size = int(training_cfg.synthetic_collective_size_mb * 1024 * 256)  # MB to float32 elements
+                        _run_synthetic_collectives(profiler, device, epoch, step, tensor_size)
+
                     profiler.record_marker("compute", f"epoch{epoch}_step{step}_end")
 
                     iteration_profile = profiler.end_iteration()
@@ -1117,7 +1149,46 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         training_cfg.max_steps or training_cfg.epochs * len(dataloader),
     )
 
-    profiler = StreamProfiler(env["device"])
+    # Configure streams based on AORTA_NUM_STREAMS environment variable
+    num_streams_env = os.environ.get("AORTA_NUM_STREAMS", "4")
+    try:
+        num_streams = int(num_streams_env)
+    except ValueError:
+        num_streams = 4
+    
+    # Generate stream names based on count
+    # Base streams: compute, aux (always needed)
+    # Additional streams: allreduce, reducescatter, comm1, comm2, ...
+    if num_streams <= 1:
+        stream_names = ["compute"]  # Minimum 1 stream
+    elif num_streams == 2:
+        stream_names = ["compute", "aux"]
+    elif num_streams == 3:
+        stream_names = ["compute", "aux", "allreduce"]
+    elif num_streams == 4:
+        stream_names = ["compute", "aux", "allreduce", "reducescatter"]
+    else:
+        # 5+ streams: add numbered comm streams
+        stream_names = ["compute", "aux", "allreduce", "reducescatter"]
+        for i in range(num_streams - 4):
+            stream_names.append(f"comm{i}")
+    
+    profiler = StreamProfiler(env["device"], stream_names=stream_names)
+    
+    # Log hardware queue configuration for debugging stream races
+    hw_queues_env = os.environ.get("GPU_MAX_HW_QUEUES")
+    if hw_queues_env:
+        hw_queues_info = hw_queues_env
+    else:
+        # Default is typically 4 on ROCm when not explicitly set
+        hw_queues_info = "4 (default, GPU_MAX_HW_QUEUES not set)"
+    log.info(
+        "[StreamConfig] Hardware queues=%s | num_streams=%d | streams=%s | rank=%d",
+        hw_queues_info,
+        num_streams,
+        list(profiler.streams.keys()),
+        rank,
+    )
     
     # Initialize NaN debugger for automatic root cause analysis
     nan_debugger = NaNDebugger(

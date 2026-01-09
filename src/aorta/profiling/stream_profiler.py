@@ -270,11 +270,25 @@ class DistributedOpsInterceptor:
             log.warning("Distributed backend not initialised; comm interception disabled")
             return None
 
-        self._patch(dist, "all_reduce", "allreduce")
+        # Only patch if the target stream exists in the profiler
+        available_streams = set(self.profiler.streams.keys())
+        
+        if "allreduce" in available_streams:
+            self._patch(dist, "all_reduce", "allreduce")
+        elif "aux" in available_streams:
+            # Fallback to aux stream if allreduce not available
+            self._patch(dist, "all_reduce", "aux")
+        
         if hasattr(dist, "reduce_scatter_tensor"):
-            self._patch(dist, "reduce_scatter_tensor", "reducescatter")
+            if "reducescatter" in available_streams:
+                self._patch(dist, "reduce_scatter_tensor", "reducescatter")
+            elif "aux" in available_streams:
+                self._patch(dist, "reduce_scatter_tensor", "aux")
+        
         if hasattr(dist, "all_gather_into_tensor"):
-            self._patch(dist, "all_gather_into_tensor", "aux")
+            if "aux" in available_streams:
+                self._patch(dist, "all_gather_into_tensor", "aux")
+        
         return None
 
     def __exit__(self, exc_type, exc, tb) -> None:

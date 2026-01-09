@@ -153,8 +153,11 @@ done
 | -m | --stats | false | rocprof stats |
 |  | --rocprof-input | none | rocprof yaml |
 |  | --master-port | auto | Master port |
+|  | --hw-queues | 4 | GPU_MAX_HW_QUEUES (hardware queue count) |
+|  | --streams | 4 | Number of CUDA/HIP streams (1-6+) |
+|  | --tcp | false | Use TCP transport instead of RDMA/RoCE |
 
-Environment variables: `CHANNELS=42 THREADS=512 ./scripts/multi_node/master_launch.sh`
+Environment variables: `CHANNELS=42 THREADS=512 HW_QUEUES=2 NUM_STREAMS=2 ./scripts/multi_node/master_launch.sh`
 
 GPU subset: Use `-p 4` or `export CUDA_VISIBLE_DEVICES=0,2,4,6`
 
@@ -261,6 +264,73 @@ ibstat
 4. If RoCE fails, use TCP instead:
 ```bash
 ./scripts/multi_node/master_launch.sh --tcp [other options]
+```
+
+---
+
+## Hardware Queue Configuration
+
+The `--hw-queues` option controls `GPU_MAX_HW_QUEUES`, which sets the number of hardware queues the GPU uses for parallel stream execution.
+
+```bash
+# Use 2 hardware queues (less parallelism, may mask race conditions)
+./scripts/multi_node/master_launch.sh --hw-queues 2 --label test
+
+# Use 4 hardware queues (default, max parallelism, exposes race conditions)
+./scripts/multi_node/master_launch.sh --hw-queues 4 --label test
+```
+
+### How It Works
+
+The trainer uses 4 software streams: `compute`, `aux`, `allreduce`, `reducescatter`. These map to hardware queues:
+
+| HW Queues | Effect |
+|-----------|--------|
+| 4 | Each stream gets own queue, max parallelism |
+| 2 | Streams share queues, less parallelism |
+| 1 | All streams serialize on one queue |
+
+### Stream Count Configuration
+
+Use `--streams` to control how many software streams are created:
+
+```bash
+# Use 2 streams (compute + aux only)
+./scripts/multi_node/master_launch.sh --streams 2 --label test
+
+# Use 6 streams (compute, aux, allreduce, reducescatter, comm0, comm1)
+./scripts/multi_node/master_launch.sh --streams 6 --label test
+```
+
+| Streams | Names Created |
+|---------|---------------|
+| 1 | compute |
+| 2 | compute, aux |
+| 3 | compute, aux, allreduce |
+| 4 | compute, aux, allreduce, reducescatter |
+| 5+ | compute, aux, allreduce, reducescatter, comm0, comm1, ... |
+
+### Synthetic Collectives on Extra Streams
+
+When `--streams > 4`, extra streams (`comm0`, `comm1`, etc.) run synthetic collective operations to stress test hardware queue scheduling. These run **after the optimizer step** to avoid collective deadlocks on NaN detection.
+
+Configure the tensor size in your config:
+
+```yaml
+training:
+  synthetic_collective_size_mb: 2.0  # Size in MB (0 = disabled)
+```
+
+The synthetic work runs real `all_reduce` operations plus device-to-device memory copies on each extra stream, providing realistic multi-stream contention.
+
+### Stream Race Conditions
+
+With multiple hardware queues, the `aux` stream may read gradients before `compute` finishes backward. Enable synchronization in your config:
+
+```yaml
+training:
+  aux_wait_compute_after_backward: true  # Recommended for correctness
+  debug_stream_race_report: true         # Log race condition warnings
 ```
 
 ---

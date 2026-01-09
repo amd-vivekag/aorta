@@ -27,7 +27,10 @@ training:
   debug_stream_race_report: true
   debug_stream_race_report_max_steps: 50
   debug_stream_race_report_wait: false
-  aux_wait_compute_after_backward: true
+  aux_wait_compute_after_backward: false
+  # Size of synthetic collective tensors in MB for extra streams (0 = disabled)
+  # Only used when --streams > 4 (creates comm0, comm1, etc.)
+  synthetic_collective_size_mb: 2.0
 
 optimizer:
   name: shampoo
@@ -109,7 +112,7 @@ profiling:
   enabled: false
   wait: 0
   warmup: 0
-  active: 2000
+  active: 10
   repeat: 1
   record_shapes: false
   profile_memory: false
@@ -117,7 +120,7 @@ profiling:
   with_flops: false
   tensorboard: false
   chrome_trace: true
-  trace_filename: user_adamw.json
+  trace_filename: traces.json
 
 tracelens:
   enabled: false

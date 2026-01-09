@@ -22,13 +22,23 @@ DOCKER_CONTAINER="${DOCKER_CONTAINER:-$(echo "${16}" | sed 's/"//g')}"
 DOCKER_CONTAINER="${DOCKER_CONTAINER:-training-overlap-bugs-rocm70_9-1}"
 AMD_WAIT=$(echo "${17}" | sed 's/"//g')
 AMD_WAIT="${AMD_WAIT:-false}"
+# HW_QUEUES passed via environment variable or param 18
+HW_QUEUES="${HW_QUEUES:-$(echo "${18}" | sed 's/"//g')}"
+HW_QUEUES="${HW_QUEUES:-4}"
+# NUM_STREAMS passed via environment variable or param 19
+NUM_STREAMS="${NUM_STREAMS:-$(echo "${19}" | sed 's/"//g')}"
+NUM_STREAMS="${NUM_STREAMS:-4}"
 
 echo "============================================"
 echo "DEBUG: Received parameters"
 echo "DEBUG: Param 16 (DOCKER_CONTAINER) = '${16}'"
 echo "DEBUG: Param 17 (AMD_WAIT) = '${17}'"
+echo "DEBUG: Param 18 (HW_QUEUES) = '${18}'"
+echo "DEBUG: Param 19 (NUM_STREAMS) = '${19}'"
 echo "DEBUG: After processing DOCKER_CONTAINER = '$DOCKER_CONTAINER'"
 echo "DEBUG: After processing AMD_WAIT = '$AMD_WAIT'"
+echo "DEBUG: After processing HW_QUEUES = '$HW_QUEUES'"
+echo "DEBUG: After processing NUM_STREAMS = '$NUM_STREAMS'"
 echo "============================================"
 echo "Node Configuration"
 echo "============================================"
@@ -46,6 +56,8 @@ echo "Channels: $CHANNELS"
 echo "Threads: $THREADS"
 echo "Docker Container: $DOCKER_CONTAINER"
 echo "AMD_OCL_WAIT_COMMAND: $AMD_WAIT"
+echo "GPU HW Queues: $HW_QUEUES"
+echo "Num Streams: $NUM_STREAMS"
 echo "============================================"
 echo ""
 
@@ -73,6 +85,10 @@ fi
 echo ""
 echo "Environment configured. Starting GEMM training..."
 echo ""
+
+# Export HW_QUEUES and NUM_STREAMS so local_launch.sh can use them
+export GPU_MAX_HW_QUEUES="$HW_QUEUES"
+export AORTA_NUM_STREAMS="$NUM_STREAMS"
 
 # Launch local_launch.sh with all parameters
 "$WORKDIR/scripts/multi_node/local_launch.sh" \

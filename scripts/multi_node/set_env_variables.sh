@@ -20,7 +20,7 @@ else
     echo "[OK] Using RDMA transport"
     export NCCL_IB_DISABLE=0
 fi
-
+export GPU_MAX_HW_QUEUES=2 
 # NCCL Debug Settings (enabled to track NaN/Inf failures)
 export NCCL_DEBUG=WARN
 #export NCCL_DEBUG_SUBSYS=ALL
