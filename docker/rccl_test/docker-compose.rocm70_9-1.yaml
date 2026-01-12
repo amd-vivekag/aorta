@@ -15,14 +15,18 @@ services:
     security_opt:
       - seccomp=unconfined
     environment:
-      - RCCL_FOLDER=/rccl
-      - LD_LIBRARY_PATH=/rccl/build/release:${LD_LIBRARY_PATH:-}
+      - RCCL_FOLDER=/rccl/rccl
+      - LD_LIBRARY_PATH=/rccl/rccl/build/release:${LD_LIBRARY_PATH:-}
       - TORCH_NCCL_HIGH_PRIORITY=1
 
     volumes:
-      # Mount parent directory (aorta/) to /workspace/aorta
-      # Use AORTA_WORKSPACE env var if set, otherwise default to parent dir (..)
-      - ${AORTA_WORKSPACE:-..}:/workspace/aorta
+      # Mount aorta/ directory to /workspace/aorta
+      # From docker/rccl_test/, go up two levels to reach aorta/
+      # Use AORTA_WORKSPACE env var if set, otherwise default to ../..
+      - ${AORTA_WORKSPACE:-../..}:/workspace/aorta
+      # RCCL build directory - use relative path for bind mount
+      # Use RCCL_WORKSPACE env var if set, otherwise default to ./rccl_build
+      - ${RCCL_WORKSPACE:-./rccl_build}:/rccl
     devices:
       - /dev/kfd
       - /dev/dri
