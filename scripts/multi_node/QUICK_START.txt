@@ -1,0 +1,64 @@
+================================================================================
+                    BATCH TRAINING - QUICK START
+================================================================================
+
+1. VERIFY SETUP
+   cd /home/vivekag/scratch/apps/aorta_work/aorta
+   ./scripts/multi_node/verify_batch_setup.sh
+
+2. START BATCH TRAINING
+   ./scripts/multi_node/batch_train.sh
+
+3. MONITOR PROGRESS
+   tail -f batch_train_*.log
+
+4. CHECK COMPLETED RUNS
+   cat .batch_train_state
+
+================================================================================
+                         TRAINING COMBINATIONS
+================================================================================
+
+SHAMPOO (6 combinations with --tcp):
+  1. shampoo_hwq2_str2
+  2. shampoo_hwq2_str4
+  3. shampoo_hwq2_str6
+  4. shampoo_hwq4_str2
+  5. shampoo_hwq4_str4
+  6. shampoo_hwq4_str6
+
+ADAMW (6 combinations with --tcp):
+  7. adam_hwq2_str2
+  8. adam_hwq2_str4
+  9. adam_hwq2_str6
+  10. adam_hwq4_str2
+  11. adam_hwq4_str4
+  12. adam_hwq4_str6
+
+================================================================================
+                             KEY FILES
+================================================================================
+
+Batch Script:        scripts/multi_node/batch_train.sh
+Documentation:       scripts/multi_node/BATCH_TRAIN_README.md
+Verification:        scripts/multi_node/verify_batch_setup.sh
+Implementation Doc:  BATCH_TRAIN_IMPLEMENTATION.md
+
+State File:          .batch_train_state
+Failed Runs:         .batch_train_state.failed
+Batch Log:           batch_train_<timestamp>.log
+
+================================================================================
+                            USEFUL COMMANDS
+================================================================================
+
+View progress:       cat .batch_train_state
+View failures:       cat .batch_train_state.failed
+Monitor logs:        tail -f batch_train_*.log
+Check experiments:   ls -lt experiments/ | head
+Monitor training:    tail -f experiments/multinode_*/logs/node_*.txt
+
+Reset state:         rm .batch_train_state .batch_train_state.failed
+Skip combination:    echo "combo_name" >> .batch_train_state
+
+================================================================================
