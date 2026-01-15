@@ -18,7 +18,7 @@ training:
   lightweight_op_waves: 3
 
 optimizer:
-  name: shampoo
+  name: adamW
   lr: 0.0002
   weight_decay: 0.01
   betas: [0.9, 0.985]
@@ -94,7 +94,7 @@ dataloader:
   pin_memory: true
 
 profiling:
-  enabled: true
+  enabled: false
   wait: 0
   warmup: 0
   active: 20
