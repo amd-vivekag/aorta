@@ -59,7 +59,7 @@ fsdp:
 
 distributed:
   backend: nccl
-  mode: fdsp
+  mode: fsdp
   bucket_cap_mb: 128
   gradient_as_bucket_view: true
   static_graph: true
