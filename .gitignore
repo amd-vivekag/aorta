@@ -42,19 +42,25 @@ checkpoints/
 runs/
 logs/
 tensorboard/
+experiments/
+artifacts/
+artifacts_*/
+overlap_debug*/
 
 # Experiment outputs and traces
-experiments/
 *.json
+*.jsonl
 *.xlsx
+*.log
+*.logs
 *_merged_enhanced.json
 nccl_thread_sweep_*.log
 nccl_thread_sweep_summary_*.txt
 expected_outputs/
 testdata/
-*.log
 actual_outputs/
 *.html
+
 # IDE/project-specific folders
 .vscode/
 .idea/
@@ -68,7 +74,13 @@ Thumbs.db
 # Data files
 *.dat
 
+# Profiler traces
 tmp_prof.*
 rocprof_traces
 overlap.*
 .*repro.*
+*.gz
+trace_*
+
+# Multi-node IP configuration (should be customized per deployment)
+node_ip_list.txt

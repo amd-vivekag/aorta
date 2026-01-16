@@ -1,9 +1,9 @@
 services:
-  torchenv-rocm70:
-    container_name: training-overlap-bugs-rocm70_9-1
+  torchenv-rocm70-shampoo:
+    container_name: training-overlap-bugs-rocm70_9-1-shampoo
     build:
       context: .
-      dockerfile: Dockerfile.rocm70_9-1
+      dockerfile: Dockerfile.rocm70_9-1-shampoo
       network: host
     user: root
     privileged: true
@@ -21,9 +21,8 @@ services:
       - TORCH_NCCL_HIGH_PRIORITY=1
 
     volumes:
-      # Mount parent directory (aorta/) to /workspace/aorta
-      # Use AORTA_WORKSPACE env var if set, otherwise default to parent dir (..)
-      - ${AORTA_WORKSPACE:-..}:/workspace/aorta
+      - /home/manrao:/manrao
+      - /home/oyazdanb/aorta:/workspace/aorta
     devices:
       - /dev/kfd
       - /dev/dri
