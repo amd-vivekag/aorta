@@ -6,19 +6,22 @@ logging:
   level: INFO
 
 training:
-  epochs: 10
+  epochs: 100
   batch_size: 512
   gradient_accumulation: 2
   mixed_precision: bf16
-  max_steps: 2200
+  max_steps: 4400
   grad_clip_norm: 1.0
   output_dir: artifacts/user_shampoo
   log_interval: 5
   additional_compute_streams: 2
   lightweight_op_waves: 3
+  race_force_async: true      
+  race_fresh_stream: true      
+  race_delay_safe_ranks: false 
 
 optimizer:
-  name: adamW
+  name: shampoo
   lr: 0.0002
   weight_decay: 0.01
   betas: [0.9, 0.985]

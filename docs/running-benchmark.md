@@ -66,6 +66,38 @@ The script:
 
 Use `rocprofv3` (or `scripts/rocprof_capture.sh`) against this benchmark to inspect SDMA engine utilization and validate whether transfers run concurrently with compute.
 
+## Multi-Node Training
+
+For distributed training across multiple nodes:
+
+```bash
+# Basic multi-node launch
+./scripts/multi_node/master_launch.sh --channels 28 --threads 256
+
+# With experiment label for easy identification
+./scripts/multi_node/master_launch.sh --label shampoo_test --config config/multi_node/shampoo_opt_multi_node.yaml
+```
+
+The `--label` option appends a custom suffix to the experiment directory name (e.g., `experiments/multinode_28ch_256th_20260116_123456_shampoo_test/`).
+
+### Prerequisites
+
+1. Configure node IPs in `scripts/multi_node/node_ip_list.txt` (one IP/hostname per line)
+2. Ensure passwordless SSH access between nodes
+3. Start the Docker container on all nodes
+
+### Available Options
+
+| Option | Description |
+| --- | --- |
+| `-c, --channels` | NCCL_MAX_NCHANNELS (default: 28) |
+| `-t, --threads` | RCCL_THREADS_PER_BLOCK (default: 256) |
+| `-f, --config` | Config file path |
+| `-p, --nproc` | Processes per node (default: 8) |
+| `-d, --docker` | Docker container name |
+| `-l, --label` | Experiment label (appended to directory name) |
+| `-r, --rocprof` | Enable rocprofv3 tracing |
+
 ## Next Steps
 
 - [Configuration Guide](configuration.md) - Tune model and training parameters

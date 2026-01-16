@@ -61,6 +61,10 @@ class TrainingConfig:
     output_dir: Path = Path("artifacts")
     inject_allreduce_copies: bool = False  # Inject all_reduce + host-device copies to trigger hang
     allreduce_stress_level: int = 1  # Number of all_reduce ops per iteration (1-10)
+    # Race injection mechanisms (for testing NaN race between backward and clip_grad_norm_)
+    race_force_async: bool = False      # Mechanism 1: Skip work.wait() in DistributedOpsInterceptor
+    race_fresh_stream: bool = False     # Mechanism 2: Use fresh CUDA stream for racing ranks
+    race_delay_safe_ranks: bool = False # Mechanism 3: Add GPU delays to safe ranks
 
 
 @dataclass
@@ -563,32 +567,11 @@ def _warmup_training_collectives(
         num_warmup_steps: Number of warmup steps to run
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    # #region agent log
-    import os as _os, json as _json, time as _time, fcntl as _fcntl
-    _debug_log_path = "/workspace/aorta/.cursor/debug.log"
-    _os.makedirs(_os.path.dirname(_debug_log_path), exist_ok=True)
-    def _dbg(msg, data=None, hyp=""):
-        entry = _json.dumps({"timestamp": _time.time(), "rank": rank, "location": "warmup_training", "message": msg, "data": data or {}, "hypothesisId": hyp}) + "\n"
-        with open(_debug_log_path, "a") as f:
-            _fcntl.flock(f.fileno(), _fcntl.LOCK_EX)
-            f.write(entry)
-            f.flush()
-            _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
-    # #endregion
-
-    # #region agent log
-    _dbg("warmup_training_start", {"num_warmup_steps": num_warmup_steps, "world_size": world_size, "optimizer_type": type(optimizer).__name__}, "A")
-    # #endregion
 
     # Get an iterator from the dataloader
     data_iter = iter(dataloader)
 
     for warmup_step in range(num_warmup_steps):
-        # #region agent log
-        _dbg("warmup_step_begin", {"step": warmup_step}, "A")
-        # #endregion
-
         try:
             cpu_batch = next(data_iter)
         except StopIteration:
@@ -596,24 +579,13 @@ def _warmup_training_collectives(
             data_iter = iter(dataloader)
             cpu_batch = next(data_iter)
 
-        # #region agent log
-        _dbg("batch_loaded", {"step": warmup_step}, "A")
-        # #endregion
-
         # Move batch to device
         batch = {k: v.to(device, non_blocking=True) if hasattr(v, 'to') else v
                  for k, v in cpu_batch.items()}
         torch.cuda.synchronize()
 
-        # #region agent log
-        _dbg("batch_on_device", {"step": warmup_step}, "A")
-        # #endregion
-
         # Forward pass
         optimizer.zero_grad(set_to_none=True)
-        # #region agent log
-        _dbg("forward_start", {"step": warmup_step}, "B")
-        # #endregion
         if autocast_dtype:
             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                 scores = model(batch)
@@ -621,67 +593,30 @@ def _warmup_training_collectives(
         else:
             scores = model(batch)
             loss = compute_loss(scores, batch)
-        # #region agent log
-        _dbg("forward_done", {"step": warmup_step, "loss": float(loss.item())}, "B")
-        # #endregion
 
         # Backward pass
-        # #region agent log
-        _dbg("backward_start", {"step": warmup_step}, "C")
-        # #endregion
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        # #region agent log
-        _dbg("backward_done", {"step": warmup_step}, "C")
-        # #endregion
 
         # Optimizer step
-        # #region agent log
-        _dbg("optimizer_step_start", {"step": warmup_step}, "D")
-        # #endregion
         if scaler is not None:
             scaler.step(optimizer)
             scaler.update()
         else:
             optimizer.step()
-        # #region agent log
-        _dbg("optimizer_step_done", {"step": warmup_step}, "D")
-        # #endregion
 
-        # Synchronize - split into separate phases for detailed debugging
-        # #region agent log
-        _dbg("cuda_sync_start", {"step": warmup_step}, "F")
-        # #endregion
+        # Synchronize all ranks after each warmup step
         torch.cuda.synchronize()
-        # #region agent log
-        _dbg("cuda_sync_done", {"step": warmup_step}, "F")
-        # #endregion
-
-        # #region agent log
-        _dbg("barrier_start", {"step": warmup_step}, "G")
-        # #endregion
         dist.barrier()
-        # #region agent log
-        _dbg("barrier_done", {"step": warmup_step}, "G")
-        # #endregion
 
         log.debug("Warmup step %d complete (rank=%d, loss=%.4f)", warmup_step, rank, loss.item())
 
-    # #region agent log
-    _dbg("final_cleanup_start", {}, "H")
-    # #endregion
     # Reset optimizer state after warmup to not affect actual training
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
-    # #region agent log
-    _dbg("final_barrier_start", {}, "H")
-    # #endregion
     dist.barrier()
-    # #region agent log
-    _dbg("warmup_complete", {}, "H")
-    # #endregion
 
 
 def build_ddp_model(
@@ -809,9 +744,15 @@ def training_loop(
 
     # Warmup training collectives before main loop to avoid RCCL race conditions
     # This exercises forward/backward/optimizer step on all communicators
-    log.info("Starting training warmup pass (rank=%d)...", rank)
-    _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler)
+    # NOTE: Reduced to 1 step (from 3) to preserve more timing variability
+    # while still exercising the collectives. RCCL warmup in build_fsdp_model
+    # handles communicator initialization separately.
+    log.info("Starting training warmup pass (rank=%d, num_steps=1)...", rank)
+    _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=1)
     log.info("Training warmup complete (rank=%d)", rank)
+
+    # Note: force_async is now controlled dynamically per-step in training loop
+    # Only racing ranks (local 1, 2 on Node 0) at step >= 3 will have force_async enabled
 
     profiler_dir = training_cfg.output_dir / "torch_profiler"
     with profiler.intercept_distributed_ops():
@@ -839,16 +780,68 @@ def training_loop(
                             scores = model(batch)
                             loss = compute_loss(scores, batch)
 
+                    # ============================================================
+                    # RACE CONDITION INJECTION: Force aux stream to read early
+                    # ============================================================
+                    # Controlled by 3 independent flags:
+                    # - race_force_async: Skip work.wait() in interceptor (during backward)
+                    # - race_fresh_stream: Use fresh CUDA stream for racing ranks
+                    # - race_delay_safe_ranks: Add GPU delays to safe ranks
+                    #
+                    # Racing ranks: local 1, 2 on Node 0 only (global ranks 1, 2)
+                    # ============================================================
+                    local_rank = rank % 8
+                    node_id = rank // 8
+                    is_racing_rank = node_id == 0 and local_rank in (1, 2)
+
+                    # Set force_async BEFORE backward so reduce-scatter uses correct value
+                    should_enable_force_async = (
+                        training_cfg.race_force_async and
+                        step >= 3 and
+                        is_racing_rank
+                    )
+                    profiler.set_force_async(should_enable_force_async)
+
                     with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
                         if scaler is not None:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
 
+                    # After backward: non-racing ranks sync to wait for reduce-scatter
+                    if training_cfg.race_force_async and step >= 3 and not is_racing_rank:
+                        torch.cuda.synchronize()
+
                     grad_norm = None
-                    if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
-                        with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
-                            grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
+                    race_active = step >= 3 and training_cfg.race_fresh_stream and is_racing_rank
+
+                    if race_active:
+                        # Mechanism 2: Racing ranks use a fresh stream with NO dependencies
+                        race_stream = torch.cuda.Stream(device=device)
+                        log.warning(
+                            "RACE INJECTION: rank=%d (node=%d, local=%d) using FRESH stream - racing",
+                            rank, node_id, local_rank
+                        )
+                        if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
+                            with torch.cuda.stream(race_stream):
+                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
+                            # Do NOT synchronize race_stream here - let it race
+                    else:
+                        # Mechanism 3: Safe ranks get artificial delays (if enabled)
+                        if step >= 3 and training_cfg.race_delay_safe_ranks:
+                            delay_tensor = torch.randn(1024 * 1024, device=device)
+                            for _ in range(100):
+                                delay_tensor = delay_tensor * 1.0001
+                            torch.cuda.synchronize()
+                            log.warning(
+                                "RACE INJECTION: rank=%d (node=%d, local=%d) SYNCHRONIZED with delay - safe",
+                                rank, node_id, local_rank
+                            )
+
+                        # Normal path: use profiler's aux stream
+                        if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
+                            with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
+                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
 
                     with profiler.range("aux", f"epoch{epoch}_step{step}_optimizer"):
                         try:
@@ -1207,7 +1200,11 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         training_cfg.max_steps or training_cfg.epochs * len(dataloader),
     )
 
-    profiler = StreamProfiler(env["device"])
+    # Start with force_async disabled - will enable after warmup if race_force_async is set
+    profiler = StreamProfiler(
+        env["device"],
+        force_async_for_race_test=False,
+    )
 
     try:
         training_loop(

@@ -138,10 +138,28 @@ done
 | -p | --nproc | 8 | GPUs per node |
 | -f | --config | config/multi_node/distributed_multinode.yaml | Config file |
 | -d | --docker | training-overlap-bugs-rocm70_9-1 | Docker container name |
+| -l | --label | (none) | Experiment label suffix |
 | -r | --rocprof | false | Enable rocprofv3 |
 | -m | --stats | false | rocprof stats |
 |  | --rocprof-input | none | rocprof yaml |
 |  | --master-port | auto | Master port |
+
+### Experiment Labels
+
+Use `--label` to add a descriptive suffix to experiment directories for easy identification:
+
+```bash
+# Without label - creates: experiments/multinode_28ch_256th_20260116_123456/
+./scripts/multi_node/master_launch.sh
+
+# With label - creates: experiments/multinode_28ch_256th_20260116_123456_shampoo_test/
+./scripts/multi_node/master_launch.sh --label shampoo_test
+
+# Short form
+./scripts/multi_node/master_launch.sh -l my_experiment
+```
+
+This is useful when running multiple experiments to track different configurations, optimizers, or hyperparameters.
 
 Environment variables: `CHANNELS=42 THREADS=512 ./scripts/multi_node/master_launch.sh`
 

@@ -10,6 +10,7 @@ usage() {
     echo "  -f, --config CONFIG         Config file path (default: config/multi_node/distributed_multinode.yaml)"
     echo "  -p, --nproc NPROC           Number of processes per node (default: 8)"
     echo "  -d, --docker CONTAINER      Docker container name (default: training-overlap-bugs-rocm70_9-1)"
+    echo "  -l, --label LABEL           Experiment label (appended to directory name)"
     echo "  -r, --rocprof               Enable rocprofv3 tracing"
     echo "  -m, --stats                 Enable rocprof stats (CU utilization, occupancy)"
     echo "      --rocprof-input FILE    Use rocprofv3 input yaml/json"
@@ -37,6 +38,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 CHANNELS="${CHANNELS:-28}"
 THREADS="${THREADS:-256}"
 DOCKER_CONTAINER="${DOCKER_CONTAINER:-training-overlap-bugs-rocm70_9-1}"
+LABEL="${LABEL:-}"
 ENABLE_ROCPROF="${ENABLE_ROCPROF:-false}"
 ROCPROF_STATS="${ROCPROF_STATS:-false}"
 ROCPROF_INPUT="${ROCPROF_INPUT:-}"
@@ -45,6 +47,23 @@ MASTER_PORT="${MASTER_PORT:-}"
 # Parse command-line arguments (override env vars)
 while [[ $# -gt 0 ]]; do
     case $1 in
+        # Handle --option=value syntax
+        --*=*)
+            key="${1%%=*}"
+            value="${1#*=}"
+            case $key in
+                --channels) CHANNELS="$value" ;;
+                --threads) THREADS="$value" ;;
+                --config) CONFIG_FILE="$value" ;;
+                --nproc) NPROC_PER_NODE="$value" ;;
+                --docker) DOCKER_CONTAINER="$value" ;;
+                --label) LABEL="$value" ;;
+                --rocprof-input) ROCPROF_INPUT="$value" ;;
+                --master-port) MASTER_PORT="$value" ;;
+                *) echo "Unknown option: $1"; usage ;;
+            esac
+            shift
+            ;;
         -c|--channels)
             CHANNELS="$2"
             shift 2
@@ -63,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -d|--docker)
             DOCKER_CONTAINER="$2"
+            shift 2
+            ;;
+        -l|--label)
+            LABEL="$2"
             shift 2
             ;;
         -r|--rocprof)
@@ -143,9 +166,23 @@ fi
 echo ""
 
 TRACE_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_DIR="$AORTA_ROOT/experiments/multinode_${CHANNELS}ch_${THREADS}th_${TRACE_TIMESTAMP}"
+EXPERIMENT_DIR="$AORTA_ROOT/experiments/multinode_${CHANNELS}ch_${THREADS}th_${TRACE_TIMESTAMP}${LABEL:+_$LABEL}"
 mkdir -p "$EXPERIMENT_DIR"
 mkdir -p "$EXPERIMENT_DIR/logs"
+
+# Save config file and experiment info
+cp "$AORTA_ROOT/$CONFIG_FILE" "$EXPERIMENT_DIR/config_used.yaml"
+
+cat > "$EXPERIMENT_DIR/experiment_info.txt" << EOF
+Experiment: ${LABEL:-unlabeled}
+Timestamp: $TRACE_TIMESTAMP
+Config: $CONFIG_FILE
+Channels: $CHANNELS | Threads: $THREADS
+Procs/node: $NPROC_PER_NODE
+Docker: $DOCKER_CONTAINER
+rocprof: $ENABLE_ROCPROF
+Git: $(git rev-parse --short HEAD 2>/dev/null || echo "N/A")
+EOF
 
 echo "=== Aorta Multi-Node GEMM Training ==="
 echo "Experiment directory: $EXPERIMENT_DIR"
