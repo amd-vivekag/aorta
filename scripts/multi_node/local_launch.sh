@@ -3,7 +3,7 @@
 # Runs on each node with single channel/thread configuration
 
 if [[ $# -lt 11 ]]; then
-  echo "Usage: $0 <NODE_RANK> <NODE_IP> <MASTER_IP> <MASTER_PORT> <NNODES> <WORLD_SIZE> <EXPERIMENT_DIR> <CONFIG_FILE> <NPROC_PER_NODE> <CHANNELS> <THREADS> [ENABLE_ROCPROF] [ROCPROF_STATS] [ROCPROF_INPUT]"
+  echo "Usage: $0 <NODE_RANK> <NODE_IP> <MASTER_IP> <MASTER_PORT> <NNODES> <WORLD_SIZE> <EXPERIMENT_DIR> <CONFIG_FILE> <NPROC_PER_NODE> <CHANNELS> <THREADS> [ENABLE_ROCPROF] [ROCPROF_STATS] [ROCPROF_INPUT] [DOCKER_CONTAINER]"
   exit 1
 fi
 
@@ -21,6 +21,7 @@ THREADS="${11}"
 ENABLE_ROCPROF="${12:-false}"
 ROCPROF_STATS="${13:-false}"
 ROCPROF_INPUT="${14:-}"
+DOCKER_CONTAINER="${15:-training-overlap-bugs-rocm70_9-1}"
 
 echo "=========================================="
 echo "Local Launch Configuration"
@@ -36,6 +37,7 @@ echo "Experiment Dir: $EXPERIMENT_DIR"
 echo "Config File: $CONFIG_FILE"
 echo "Channels: $CHANNELS"
 echo "Threads: $THREADS"
+echo "Docker Container: $DOCKER_CONTAINER"
 echo "rocprof enabled: $ENABLE_ROCPROF"
 echo "=========================================="
 echo ""
@@ -75,8 +77,8 @@ cleanup() {
     log "Cleaning up training processes on node ${NODE_RANK}..."
 
     # Try to kill processes inside Docker container
-    docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f "train.py" 2>/dev/null || true
-    docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f "torchrun" 2>/dev/null || true
+    docker exec "$DOCKER_CONTAINER" pkill -9 -f "train.py" 2>/dev/null || true
+    docker exec "$DOCKER_CONTAINER" pkill -9 -f "torchrun" 2>/dev/null || true
 
     # Also try on host (in case anything leaked)
     sudo pkill -9 -f "train.py" 2>/dev/null || true
@@ -92,9 +94,6 @@ log "Starting multi-node training with RCCL_THREADS_PER_BLOCK=${THREADS}, NCCL_M
 log "Output directory: ${OUTPUT_DIR}"
 
 START_TIME=$(date +%s)
-
-# Docker container name (update if different)
-DOCKER_CONTAINER="training-overlap-bugs-rocm70_9-1"
 
 # Check if Docker container is running
 if ! docker ps --format '{{.Names}}' | grep -q "^${DOCKER_CONTAINER}$"; then
