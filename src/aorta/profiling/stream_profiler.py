@@ -37,7 +37,12 @@ class MarkerRecord:
 class StreamProfiler:
     """Track activity across multiple CUDA/HIP streams with precise timing."""
 
-    def __init__(self, device: torch.device, stream_names: Optional[Iterable[StreamName]] = None) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        stream_names: Optional[Iterable[StreamName]] = None,
+        force_async_for_race_test: bool = False,
+    ) -> None:
         if not torch.cuda.is_available():  # pragma: no cover - runtime guard
             raise RuntimeError("StreamProfiler requires CUDA/HIP availability")
 
@@ -52,6 +57,13 @@ class StreamProfiler:
 
         self.iteration_records: List[Dict[str, Any]] = []
         self._current_iteration: Optional[Dict[str, Any]] = None
+        # When True, DistributedOpsInterceptor skips work.wait() to allow truly async
+        # operations for race condition testing
+        self.force_async_for_race_test = force_async_for_race_test
+
+    def set_force_async(self, enabled: bool) -> None:
+        """Toggle force_async mode (e.g., enable after warmup to avoid NaN during warmup)."""
+        self.force_async_for_race_test = enabled
 
     # ------------------------------------------------------------------
     # Iteration lifecycle
@@ -301,7 +313,9 @@ class DistributedOpsInterceptor:
             tag = kwargs.get("tag", name)
             metadata = {"function": name}
             self.profiler.register_external_range(stream_name, f"{tag}", start, end, metadata=metadata)
-            if not async_requested:
+            # Skip work.wait() if force_async_for_race_test is enabled
+            # This allows reduce-scatter to complete asynchronously for race testing
+            if not async_requested and not self.profiler.force_async_for_race_test:
                 work.wait()
                 return None
             return work

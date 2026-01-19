@@ -37,7 +37,6 @@ echo "Experiment Dir: $EXPERIMENT_DIR"
 echo "Config File: $CONFIG_FILE"
 echo "Channels: $CHANNELS"
 echo "Threads: $THREADS"
-echo "Docker Container: $DOCKER_CONTAINER"
 echo "rocprof enabled: $ENABLE_ROCPROF"
 echo "=========================================="
 echo ""
@@ -60,25 +59,22 @@ else
     CONFIG_FILE_DOCKER="$CONFIG_FILE"
 fi
 
-# Log file
-LOG_FILE="${OUTPUT_DIR}/node_${NODE_RANK}_output.log"
-
 # Function to log with timestamp
 log() {
     local message="$1"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${timestamp}] [Node ${NODE_RANK}] ${message}" | tee -a "${LOG_FILE}"
+    echo "[${timestamp}] [Node ${NODE_RANK}] ${message}"
 }
 
 # Cleanup function
 cleanup() {
     echo ""
-    echo "=== Caught interrupt signal ===" | tee -a "${LOG_FILE}"
+    echo "=== Caught interrupt signal ==="
     log "Cleaning up training processes on node ${NODE_RANK}..."
 
     # Try to kill processes inside Docker container
-    docker exec "$DOCKER_CONTAINER" pkill -9 -f "train.py" 2>/dev/null || true
-    docker exec "$DOCKER_CONTAINER" pkill -9 -f "torchrun" 2>/dev/null || true
+    docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f "train.py" 2>/dev/null || true
+    docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f "torchrun" 2>/dev/null || true
 
     # Also try on host (in case anything leaked)
     sudo pkill -9 -f "train.py" 2>/dev/null || true
@@ -109,11 +105,25 @@ BASE_CMD="torchrun --nnodes ${NNODES} --node_rank ${NODE_RANK} --nproc_per_node 
 BASE_OVERRIDES="--override profiling.tensorboard=false"
 
 # Build docker exec prefix with environment variables
+# Pass through all NCCL/RCCL configuration from set_env_variables.sh
 DOCKER_EXEC="docker exec \
     -e RCCL_THREADS_PER_BLOCK=${THREADS} \
     -e NCCL_MAX_NCHANNELS=${CHANNELS} \
     -e HSA_ENABLE_SDMA=0 \
     -e PYTORCH_ROCM_PROFILER_ENABLE_TRACING=1 \
+    -e NCCL_DEBUG=${NCCL_DEBUG:-} \
+    -e NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-} \
+    -e NCCL_IB_HCA=${NCCL_IB_HCA:-} \
+    -e NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3} \
+    -e NCCL_NCHANNELS_PER_NET_PEER=${NCCL_NCHANNELS_PER_NET_PEER:-8} \
+    -e HSA_ENABLE_IPC_MODE_LEGACY=${HSA_ENABLE_IPC_MODE_LEGACY:-1} \
+    -e NCCL_PROTO=${NCCL_PROTO:-Simple} \
+    -e NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-40} \
+    -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-} \
+    -e NCCL_TIMEOUT_MS=${NCCL_TIMEOUT_MS:-60000} \
+    -e TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1} \
+    -e TORCH_NCCL_TRACE_BUFFER_SIZE=10000 \
+    -e TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
     ${DOCKER_CONTAINER}"
 
 # Run with or without rocprofv3
