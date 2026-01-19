@@ -237,7 +237,7 @@ def set_seed(seed: int, rank: int) -> None:
 
 
 def init_distributed(training_cfg: TrainingConfig, log_level: str) -> Dict[str, Any]:
-    
+
     backend = get_distributed_backend()
     # Reduce timeout for faster debugging of hangs (default 600s -> 120s)
     # This timeout applies to ALL collective operations, not just initialization
@@ -479,7 +479,7 @@ def _run_synthetic_collectives(
     tensor_size: int = 1024 * 512,  # 2MB in float32 elements
 ) -> None:
     """Run synthetic collectives on extra streams (comm0, comm1, etc.).
-    
+
     This stresses hardware queue scheduling by running real NCCL/RCCL collectives
     on additional streams. Only runs on streams whose names start with 'comm'.
     """
@@ -534,7 +534,7 @@ def training_loop(
     model.train()
 
     profiler_dir = training_cfg.output_dir / "torch_profiler"
-    
+
     # Create TCPStore for coordinating trace export across ranks on NaN detection
     store = None
     if dist.is_initialized():
@@ -550,7 +550,7 @@ def training_loop(
         except Exception as e:
             log.warning("[Coordination] Failed to create TCPStore: %s | rank=%d", e, rank)
             store = None
-    
+
     with profiler.intercept_distributed_ops():
         with _torch_profiler_context(profiler_cfg, profiler_dir, rank, device) as torch_profiler:
             for epoch in range(training_cfg.epochs):
@@ -585,7 +585,7 @@ def training_loop(
                             # Stop training
                             stop_flag["stop"] = True
                             break
-                    
+
                     profiler.start_iteration(global_step)
 
                     with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
@@ -603,7 +603,7 @@ def training_loop(
                         else:
                             scores = model(batch)
                             loss = compute_loss(scores, batch)
-                    
+
                     # Check loss for NaN/Inf with diagnostics
                     has_nan_loss = False
                     if nan_debugger is not None:
@@ -620,7 +620,7 @@ def training_loop(
                             # Signal other ranks best-effort
                             if store is not None and not nan_failure_flag["detected"]:
                                 nan_debugger.signal_nan_to_ranks(store, global_step)
-                    
+
                     # Synchronize NaN detection across all ranks
                     if nan_debugger is not None:
                         if nan_debugger.broadcast_nan_stop_signal(has_nan_loss, device):
@@ -632,7 +632,7 @@ def training_loop(
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
-                    
+
                     # Extend race window: add extra compute on compute stream to keep it busy
                     # This widens the timing window where aux can observe partially-written gradients
                     if training_cfg.extend_backward_compute_ms > 0 and device.type == "cuda":
@@ -646,7 +646,7 @@ def training_loop(
                                 dummy_c = torch.mm(dummy_a, dummy_b)
                                 dummy_a = dummy_c  # chain to prevent optimization
                             del dummy_a, dummy_b, dummy_c
-                    
+
                     # Optional debug: detect whether backward work on "compute" is still in flight when we are
                     # about to touch gradients on "aux". If this triggers, you must add a stream dependency
                     # (e.g., aux.wait_stream(compute)) or run grad ops on the compute stream.
@@ -679,7 +679,7 @@ def training_loop(
                                 if training_cfg.debug_stream_race_report_wait:
                                     profiler.stream("aux").wait_stream(profiler.stream("compute"))
                             nan_debugger.track_parameter_evolution(global_step)
-                            
+
                             # Check gradients IMMEDIATELY in the same race window (before clip_grad_norm_)
                             # This catches stream race NaNs that would otherwise disappear after sync
                             if nan_debugger.check_gradients(global_step):
@@ -693,13 +693,13 @@ def training_loop(
                                 # Signal other ranks best-effort
                                 if store is not None and not nan_failure_flag["detected"]:
                                     nan_debugger.signal_nan_to_ranks(store, global_step)
-                    
+
                     # Synchronize NaN detection across all ranks (before clip to stop early)
-                    if nan_debugger is not None and has_nan_grad:
+                    if nan_debugger is not None:
                         if nan_debugger.broadcast_nan_stop_signal(has_nan_grad, device):
                             stop_flag["stop"] = True
                             break
-                    
+
                     # Clip gradients to prevent extreme values
                     grad_norm = None
                     if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
@@ -713,7 +713,7 @@ def training_loop(
                                 if training_cfg.debug_stream_race_report_wait:
                                     profiler.stream("aux").wait_stream(profiler.stream("compute"))
                             grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
-                    
+
                     # Check gradients for NaN/Inf again after clipping (catches real numerical issues)
                     if nan_debugger is not None and not has_nan_grad:
                         if nan_debugger.check_gradients(global_step):
@@ -730,14 +730,14 @@ def training_loop(
                             # Signal other ranks best-effort
                             if store is not None and not nan_failure_flag["detected"]:
                                 nan_debugger.signal_nan_to_ranks(store, global_step)
-                    
+
                     # Synchronize NaN detection across all ranks (after clip for post-clip NaNs)
-                    if nan_debugger is not None and has_nan_grad:
+                    if nan_debugger is not None:
                         if nan_debugger.broadcast_nan_stop_signal(has_nan_grad, device):
                             stop_flag["stop"] = True
                             break
 
-                   
+
                     with profiler.range("aux", f"epoch{epoch}_step{step}_optimizer"):
                         step_error_local = False
                         step_error_msg: Optional[str] = None
@@ -757,21 +757,21 @@ def training_loop(
                                 step_error_local = True
                                 step_error_msg = error_str
                                 step_error_exception = e
-                                
+
                                 # Signal to all other ranks that NaN detected (non-blocking)
                                 if store is not None and not nan_failure_flag["detected"]:
                                     if nan_debugger.signal_nan_to_ranks(store, global_step):
                                         nan_failure_flag["detected"] = True
                                         nan_failure_flag["step"] = global_step
                                         nan_failure_flag["rank"] = rank
-                                
+
                                 # Export this rank's profiler trace
                                 if nan_debugger is not None:
                                     nan_debugger.export_profiler_trace(
                                         torch_profiler, profiler_cfg, profiler_dir,
                                         f"nan_failure_step{global_step}.json"
                                     )
-                                
+
                                 # Investigate root cause when optimizer detects NaN/Inf
                                 if nan_debugger is not None:
                                     log.error("[NaNDebugger] Optimizer detected NaN/Inf - investigating root cause | rank=%d", rank)
@@ -779,7 +779,7 @@ def training_loop(
                                     # Investigate which gradients/parameters contain NaN/Inf
                                     # These checks validate actual NaN/Inf counts to avoid false positives
                                     nan_debugger.investigate_optimizer_failure(global_step, error_str)
-                                
+
                                 # Give other ranks time to see signal and export their traces
                                 import time
                                 time.sleep(2)  # 2 seconds for other ranks to export traces
@@ -911,7 +911,7 @@ def training_loop(
                     break
 
     metrics_logger.close()
-    
+
     if rank == 0:
         log.info("Training loop finished. Profiler will export traces in cleanup phase.")
         log.info("Output directory: %s", training_cfg.output_dir)
@@ -1014,7 +1014,7 @@ def _torch_profiler_context(
     def _export_traces(prof_obj: profile, rank_dir: Path) -> None:
         # Always attempt to export if requested, even if stats aren't fully available
         # This is important for early training stops (e.g., NaN at step 1)
-        
+
         if cfg.chrome_trace:
             stem, ext = os.path.splitext(cfg.trace_filename)
             if not ext:
@@ -1155,7 +1155,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         num_streams = int(num_streams_env)
     except ValueError:
         num_streams = 4
-    
+
     # Generate stream names based on count
     # Base streams: compute, aux (always needed)
     # Additional streams: allreduce, reducescatter, comm1, comm2, ...
@@ -1172,9 +1172,9 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         stream_names = ["compute", "aux", "allreduce", "reducescatter"]
         for i in range(num_streams - 4):
             stream_names.append(f"comm{i}")
-    
+
     profiler = StreamProfiler(env["device"], stream_names=stream_names)
-    
+
     # Log hardware queue configuration for debugging stream races
     hw_queues_env = os.environ.get("GPU_MAX_HW_QUEUES")
     if hw_queues_env:
@@ -1189,7 +1189,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         list(profiler.streams.keys()),
         rank,
     )
-    
+
     # Initialize NaN debugger for automatic root cause analysis
     nan_debugger = NaNDebugger(
         model=model,
