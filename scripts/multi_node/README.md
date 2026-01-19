@@ -49,6 +49,9 @@ scontrol show hostnames $SLURM_NODELIST > scripts/multi_node/node_ip_list.txt
 
 # Run training
 ./scripts/multi_node/master_launch.sh --channels 28 --threads 256 --nproc 8
+
+# With custom Docker container and experiment label
+./scripts/multi_node/master_launch.sh --docker my-container --label experiment_v1
 ```
 
 World size: `NPROC_PER_NODE × NUM_NODES` (e.g., 8 GPUs/node × 2 nodes = 16)
@@ -119,6 +122,12 @@ done
 
 # Custom parameters
 ./scripts/multi_node/master_launch.sh -c 28 -t 256 -p 4 -f config/custom.yaml
+
+# With Shampoo optimizer container and experiment label
+./scripts/multi_node/master_launch.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --label shampoo_test \
+    --config config/multi_node/shampoo_opt_multi_node.yaml
 ```
 
 ### Parameters
@@ -129,10 +138,14 @@ done
 | -t | --threads | 256 | RCCL_THREADS_PER_BLOCK |
 | -p | --nproc | 8 | GPUs per node |
 | -f | --config | config/multi_node/distributed_multinode.yaml | Config file |
+| -d | --docker | training-overlap-bugs-rocm70_9-1 | Docker container name |
+| -l | --label | none | Experiment label (appended to directory name) |
 | -r | --rocprof | false | Enable rocprofv3 |
 | -m | --stats | false | rocprof stats |
 |  | --rocprof-input | none | rocprof yaml |
 |  | --master-port | auto | Master port |
+
+Supports `--option=value` syntax: `./scripts/multi_node/master_launch.sh --docker=my-container --label=test`
 
 Environment variables: `CHANNELS=42 THREADS=512 ./scripts/multi_node/master_launch.sh`
 
@@ -148,12 +161,28 @@ Select a config file from `config/` or `config/multi_node/`:
     --config config/multi_node/distributed_multinode.yaml
 ```
 
+### Experiment Output
+
+Each run creates an experiment directory with:
+```
+experiments/multinode_28ch_256th_20260119_171958_mylabel/
+├── config_used.yaml       # Copy of config file used
+├── experiment_info.txt    # Experiment metadata
+├── logs/                  # Per-node launch logs
+│   ├── node_0_*.txt
+│   └── node_1_*.txt
+└── 256thread_28channels/  # Training outputs
+    ├── rank_00_metrics.jsonl
+    └── checkpoints/
+```
+
 ### Monitoring
 
 ```bash
 tail -f experiments/multinode_*/logs/node_*.txt                        # All nodes
 tail -f experiments/multinode_*/logs/node_0_*.txt                      # Master only
-cat experiments/multinode_*/outputs/rank_00_metrics.jsonl | tail -n 5  # Metrics
+cat experiments/multinode_*/256thread_*/rank_00_metrics.jsonl | tail -5  # Metrics
+cat experiments/multinode_*/experiment_info.txt                        # Experiment info
 ```
 
 ---
@@ -162,10 +191,11 @@ cat experiments/multinode_*/outputs/rank_00_metrics.jsonl | tail -n 5  # Metrics
 
 `Ctrl+C` stops monitoring but training continues in background.
 
-To stop training:
+To stop training (replace container name if using `--docker`):
 ```bash
+CONTAINER="training-overlap-bugs-rocm70_9-1"  # or your custom container
 for HOST in $(cat scripts/multi_node/node_ip_list.txt); do
-  ssh $HOST "docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f 'train.py|torchrun'"
+  ssh $HOST "docker exec $CONTAINER pkill -9 -f 'train.py|torchrun'"
 done
 ```
 
