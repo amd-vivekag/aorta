@@ -16,9 +16,15 @@ training:
   log_interval: 5
   additional_compute_streams: 2
   lightweight_op_waves: 3
-  race_force_async: true      
-  race_fresh_stream: true      
-  race_delay_safe_ranks: false 
+
+# Warmup settings to prevent RCCL hangs in multi-node training
+warmup:
+  # RCCL communicator warmup - runs all_reduce on process groups before FSDP init
+  enable_rccl_warmup: true
+  rccl_warmup_iterations: 5
+  # Training warmup - runs forward/backward/optimizer steps before main loop
+  enable_training_warmup: true
+  training_warmup_steps: 1
 
 optimizer:
   name: shampoo
@@ -62,7 +68,7 @@ fsdp:
 
 distributed:
   backend: nccl
-  mode: fdsp
+  mode: fsdp
   bucket_cap_mb: 128
   gradient_as_bucket_view: true
   static_graph: true

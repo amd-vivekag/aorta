@@ -61,10 +61,17 @@ class TrainingConfig:
     output_dir: Path = Path("artifacts")
     inject_allreduce_copies: bool = False  # Inject all_reduce + host-device copies to trigger hang
     allreduce_stress_level: int = 1  # Number of all_reduce ops per iteration (1-10)
-    # Race injection mechanisms (for testing NaN race between backward and clip_grad_norm_)
-    race_force_async: bool = False      # Mechanism 1: Skip work.wait() in DistributedOpsInterceptor
-    race_fresh_stream: bool = False     # Mechanism 2: Use fresh CUDA stream for racing ranks
-    race_delay_safe_ranks: bool = False # Mechanism 3: Add GPU delays to safe ranks
+
+
+@dataclass
+class WarmupConfig:
+    """Warmup settings to prevent RCCL hangs in multi-node training."""
+    # RCCL communicator warmup - runs all_reduce on process groups before FSDP init
+    enable_rccl_warmup: bool = True
+    rccl_warmup_iterations: int = 10
+    # Training warmup - runs forward/backward/optimizer steps before main loop
+    enable_training_warmup: bool = True
+    training_warmup_steps: int = 1
 
 
 @dataclass
@@ -79,10 +86,6 @@ class FSDPConfig:
     # For HYBRID_SHARD: GPUs per node (None = auto-detect from LOCAL_WORLD_SIZE env var)
     # Only set this if auto-detection fails or you want to override
     hybrid_shard_gpus_per_node: Optional[int] = None
-    # Number of warmup operations to perform on RCCL communicators before FSDP init
-    # This helps avoid race conditions in inter-node RDMA setup
-    # Higher values provide more stability but increase startup time
-    rccl_warmup_iterations: int = 10
 
 
 @dataclass
@@ -181,6 +184,15 @@ def _build_fsdp_config(raw: Dict[str, Any]) -> FSDPConfig:
     return cfg
 
 
+def _build_warmup_config(raw: Dict[str, Any]) -> WarmupConfig:
+    section = raw.get("warmup", {})
+    cfg = WarmupConfig()
+    for field in dataclass_fields(WarmupConfig):
+        if field.name in section:
+            setattr(cfg, field.name, section[field.name])
+    return cfg
+
+
 def _build_ddp_config(raw: Dict[str, Any]) -> DDPConfig:
     section = raw.get("distributed", {})
     cfg = DDPConfig()
@@ -226,7 +238,7 @@ def set_seed(seed: int, rank: int) -> None:
 
 
 def init_distributed(training_cfg: TrainingConfig, log_level: str) -> Dict[str, Any]:
-    
+
     backend = get_distributed_backend()
     timeout_seconds = int(os.environ.get("TORCH_DIST_INIT_TIMEOUT", "600"))
     dist.init_process_group(backend=backend, timeout=timedelta(seconds=timeout_seconds))
@@ -260,6 +272,7 @@ def build_fsdp_model(
     model_cfg: ModelConfig,
     fsdp_cfg: FSDPConfig,
     compile_cfg: CompileConfig,
+    warmup_cfg: WarmupConfig,
     device: torch.device,
 ) -> FSDP:
     model = RankingTransformerModel(model_cfg)
@@ -285,12 +298,13 @@ def build_fsdp_model(
             # Warmup RCCL communicators BEFORE FSDP initialization
             # This ensures inter-node communicators are fully established before
             # the _sync_params_and_buffers broadcasts that can cause hangs
-            _warmup_rccl_communicators(
-                shard_group,
-                replicate_group,
-                device,
-                num_warmup_ops=fsdp_cfg.rccl_warmup_iterations,
-            )
+            if warmup_cfg.enable_rccl_warmup:
+                _warmup_rccl_communicators(
+                    shard_group,
+                    replicate_group,
+                    device,
+                    num_warmup_ops=warmup_cfg.rccl_warmup_iterations,
+                )
             log.info("Created custom process groups for HYBRID_SHARD strategy")
 
     # Ensure CUDA operations are complete before FSDP wrapping
@@ -710,6 +724,7 @@ def training_loop(
     optimizer: torch.optim.Optimizer,
     dataloader,
     training_cfg: TrainingConfig,
+    warmup_cfg: WarmupConfig,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     environment: Dict[str, Any],
     profiler: StreamProfiler,
@@ -744,12 +759,10 @@ def training_loop(
 
     # Warmup training collectives before main loop to avoid RCCL race conditions
     # This exercises forward/backward/optimizer step on all communicators
-    # NOTE: Reduced to 1 step (from 3) to preserve more timing variability
-    # while still exercising the collectives. RCCL warmup in build_fsdp_model
-    # handles communicator initialization separately.
-    log.info("Starting training warmup pass (rank=%d, num_steps=1)...", rank)
-    _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=1)
-    log.info("Training warmup complete (rank=%d)", rank)
+    if warmup_cfg.enable_training_warmup:
+        log.info("Starting training warmup pass (rank=%d, num_steps=%d)...", rank, warmup_cfg.training_warmup_steps)
+        _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=warmup_cfg.training_warmup_steps)
+        log.info("Training warmup complete (rank=%d)", rank)
 
     # Note: force_async is now controlled dynamically per-step in training loop
     # Only racing ranks (local 1, 2 on Node 0) at step >= 3 will have force_async enabled
@@ -780,68 +793,16 @@ def training_loop(
                             scores = model(batch)
                             loss = compute_loss(scores, batch)
 
-                    # ============================================================
-                    # RACE CONDITION INJECTION: Force aux stream to read early
-                    # ============================================================
-                    # Controlled by 3 independent flags:
-                    # - race_force_async: Skip work.wait() in interceptor (during backward)
-                    # - race_fresh_stream: Use fresh CUDA stream for racing ranks
-                    # - race_delay_safe_ranks: Add GPU delays to safe ranks
-                    #
-                    # Racing ranks: local 1, 2 on Node 0 only (global ranks 1, 2)
-                    # ============================================================
-                    local_rank = rank % 8
-                    node_id = rank // 8
-                    is_racing_rank = node_id == 0 and local_rank in (1, 2)
-
-                    # Set force_async BEFORE backward so reduce-scatter uses correct value
-                    should_enable_force_async = (
-                        training_cfg.race_force_async and
-                        step >= 3 and
-                        is_racing_rank
-                    )
-                    profiler.set_force_async(should_enable_force_async)
-
                     with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
                         if scaler is not None:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
 
-                    # After backward: non-racing ranks sync to wait for reduce-scatter
-                    if training_cfg.race_force_async and step >= 3 and not is_racing_rank:
-                        torch.cuda.synchronize()
-
                     grad_norm = None
-                    race_active = step >= 3 and training_cfg.race_fresh_stream and is_racing_rank
-
-                    if race_active:
-                        # Mechanism 2: Racing ranks use a fresh stream with NO dependencies
-                        race_stream = torch.cuda.Stream(device=device)
-                        log.warning(
-                            "RACE INJECTION: rank=%d (node=%d, local=%d) using FRESH stream - racing",
-                            rank, node_id, local_rank
-                        )
-                        if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
-                            with torch.cuda.stream(race_stream):
-                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
-                            # Do NOT synchronize race_stream here - let it race
-                    else:
-                        # Mechanism 3: Safe ranks get artificial delays (if enabled)
-                        if step >= 3 and training_cfg.race_delay_safe_ranks:
-                            delay_tensor = torch.randn(1024 * 1024, device=device)
-                            for _ in range(100):
-                                delay_tensor = delay_tensor * 1.0001
-                            torch.cuda.synchronize()
-                            log.warning(
-                                "RACE INJECTION: rank=%d (node=%d, local=%d) SYNCHRONIZED with delay - safe",
-                                rank, node_id, local_rank
-                            )
-
-                        # Normal path: use profiler's aux stream
-                        if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
-                            with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
-                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
+                    if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
+                        with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
+                            grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
 
                     with profiler.range("aux", f"epoch{epoch}_step{step}_optimizer"):
                         try:
@@ -969,7 +930,7 @@ def training_loop(
                     break
 
     metrics_logger.close()
-    
+
     if rank == 0:
         log.info("Training loop finished. Profiler will export traces in cleanup phase.")
         log.info("Output directory: %s", training_cfg.output_dir)
@@ -1111,7 +1072,7 @@ def _torch_profiler_context(
         prof.__exit__(None, None, None)
         produce_tb = cfg.tensorboard
         produce_chrome = cfg.chrome_trace
-        
+
         if produce_tb:
             try:
                 handler = tensorboard_trace_handler(str(rank_dir))
@@ -1165,6 +1126,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     model_cfg = _build_model_config(config)
     dataset_cfg = _build_dataset_config(config)
     fsdp_cfg = _build_fsdp_config(config)
+    warmup_cfg = _build_warmup_config(config)
     ddp_cfg = _build_ddp_config(config)
     compile_cfg = _build_compile_config(config)
     profiler_cfg = _build_profiler_config(config)
@@ -1192,7 +1154,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     if dist_mode == "ddp":
         model = build_ddp_model(model_cfg, ddp_cfg, compile_cfg, env["device"])
     else:
-        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"])
+        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, warmup_cfg, env["device"])
     optimizer = configure_optimizer(model, optimizer_cfg, dist_mode)
     scheduler = configure_scheduler(
         optimizer,
@@ -1200,11 +1162,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         training_cfg.max_steps or training_cfg.epochs * len(dataloader),
     )
 
-    # Start with force_async disabled - will enable after warmup if race_force_async is set
-    profiler = StreamProfiler(
-        env["device"],
-        force_async_for_race_test=False,
-    )
+    profiler = StreamProfiler(env["device"])
 
     try:
         training_loop(
@@ -1212,6 +1170,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
             optimizer,
             dataloader,
             training_cfg,
+            warmup_cfg,
             scheduler,
             env,
             profiler,
