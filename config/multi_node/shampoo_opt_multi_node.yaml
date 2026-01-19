@@ -56,6 +56,10 @@ fsdp:
   forward_prefetch: true
   sync_module_states: true
   param_init_device: meta
+  # HYBRID_SHARD warmup settings (fixes RCCL race condition hangs)
+  enable_rccl_warmup: true
+  rccl_warmup_iterations: 10
+  warmup_training_steps: 1
 
 distributed:
   backend: nccl
