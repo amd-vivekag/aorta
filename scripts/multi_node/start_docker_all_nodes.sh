@@ -39,7 +39,7 @@ if [[ "$MASTER_BRANCH" != "not-a-git-repo" ]]; then
 
         if [[ "$node" -gt 0 ]]; then
             echo "[STAGE] Checking worker node $node ($HOST)..."
-            WORKER_BRANCH=$(ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$USER@$HOST" "cd ~/aorta && git rev-parse --abbrev-ref HEAD 2>/dev/null" || echo "not-a-git-repo")
+            WORKER_BRANCH=$(ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$USER@$HOST" "cd $AORTA_ROOT && git rev-parse --abbrev-ref HEAD 2>/dev/null" || echo "not-a-git-repo")
 
             if [[ "$WORKER_BRANCH" == "not-a-git-repo" ]]; then
                 echo "  [WARN] Worker node $HOST: Not a git repository"
@@ -48,7 +48,7 @@ if [[ "$MASTER_BRANCH" != "not-a-git-repo" ]]; then
                 echo "  Master: $MASTER_BRANCH"
                 echo "  Worker: $WORKER_BRANCH"
                 echo ""
-                echo "Fix: ssh $USER@$HOST 'cd ~/aorta && git checkout $MASTER_BRANCH && git pull'"
+                echo "Fix: ssh $USER@$HOST 'cd $AORTA_ROOT && git checkout $MASTER_BRANCH && git pull'"
                 exit 1
             else
                 echo "  Worker node $HOST: $WORKER_BRANCH [OK]"
@@ -112,7 +112,7 @@ while IFS= read -r HOST || [[ -n "$HOST" ]]; do  # HOST can be hostname or IP
     echo "  [STAGE] Running docker compose up -d on worker..."
     COMPOSE_FILE_PATH="${DOCKER_COMPOSE_FILE#docker/}"
     ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$USER@$HOST" \
-      "cd /home/$USER/aorta/docker && docker compose -f $COMPOSE_FILE_PATH up -d"
+      "cd $AORTA_ROOT/docker && docker compose -f $COMPOSE_FILE_PATH up -d"
 
     echo "  [STAGE] Verifying worker container..."
     if ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$USER@$HOST" "docker ps --format '{{.Names}}'" | grep -q "^${DOCKER_CONTAINER}$"; then
