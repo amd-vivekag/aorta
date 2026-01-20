@@ -582,10 +582,13 @@ def _warmup_training_collectives(
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
 
+    log.info("[Warmup] Starting training warmup (rank=%d, steps=%d)...", rank, num_warmup_steps)
+
     # Get an iterator from the dataloader
     data_iter = iter(dataloader)
 
     for warmup_step in range(num_warmup_steps):
+        log.info("[Warmup] Step %d/%d: Getting batch (rank=%d)...", warmup_step + 1, num_warmup_steps, rank)
         try:
             cpu_batch = next(data_iter)
         except StopIteration:
@@ -597,9 +600,11 @@ def _warmup_training_collectives(
         batch = {k: v.to(device, non_blocking=True) if hasattr(v, 'to') else v
                  for k, v in cpu_batch.items()}
         torch.cuda.synchronize()
+        log.info("[Warmup] Step %d/%d: Batch moved to device (rank=%d)", warmup_step + 1, num_warmup_steps, rank)
 
         # Forward pass
         optimizer.zero_grad(set_to_none=True)
+        log.info("[Warmup] Step %d/%d: Starting forward pass (rank=%d)...", warmup_step + 1, num_warmup_steps, rank)
         if autocast_dtype:
             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                 scores = model(batch)
@@ -607,30 +612,39 @@ def _warmup_training_collectives(
         else:
             scores = model(batch)
             loss = compute_loss(scores, batch)
+        torch.cuda.synchronize()
+        log.info("[Warmup] Step %d/%d: Forward pass complete, loss=%.4f (rank=%d)", warmup_step + 1, num_warmup_steps, loss.item(), rank)
 
         # Backward pass
+        log.info("[Warmup] Step %d/%d: Starting backward pass (rank=%d)...", warmup_step + 1, num_warmup_steps, rank)
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        torch.cuda.synchronize()
+        log.info("[Warmup] Step %d/%d: Backward pass complete (rank=%d)", warmup_step + 1, num_warmup_steps, rank)
 
         # Optimizer step
+        log.info("[Warmup] Step %d/%d: Starting optimizer step (rank=%d)...", warmup_step + 1, num_warmup_steps, rank)
         if scaler is not None:
             scaler.step(optimizer)
             scaler.update()
         else:
             optimizer.step()
+        torch.cuda.synchronize()
+        log.info("[Warmup] Step %d/%d: Optimizer step complete (rank=%d)", warmup_step + 1, num_warmup_steps, rank)
 
         # Synchronize all ranks after each warmup step
-        torch.cuda.synchronize()
+        log.info("[Warmup] Step %d/%d: Starting barrier (rank=%d)...", warmup_step + 1, num_warmup_steps, rank)
         dist.barrier()
-
-        log.debug("Warmup step %d complete (rank=%d, loss=%.4f)", warmup_step, rank, loss.item())
+        log.info("[Warmup] Step %d/%d: Barrier complete (rank=%d)", warmup_step + 1, num_warmup_steps, rank)
 
     # Reset optimizer state after warmup to not affect actual training
+    log.info("[Warmup] Resetting optimizer state (rank=%d)...", rank)
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     dist.barrier()
+    log.info("[Warmup] Training warmup complete (rank=%d)", rank)
 
 
 def build_ddp_model(

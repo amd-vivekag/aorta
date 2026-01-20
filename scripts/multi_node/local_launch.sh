@@ -1,6 +1,9 @@
 #!/bin/bash
 # Multi-node local launch script for GEMM training
 # Runs on each node with single channel/thread configuration
+#
+# NCCL/RCCL environment variables are sourced from set_env_variables.sh
+# Edit that file to change NCCL configuration - no need to modify this script.
 
 if [[ $# -lt 11 ]]; then
   echo "Usage: $0 <NODE_RANK> <NODE_IP> <MASTER_IP> <MASTER_PORT> <NNODES> <WORLD_SIZE> <EXPERIMENT_DIR> <CONFIG_FILE> <NPROC_PER_NODE> <CHANNELS> <THREADS> [ENABLE_ROCPROF] [ROCPROF_STATS] [ROCPROF_INPUT] [DOCKER_CONTAINER]"
@@ -22,6 +25,16 @@ ENABLE_ROCPROF="${12:-false}"
 ROCPROF_STATS="${13:-false}"
 ROCPROF_INPUT="${14:-}"
 DOCKER_CONTAINER="${15:-training-overlap-bugs-rocm70_9-1}"
+
+# Source environment variables (should already be sourced by config_node.sh, but ensure it's loaded)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/set_env_variables.sh" ]]; then
+    source "$SCRIPT_DIR/set_env_variables.sh"
+fi
+
+# Override channel/thread settings from command line arguments
+export NCCL_MAX_NCHANNELS="${CHANNELS}"
+export RCCL_THREADS_PER_BLOCK="${THREADS}"
 
 echo "=========================================="
 echo "Local Launch Configuration"
@@ -105,26 +118,15 @@ BASE_CMD="torchrun --nnodes ${NNODES} --node_rank ${NODE_RANK} --nproc_per_node 
 BASE_OVERRIDES="--override profiling.tensorboard=false"
 
 # Build docker exec prefix with environment variables
-# Pass through all NCCL/RCCL configuration from set_env_variables.sh
-DOCKER_EXEC="docker exec \
-    -e RCCL_THREADS_PER_BLOCK=${THREADS} \
-    -e NCCL_MAX_NCHANNELS=${CHANNELS} \
-    -e HSA_ENABLE_SDMA=0 \
-    -e PYTORCH_ROCM_PROFILER_ENABLE_TRACING=1 \
-    -e NCCL_DEBUG=${NCCL_DEBUG:-} \
-    -e NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-} \
-    -e NCCL_IB_HCA=${NCCL_IB_HCA:-} \
-    -e NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3} \
-    -e NCCL_NCHANNELS_PER_NET_PEER=${NCCL_NCHANNELS_PER_NET_PEER:-8} \
-    -e HSA_ENABLE_IPC_MODE_LEGACY=${HSA_ENABLE_IPC_MODE_LEGACY:-1} \
-    -e NCCL_PROTO=${NCCL_PROTO:-Simple} \
-    -e NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-40} \
-    -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-} \
-    -e NCCL_TIMEOUT_MS=${NCCL_TIMEOUT_MS:-60000} \
-    -e TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1} \
-    -e TORCH_NCCL_TRACE_BUFFER_SIZE=10000 \
-    -e TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
-    ${DOCKER_CONTAINER}"
+# All NCCL/RCCL variables are defined in set_env_variables.sh
+DOCKER_ENV_FLAGS=$(build_docker_env_flags)
+DOCKER_EXEC="docker exec ${DOCKER_ENV_FLAGS} ${DOCKER_CONTAINER}"
+
+# Log which env vars are being passed
+log "Docker environment variables:"
+for var in "${DOCKER_ENV_VARS[@]}"; do
+    log "  ${var}=${!var}"
+done
 
 # Run with or without rocprofv3
 if [ "${ENABLE_ROCPROF}" = "true" ]; then
