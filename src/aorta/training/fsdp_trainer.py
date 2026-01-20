@@ -65,6 +65,21 @@ class TrainingConfig:
     race_force_async: bool = False      # Mechanism 1: Skip work.wait() in DistributedOpsInterceptor
     race_fresh_stream: bool = False     # Mechanism 2: Use fresh CUDA stream for racing ranks
     race_delay_safe_ranks: bool = False # Mechanism 3: Add GPU delays to safe ranks
+    # Stream conflict test (TorchRec pattern) - simulates memcpy/datadist/default stream races
+    stream_conflict_test: bool = False           # Enable stream conflict injection (old synthetic version)
+    stream_conflict_memcpy_racing: bool = True   # Race memcpy stream with default stream
+    stream_conflict_datadist_racing: bool = True # Race datadist stream with default stream
+    stream_conflict_start_step: int = 3          # Start racing at this step
+    # H2D memcpy racing (realistic TorchRec pattern) - races actual batch loading with forward/RCCL
+    h2d_memcpy_racing: bool = False              # Use separate stream for H2D batch copy
+    h2d_skip_sync_before_forward: bool = False   # Skip wait_stream() before forward (causes race!)
+    h2d_racing_start_step: int = 3               # Start H2D racing at this step
+    # Warmup control
+    skip_training_warmup: bool = False           # Skip training warmup to maximize timing variability
+    # NaN checking around collectives
+    nan_check_collectives: bool = False  # Enable NaN checking before/after RCCL collectives
+    # Hardware queue configuration for race testing
+    gpu_max_hw_queues: Optional[int] = None  # Set GPU_MAX_HW_QUEUES (4+ recommended for race testing)
 
 
 @dataclass
@@ -226,7 +241,16 @@ def set_seed(seed: int, rank: int) -> None:
 
 
 def init_distributed(training_cfg: TrainingConfig, log_level: str) -> Dict[str, Any]:
-    
+    # Set GPU_MAX_HW_QUEUES if configured (must be set BEFORE CUDA init)
+    # This controls hardware queue parallelism - 4+ is needed to expose race conditions
+    if training_cfg.gpu_max_hw_queues is not None:
+        os.environ["GPU_MAX_HW_QUEUES"] = str(training_cfg.gpu_max_hw_queues)
+        log.info("Set GPU_MAX_HW_QUEUES=%d for race testing", training_cfg.gpu_max_hw_queues)
+
+    # Log current HW queue setting
+    hw_queues = os.environ.get("GPU_MAX_HW_QUEUES", "not set (using default)")
+    log.info("GPU_MAX_HW_QUEUES=%s", hw_queues)
+
     backend = get_distributed_backend()
     timeout_seconds = int(os.environ.get("TORCH_DIST_INIT_TIMEOUT", "600"))
     dist.init_process_group(backend=backend, timeout=timedelta(seconds=timeout_seconds))
@@ -619,6 +643,118 @@ def _warmup_training_collectives(
     dist.barrier()
 
 
+def _inject_stream_conflict(
+    device: torch.device,
+    batch: Dict[str, torch.Tensor],
+    training_cfg: TrainingConfig,
+    step: int,
+    rank: int,
+) -> Dict[str, torch.Tensor]:
+    """
+    Simulate TorchRec stream pattern to reproduce NaN race condition.
+
+    The original issue occurs in TorchRec with conflicts between:
+    1. Memcpy stream: H2D copy (like TorchRec's data loading)
+    2. Datadist stream: all_to_all simulation (like TorchRec's data distribution)
+    3. Default stream: RCCL collective (where race occurs)
+
+    From Slack experiments:
+    - Experiment (2): Using default stream for memcpy → NO NaN (best workaround)
+    - Experiment (4): H2D + data dist on SAME new stream → STILL NaN
+    - This suggests the issue is about streams not synchronizing with default stream
+
+    Args:
+        device: CUDA device
+        batch: Current batch tensors
+        training_cfg: Training configuration with stream conflict settings
+        step: Current training step
+        rank: Current rank
+
+    Returns:
+        Modified batch (may have racing tensors)
+    """
+    if not training_cfg.stream_conflict_test:
+        return batch
+
+    if step < training_cfg.stream_conflict_start_step:
+        return batch
+
+    # Create separate streams to simulate TorchRec pattern
+    memcpy_stream = torch.cuda.Stream(device=device)
+    datadist_stream = torch.cuda.Stream(device=device)
+    # Note: default_stream is torch.cuda.current_stream() - stream 0
+
+    modified_batch = {}
+
+    # Pattern 1: Memcpy stream racing with default stream
+    # This simulates TorchRec's data loading on a separate stream
+    if training_cfg.stream_conflict_memcpy_racing:
+        with torch.cuda.stream(memcpy_stream):
+            for key, tensor in batch.items():
+                if isinstance(tensor, torch.Tensor):
+                    # Simulate H2D copy by creating a CPU tensor and copying back
+                    # This exercises the memcpy path that caused issues
+                    cpu_copy = tensor.cpu()
+                    # Copy back to device on memcpy stream (racing with default stream)
+                    modified_batch[key] = cpu_copy.to(device, non_blocking=True)
+                else:
+                    modified_batch[key] = tensor
+        # DO NOT synchronize memcpy_stream here - let it race with default stream
+        log.debug(
+            "STREAM CONFLICT: rank=%d step=%d memcpy_stream racing (no sync)",
+            rank, step
+        )
+    else:
+        modified_batch = dict(batch)
+
+    # Pattern 2: Datadist stream with all_to_all simulation
+    # This simulates TorchRec's data distribution class behavior
+    if training_cfg.stream_conflict_datadist_racing and dist.is_initialized():
+        world_size = dist.get_world_size()
+        with torch.cuda.stream(datadist_stream):
+            # Simulate data distribution pattern with all_to_all
+            # Create a tensor that will be distributed
+            sample_tensor = next(iter(modified_batch.values()))
+            if isinstance(sample_tensor, torch.Tensor):
+                # Create input/output tensors for all_to_all
+                # Each rank sends a chunk to every other rank
+                chunk_size = sample_tensor.numel() // world_size
+                if chunk_size > 0:
+                    input_tensor = torch.randn(
+                        world_size * chunk_size, device=device, dtype=sample_tensor.dtype
+                    )
+                    output_tensor = torch.empty_like(input_tensor)
+
+                    # Perform all_to_all on datadist stream (racing with default stream)
+                    # This is async because we're on a non-default stream
+                    dist.all_to_all_single(
+                        output_tensor,
+                        input_tensor,
+                        async_op=True,  # Async to maximize race potential
+                    )
+                    log.debug(
+                        "STREAM CONFLICT: rank=%d step=%d datadist_stream all_to_all racing (async)",
+                        rank, step
+                    )
+        # DO NOT synchronize datadist_stream here - let it race with default stream
+
+    # Pattern 3: Issue all_reduce on default stream WITHOUT waiting for other streams
+    # This is where the race condition manifests - default stream starts collective
+    # while memcpy_stream and datadist_stream are still running
+    if dist.is_initialized():
+        sample_tensor = next(iter(modified_batch.values()))
+        if isinstance(sample_tensor, torch.Tensor):
+            # All-reduce on default stream - races with memcpy_stream and datadist_stream
+            sync_tensor = sample_tensor.clone()
+            dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
+            log.debug(
+                "STREAM CONFLICT: rank=%d step=%d default_stream all_reduce (racing with other streams)",
+                rank, step
+            )
+
+    return modified_batch
+
+
 def build_ddp_model(
     model_cfg: ModelConfig,
     ddp_cfg: DDPConfig,
@@ -666,6 +802,79 @@ class MetricsLogger:
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     return {key: tensor.to(device, non_blocking=True) for key, tensor in batch.items()}
+
+
+# Global memcpy stream for H2D racing (created lazily per device)
+_memcpy_streams: Dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _get_memcpy_stream(device: torch.device) -> torch.cuda.Stream:
+    """Get or create the memcpy stream for a device."""
+    if device not in _memcpy_streams:
+        _memcpy_streams[device] = torch.cuda.Stream(device=device)
+    return _memcpy_streams[device]
+
+
+def move_batch_to_device_racing(
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    step: int,
+    training_cfg: TrainingConfig,
+    rank: int,
+) -> Dict[str, torch.Tensor]:
+    """
+    Move batch to device using separate memcpy stream (TorchRec pattern).
+
+    This simulates the client's issue where:
+    1. H2D memcpy happens on memcpy_stream (not default stream)
+    2. Forward pass may start before H2D completes
+    3. RCCL collective reads potentially incomplete data
+
+    From Slack experiments:
+    - Experiment (2): Using default stream for memcpy → NO NaN (best workaround)
+    - This function does the OPPOSITE to reproduce the issue
+
+    Args:
+        batch: CPU batch tensors
+        device: Target CUDA device
+        step: Current training step
+        training_cfg: Training configuration
+        rank: Current rank
+
+    Returns:
+        Batch tensors on GPU (may still be in-flight if racing enabled!)
+    """
+    if not training_cfg.h2d_memcpy_racing:
+        # Normal path: use default stream
+        return move_batch_to_device(batch, device)
+
+    if step < training_cfg.h2d_racing_start_step:
+        # Before racing starts: use default stream
+        return move_batch_to_device(batch, device)
+
+    # Racing path: use separate memcpy stream
+    memcpy_stream = _get_memcpy_stream(device)
+
+    result = {}
+    with torch.cuda.stream(memcpy_stream):
+        for key, tensor in batch.items():
+            if isinstance(tensor, torch.Tensor):
+                # H2D copy on memcpy_stream (NOT default stream)
+                # This is the pattern that causes the client's NaN issue
+                result[key] = tensor.to(device, non_blocking=True)
+            else:
+                result[key] = tensor
+
+    # CRITICAL: We intentionally DO NOT synchronize memcpy_stream here
+    # The caller may or may not wait for memcpy_stream before forward pass
+    # If h2d_skip_sync_before_forward=True, forward will race with H2D
+
+    log.debug(
+        "H2D RACING: rank=%d step=%d batch on memcpy_stream (NOT synced)",
+        rank, step
+    )
+
+    return result
 
 
 def compute_loss(scores: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -747,12 +956,38 @@ def training_loop(
     # NOTE: Reduced to 1 step (from 3) to preserve more timing variability
     # while still exercising the collectives. RCCL warmup in build_fsdp_model
     # handles communicator initialization separately.
-    log.info("Starting training warmup pass (rank=%d, num_steps=1)...", rank)
-    _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=1)
-    log.info("Training warmup complete (rank=%d)", rank)
+    # Can be skipped with skip_training_warmup=True to maximize timing variability for race testing
+    if training_cfg.skip_training_warmup:
+        log.warning("SKIPPING training warmup (skip_training_warmup=True) - may increase race likelihood")
+    else:
+        log.info("Starting training warmup pass (rank=%d, num_steps=1)...", rank)
+        _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=1)
+        log.info("Training warmup complete (rank=%d)", rank)
 
     # Note: force_async is now controlled dynamically per-step in training loop
     # Only racing ranks (local 1, 2 on Node 0) at step >= 3 will have force_async enabled
+
+    # Enable NaN checking around RCCL collectives if configured
+    # This implements Wenkai Du's suggestion: nan-check -> rccl -> nan-check
+    if training_cfg.nan_check_collectives:
+        profiler.enable_nan_checking(True)
+        log.info("NaN checking enabled around RCCL collectives (rank=%d)", rank)
+
+    # Warn if H2D racing is enabled but HW queues may mask the race
+    if training_cfg.h2d_memcpy_racing:
+        hw_queues_str = os.environ.get("GPU_MAX_HW_QUEUES")
+        try:
+            hw_queues_val = int(hw_queues_str) if hw_queues_str else 0
+        except ValueError:
+            hw_queues_val = 0
+        if hw_queues_val < 4:
+            log.warning(
+                "H2D racing enabled but GPU_MAX_HW_QUEUES=%s - race may be MASKED by implicit serialization! "
+                "Set gpu_max_hw_queues: 4 in config or export GPU_MAX_HW_QUEUES=4 for true parallelism.",
+                hw_queues_str or "not set"
+            )
+        else:
+            log.info("H2D racing enabled with GPU_MAX_HW_QUEUES=%d - sufficient for true stream parallelism", hw_queues_val)
 
     profiler_dir = training_cfg.output_dir / "torch_profiler"
     with profiler.intercept_distributed_ops():
@@ -763,11 +998,58 @@ def training_loop(
 
                 for step, cpu_batch in enumerate(dataloader):
                     profiler.start_iteration(global_step)
+                    # Update current step for NaN checking in collectives
+                    profiler.set_current_step(global_step)
 
-                    with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
-                        batch = move_batch_to_device(cpu_batch, device)
+                    # ============================================================
+                    # H2D MEMCPY RACING (TorchRec realistic pattern)
+                    # ============================================================
+                    # When h2d_memcpy_racing=True:
+                    # - Batch is moved to GPU on separate memcpy_stream
+                    # - If h2d_skip_sync_before_forward=True, forward may race with H2D
+                    # This is the ACTUAL pattern causing the client's NaN issue
+                    # ============================================================
+                    if training_cfg.h2d_memcpy_racing:
+                        with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
+                            batch = move_batch_to_device_racing(
+                                cpu_batch, device, step, training_cfg, rank
+                            )
 
-                    profiler.stream("compute").wait_stream(profiler.stream("aux"))
+                        # Conditionally wait for memcpy_stream before forward
+                        if training_cfg.h2d_skip_sync_before_forward and step >= training_cfg.h2d_racing_start_step:
+                            # RACE CONDITION: Forward starts before H2D completes!
+                            # This is EXACTLY what causes the client's NaN issue
+                            log.debug(
+                                "H2D RACING: rank=%d step=%d SKIPPING sync before forward - RACE ENABLED",
+                                rank, step
+                            )
+                            # We need to make compute stream wait on aux stream but NOT on memcpy_stream
+                            # So compute can race with the H2D copy
+                            profiler.stream("compute").wait_stream(profiler.stream("aux"))
+                        else:
+                            # Safe path: wait for memcpy_stream to complete
+                            memcpy_stream = _get_memcpy_stream(device)
+                            profiler.stream("compute").wait_stream(memcpy_stream)
+                            profiler.stream("compute").wait_stream(profiler.stream("aux"))
+                    else:
+                        # Original path: use default stream for H2D (no race)
+                        with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
+                            batch = move_batch_to_device(cpu_batch, device)
+
+                        profiler.stream("compute").wait_stream(profiler.stream("aux"))
+
+                    # ============================================================
+                    # STREAM CONFLICT TEST: Synthetic stream racing (old version)
+                    # ============================================================
+                    # Inject stream conflicts AFTER batch prefetch but BEFORE forward
+                    # This simulates TorchRec's pattern where:
+                    # - memcpy_stream: H2D copies (data loading)
+                    # - datadist_stream: all_to_all (data distribution)
+                    # - default_stream: RCCL collectives
+                    # The race happens when these streams don't synchronize properly
+                    # NOTE: This is the OLD synthetic version, prefer h2d_memcpy_racing
+                    if training_cfg.stream_conflict_test:
+                        batch = _inject_stream_conflict(device, batch, training_cfg, step, rank)
 
                     optimizer.zero_grad(set_to_none=True)
 
@@ -969,6 +1251,22 @@ def training_loop(
                     break
 
     metrics_logger.close()
+
+    # Report NaN check results if enabled
+    if training_cfg.nan_check_collectives:
+        nan_results = profiler.get_nan_check_results()
+        if nan_results:
+            log.warning(
+                "[NaN SUMMARY] rank=%d detected %d NaN/Inf events during training",
+                rank, len(nan_results)
+            )
+            # Write NaN results to file for analysis
+            nan_log_path = training_cfg.output_dir / f"nan_check_rank{rank}.json"
+            with open(nan_log_path, "w") as f:
+                json.dump(nan_results, f, indent=2)
+            log.info("NaN check results written to %s", nan_log_path)
+        else:
+            log.info("[NaN SUMMARY] rank=%d no NaN/Inf detected in RCCL collectives", rank)
     
     if rank == 0:
         log.info("Training loop finished. Profiler will export traces in cleanup phase.")

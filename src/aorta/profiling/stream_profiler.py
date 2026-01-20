@@ -10,11 +10,56 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 log = logging.getLogger(__name__)
 
 
 StreamName = str
+
+
+def _check_tensor_nan_inf(
+    tensor: torch.Tensor,
+    location: str,  # "pre" or "post"
+    op_name: str,   # "all_reduce", "reduce_scatter", etc.
+    rank: int,
+    step: int,
+) -> Dict[str, Any]:
+    """
+    Check tensor for NaN/Inf and return diagnostic info.
+
+    This implements Wenkai Du's suggestion: nan-check -> rccl -> nan-check
+    to identify WHERE NaN originates (before or after RCCL collective).
+
+    Args:
+        tensor: Tensor to check
+        location: "pre" (before collective) or "post" (after collective)
+        op_name: Name of the collective operation
+        rank: Current rank
+        step: Current training step
+
+    Returns:
+        Dict with detection results. If NaN/Inf detected, includes counts and shape.
+    """
+    with torch.no_grad():
+        has_nan = torch.isnan(tensor).any().item()
+        has_inf = torch.isinf(tensor).any().item()
+        if has_nan or has_inf:
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            return {
+                "detected": True,
+                "location": location,
+                "op_name": op_name,
+                "rank": rank,
+                "step": step,
+                "nan_count": nan_count,
+                "inf_count": inf_count,
+                "tensor_shape": list(tensor.shape),
+                "tensor_dtype": str(tensor.dtype),
+                "tensor_numel": tensor.numel(),
+            }
+    return {"detected": False}
 
 
 @dataclass
@@ -61,9 +106,30 @@ class StreamProfiler:
         # operations for race condition testing
         self.force_async_for_race_test = force_async_for_race_test
 
+        # NaN checking around collectives (implements Wenkai Du's suggestion)
+        self.nan_check_enabled = False
+        self.nan_check_results: List[Dict[str, Any]] = []
+        self._current_step = 0  # Track current step for NaN checking
+
     def set_force_async(self, enabled: bool) -> None:
         """Toggle force_async mode (e.g., enable after warmup to avoid NaN during warmup)."""
         self.force_async_for_race_test = enabled
+
+    def enable_nan_checking(self, enabled: bool = True) -> None:
+        """Enable or disable NaN/Inf checking around RCCL collectives."""
+        self.nan_check_enabled = enabled
+        if enabled:
+            log.info("NaN checking enabled for RCCL collectives")
+        else:
+            log.info("NaN checking disabled for RCCL collectives")
+
+    def set_current_step(self, step: int) -> None:
+        """Set the current training step for NaN check logging."""
+        self._current_step = step
+
+    def get_nan_check_results(self) -> List[Dict[str, Any]]:
+        """Return all NaN/Inf detection results."""
+        return self.nan_check_results.copy()
 
     # ------------------------------------------------------------------
     # Iteration lifecycle
@@ -301,6 +367,27 @@ class DistributedOpsInterceptor:
         self._originals[(module, name)] = (module, name, original)
 
         def wrapper(*args, **kwargs):
+            # Get current rank and step for NaN checking
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            step = self.profiler._current_step
+
+            # ============================================================
+            # PRE-COLLECTIVE NaN CHECK
+            # ============================================================
+            # Check input tensors for NaN/Inf BEFORE the collective
+            # This helps identify if NaN originated before RCCL
+            if self.profiler.nan_check_enabled:
+                for i, arg in enumerate(args):
+                    if isinstance(arg, torch.Tensor):
+                        result = _check_tensor_nan_inf(arg, "pre", name, rank, step)
+                        if result["detected"]:
+                            log.error(
+                                "[NaN PRE-%s] rank=%d step=%d arg=%d: nan=%d inf=%d shape=%s",
+                                name, rank, step, i,
+                                result["nan_count"], result["inf_count"], result["tensor_shape"]
+                            )
+                            self.profiler.nan_check_results.append(result)
+
             async_requested = kwargs.get("async_op", False)
             kwargs["async_op"] = True
             stream = self.profiler.stream(stream_name)
@@ -313,6 +400,33 @@ class DistributedOpsInterceptor:
             tag = kwargs.get("tag", name)
             metadata = {"function": name}
             self.profiler.register_external_range(stream_name, f"{tag}", start, end, metadata=metadata)
+
+            # ============================================================
+            # POST-COLLECTIVE NaN CHECK
+            # ============================================================
+            # Check output tensors for NaN/Inf AFTER the collective completes
+            # This helps identify if NaN was introduced BY the RCCL collective
+            if self.profiler.nan_check_enabled:
+                # For post-check, we need to wait for the collective to complete
+                # to ensure we're checking the actual output values
+                if work is not None:
+                    work.wait()
+                    # Now check for NaN in the result
+                    for i, arg in enumerate(args):
+                        if isinstance(arg, torch.Tensor):
+                            result = _check_tensor_nan_inf(arg, "post", name, rank, step)
+                            if result["detected"]:
+                                log.error(
+                                    "[NaN POST-%s] rank=%d step=%d arg=%d: nan=%d inf=%d shape=%s",
+                                    name, rank, step, i,
+                                    result["nan_count"], result["inf_count"], result["tensor_shape"]
+                                )
+                                self.profiler.nan_check_results.append(result)
+                    # Already waited, so don't wait again
+                    if not async_requested:
+                        return None
+                    return work
+
             # Skip work.wait() if force_async_for_race_test is enabled
             # This allows reduce-scatter to complete asynchronously for race testing
             if not async_requested and not self.profiler.force_async_for_race_test:
