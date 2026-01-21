@@ -143,10 +143,14 @@ def _parse_config(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _build_training_config(raw: Dict[str, Any]) -> TrainingConfig:
     training = raw.get("training", {})
+    race_experiment = raw.get("race_experiment", {})  # Separate section for race settings
     cfg = TrainingConfig()
     for field in dataclass_fields(TrainingConfig):
+        # First check training section, then race_experiment section
         if field.name in training:
             setattr(cfg, field.name, training[field.name])
+        elif field.name in race_experiment:
+            setattr(cfg, field.name, race_experiment[field.name])
     cfg.output_dir = Path(cfg.output_dir)
     return cfg
 

@@ -16,9 +16,28 @@ training:
   log_interval: 5
   additional_compute_streams: 2
   lightweight_op_waves: 3
+
+race_experiment:
+  # Backward/clip race injection (different from client's issue)
   race_force_async: false      
   race_fresh_stream: false      
-  race_delay_safe_ranks: false 
+  race_delay_safe_ranks: false
+  
+  # H2D memcpy racing (realistic TorchRec pattern)
+  h2d_memcpy_racing: false
+  h2d_skip_sync_before_forward: false
+  h2d_racing_start_step: 0
+  
+  # Stream conflict test (old synthetic version)
+  stream_conflict_test: false
+  stream_conflict_start_step: 0
+  
+  # Warmup and detection
+  skip_training_warmup: false
+  nan_check_collectives: false
+  
+  # Hardware queues (4+ needed to expose race)
+  gpu_max_hw_queues: null
 
 optimizer:
   name: shampoo
