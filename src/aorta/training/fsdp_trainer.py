@@ -29,6 +29,29 @@ from datetime import timedelta
 from aorta.data import SyntheticDatasetConfig, create_dataloader
 from aorta.models import ModelConfig, RankingTransformerModel
 from aorta.profiling.stream_profiler import StreamProfiler
+from aorta.race import RaceConfig
+from aorta.race.injectors import (
+    setup_gpu_max_hw_queues,
+    check_hw_queues_warning,
+    log_race_config_status,
+    inject_h2d_racing,
+    inject_datadist_racing,
+    inject_stream_conflict,
+    inject_timing_skew,
+    setup_backward_race,
+    should_skip_h2d_sync,
+    should_skip_datadist_sync,
+    get_memcpy_stream,
+    get_datadist_stream,
+    should_sync_after_backward,
+    clip_gradients_racing,
+    inject_safe_rank_delay,
+    is_racing_rank,
+    get_racing_rank_info,
+    check_loss_for_nan,
+    check_gradients_for_nan,
+)
+from aorta.race.h2d_racing import move_batch_to_device
 from aorta.utils import detect_accelerator, get_device, get_distributed_backend, load_config, merge_cli_overrides, setup_logging
 
 log = logging.getLogger(__name__)
@@ -61,25 +84,7 @@ class TrainingConfig:
     output_dir: Path = Path("artifacts")
     inject_allreduce_copies: bool = False  # Inject all_reduce + host-device copies to trigger hang
     allreduce_stress_level: int = 1  # Number of all_reduce ops per iteration (1-10)
-    # Race injection mechanisms (for testing NaN race between backward and clip_grad_norm_)
-    race_force_async: bool = False      # Mechanism 1: Skip work.wait() in DistributedOpsInterceptor
-    race_fresh_stream: bool = False     # Mechanism 2: Use fresh CUDA stream for racing ranks
-    race_delay_safe_ranks: bool = False # Mechanism 3: Add GPU delays to safe ranks
-    # Stream conflict test (TorchRec pattern) - simulates memcpy/datadist/default stream races
-    stream_conflict_test: bool = False           # Enable stream conflict injection (old synthetic version)
-    stream_conflict_memcpy_racing: bool = True   # Race memcpy stream with default stream
-    stream_conflict_datadist_racing: bool = True # Race datadist stream with default stream
-    stream_conflict_start_step: int = 3          # Start racing at this step
-    # H2D memcpy racing (realistic TorchRec pattern) - races actual batch loading with forward/RCCL
-    h2d_memcpy_racing: bool = False              # Use separate stream for H2D batch copy
-    h2d_skip_sync_before_forward: bool = False   # Skip wait_stream() before forward (causes race!)
-    h2d_racing_start_step: int = 3               # Start H2D racing at this step
-    # Warmup control
-    skip_training_warmup: bool = False           # Skip training warmup to maximize timing variability
-    # NaN checking around collectives
-    nan_check_collectives: bool = False  # Enable NaN checking before/after RCCL collectives
-    # Hardware queue configuration for race testing
-    gpu_max_hw_queues: Optional[int] = None  # Set GPU_MAX_HW_QUEUES (4+ recommended for race testing)
+    # Race experiment settings are in RaceConfig (loaded from race_experiment: section)
 
 
 @dataclass
@@ -143,15 +148,21 @@ def _parse_config(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _build_training_config(raw: Dict[str, Any]) -> TrainingConfig:
     training = raw.get("training", {})
-    race_experiment = raw.get("race_experiment", {})  # Separate section for race settings
     cfg = TrainingConfig()
     for field in dataclass_fields(TrainingConfig):
-        # First check training section, then race_experiment section
         if field.name in training:
             setattr(cfg, field.name, training[field.name])
-        elif field.name in race_experiment:
-            setattr(cfg, field.name, race_experiment[field.name])
     cfg.output_dir = Path(cfg.output_dir)
+    return cfg
+
+
+def _build_race_config(raw: Dict[str, Any]) -> RaceConfig:
+    """Build RaceConfig from the race_experiment section."""
+    section = raw.get("race_experiment", {})
+    cfg = RaceConfig()
+    for field in dataclass_fields(RaceConfig):
+        if field.name in section:
+            setattr(cfg, field.name, section[field.name])
     return cfg
 
 
@@ -244,16 +255,10 @@ def set_seed(seed: int, rank: int) -> None:
     log.info("Set random seed=%d for rank=%d (base_seed=%d)", seed_value, rank, seed)
 
 
-def init_distributed(training_cfg: TrainingConfig, log_level: str) -> Dict[str, Any]:
+def init_distributed(training_cfg: TrainingConfig, race_cfg: RaceConfig, log_level: str) -> Dict[str, Any]:
     # Set GPU_MAX_HW_QUEUES if configured (must be set BEFORE CUDA init)
     # This controls hardware queue parallelism - 4+ is needed to expose race conditions
-    if training_cfg.gpu_max_hw_queues is not None:
-        os.environ["GPU_MAX_HW_QUEUES"] = str(training_cfg.gpu_max_hw_queues)
-        log.info("Set GPU_MAX_HW_QUEUES=%d for race testing", training_cfg.gpu_max_hw_queues)
-
-    # Log current HW queue setting
-    hw_queues = os.environ.get("GPU_MAX_HW_QUEUES", "not set (using default)")
-    log.info("GPU_MAX_HW_QUEUES=%s", hw_queues)
+    setup_gpu_max_hw_queues(race_cfg)
 
     backend = get_distributed_backend()
     timeout_seconds = int(os.environ.get("TORCH_DIST_INIT_TIMEOUT", "600"))
@@ -289,6 +294,7 @@ def build_fsdp_model(
     fsdp_cfg: FSDPConfig,
     compile_cfg: CompileConfig,
     device: torch.device,
+    race_cfg: Optional[RaceConfig] = None,
 ) -> FSDP:
     model = RankingTransformerModel(model_cfg)
 
@@ -313,12 +319,18 @@ def build_fsdp_model(
             # Warmup RCCL communicators BEFORE FSDP initialization
             # This ensures inter-node communicators are fully established before
             # the _sync_params_and_buffers broadcasts that can cause hangs
-            _warmup_rccl_communicators(
-                shard_group,
-                replicate_group,
-                device,
-                num_warmup_ops=fsdp_cfg.rccl_warmup_iterations,
-            )
+            # Can be skipped with skip_rccl_warmup=True to test race conditions
+            if race_cfg is not None and race_cfg.skip_rccl_warmup:
+                log.warning("SKIPPING RCCL warmup (skip_rccl_warmup=True) - may cause hangs or race conditions")
+            else:
+                # Use race_cfg iterations if provided, otherwise fall back to fsdp_cfg
+                rccl_iterations = race_cfg.rccl_warmup_iterations if race_cfg is not None else fsdp_cfg.rccl_warmup_iterations
+                _warmup_rccl_communicators(
+                    shard_group,
+                    replicate_group,
+                    device,
+                    num_warmup_ops=rccl_iterations,
+                )
             log.info("Created custom process groups for HYBRID_SHARD strategy")
 
     # Ensure CUDA operations are complete before FSDP wrapping
@@ -647,116 +659,7 @@ def _warmup_training_collectives(
     dist.barrier()
 
 
-def _inject_stream_conflict(
-    device: torch.device,
-    batch: Dict[str, torch.Tensor],
-    training_cfg: TrainingConfig,
-    step: int,
-    rank: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    Simulate TorchRec stream pattern to reproduce NaN race condition.
-
-    The original issue occurs in TorchRec with conflicts between:
-    1. Memcpy stream: H2D copy (like TorchRec's data loading)
-    2. Datadist stream: all_to_all simulation (like TorchRec's data distribution)
-    3. Default stream: RCCL collective (where race occurs)
-
-    From Slack experiments:
-    - Experiment (2): Using default stream for memcpy → NO NaN (best workaround)
-    - Experiment (4): H2D + data dist on SAME new stream → STILL NaN
-    - This suggests the issue is about streams not synchronizing with default stream
-
-    Args:
-        device: CUDA device
-        batch: Current batch tensors
-        training_cfg: Training configuration with stream conflict settings
-        step: Current training step
-        rank: Current rank
-
-    Returns:
-        Modified batch (may have racing tensors)
-    """
-    if not training_cfg.stream_conflict_test:
-        return batch
-
-    if step < training_cfg.stream_conflict_start_step:
-        return batch
-
-    # Create separate streams to simulate TorchRec pattern
-    memcpy_stream = torch.cuda.Stream(device=device)
-    datadist_stream = torch.cuda.Stream(device=device)
-    # Note: default_stream is torch.cuda.current_stream() - stream 0
-
-    modified_batch = {}
-
-    # Pattern 1: Memcpy stream racing with default stream
-    # This simulates TorchRec's data loading on a separate stream
-    if training_cfg.stream_conflict_memcpy_racing:
-        with torch.cuda.stream(memcpy_stream):
-            for key, tensor in batch.items():
-                if isinstance(tensor, torch.Tensor):
-                    # Simulate H2D copy by creating a CPU tensor and copying back
-                    # This exercises the memcpy path that caused issues
-                    cpu_copy = tensor.cpu()
-                    # Copy back to device on memcpy stream (racing with default stream)
-                    modified_batch[key] = cpu_copy.to(device, non_blocking=True)
-                else:
-                    modified_batch[key] = tensor
-        # DO NOT synchronize memcpy_stream here - let it race with default stream
-        log.debug(
-            "STREAM CONFLICT: rank=%d step=%d memcpy_stream racing (no sync)",
-            rank, step
-        )
-    else:
-        modified_batch = dict(batch)
-
-    # Pattern 2: Datadist stream with all_to_all simulation
-    # This simulates TorchRec's data distribution class behavior
-    if training_cfg.stream_conflict_datadist_racing and dist.is_initialized():
-        world_size = dist.get_world_size()
-        with torch.cuda.stream(datadist_stream):
-            # Simulate data distribution pattern with all_to_all
-            # Create a tensor that will be distributed
-            sample_tensor = next(iter(modified_batch.values()))
-            if isinstance(sample_tensor, torch.Tensor):
-                # Create input/output tensors for all_to_all
-                # Each rank sends a chunk to every other rank
-                chunk_size = sample_tensor.numel() // world_size
-                if chunk_size > 0:
-                    input_tensor = torch.randn(
-                        world_size * chunk_size, device=device, dtype=sample_tensor.dtype
-                    )
-                    output_tensor = torch.empty_like(input_tensor)
-
-                    # Perform all_to_all on datadist stream (racing with default stream)
-                    # This is async because we're on a non-default stream
-                    dist.all_to_all_single(
-                        output_tensor,
-                        input_tensor,
-                        async_op=True,  # Async to maximize race potential
-                    )
-                    log.debug(
-                        "STREAM CONFLICT: rank=%d step=%d datadist_stream all_to_all racing (async)",
-                        rank, step
-                    )
-        # DO NOT synchronize datadist_stream here - let it race with default stream
-
-    # Pattern 3: Issue all_reduce on default stream WITHOUT waiting for other streams
-    # This is where the race condition manifests - default stream starts collective
-    # while memcpy_stream and datadist_stream are still running
-    if dist.is_initialized():
-        sample_tensor = next(iter(modified_batch.values()))
-        if isinstance(sample_tensor, torch.Tensor):
-            # All-reduce on default stream - races with memcpy_stream and datadist_stream
-            sync_tensor = sample_tensor.clone()
-            dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
-            log.debug(
-                "STREAM CONFLICT: rank=%d step=%d default_stream all_reduce (racing with other streams)",
-                rank, step
-            )
-
-    return modified_batch
+# NOTE: _inject_stream_conflict moved to aorta.race.stream_conflict
 
 
 def build_ddp_model(
@@ -804,81 +707,7 @@ class MetricsLogger:
         return obj
 
 
-def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {key: tensor.to(device, non_blocking=True) for key, tensor in batch.items()}
-
-
-# Global memcpy stream for H2D racing (created lazily per device)
-_memcpy_streams: Dict[torch.device, torch.cuda.Stream] = {}
-
-
-def _get_memcpy_stream(device: torch.device) -> torch.cuda.Stream:
-    """Get or create the memcpy stream for a device."""
-    if device not in _memcpy_streams:
-        _memcpy_streams[device] = torch.cuda.Stream(device=device)
-    return _memcpy_streams[device]
-
-
-def move_batch_to_device_racing(
-    batch: Dict[str, torch.Tensor],
-    device: torch.device,
-    step: int,
-    training_cfg: TrainingConfig,
-    rank: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    Move batch to device using separate memcpy stream (TorchRec pattern).
-
-    This simulates the client's issue where:
-    1. H2D memcpy happens on memcpy_stream (not default stream)
-    2. Forward pass may start before H2D completes
-    3. RCCL collective reads potentially incomplete data
-
-    From Slack experiments:
-    - Experiment (2): Using default stream for memcpy → NO NaN (best workaround)
-    - This function does the OPPOSITE to reproduce the issue
-
-    Args:
-        batch: CPU batch tensors
-        device: Target CUDA device
-        step: Current training step
-        training_cfg: Training configuration
-        rank: Current rank
-
-    Returns:
-        Batch tensors on GPU (may still be in-flight if racing enabled!)
-    """
-    if not training_cfg.h2d_memcpy_racing:
-        # Normal path: use default stream
-        return move_batch_to_device(batch, device)
-
-    if step < training_cfg.h2d_racing_start_step:
-        # Before racing starts: use default stream
-        return move_batch_to_device(batch, device)
-
-    # Racing path: use separate memcpy stream
-    memcpy_stream = _get_memcpy_stream(device)
-
-    result = {}
-    with torch.cuda.stream(memcpy_stream):
-        for key, tensor in batch.items():
-            if isinstance(tensor, torch.Tensor):
-                # H2D copy on memcpy_stream (NOT default stream)
-                # This is the pattern that causes the client's NaN issue
-                result[key] = tensor.to(device, non_blocking=True)
-            else:
-                result[key] = tensor
-
-    # CRITICAL: We intentionally DO NOT synchronize memcpy_stream here
-    # The caller may or may not wait for memcpy_stream before forward pass
-    # If h2d_skip_sync_before_forward=True, forward will race with H2D
-
-    log.debug(
-        "H2D RACING: rank=%d step=%d batch on memcpy_stream (NOT synced)",
-        rank, step
-    )
-
-    return result
+# NOTE: move_batch_to_device and H2D racing functions moved to aorta.race.h2d_racing
 
 
 def compute_loss(scores: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -923,6 +752,7 @@ def training_loop(
     optimizer: torch.optim.Optimizer,
     dataloader,
     training_cfg: TrainingConfig,
+    race_cfg: RaceConfig,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     environment: Dict[str, Any],
     profiler: StreamProfiler,
@@ -961,37 +791,27 @@ def training_loop(
     # while still exercising the collectives. RCCL warmup in build_fsdp_model
     # handles communicator initialization separately.
     # Can be skipped with skip_training_warmup=True to maximize timing variability for race testing
-    if training_cfg.skip_training_warmup:
+    if race_cfg.skip_training_warmup:
         log.warning("SKIPPING training warmup (skip_training_warmup=True) - may increase race likelihood")
     else:
-        log.info("Starting training warmup pass (rank=%d, num_steps=1)...", rank)
-        _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=1)
+        log.info("Starting training warmup pass (rank=%d, num_steps=%d)...", rank, race_cfg.training_warmup_steps)
+        _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=race_cfg.training_warmup_steps)
         log.info("Training warmup complete (rank=%d)", rank)
 
     # Note: force_async is now controlled dynamically per-step in training loop
     # Only racing ranks (local 1, 2 on Node 0) at step >= 3 will have force_async enabled
 
     # Enable NaN checking around RCCL collectives if configured
-    # This implements Wenkai Du's suggestion: nan-check -> rccl -> nan-check
-    if training_cfg.nan_check_collectives:
+    # Recommended approach: nan-check -> rccl -> nan-check
+    if race_cfg.nan_check_collectives:
         profiler.enable_nan_checking(True)
         log.info("NaN checking enabled around RCCL collectives (rank=%d)", rank)
 
     # Warn if H2D racing is enabled but HW queues may mask the race
-    if training_cfg.h2d_memcpy_racing:
-        hw_queues_str = os.environ.get("GPU_MAX_HW_QUEUES")
-        try:
-            hw_queues_val = int(hw_queues_str) if hw_queues_str else 0
-        except ValueError:
-            hw_queues_val = 0
-        if hw_queues_val < 4:
-            log.warning(
-                "H2D racing enabled but GPU_MAX_HW_QUEUES=%s - race may be MASKED by implicit serialization! "
-                "Set gpu_max_hw_queues: 4 in config or export GPU_MAX_HW_QUEUES=4 for true parallelism.",
-                hw_queues_str or "not set"
-            )
-        else:
-            log.info("H2D racing enabled with GPU_MAX_HW_QUEUES=%d - sufficient for true stream parallelism", hw_queues_val)
+    check_hw_queues_warning(race_cfg)
+
+    # Log race configuration status
+    log_race_config_status(race_cfg, rank)
 
     profiler_dir = training_cfg.output_dir / "torch_profiler"
     with profiler.intercept_distributed_ops():
@@ -1006,37 +826,53 @@ def training_loop(
                     profiler.set_current_step(global_step)
 
                     # ============================================================
-                    # H2D MEMCPY RACING (TorchRec realistic pattern)
+                    # H2D MEMCPY RACING (realistic pattern)
                     # ============================================================
-                    # When h2d_memcpy_racing=True:
+                    # When h2d_memcpy_racing=True AND step >= start_step:
                     # - Batch is moved to GPU on separate memcpy_stream
                     # - If h2d_skip_sync_before_forward=True, forward may race with H2D
-                    # This is the ACTUAL pattern causing the client's NaN issue
+                    # This pattern can cause NaN when forward races with incomplete H2D
+                    #
+                    # IMPORTANT: For step < start_step, use EXACT same path as disabled
+                    # to avoid any timing differences during warmup/early steps.
                     # ============================================================
-                    if training_cfg.h2d_memcpy_racing:
+                    h2d_racing_active = (
+                        race_cfg.h2d_memcpy_racing
+                        and step >= race_cfg.h2d_racing_start_step
+                    )
+
+                    if h2d_racing_active:
+                        # Log first activation
+                        if step == race_cfg.h2d_racing_start_step:
+                            log.info(
+                                "H2D RACING: ACTIVATED at step=%d rank=%d (skip_sync=%s)",
+                                step, rank, race_cfg.h2d_skip_sync_before_forward
+                            )
+
                         with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
-                            batch = move_batch_to_device_racing(
-                                cpu_batch, device, step, training_cfg, rank
+                            batch, memcpy_stream = inject_h2d_racing(
+                                cpu_batch, device, step, race_cfg, rank
                             )
 
                         # Conditionally wait for memcpy_stream before forward
-                        if training_cfg.h2d_skip_sync_before_forward and step >= training_cfg.h2d_racing_start_step:
+                        if should_skip_h2d_sync(step, race_cfg):
                             # RACE CONDITION: Forward starts before H2D completes!
-                            # This is EXACTLY what causes the client's NaN issue
-                            log.debug(
-                                "H2D RACING: rank=%d step=%d SKIPPING sync before forward - RACE ENABLED",
-                                rank, step
+                            log.info(
+                                "H2D RACING: step=%d rank=%d memcpy_stream NOT synced - RACE WINDOW OPEN",
+                                step, rank
                             )
-                            # We need to make compute stream wait on aux stream but NOT on memcpy_stream
-                            # So compute can race with the H2D copy
+                            # Compute stream waits on aux but NOT on memcpy_stream
                             profiler.stream("compute").wait_stream(profiler.stream("aux"))
                         else:
                             # Safe path: wait for memcpy_stream to complete
-                            memcpy_stream = _get_memcpy_stream(device)
-                            profiler.stream("compute").wait_stream(memcpy_stream)
+                            if memcpy_stream is not None:
+                                profiler.stream("compute").wait_stream(memcpy_stream)
                             profiler.stream("compute").wait_stream(profiler.stream("aux"))
                     else:
                         # Original path: use default stream for H2D (no race)
+                        # This path is used when:
+                        # - h2d_memcpy_racing=False, OR
+                        # - step < h2d_racing_start_step
                         with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
                             batch = move_batch_to_device(cpu_batch, device)
 
@@ -1046,14 +882,70 @@ def training_loop(
                     # STREAM CONFLICT TEST: Synthetic stream racing (old version)
                     # ============================================================
                     # Inject stream conflicts AFTER batch prefetch but BEFORE forward
-                    # This simulates TorchRec's pattern where:
+                    # This simulates a multi-stream pattern where:
                     # - memcpy_stream: H2D copies (data loading)
                     # - datadist_stream: all_to_all (data distribution)
                     # - default_stream: RCCL collectives
                     # The race happens when these streams don't synchronize properly
-                    # NOTE: This is the OLD synthetic version, prefer h2d_memcpy_racing
-                    if training_cfg.stream_conflict_test:
-                        batch = _inject_stream_conflict(device, batch, training_cfg, step, rank)
+                    # NOTE: This is the OLD synthetic version, prefer h2d_memcpy_racing + datadist_racing
+                    if race_cfg.stream_conflict_test:
+                        batch = inject_stream_conflict(device, batch, race_cfg, step, rank)
+
+                    # ============================================================
+                    # DATADIST RACING (TorchRec-style all_to_all on separate stream)
+                    # ============================================================
+                    # When datadist_racing=True AND step >= start_step:
+                    # - all_to_all runs on separate datadist_stream
+                    # - If datadist_skip_sync_before_collective=True, FSDP collective may race
+                    # This pattern simulates TorchRec's SparseDataDistributedAllToAll race
+                    #
+                    # IMPORTANT: For step < start_step, skip entirely to avoid any
+                    # timing differences during warmup/early steps.
+                    # ============================================================
+                    datadist_racing_active = (
+                        race_cfg.datadist_racing
+                        and step >= race_cfg.datadist_racing_start_step
+                    )
+
+                    if datadist_racing_active:
+                        # Log first activation
+                        if step == race_cfg.datadist_racing_start_step:
+                            log.info(
+                                "DATADIST RACING: ACTIVATED at step=%d rank=%d (skip_sync=%s)",
+                                step, rank, race_cfg.datadist_skip_sync_before_collective
+                            )
+
+                        batch, datadist_stream = inject_datadist_racing(
+                            batch, device, step, race_cfg, rank
+                        )
+
+                        # Conditionally wait for datadist_stream before forward/collective
+                        if should_skip_datadist_sync(step, race_cfg):
+                            # RACE CONDITION: Forward/collective starts before all_to_all completes!
+                            log.info(
+                                "DATADIST RACING: step=%d rank=%d datadist_stream NOT synced - RACE WINDOW OPEN",
+                                step, rank
+                            )
+                        else:
+                            # Safe path: wait for datadist_stream to complete
+                            if datadist_stream is not None:
+                                torch.cuda.current_stream().wait_stream(datadist_stream)
+                    # else: step < start_step or datadist_racing=False - no datadist injection
+
+                    # ============================================================
+                    # TIMING SKEW EXPERIMENT (demonstrates NaN progression)
+                    # ============================================================
+                    # When timing_skew_enabled=True AND step >= start_step:
+                    # - Introduces controlled delays on specific ranks
+                    # - Shows progression: small skew → NaN, large skew → hang
+                    # ============================================================
+                    if race_cfg.is_timing_skew_active(step):
+                        skew_delay = inject_timing_skew(step, rank, race_cfg)
+                        if skew_delay > 0:
+                            log.debug(
+                                "TIMING SKEW: rank=%d step=%d delay=%.0f us",
+                                rank, step, skew_delay
+                            )
 
                     optimizer.zero_grad(set_to_none=True)
 
@@ -1066,27 +958,32 @@ def training_loop(
                             scores = model(batch)
                             loss = compute_loss(scores, batch)
 
+                    # NaN check after forward (for race/timing skew experiments)
+                    if race_cfg.nan_check_collectives:
+                        if check_loss_for_nan(loss, step, rank):
+                            log.warning(
+                                "\n"
+                                "╔══════════════════════════════════════════════════════════════╗\n"
+                                "║  NaN DETECTED IN LOSS                                        ║\n"
+                                "║  Step: %-4d   Rank: %-2d   Loss: NaN                           ║\n"
+                                "╚══════════════════════════════════════════════════════════════╝",
+                                step, rank
+                            )
+
                     # ============================================================
                     # RACE CONDITION INJECTION: Force aux stream to read early
                     # ============================================================
-                    # Controlled by 3 independent flags:
+                    # Controlled by 3 independent flags (in race_cfg):
                     # - race_force_async: Skip work.wait() in interceptor (during backward)
                     # - race_fresh_stream: Use fresh CUDA stream for racing ranks
                     # - race_delay_safe_ranks: Add GPU delays to safe ranks
                     #
                     # Racing ranks: local 1, 2 on Node 0 only (global ranks 1, 2)
                     # ============================================================
-                    local_rank = rank % 8
-                    node_id = rank // 8
-                    is_racing_rank = node_id == 0 and local_rank in (1, 2)
+                    is_racing, node_id, local_rank = get_racing_rank_info(rank)
 
                     # Set force_async BEFORE backward so reduce-scatter uses correct value
-                    should_enable_force_async = (
-                        training_cfg.race_force_async and
-                        step >= 3 and
-                        is_racing_rank
-                    )
-                    profiler.set_force_async(should_enable_force_async)
+                    setup_backward_race(profiler, race_cfg, step, rank)
 
                     with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
                         if scaler is not None:
@@ -1095,37 +992,37 @@ def training_loop(
                             loss.backward()
 
                     # After backward: non-racing ranks sync to wait for reduce-scatter
-                    if training_cfg.race_force_async and step >= 3 and not is_racing_rank:
+                    if should_sync_after_backward(step, race_cfg, rank):
                         torch.cuda.synchronize()
 
-                    grad_norm = None
-                    race_active = step >= 3 and training_cfg.race_fresh_stream and is_racing_rank
-
-                    if race_active:
-                        # Mechanism 2: Racing ranks use a fresh stream with NO dependencies
-                        race_stream = torch.cuda.Stream(device=device)
-                        log.warning(
-                            "RACE INJECTION: rank=%d (node=%d, local=%d) using FRESH stream - racing",
-                            rank, node_id, local_rank
-                        )
-                        if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
-                            with torch.cuda.stream(race_stream):
-                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
-                            # Do NOT synchronize race_stream here - let it race
-                    else:
-                        # Mechanism 3: Safe ranks get artificial delays (if enabled)
-                        if step >= 3 and training_cfg.race_delay_safe_ranks:
-                            delay_tensor = torch.randn(1024 * 1024, device=device)
-                            for _ in range(100):
-                                delay_tensor = delay_tensor * 1.0001
-                            torch.cuda.synchronize()
+                    # NaN check after backward (for race/timing skew experiments)
+                    if race_cfg.nan_check_collectives:
+                        has_nan_grads, nan_count = check_gradients_for_nan(model, step, rank)
+                        if has_nan_grads:
                             log.warning(
-                                "RACE INJECTION: rank=%d (node=%d, local=%d) SYNCHRONIZED with delay - safe",
-                                rank, node_id, local_rank
+                                "\n"
+                                "╔══════════════════════════════════════════════════════════════╗\n"
+                                "║  NaN DETECTED IN GRADIENTS                                   ║\n"
+                                "║  Step: %-4d   Rank: %-2d   NaN Count: %-10d               ║\n"
+                                "╚══════════════════════════════════════════════════════════════╝",
+                                step, rank, nan_count
                             )
 
-                        # Normal path: use profiler's aux stream
-                        if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
+                    grad_norm = None
+
+                    # Try racing gradient clipping (returns None if not racing)
+                    if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
+                        racing_grad_norm = clip_gradients_racing(
+                            model, training_cfg.grad_clip_norm, device,
+                            step, race_cfg, rank
+                        )
+                        if racing_grad_norm is not None:
+                            grad_norm = racing_grad_norm
+                        else:
+                            # Inject delays for safe ranks if enabled
+                            inject_safe_rank_delay(device, step, race_cfg, rank)
+
+                            # Normal path: use profiler's aux stream
                             with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
                                 grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
 
@@ -1179,7 +1076,7 @@ def training_loop(
                                     dist.all_reduce(temp_storage, op=dist.ReduceOp.SUM)
 
                                     # Force blocking host-device copy (triggers hipMemcpyWithStream)
-                                    # This is the pattern that causes the hang according to customer
+                                    # This pattern can cause hangs due to stream contention
                                     tensor_cpu = temp_storage.cpu()  # Device → Host copy
                                     tensor_back = tensor_cpu.to(device, non_blocking=False)  # Host → Device blocking copy
 
@@ -1462,6 +1359,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
 
     config = _parse_config(parsed)
     training_cfg = _build_training_config(config)
+    race_cfg = _build_race_config(config)
     optimizer_cfg = _build_optimizer_config(config)
     scheduler_cfg = _build_scheduler_config(config)
     model_cfg = _build_model_config(config)
@@ -1472,7 +1370,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     profiler_cfg = _build_profiler_config(config)
 
     log_level = config.get("logging", {}).get("level", "INFO")
-    env = init_distributed(training_cfg, log_level)
+    env = init_distributed(training_cfg, race_cfg, log_level)
     rank = env["rank"]
 
     set_seed(dataset_cfg.seed, rank)
@@ -1494,7 +1392,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     if dist_mode == "ddp":
         model = build_ddp_model(model_cfg, ddp_cfg, compile_cfg, env["device"])
     else:
-        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"])
+        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"], race_cfg)
     optimizer = configure_optimizer(model, optimizer_cfg, dist_mode)
     scheduler = configure_scheduler(
         optimizer,
@@ -1514,6 +1412,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
             optimizer,
             dataloader,
             training_cfg,
+            race_cfg,
             scheduler,
             env,
             profiler,

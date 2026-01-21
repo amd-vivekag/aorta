@@ -7,6 +7,7 @@ Scripts for multi-node distributed training with custom NCCL channel and thread 
 - [Quick Start](#quick-start)
 - [Slurm Setup](#slurm-setup)
 - [Usage](#usage)
+- [Race Experiments](#race-experiments)
 - [Stopping Training](#stopping-training)
 - [Troubleshooting](#troubleshooting)
 - [NCCL Configuration](#nccl-configuration)
@@ -36,8 +37,19 @@ aorta/
 │   └── docker-compose.rocm70_9-1-shampoo.yaml # Docker with Shampoo (supports both Adam and Shampoo)
 ├── config/
 │   ├── multi_node/
-│   │   └── distributed_multinode.yaml  # Default config
+│   │   ├── distributed_multinode.yaml  # Default config
+│   │   └── shampoo_opt_multi_node.yaml # Shampoo + race experiments config
 │   └── shampoo_opt.yaml                # Shampoo optimizer config
+├── src/aorta/
+│   ├── training/
+│   │   └── fsdp_trainer.py             # Main FSDP trainer
+│   └── race/                           # Race condition experiments module
+│       ├── __init__.py                 # Public API exports
+│       ├── config.py                   # RaceConfig dataclass
+│       ├── h2d_racing.py               # H2D memcpy racing
+│       ├── stream_conflict.py          # Synthetic stream conflicts
+│       ├── backward_race.py            # Backward/clip race helpers
+│       └── injectors.py                # High-level injection API
 ```
 
 ## Quick Start
@@ -172,6 +184,64 @@ tail -f experiments/multinode_*/logs/node_*.txt                        # All nod
 tail -f experiments/multinode_*/logs/node_0_*.txt                      # Master only
 cat experiments/multinode_*/outputs/rank_00_metrics.jsonl | tail -n 5  # Metrics
 ```
+
+---
+
+## Race Experiments
+
+The `src/aorta/race/` module provides tools to inject controlled race conditions for testing distributed training robustness.
+
+### Configuration
+
+Race settings are configured in the `race_experiment:` section of your config file:
+
+```yaml
+race_experiment:
+  # Warmup control
+  skip_training_warmup: false         # Skip forward/backward warmup
+  training_warmup_steps: 1            # Steps if warmup is enabled
+  skip_rccl_warmup: false             # Skip RCCL communicator warmup
+  rccl_warmup_iterations: 10          # Iterations if warmup is enabled
+
+  # H2D memcpy racing (realistic pattern)
+  h2d_memcpy_racing: false           # Use separate stream for H2D batch copy
+  h2d_skip_sync_before_forward: false # Skip sync before forward (causes race!)
+  h2d_racing_start_step: 0           # Step to start racing
+
+  # Backward/clip race injection
+  race_force_async: false            # Make reduce-scatter async
+  race_fresh_stream: false           # Fresh stream for racing ranks
+  race_delay_safe_ranks: false       # Add GPU delays to safe ranks
+
+  # Stream conflict test (synthetic)
+  stream_conflict_test: false
+  stream_conflict_start_step: 0
+
+  # Supporting options
+  nan_check_collectives: false       # NaN check around RCCL collectives
+  gpu_max_hw_queues: null            # Set to 4+ to expose races
+```
+
+### Race Types
+
+| Type | Description |
+|------|-------------|
+| **H2D Race** | Races H2D memcpy with forward pass. Enable `h2d_memcpy_racing` + `h2d_skip_sync_before_forward` |
+| **Backward/Clip Race** | Races reduce-scatter with gradient clipping. Enable `race_force_async` (optionally add `race_fresh_stream` for targeted ranks) |
+| **Stream Conflict** | Synthetic multi-stream conflicts. Enable `stream_conflict_test` |
+
+Note: `race_fresh_stream` alone typically won't race because reduce-scatter stays synchronous unless `race_force_async` is enabled.
+
+### Hardware Queues
+
+**Critical:** Set `gpu_max_hw_queues: 4` to expose races. With 1-2 queues, streams share hardware queues causing implicit serialization that masks races.
+
+```yaml
+race_experiment:
+  gpu_max_hw_queues: 4  # Required to expose race conditions
+```
+
+Or via environment: `export GPU_MAX_HW_QUEUES=4`
 
 ---
 

@@ -29,6 +29,25 @@ python -m aorta.hw_queue_eval run hetero_kernels --streams 8
 python -m aorta.hw_queue_eval sweep hetero_kernels --streams 1,2,4,8,16
 ```
 
+## Race Condition Testing
+
+AORTA includes tools for reproducing and debugging CUDA/HIP stream race conditions in distributed training. Configure via the `race_experiment:` section:
+
+```yaml
+race_experiment:
+  # Warmup control
+  skip_training_warmup: false     # Skip forward/backward warmup
+  training_warmup_steps: 1        # Steps if enabled
+  skip_rccl_warmup: false         # Skip RCCL communicator warmup
+  rccl_warmup_iterations: 10      # Iterations if enabled
+
+  # Race injection (for debugging)
+  h2d_memcpy_racing: false        # Race H2D memcpy with forward pass
+  gpu_max_hw_queues: 4            # Set GPU_MAX_HW_QUEUES (4+ exposes races)
+```
+
+See [config/multi_node/shampoo_opt_multi_node.yaml](config/multi_node/shampoo_opt_multi_node.yaml) for full options.
+
 ## Example Analysis
 
 AORTA generates comprehensive performance reports comparing ROCm versions across multiple configurations. See a [full example report](docs/comprehensive_report.html) comparing rocm-7.0.8-meta vs rocm-7.0.10-meta:

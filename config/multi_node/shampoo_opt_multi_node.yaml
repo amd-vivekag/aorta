@@ -13,20 +13,25 @@ training:
   max_steps: 4400
   grad_clip_norm: 1.0
   output_dir: artifacts/user_shampoo
-  log_interval: 5
+  log_interval: 1
   additional_compute_streams: 2
   lightweight_op_waves: 3
 
 race_experiment:
-  # Backward/clip race injection (different from client's issue)
+  # Backward/clip race injection
   race_force_async: false      
   race_fresh_stream: false      
   race_delay_safe_ranks: false
   
-  # H2D memcpy racing (realistic TorchRec pattern)
-  h2d_memcpy_racing: false
-  h2d_skip_sync_before_forward: false
-  h2d_racing_start_step: 0
+  # H2D memcpy racing (realistic pattern)
+  h2d_memcpy_racing: true
+  h2d_skip_sync_before_forward: true
+  h2d_racing_start_step: 3    # Start after warmup (step 0-1 is warmup)
+  
+  # Datadist racing (TorchRec-style all_to_all on separate stream)
+  datadist_racing: true
+  datadist_skip_sync_before_collective: true
+  datadist_racing_start_step: 3    # Start after warmup (step 0-1 is warmup)
   
   # Stream conflict test (old synthetic version)
   stream_conflict_test: false
@@ -34,10 +39,21 @@ race_experiment:
   
   # Warmup and detection
   skip_training_warmup: false
+  training_warmup_steps: 1
+  skip_rccl_warmup: false
+  rccl_warmup_iterations: 5
   nan_check_collectives: false
   
   # Hardware queues (4+ needed to expose race)
-  gpu_max_hw_queues: null
+  gpu_max_hw_queues: 4
+  
+  # Timing skew experiment (demonstrates NaN progression)
+  # Shows: small skew → intermittent NaN, medium skew → consistent NaN, large skew → hang
+  timing_skew_enabled: true
+  timing_skew_mode: "fixed"        # none, fixed, progressive, random
+  timing_skew_us: 300              # Delay in microseconds (for fixed/progressive)
+  timing_skew_ranks: [0,10]           # Which ranks get delayed (empty = all)
+  timing_skew_start_step: 3       # Step to start skew (after warmup)
 
 optimizer:
   name: shampoo
