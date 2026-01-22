@@ -25,8 +25,8 @@ race_experiment:
 
   # Datadist racing (TorchRec-style all_to_all on separate stream)
   # NOTE: Disabled to avoid memory faults - H2D racing alone is sufficient
-  datadist_racing: false
-  datadist_skip_sync_before_collective: false
+  datadist_racing: true
+  datadist_skip_sync_before_collective: true
   datadist_racing_start_step: 3
 
   # Warmup and detection
@@ -44,8 +44,8 @@ race_experiment:
   # Shows: small skew → intermittent NaN, medium skew → consistent NaN, large skew → hang
   timing_skew_enabled: true
   timing_skew_mode: "fixed"        # none, fixed, progressive, random
-  timing_skew_us: 100              # Delay in microseconds (moderate, not too aggressive)
-  timing_skew_ranks: [0, 4, 8, 12] # More ranks delayed for faster manifestation
+  timing_skew_us: 100             # Delay in microseconds (moderate, not too aggressive)
+  timing_skew_ranks: [0,  8] # More ranks delayed for faster manifestation
   timing_skew_start_step: 3        # Step to start skew (after warmup)
 
 optimizer:
