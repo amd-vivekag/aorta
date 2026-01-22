@@ -2,22 +2,19 @@
 Race condition injection module for testing distributed training robustness.
 
 This module provides tools to inject controlled race conditions to simulate
-scenarios where H2D memcpy and RCCL collectives race on different CUDA streams.
+scenarios where H2D memcpy and RCCL collectives race on different GPU streams.
 
-Four categories of race conditions:
+Three categories of race conditions:
 1. H2D Race - Races H2D memcpy with forward pass (realistic pattern)
 2. Datadist Race - Races all_to_all with FSDP collectives (TorchRec-style)
-3. Backward/Clip Race - Races reduce-scatter with gradient clipping
-4. Timing Skew - Controlled delays to demonstrate NaN progression
+3. Timing Skew - Controlled delays to demonstrate NaN progression
 """
 
 from aorta.race.config import RaceConfig
 from aorta.race.injectors import (
     inject_h2d_racing,
     inject_datadist_racing,
-    inject_stream_conflict,
     inject_timing_skew,
-    setup_backward_race,
     should_skip_h2d_sync,
     should_skip_datadist_sync,
     get_memcpy_stream,
@@ -25,20 +22,15 @@ from aorta.race.injectors import (
     setup_gpu_max_hw_queues,
     check_hw_queues_warning,
     log_race_config_status,
-    check_batch_for_nan,
     check_loss_for_nan,
     check_gradients_for_nan,
-    inject_nan_on_race,
-    TIMING_SKEW_PRESETS,
 )
 
 __all__ = [
     "RaceConfig",
     "inject_h2d_racing",
     "inject_datadist_racing",
-    "inject_stream_conflict",
     "inject_timing_skew",
-    "setup_backward_race",
     "should_skip_h2d_sync",
     "should_skip_datadist_sync",
     "get_memcpy_stream",
@@ -46,9 +38,6 @@ __all__ = [
     "setup_gpu_max_hw_queues",
     "check_hw_queues_warning",
     "log_race_config_status",
-    "check_batch_for_nan",
     "check_loss_for_nan",
     "check_gradients_for_nan",
-    "inject_nan_on_race",
-    "TIMING_SKEW_PRESETS",
 ]

@@ -47,8 +47,7 @@ aorta/
 │       ├── __init__.py                 # Public API exports
 │       ├── config.py                   # RaceConfig dataclass
 │       ├── h2d_racing.py               # H2D memcpy racing
-│       ├── stream_conflict.py          # Synthetic stream conflicts
-│       ├── backward_race.py            # Backward/clip race helpers
+│       ├── datadist_racing.py          # Datadist/all_to_all racing
 │       └── injectors.py                # High-level injection API
 ```
 
@@ -208,15 +207,6 @@ race_experiment:
   h2d_skip_sync_before_forward: false # Skip sync before forward (causes race!)
   h2d_racing_start_step: 0           # Step to start racing
 
-  # Backward/clip race injection
-  race_force_async: false            # Make reduce-scatter async
-  race_fresh_stream: false           # Fresh stream for racing ranks
-  race_delay_safe_ranks: false       # Add GPU delays to safe ranks
-
-  # Stream conflict test (synthetic)
-  stream_conflict_test: false
-  stream_conflict_start_step: 0
-
   # Supporting options
   nan_check_collectives: false       # NaN check around RCCL collectives
   gpu_max_hw_queues: null            # Set to 4+ to expose races
@@ -227,10 +217,7 @@ race_experiment:
 | Type | Description |
 |------|-------------|
 | **H2D Race** | Races H2D memcpy with forward pass. Enable `h2d_memcpy_racing` + `h2d_skip_sync_before_forward` |
-| **Backward/Clip Race** | Races reduce-scatter with gradient clipping. Enable `race_force_async` (optionally add `race_fresh_stream` for targeted ranks) |
-| **Stream Conflict** | Synthetic multi-stream conflicts. Enable `stream_conflict_test` |
-
-Note: `race_fresh_stream` alone typically won't race because reduce-scatter stays synchronous unless `race_force_async` is enabled.
+| **Datadist Race** | Races all_to_all with FSDP collectives. Enable `datadist_racing` + `datadist_skip_sync_before_collective` |
 
 ### Hardware Queues
 

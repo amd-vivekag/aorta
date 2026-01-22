@@ -16,7 +16,6 @@ from aorta.race.config import RaceConfig
 from aorta.race.h2d_racing import (
     get_memcpy_stream,
     move_batch_to_device_racing as _move_batch_racing,
-    move_batch_to_device as _move_batch_normal,
     should_skip_h2d_sync,
 )
 from aorta.race.datadist_racing import (
@@ -24,25 +23,10 @@ from aorta.race.datadist_racing import (
     inject_datadist_racing as _inject_datadist_racing,
     should_skip_datadist_sync,
 )
-from aorta.race.stream_conflict import inject_stream_conflict as _inject_stream_conflict
-from aorta.race.backward_race import (
-    should_enable_force_async,
-    should_sync_after_backward,
-    clip_gradients_racing,
-    inject_safe_rank_delay,
-    is_racing_rank,
-    get_racing_rank_info,
-)
 from aorta.race.timing_skew_experiment import (
-    TimingSkewConfig,
-    introduce_timing_skew as _introduce_timing_skew,
     inject_timing_skew_from_race_config,
-    check_batch_for_nan,
     check_loss_for_nan,
     check_gradients_for_nan,
-    timing_skew_config_from_race_config,
-    inject_nan_on_race,
-    EXPERIMENT_PRESETS as TIMING_SKEW_PRESETS,
 )
 
 
@@ -53,26 +37,15 @@ log = logging.getLogger(__name__)
 __all__ = [
     "inject_h2d_racing",
     "inject_datadist_racing",
-    "inject_stream_conflict",
     "inject_timing_skew",
-    "setup_backward_race",
     "should_skip_h2d_sync",
     "should_skip_datadist_sync",
     "get_memcpy_stream",
     "get_datadist_stream",
     "setup_gpu_max_hw_queues",
     "log_race_config_status",
-    "should_enable_force_async",
-    "should_sync_after_backward",
-    "clip_gradients_racing",
-    "inject_safe_rank_delay",
-    "is_racing_rank",
-    "get_racing_rank_info",
-    "check_batch_for_nan",
     "check_loss_for_nan",
     "check_gradients_for_nan",
-    "inject_nan_on_race",
-    "TIMING_SKEW_PRESETS",
 ]
 
 
@@ -80,7 +53,7 @@ def setup_gpu_max_hw_queues(race_cfg: RaceConfig) -> None:
     """
     Set GPU_MAX_HW_QUEUES environment variable if configured.
 
-    CRITICAL: This must be called BEFORE any CUDA initialization!
+    CRITICAL: This must be called BEFORE any GPU initialization!
 
     GPU_MAX_HW_QUEUES controls hardware queue parallelism:
     - 1-2: Streams share HW queues → implicit serialization → RACE MASKED
@@ -160,20 +133,6 @@ def log_race_config_status(race_cfg: RaceConfig, rank: int) -> None:
         log.info("  - Datadist racing: ON (start_step=%d, skip_sync=%s)",
                  race_cfg.datadist_racing_start_step, race_cfg.datadist_skip_sync_before_collective)
 
-    if race_cfg.race_force_async:
-        log.info("  - Backward race (force_async): ON")
-
-    if race_cfg.race_fresh_stream:
-        is_racing = is_racing_rank(rank)
-        log.info("  - Fresh stream for racing ranks: ON (this_rank_races=%s)", is_racing)
-
-    if race_cfg.race_delay_safe_ranks:
-        log.info("  - Safe rank delays: ON")
-
-    if race_cfg.stream_conflict_test:
-        log.info("  - Stream conflict test (synthetic): ON (start_step=%d)",
-                 race_cfg.stream_conflict_start_step)
-
     if race_cfg.skip_training_warmup:
         log.info("  - Training warmup: SKIPPED (for timing variability)")
     else:
@@ -210,7 +169,7 @@ def inject_timing_skew(
         step: Current training step
         rank: Current rank
         race_cfg: Race configuration
-        stream: CUDA stream to introduce delay on (None = current stream)
+        stream: GPU stream to introduce delay on (None = current stream)
 
     Returns:
         Actual delay introduced in microseconds
@@ -233,7 +192,7 @@ def inject_h2d_racing(
 
     Args:
         batch: CPU batch tensors
-        device: Target CUDA device
+        device: Target GPU device
         step: Current training step
         race_cfg: Race configuration
         rank: Current rank
@@ -259,7 +218,7 @@ def inject_datadist_racing(
 
     Args:
         batch: Batch tensors (already on GPU)
-        device: CUDA device
+        device: GPU device
         step: Current training step
         race_cfg: Race configuration
         rank: Current rank
@@ -268,55 +227,3 @@ def inject_datadist_racing(
         Tuple of (batch, datadist_stream or None)
     """
     return _inject_datadist_racing(batch, device, step, race_cfg, rank)
-
-
-def inject_stream_conflict(
-    device: torch.device,
-    batch: Dict[str, torch.Tensor],
-    race_cfg: RaceConfig,
-    step: int,
-    rank: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    Inject synthetic stream conflicts (old version).
-
-    NOTE: Prefer h2d_memcpy_racing for realistic testing.
-
-    Args:
-        device: CUDA device
-        batch: Current batch tensors
-        race_cfg: Race configuration
-        step: Current training step
-        rank: Current rank
-
-    Returns:
-        Modified batch
-    """
-    return _inject_stream_conflict(device, batch, race_cfg, step, rank)
-
-
-def setup_backward_race(
-    profiler,
-    race_cfg: RaceConfig,
-    step: int,
-    rank: int,
-    gpus_per_node: int = 8,
-) -> bool:
-    """
-    Configure profiler for backward race if enabled.
-
-    Sets force_async on the profiler's interceptor for racing ranks.
-
-    Args:
-        profiler: StreamProfiler instance
-        race_cfg: Race configuration
-        step: Current training step
-        rank: Global rank
-        gpus_per_node: Number of GPUs per node
-
-    Returns:
-        True if force_async was enabled
-    """
-    should_enable = should_enable_force_async(step, race_cfg, rank, gpus_per_node)
-    profiler.set_force_async(should_enable)
-    return should_enable

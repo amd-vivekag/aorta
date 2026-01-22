@@ -12,7 +12,7 @@ import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, Optional
+from typing import Any, Dict, Generator, Iterable, Optional, Tuple
 from functools import partial
 
 import numpy as np
@@ -36,23 +36,24 @@ from aorta.race.injectors import (
     log_race_config_status,
     inject_h2d_racing,
     inject_datadist_racing,
-    inject_stream_conflict,
     inject_timing_skew,
-    setup_backward_race,
     should_skip_h2d_sync,
     should_skip_datadist_sync,
-    get_memcpy_stream,
-    get_datadist_stream,
-    should_sync_after_backward,
-    clip_gradients_racing,
-    inject_safe_rank_delay,
-    is_racing_rank,
-    get_racing_rank_info,
     check_loss_for_nan,
     check_gradients_for_nan,
 )
 from aorta.race.h2d_racing import move_batch_to_device
-from aorta.utils import detect_accelerator, get_device, get_distributed_backend, load_config, merge_cli_overrides, setup_logging
+from aorta.utils import (
+    detect_accelerator,
+    get_device,
+    get_distributed_backend,
+    load_config,
+    manual_sync_params,
+    merge_cli_overrides,
+    setup_logging,
+    warmup_rccl_communicators,
+    warmup_training_collectives,
+)
 
 log = logging.getLogger(__name__)
 
@@ -256,7 +257,7 @@ def set_seed(seed: int, rank: int) -> None:
 
 
 def init_distributed(training_cfg: TrainingConfig, race_cfg: RaceConfig, log_level: str) -> Dict[str, Any]:
-    # Set GPU_MAX_HW_QUEUES if configured (must be set BEFORE CUDA init)
+    # Set GPU_MAX_HW_QUEUES if configured (must be set BEFORE GPU init)
     # This controls hardware queue parallelism - 4+ is needed to expose race conditions
     setup_gpu_max_hw_queues(race_cfg)
 
@@ -325,7 +326,7 @@ def build_fsdp_model(
             else:
                 # Use race_cfg iterations if provided, otherwise fall back to fsdp_cfg
                 rccl_iterations = race_cfg.rccl_warmup_iterations if race_cfg is not None else fsdp_cfg.rccl_warmup_iterations
-                _warmup_rccl_communicators(
+                warmup_rccl_communicators(
                     shard_group,
                     replicate_group,
                     device,
@@ -333,7 +334,7 @@ def build_fsdp_model(
                 )
             log.info("Created custom process groups for HYBRID_SHARD strategy")
 
-    # Ensure CUDA operations are complete before FSDP wrapping
+    # Ensure GPU operations are complete before FSDP wrapping
     # This helps prevent race conditions with inter-node communicators
     torch.cuda.synchronize()
     dist.barrier()
@@ -369,7 +370,7 @@ def build_fsdp_model(
 
     # Manual parameter sync for HYBRID_SHARD after FSDP wrapping
     if needs_manual_sync and replicate_group is not None:
-        _manual_sync_params(fsdp_model, replicate_group)
+        manual_sync_params(fsdp_model, replicate_group)
         # Extra synchronization after manual sync before proceeding
         torch.cuda.synchronize()
         dist.barrier()
@@ -458,208 +459,7 @@ def _create_hybrid_shard_process_groups(gpus_per_node: Optional[int] = None):
     return (my_shard_group, my_replicate_group)
 
 
-def _warmup_rccl_communicators(
-    shard_group: Optional[dist.ProcessGroup],
-    replicate_group: Optional[dist.ProcessGroup],
-    device: torch.device,
-    num_warmup_ops: int = 5,
-) -> None:
-    """
-    Warm up RCCL communicators with small operations before heavy FSDP usage.
-
-    This ensures inter-node communicators are fully established before the
-    _sync_params_and_buffers broadcasts. The race condition in RCCL/RoCE RDMA
-    setup can cause hangs during FSDP initialization if broadcasts are issued
-    before the communicators are ready.
-
-    Args:
-        shard_group: Intra-node shard process group (may be None)
-        replicate_group: Inter-node replicate process group (may be None)
-        device: CUDA device to use for warmup tensors
-        num_warmup_ops: Number of warmup operations to perform (default: 5)
-    """
-    rank = dist.get_rank()
-    # Use a larger tensor for more thorough warmup
-    warmup_tensor = torch.ones(8192, device=device, dtype=torch.float32)
-
-    log.info("Starting RCCL communicator warmup with %d iterations (rank=%d)...", num_warmup_ops, rank)
-
-    # First, warmup the global world group
-    log.info("Warming up global world group...")
-    for i in range(num_warmup_ops):
-        dist.all_reduce(warmup_tensor)
-        dist.broadcast(warmup_tensor, src=0)
-        torch.cuda.synchronize()
-
-    dist.barrier()
-    log.info("Global world group warmup complete")
-
-    # Then warmup the shard and replicate groups
-    for i in range(num_warmup_ops):
-        # Warmup intra-node shard group
-        if shard_group is not None:
-            dist.all_reduce(warmup_tensor, group=shard_group)
-            # Also do broadcast from first rank in shard group
-            shard_ranks = dist.get_process_group_ranks(shard_group)
-            dist.broadcast(warmup_tensor, src=shard_ranks[0], group=shard_group)
-
-        # Warmup inter-node replicate group (this is where the race condition occurs)
-        if replicate_group is not None:
-            # Get the ranks in this replicate group and use the first one as source
-            # Note: dist.get_process_group_ranks returns global ranks in the group
-            group_ranks = dist.get_process_group_ranks(replicate_group)
-            src_global_rank = group_ranks[0]  # First rank in the group
-            dist.broadcast(warmup_tensor, src=src_global_rank, group=replicate_group)
-            dist.all_reduce(warmup_tensor, group=replicate_group)
-
-        # Synchronize CUDA and global barrier between iterations
-        torch.cuda.synchronize()
-        dist.barrier()
-
-    # Final synchronization with extra delay
-    torch.cuda.synchronize()
-    dist.barrier()
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    log.info("RCCL communicator warmup complete (rank=%d)", rank)
-
-
-def _manual_sync_params(
-    model: FSDP,
-    replicate_group: Optional[dist.ProcessGroup],
-) -> None:
-    """
-    Manually synchronize FSDP parameters from the first rank in each replicate group.
-
-    This replaces the automatic sync_module_states with controlled synchronization
-    to avoid race conditions in RCCL/RDMA during FSDP initialization. Parameters
-    are broadcast from the first rank in each replicate group to ensure consistency.
-
-    Args:
-        model: The FSDP-wrapped model
-        replicate_group: Inter-node replicate process group for broadcasting
-    """
-    rank = dist.get_rank()
-
-    log.info("Starting manual parameter synchronization (rank=%d)...", rank)
-
-    # Synchronize before param sync
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    # Determine the source rank for this replicate group
-    # Each replicate group contains ranks with the same local_rank across nodes
-    # e.g., group for local_rank 2: [2, 10, 18] - we broadcast from rank 2 (first in group)
-    src_global_rank = None
-    if replicate_group is not None:
-        group_ranks = dist.get_process_group_ranks(replicate_group)
-        src_global_rank = group_ranks[0]  # First rank in the group
-        log.info("Manual sync: replicate group ranks=%s, src_rank=%d", group_ranks, src_global_rank)
-
-    param_count = 0
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if param.is_meta:
-                log.debug("Skipping meta parameter: %s", name)
-                continue
-
-            # Broadcast from the first rank within this replicate group
-            if replicate_group is not None and src_global_rank is not None:
-                dist.broadcast(param.data, src=src_global_rank, group=replicate_group)
-
-            param_count += 1
-
-            # Periodic sync to prevent overwhelming the network
-            if param_count % 10 == 0:
-                torch.cuda.synchronize()
-
-    # Final barrier to ensure all ranks complete
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    log.info("Manual parameter synchronization complete (rank=%d, params=%d)", rank, param_count)
-
-
-def _warmup_training_collectives(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    dataloader,
-    device: torch.device,
-    autocast_dtype: Optional[torch.dtype],
-    scaler: Optional[torch.cuda.amp.GradScaler],
-    num_warmup_steps: int = 3,
-) -> None:
-    """
-    Warm up training collectives by running dummy forward/backward/optimizer steps.
-
-    This exercises all the collective operations used during training (all-gather,
-    reduce-scatter, all-reduce) to ensure RCCL communicators are fully established
-    before the main training loop starts.
-
-    Args:
-        model: The model (FSDP-wrapped)
-        optimizer: The optimizer
-        dataloader: Training dataloader
-        device: CUDA device
-        autocast_dtype: Mixed precision dtype (or None)
-        scaler: Gradient scaler for fp16 (or None)
-        num_warmup_steps: Number of warmup steps to run
-    """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-
-    # Get an iterator from the dataloader
-    data_iter = iter(dataloader)
-
-    for warmup_step in range(num_warmup_steps):
-        try:
-            cpu_batch = next(data_iter)
-        except StopIteration:
-            # Restart iterator if dataloader is exhausted
-            data_iter = iter(dataloader)
-            cpu_batch = next(data_iter)
-
-        # Move batch to device
-        batch = {k: v.to(device, non_blocking=True) if hasattr(v, 'to') else v
-                 for k, v in cpu_batch.items()}
-        torch.cuda.synchronize()
-
-        # Forward pass
-        optimizer.zero_grad(set_to_none=True)
-        if autocast_dtype:
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                scores = model(batch)
-                loss = compute_loss(scores, batch)
-        else:
-            scores = model(batch)
-            loss = compute_loss(scores, batch)
-
-        # Backward pass
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        # Optimizer step
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-
-        # Synchronize all ranks after each warmup step
-        torch.cuda.synchronize()
-        dist.barrier()
-
-        log.debug("Warmup step %d complete (rank=%d, loss=%.4f)", warmup_step, rank, loss.item())
-
-    # Reset optimizer state after warmup to not affect actual training
-    optimizer.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
-    dist.barrier()
-
-
-# NOTE: _inject_stream_conflict moved to aorta.race.stream_conflict
+# NOTE: warmup functions moved to aorta.utils.warmup
 
 
 def build_ddp_model(
@@ -747,6 +547,213 @@ def setup_signal_handlers(stop_flag: Dict[str, bool]) -> None:
         signal.signal(sig, _handle)
 
 
+# ---------------------------------------------------------------------------
+# Training loop helper functions (extracted for clarity and maintainability)
+# ---------------------------------------------------------------------------
+
+
+def _setup_mixed_precision(
+    mode: str,
+) -> Tuple[Optional[torch.dtype], Optional[torch.cuda.amp.GradScaler]]:
+    """Configure mixed precision training (fp16/bf16/none).
+
+    Args:
+        mode: Mixed precision mode string ("fp16", "bf16", or "none").
+
+    Returns:
+        Tuple of (autocast_dtype, scaler). scaler is None for bf16/none.
+    """
+    mp_mode = mode.lower()
+    if mp_mode == "fp16":
+        return torch.float16, torch.cuda.amp.GradScaler()
+    elif mp_mode == "bf16":
+        return torch.bfloat16, None
+    return None, None
+
+
+def _inject_allreduce_stress(
+    device: torch.device,
+    loss: torch.Tensor,
+    stress_level: int,
+    profiler: "StreamProfiler",
+    step: int,
+    epoch: int,
+) -> None:
+    """Inject all_reduce + memcpy stress pattern for hang reproduction.
+
+    Pattern: all_reduce -> device-to-device copy -> host-device copy -> compute blocked.
+    This stresses the pattern that can cause rocprim deadlocks.
+
+    Args:
+        device: Target device.
+        loss: Current loss tensor.
+        stress_level: Number of stress cycles (1-10).
+        profiler: StreamProfiler for range annotations.
+        step: Current step in the epoch.
+        epoch: Current epoch.
+    """
+    with profiler.range("aux", f"epoch{epoch}_step{step}_allreduce_sync"):
+        # Perform multiple all_reduce + memory copy cycles
+        stress_level = min(max(stress_level, 1), 10)
+
+        for i in range(stress_level):
+            # Create moderately-sized tensors to stress RCCL and memory copy
+            # Size: ~4MB per tensor
+            tensor_size = 1024 * 1024  # 1M elements = 4MB in FP32
+            stress_tensor = torch.randn(tensor_size, device=device, dtype=torch.float32)
+
+            # All-reduce operation (collective that triggers RCCL multi-stream)
+            dist.all_reduce(stress_tensor, op=dist.ReduceOp.AVG)
+
+            # Device-to-device copy (triggers hipMemcpyAsync device-to-device)
+            device_copy_1 = stress_tensor.clone()
+            device_copy_2 = device_copy_1.contiguous()
+
+            # Force device-to-device copy via different tensor
+            temp_storage = torch.empty_like(device_copy_2)
+            temp_storage.copy_(device_copy_2, non_blocking=False)
+
+            # All-reduce on device-copied tensor
+            dist.all_reduce(temp_storage, op=dist.ReduceOp.SUM)
+
+            # Force blocking host-device copy (triggers hipMemcpyWithStream)
+            tensor_cpu = temp_storage.cpu()
+            tensor_back = tensor_cpu.to(device, non_blocking=False)
+
+            # Additional all_reduce on the copied-back tensor
+            dist.all_reduce(tensor_back, op=dist.ReduceOp.AVG)
+
+            # More device-to-device copies after all-reduce
+            final_copy = tensor_back.clone()
+            _ = final_copy.contiguous()
+
+            # Clean up
+            del stress_tensor, device_copy_1, device_copy_2, temp_storage
+            del tensor_cpu, tensor_back, final_copy
+
+        # Also all-reduce actual metrics (common pattern) with device copies
+        loss_tensor = loss.detach().clone()
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+
+        # Device-to-device copy
+        loss_device_copy = loss_tensor.clone()
+
+        # Host-device copy
+        loss_cpu = loss_device_copy.cpu()
+        _ = loss_cpu.to(device, non_blocking=False)
+
+
+def _log_iteration_metrics(
+    profiler: "StreamProfiler",
+    metrics_logger: MetricsLogger,
+    loss: torch.Tensor,
+    grad_norm: Optional[torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    training_cfg: TrainingConfig,
+    iteration_profile: Dict[str, Any],
+    step: int,
+    epoch: int,
+    global_step: int,
+    rank: int,
+    world_size: int,
+    enable_rocm_metrics: bool,
+) -> None:
+    """Record iteration metrics and log to console/files.
+
+    Args:
+        profiler: StreamProfiler instance.
+        metrics_logger: MetricsLogger instance.
+        loss: Loss tensor from forward pass.
+        grad_norm: Gradient norm (or None if clipping disabled).
+        optimizer: The optimizer (for learning rate).
+        training_cfg: Training configuration.
+        iteration_profile: Profile data from profiler.end_iteration().
+        step: Current step in the epoch.
+        epoch: Current epoch.
+        global_step: Global step counter.
+        rank: Current rank.
+        world_size: Total number of ranks.
+        enable_rocm_metrics: Whether to collect ROCm metrics.
+    """
+    iteration_payload = {
+        "rank": rank,
+        "world_size": world_size,
+        "epoch": epoch,
+        "step": step,
+        "global_step": global_step,
+        "loss": float(loss.detach().cpu()),
+        "grad_norm": float(grad_norm.cpu()) if grad_norm is not None else None,
+        "lr": optimizer.param_groups[0]["lr"],
+        "profile": iteration_profile,
+    }
+
+    iteration_payload.update(collect_rocm_metrics(enable_rocm_metrics))
+    metrics_logger.log(iteration_payload)
+
+    # Write to loss log file
+    loss_log = training_cfg.output_dir / f"loss_rank{rank}.log"
+    with open(loss_log, "a") as f:
+        f.write(
+            f"step={global_step} epoch={epoch} loss={iteration_payload['loss']:.6f} "
+            f"lr={iteration_payload['lr']:.6f}\n"
+        )
+
+    # Periodic console logging
+    if global_step % training_cfg.log_interval == 0 and rank == 0:
+        log.info(
+            "epoch=%s step=%s loss=%.5f lr=%.6f overlap=%.3fms compute=%.3fms",
+            epoch,
+            step,
+            iteration_payload["loss"],
+            iteration_payload["lr"],
+            iteration_profile["overlap"]["overlap_ms"].get("compute_comm", 0.0),
+            iteration_profile["overlap"]["per_stream_ms"].get("compute", 0.0),
+        )
+
+
+def _finalize_training(
+    metrics_logger: MetricsLogger,
+    profiler: "StreamProfiler",
+    training_cfg: TrainingConfig,
+    race_cfg: RaceConfig,
+    rank: int,
+) -> None:
+    """Close metrics logger and report NaN summary.
+
+    Args:
+        metrics_logger: MetricsLogger instance to close.
+        profiler: StreamProfiler instance for NaN results.
+        training_cfg: Training configuration.
+        race_cfg: Race experiment configuration.
+        rank: Current rank.
+    """
+    metrics_logger.close()
+
+    # Report NaN check results if enabled
+    if race_cfg.nan_check_collectives:
+        nan_results = profiler.get_nan_check_results()
+        if nan_results:
+            log.warning(
+                "[NaN SUMMARY] rank=%d detected %d NaN/Inf events during training",
+                rank,
+                len(nan_results),
+            )
+            # Write NaN results to file for analysis
+            nan_log_path = training_cfg.output_dir / f"nan_check_rank{rank}.json"
+            with open(nan_log_path, "w") as f:
+                json.dump(nan_results, f, indent=2)
+            log.info("NaN check results written to %s", nan_log_path)
+        else:
+            log.info("[NaN SUMMARY] rank=%d no NaN/Inf detected in RCCL collectives", rank)
+
+    if rank == 0:
+        log.info("Training loop finished. Profiler will export traces in cleanup phase.")
+        log.info("Output directory: %s", training_cfg.output_dir)
+        log.info("Torch profiler traces: %s", training_cfg.output_dir / "torch_profiler")
+        log.info("Loss logs: %s/loss_rank*.log", training_cfg.output_dir)
+        log.info("Metrics: %s/rank_*_metrics.jsonl", training_cfg.output_dir)
+
+
 def training_loop(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -758,62 +765,80 @@ def training_loop(
     profiler: StreamProfiler,
     enable_rocm_metrics: bool,
     profiler_cfg: ProfilerConfig,
+    warmup_dataloader=None,
 ) -> None:
+    """Main training loop with profiling, race injection, and metrics logging.
+
+    The loop structure keeps race injection timing visible:
+    - H2D racing injection happens BEFORE forward pass
+    - Datadist racing injection happens BEFORE forward pass
+    - Timing skew injection happens BEFORE forward pass
+    - Forward and backward passes are clearly separated
+    - NaN checks happen after forward and after backward
+
+    Args:
+        model: The model to train.
+        optimizer: The optimizer.
+        dataloader: Training dataloader.
+        training_cfg: Training configuration.
+        race_cfg: Race experiment configuration.
+        scheduler: Learning rate scheduler (optional).
+        environment: Distributed environment info (rank, world_size, device).
+        profiler: StreamProfiler for timing and tracing.
+        enable_rocm_metrics: Whether to collect ROCm GPU metrics.
+        profiler_cfg: Torch profiler configuration.
+        warmup_dataloader: Optional separate dataloader for warmup (with smaller batch_size).
+    """
+    # =========================================================================
+    # SETUP
+    # =========================================================================
     rank = environment["rank"]
     world_size = environment["world_size"]
     device = environment["device"]
 
-    scaler: Optional[torch.cuda.amp.GradScaler]
-    autocast_dtype: Optional[torch.dtype]
-    mp_mode = training_cfg.mixed_precision.lower()
-    if mp_mode == "fp16":
-        autocast_dtype = torch.float16
-        scaler = torch.cuda.amp.GradScaler()
-    elif mp_mode == "bf16":
-        autocast_dtype = torch.bfloat16
-        scaler = None
-    else:
-        autocast_dtype = None
-        scaler = None
-
+    autocast_dtype, scaler = _setup_mixed_precision(training_cfg.mixed_precision)
     metrics_logger = MetricsLogger(training_cfg.output_dir, rank)
 
-    total_steps = training_cfg.max_steps or len(dataloader) * training_cfg.epochs
     global_step = 0
     stop_flag = {"stop": False}
     setup_signal_handlers(stop_flag)
 
     model.train()
 
-    # Warmup training collectives before main loop to avoid RCCL race conditions
-    # This exercises forward/backward/optimizer step on all communicators
-    # NOTE: Reduced to 1 step (from 3) to preserve more timing variability
-    # while still exercising the collectives. RCCL warmup in build_fsdp_model
-    # handles communicator initialization separately.
-    # Can be skipped with skip_training_warmup=True to maximize timing variability for race testing
+    # =========================================================================
+    # WARMUP (timing visible - warmup reduces race likelihood)
+    # =========================================================================
     if race_cfg.skip_training_warmup:
         log.warning("SKIPPING training warmup (skip_training_warmup=True) - may increase race likelihood")
     else:
-        log.info("Starting training warmup pass (rank=%d, num_steps=%d)...", rank, race_cfg.training_warmup_steps)
-        _warmup_training_collectives(model, optimizer, dataloader, device, autocast_dtype, scaler, num_warmup_steps=race_cfg.training_warmup_steps)
+        # Use warmup_dataloader if provided (allows smaller batch size for faster warmup)
+        warmup_dl = warmup_dataloader if warmup_dataloader is not None else dataloader
+        warmup_batch_info = ""
+        if warmup_dataloader is not None:
+            warmup_batch_info = f", warmup_batch_size={race_cfg.warmup_batch_size}"
+        log.info(
+            "Starting training warmup pass (rank=%d, num_steps=%d%s)...",
+            rank, race_cfg.training_warmup_steps, warmup_batch_info
+        )
+        warmup_training_collectives(
+            model, optimizer, warmup_dl, device, autocast_dtype, scaler,
+            loss_fn=compute_loss, num_warmup_steps=race_cfg.training_warmup_steps,
+        )
         log.info("Training warmup complete (rank=%d)", rank)
 
-    # Note: force_async is now controlled dynamically per-step in training loop
-    # Only racing ranks (local 1, 2 on Node 0) at step >= 3 will have force_async enabled
-
     # Enable NaN checking around RCCL collectives if configured
-    # Recommended approach: nan-check -> rccl -> nan-check
     if race_cfg.nan_check_collectives:
         profiler.enable_nan_checking(True)
         log.info("NaN checking enabled around RCCL collectives (rank=%d)", rank)
 
-    # Warn if H2D racing is enabled but HW queues may mask the race
     check_hw_queues_warning(race_cfg)
-
-    # Log race configuration status
     log_race_config_status(race_cfg, rank)
 
+    # =========================================================================
+    # MAIN TRAINING LOOP
+    # =========================================================================
     profiler_dir = training_cfg.output_dir / "torch_profiler"
+
     with profiler.intercept_distributed_ops():
         with _torch_profiler_context(profiler_cfg, profiler_dir, rank, device) as torch_profiler:
             for epoch in range(training_cfg.epochs):
@@ -822,131 +847,71 @@ def training_loop(
 
                 for step, cpu_batch in enumerate(dataloader):
                     profiler.start_iteration(global_step)
-                    # Update current step for NaN checking in collectives
                     profiler.set_current_step(global_step)
 
-                    # ============================================================
-                    # H2D MEMCPY RACING (realistic pattern)
-                    # ============================================================
-                    # When h2d_memcpy_racing=True AND step >= start_step:
-                    # - Batch is moved to GPU on separate memcpy_stream
-                    # - If h2d_skip_sync_before_forward=True, forward may race with H2D
-                    # This pattern can cause NaN when forward races with incomplete H2D
-                    #
-                    # IMPORTANT: For step < start_step, use EXACT same path as disabled
-                    # to avoid any timing differences during warmup/early steps.
-                    # ============================================================
-                    h2d_racing_active = (
-                        race_cfg.h2d_memcpy_racing
-                        and step >= race_cfg.h2d_racing_start_step
-                    )
+                    # ---------------------------------------------------------
+                    # H2D RACING INJECTION (before forward)
+                    # ---------------------------------------------------------
+                    h2d_racing_active = race_cfg.h2d_memcpy_racing and step >= race_cfg.h2d_racing_start_step
 
                     if h2d_racing_active:
                         # Log first activation
                         if step == race_cfg.h2d_racing_start_step:
                             log.info(
                                 "H2D RACING: ACTIVATED at step=%d rank=%d (skip_sync=%s)",
-                                step, rank, race_cfg.h2d_skip_sync_before_forward
+                                step, rank, race_cfg.h2d_skip_sync_before_forward,
                             )
 
                         with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
-                            batch, memcpy_stream = inject_h2d_racing(
-                                cpu_batch, device, step, race_cfg, rank
-                            )
+                            batch, memcpy_stream = inject_h2d_racing(cpu_batch, device, step, race_cfg, rank)
 
-                        # Conditionally wait for memcpy_stream before forward
                         if should_skip_h2d_sync(step, race_cfg):
-                            # RACE CONDITION: Forward starts before H2D completes!
-                            log.info(
-                                "H2D RACING: step=%d rank=%d memcpy_stream NOT synced - RACE WINDOW OPEN",
-                                step, rank
-                            )
-                            # Compute stream waits on aux but NOT on memcpy_stream
+                            # RACE: skip memcpy sync - forward may read incomplete H2D data
+                            log.info("H2D RACING: step=%d rank=%d - race window open", step, rank)
                             profiler.stream("compute").wait_stream(profiler.stream("aux"))
                         else:
-                            # Safe path: wait for memcpy_stream to complete
                             if memcpy_stream is not None:
                                 profiler.stream("compute").wait_stream(memcpy_stream)
                             profiler.stream("compute").wait_stream(profiler.stream("aux"))
                     else:
-                        # Original path: use default stream for H2D (no race)
-                        # This path is used when:
-                        # - h2d_memcpy_racing=False, OR
-                        # - step < h2d_racing_start_step
+                        # Normal path (no H2D racing)
                         with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
                             batch = move_batch_to_device(cpu_batch, device)
-
                         profiler.stream("compute").wait_stream(profiler.stream("aux"))
 
-                    # ============================================================
-                    # STREAM CONFLICT TEST: Synthetic stream racing (old version)
-                    # ============================================================
-                    # Inject stream conflicts AFTER batch prefetch but BEFORE forward
-                    # This simulates a multi-stream pattern where:
-                    # - memcpy_stream: H2D copies (data loading)
-                    # - datadist_stream: all_to_all (data distribution)
-                    # - default_stream: RCCL collectives
-                    # The race happens when these streams don't synchronize properly
-                    # NOTE: This is the OLD synthetic version, prefer h2d_memcpy_racing + datadist_racing
-                    if race_cfg.stream_conflict_test:
-                        batch = inject_stream_conflict(device, batch, race_cfg, step, rank)
-
-                    # ============================================================
-                    # DATADIST RACING (TorchRec-style all_to_all on separate stream)
-                    # ============================================================
-                    # When datadist_racing=True AND step >= start_step:
-                    # - all_to_all runs on separate datadist_stream
-                    # - If datadist_skip_sync_before_collective=True, FSDP collective may race
-                    # This pattern simulates TorchRec's SparseDataDistributedAllToAll race
-                    #
-                    # IMPORTANT: For step < start_step, skip entirely to avoid any
-                    # timing differences during warmup/early steps.
-                    # ============================================================
-                    datadist_racing_active = (
-                        race_cfg.datadist_racing
-                        and step >= race_cfg.datadist_racing_start_step
-                    )
+                    # ---------------------------------------------------------
+                    # DATADIST RACING INJECTION (before forward)
+                    # ---------------------------------------------------------
+                    datadist_racing_active = race_cfg.datadist_racing and step >= race_cfg.datadist_racing_start_step
 
                     if datadist_racing_active:
                         # Log first activation
                         if step == race_cfg.datadist_racing_start_step:
                             log.info(
                                 "DATADIST RACING: ACTIVATED at step=%d rank=%d (skip_sync=%s)",
-                                step, rank, race_cfg.datadist_skip_sync_before_collective
+                                step, rank, race_cfg.datadist_skip_sync_before_collective,
                             )
 
-                        batch, datadist_stream = inject_datadist_racing(
-                            batch, device, step, race_cfg, rank
-                        )
+                        batch, datadist_stream = inject_datadist_racing(batch, device, step, race_cfg, rank)
 
-                        # Conditionally wait for datadist_stream before forward/collective
                         if should_skip_datadist_sync(step, race_cfg):
-                            # RACE CONDITION: Forward/collective starts before all_to_all completes!
-                            log.info(
-                                "DATADIST RACING: step=%d rank=%d datadist_stream NOT synced - RACE WINDOW OPEN",
-                                step, rank
-                            )
+                            # RACE: skip datadist sync - FSDP collective may read incomplete data
+                            log.info("DATADIST RACING: step=%d rank=%d - race window open", step, rank)
                         else:
-                            # Safe path: wait for datadist_stream to complete
                             if datadist_stream is not None:
                                 torch.cuda.current_stream().wait_stream(datadist_stream)
-                    # else: step < start_step or datadist_racing=False - no datadist injection
 
-                    # ============================================================
-                    # TIMING SKEW EXPERIMENT (demonstrates NaN progression)
-                    # ============================================================
-                    # When timing_skew_enabled=True AND step >= start_step:
-                    # - Introduces controlled delays on specific ranks
-                    # - Shows progression: small skew → NaN, large skew → hang
-                    # ============================================================
+                    # ---------------------------------------------------------
+                    # TIMING SKEW INJECTION (before forward)
+                    # ---------------------------------------------------------
                     if race_cfg.is_timing_skew_active(step):
                         skew_delay = inject_timing_skew(step, rank, race_cfg)
                         if skew_delay > 0:
-                            log.debug(
-                                "TIMING SKEW: rank=%d step=%d delay=%.0f us",
-                                rank, step, skew_delay
-                            )
+                            log.debug("TIMING SKEW: rank=%d step=%d delay=%.0f us", rank, step, skew_delay)
 
+                    # ---------------------------------------------------------
+                    # FORWARD PASS
+                    # ---------------------------------------------------------
                     optimizer.zero_grad(set_to_none=True)
 
                     with profiler.range("compute", f"epoch{epoch}_step{step}_forward"):
@@ -958,74 +923,37 @@ def training_loop(
                             scores = model(batch)
                             loss = compute_loss(scores, batch)
 
-                    # NaN check after forward (for race/timing skew experiments)
+                    # NaN check after forward
                     if race_cfg.nan_check_collectives:
                         if check_loss_for_nan(loss, step, rank):
-                            log.warning(
-                                "\n"
-                                "╔══════════════════════════════════════════════════════════════╗\n"
-                                "║  NaN DETECTED IN LOSS                                        ║\n"
-                                "║  Step: %-4d   Rank: %-2d   Loss: NaN                           ║\n"
-                                "╚══════════════════════════════════════════════════════════════╝",
-                                step, rank
-                            )
+                            log.warning("NaN detected in loss at step=%d rank=%d", step, rank)
 
-                    # ============================================================
-                    # RACE CONDITION INJECTION: Force aux stream to read early
-                    # ============================================================
-                    # Controlled by 3 independent flags (in race_cfg):
-                    # - race_force_async: Skip work.wait() in interceptor (during backward)
-                    # - race_fresh_stream: Use fresh CUDA stream for racing ranks
-                    # - race_delay_safe_ranks: Add GPU delays to safe ranks
-                    #
-                    # Racing ranks: local 1, 2 on Node 0 only (global ranks 1, 2)
-                    # ============================================================
-                    is_racing, node_id, local_rank = get_racing_rank_info(rank)
-
-                    # Set force_async BEFORE backward so reduce-scatter uses correct value
-                    setup_backward_race(profiler, race_cfg, step, rank)
-
+                    # ---------------------------------------------------------
+                    # BACKWARD PASS
+                    # ---------------------------------------------------------
                     with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
                         if scaler is not None:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
 
-                    # After backward: non-racing ranks sync to wait for reduce-scatter
-                    if should_sync_after_backward(step, race_cfg, rank):
-                        torch.cuda.synchronize()
-
-                    # NaN check after backward (for race/timing skew experiments)
+                    # NaN check after backward
                     if race_cfg.nan_check_collectives:
                         has_nan_grads, nan_count = check_gradients_for_nan(model, step, rank)
                         if has_nan_grads:
-                            log.warning(
-                                "\n"
-                                "╔══════════════════════════════════════════════════════════════╗\n"
-                                "║  NaN DETECTED IN GRADIENTS                                   ║\n"
-                                "║  Step: %-4d   Rank: %-2d   NaN Count: %-10d               ║\n"
-                                "╚══════════════════════════════════════════════════════════════╝",
-                                step, rank, nan_count
-                            )
-
+                            log.warning("NaN detected in gradients at step=%d rank=%d count=%d", step, rank, nan_count)
+                    profiler.stream("aux").wait_stream(profiler.stream("compute"))
+                    # ---------------------------------------------------------
+                    # GRADIENT CLIPPING
+                    # ---------------------------------------------------------
                     grad_norm = None
-
-                    # Try racing gradient clipping (returns None if not racing)
                     if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
-                        racing_grad_norm = clip_gradients_racing(
-                            model, training_cfg.grad_clip_norm, device,
-                            step, race_cfg, rank
-                        )
-                        if racing_grad_norm is not None:
-                            grad_norm = racing_grad_norm
-                        else:
-                            # Inject delays for safe ranks if enabled
-                            inject_safe_rank_delay(device, step, race_cfg, rank)
+                        with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
+                            grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
 
-                            # Normal path: use profiler's aux stream
-                            with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
-                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
-
+                    # ---------------------------------------------------------
+                    # OPTIMIZER STEP
+                    # ---------------------------------------------------------
                     with profiler.range("aux", f"epoch{epoch}_step{step}_optimizer"):
                         try:
                             if scaler is not None:
@@ -1045,96 +973,33 @@ def training_loop(
                         if scheduler is not None:
                             scheduler.step()
 
-                    # Inject all_reduce operations to trigger hang pattern
-                    # Pattern: all_reduce → device-to-device copy → host-device copy → compute blocked
-                    if training_cfg.inject_allreduce_copies:
-                        if dist.is_initialized():
-                            with profiler.range("aux", f"epoch{epoch}_step{step}_allreduce_sync"):
-                                # Perform multiple all_reduce + memory copy cycles
-                                # This stresses the pattern: all_reduce → device copies → hipMemcpyWithStream → rocprim deadlock
-                                stress_level = min(max(training_cfg.allreduce_stress_level, 1), 10)
+                    # ---------------------------------------------------------
+                    # OPTIONAL ALLREDUCE STRESS TEST
+                    # ---------------------------------------------------------
+                    if training_cfg.inject_allreduce_copies and dist.is_initialized():
+                        _inject_allreduce_stress(device, loss, training_cfg.allreduce_stress_level, profiler, step, epoch)
 
-                                for i in range(stress_level):
-                                    # Create moderately-sized tensors to stress RCCL and memory copy
-                                    # Size: ~4MB per tensor
-                                    tensor_size = 1024 * 1024  # 1M elements = 4MB in FP32
-                                    stress_tensor = torch.randn(tensor_size, device=device, dtype=torch.float32)
-
-                                    # All-reduce operation (collective that triggers RCCL multi-stream)
-                                    dist.all_reduce(stress_tensor, op=dist.ReduceOp.AVG)
-
-                                    # Device-to-device copy (triggers hipMemcpyAsync device-to-device)
-                                    # This happens when moving data between GPU memory regions or during P2P transfers
-                                    device_copy_1 = stress_tensor.clone()  # Explicit device copy
-                                    device_copy_2 = device_copy_1.contiguous()  # May trigger another copy if not contiguous
-
-                                    # Force device-to-device copy via different tensor
-                                    temp_storage = torch.empty_like(device_copy_2)
-                                    temp_storage.copy_(device_copy_2, non_blocking=False)  # Blocking device-to-device copy
-
-                                    # All-reduce on device-copied tensor
-                                    dist.all_reduce(temp_storage, op=dist.ReduceOp.SUM)
-
-                                    # Force blocking host-device copy (triggers hipMemcpyWithStream)
-                                    # This pattern can cause hangs due to stream contention
-                                    tensor_cpu = temp_storage.cpu()  # Device → Host copy
-                                    tensor_back = tensor_cpu.to(device, non_blocking=False)  # Host → Device blocking copy
-
-                                    # Additional all_reduce on the copied-back tensor
-                                    dist.all_reduce(tensor_back, op=dist.ReduceOp.AVG)
-
-                                    # More device-to-device copies after all-reduce
-                                    final_copy = tensor_back.clone()
-                                    _ = final_copy.contiguous()
-
-                                    # Clean up
-                                    del stress_tensor, device_copy_1, device_copy_2, temp_storage
-                                    del tensor_cpu, tensor_back, final_copy
-
-                                # Also all-reduce actual metrics (common pattern) with device copies
-                                loss_tensor = loss.detach().clone()
-                                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-
-                                # Device-to-device copy
-                                loss_device_copy = loss_tensor.clone()
-
-                                # Host-device copy
-                                loss_cpu = loss_device_copy.cpu()
-                                _ = loss_cpu.to(device, non_blocking=False)
-
+                    # ---------------------------------------------------------
+                    # END ITERATION AND LOG METRICS
+                    # ---------------------------------------------------------
                     profiler.record_marker("compute", f"epoch{epoch}_step{step}_end")
-
                     iteration_profile = profiler.end_iteration()
 
-                    iteration_payload = {
-                        "rank": rank,
-                        "world_size": world_size,
-                        "epoch": epoch,
-                        "step": step,
-                        "global_step": global_step,
-                        "loss": float(loss.detach().cpu()),
-                        "grad_norm": float(grad_norm.cpu()) if grad_norm is not None else None,
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "profile": iteration_profile,
-                    }
-
-                    iteration_payload.update(collect_rocm_metrics(enable_rocm_metrics))
-                    metrics_logger.log(iteration_payload)
-
-                    loss_log = training_cfg.output_dir / f"loss_rank{rank}.log"
-                    with open(loss_log, "a") as f:
-                        f.write(f"step={global_step} epoch={epoch} loss={iteration_payload['loss']:.6f} lr={iteration_payload['lr']:.6f}\n")
-
-                    if global_step % training_cfg.log_interval == 0 and rank == 0:
-                        log.info(
-                            "epoch=%s step=%s loss=%.5f lr=%.6f overlap=%.3fms compute=%.3fms",
-                            epoch,
-                            step,
-                            iteration_payload["loss"],
-                            iteration_payload["lr"],
-                            iteration_profile["overlap"]["overlap_ms"].get("compute_comm", 0.0),
-                            iteration_profile["overlap"]["per_stream_ms"].get("compute", 0.0),
-                        )
+                    _log_iteration_metrics(
+                        profiler=profiler,
+                        metrics_logger=metrics_logger,
+                        loss=loss,
+                        grad_norm=grad_norm,
+                        optimizer=optimizer,
+                        training_cfg=training_cfg,
+                        iteration_profile=iteration_profile,
+                        step=step,
+                        epoch=epoch,
+                        global_step=global_step,
+                        rank=rank,
+                        world_size=world_size,
+                        enable_rocm_metrics=enable_rocm_metrics,
+                    )
 
                     if torch_profiler is not None:
                         torch_profiler.step()
@@ -1151,30 +1016,16 @@ def training_loop(
                         log.info("Training stopped at epoch=%d step=%d", epoch, step)
                     break
 
-    metrics_logger.close()
-
-    # Report NaN check results if enabled
-    if training_cfg.nan_check_collectives:
-        nan_results = profiler.get_nan_check_results()
-        if nan_results:
-            log.warning(
-                "[NaN SUMMARY] rank=%d detected %d NaN/Inf events during training",
-                rank, len(nan_results)
-            )
-            # Write NaN results to file for analysis
-            nan_log_path = training_cfg.output_dir / f"nan_check_rank{rank}.json"
-            with open(nan_log_path, "w") as f:
-                json.dump(nan_results, f, indent=2)
-            log.info("NaN check results written to %s", nan_log_path)
-        else:
-            log.info("[NaN SUMMARY] rank=%d no NaN/Inf detected in RCCL collectives", rank)
-    
-    if rank == 0:
-        log.info("Training loop finished. Profiler will export traces in cleanup phase.")
-        log.info("Output directory: %s", training_cfg.output_dir)
-        log.info("Torch profiler traces: %s", training_cfg.output_dir / "torch_profiler")
-        log.info("Loss logs: %s/loss_rank*.log", training_cfg.output_dir)
-        log.info("Metrics: %s/rank_*_metrics.jsonl", training_cfg.output_dir)
+    # =========================================================================
+    # FINALIZATION
+    # =========================================================================
+    _finalize_training(
+        metrics_logger=metrics_logger,
+        profiler=profiler,
+        training_cfg=training_cfg,
+        race_cfg=race_cfg,
+        rank=rank,
+    )
 
 
 def configure_optimizer(model: nn.Module, cfg: OptimizerConfig, dist_mode: str = "ddp") -> torch.optim.Optimizer:
@@ -1384,6 +1235,22 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         pin_memory=config.get("dataloader", {}).get("pin_memory", True),
     )
 
+    # Create separate warmup dataloader if warmup_batch_size is specified
+    warmup_dataloader = None
+    if race_cfg.warmup_batch_size is not None and not race_cfg.skip_training_warmup:
+        warmup_dataloader = create_dataloader(
+            dataset_cfg,
+            batch_size=race_cfg.warmup_batch_size,
+            world_size=env["world_size"],
+            rank=rank,
+            num_workers=0,  # Use fewer workers for warmup
+            pin_memory=config.get("dataloader", {}).get("pin_memory", True),
+        )
+        log.info(
+            "Created warmup dataloader with batch_size=%d (training batch_size=%d)",
+            race_cfg.warmup_batch_size, training_cfg.batch_size
+        )
+
     dist_mode = config.get("distributed", {}).get("mode")
     if dist_mode is None:
         dist_mode = "fsdp"
@@ -1400,11 +1267,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         training_cfg.max_steps or training_cfg.epochs * len(dataloader),
     )
 
-    # Start with force_async disabled - will enable after warmup if race_force_async is set
-    profiler = StreamProfiler(
-        env["device"],
-        force_async_for_race_test=False,
-    )
+    profiler = StreamProfiler(env["device"])
 
     try:
         training_loop(
@@ -1418,6 +1281,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
             profiler,
             enable_rocm_metrics,
             profiler_cfg,
+            warmup_dataloader=warmup_dataloader,
         )
     finally:
         if dist.is_initialized():

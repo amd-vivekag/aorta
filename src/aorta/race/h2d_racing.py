@@ -34,19 +34,14 @@ def get_memcpy_stream(device: torch.device) -> torch.cuda.Stream:
     It's created lazily and cached per device.
 
     Args:
-        device: CUDA device
+        device: GPU device
 
     Returns:
-        CUDA stream for memcpy operations
+        GPU stream for memcpy operations
     """
     if device not in _memcpy_streams:
         _memcpy_streams[device] = torch.cuda.Stream(device=device)
     return _memcpy_streams[device]
-
-
-def clear_memcpy_streams() -> None:
-    """Clear all cached memcpy streams (for testing)."""
-    _memcpy_streams.clear()
 
 
 def move_batch_to_device(
@@ -58,7 +53,7 @@ def move_batch_to_device(
 
     Args:
         batch: CPU batch tensors
-        device: Target CUDA device
+        device: Target GPU device
 
     Returns:
         Batch tensors on GPU
@@ -89,7 +84,7 @@ def move_batch_to_device_racing(
 
     Args:
         batch: CPU batch tensors
-        device: Target CUDA device
+        device: Target GPU device
         step: Current training step
         race_cfg: Race configuration
         rank: Current rank

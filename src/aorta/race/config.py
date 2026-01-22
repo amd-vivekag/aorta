@@ -26,12 +26,7 @@ class RaceConfig:
        - datadist_skip_sync_before_collective: Skips wait_stream() before FSDP collective (causes race!)
        - datadist_racing_start_step: Step to start datadist racing
 
-    3. Backward/Clip Race:
-       - race_force_async: Makes reduce-scatter async
-       - race_fresh_stream: Uses fresh stream for racing ranks
-       - race_delay_safe_ranks: Adds GPU delays to safe ranks
-
-    4. Timing Skew Experiment (demonstrates NaN progression):
+    3. Timing Skew Experiment (demonstrates NaN progression):
        - timing_skew_enabled: Enable controlled timing skew
        - timing_skew_mode: none, fixed, progressive, random
        - timing_skew_us: Delay in microseconds
@@ -39,7 +34,6 @@ class RaceConfig:
        - timing_skew_start_step: Step to start skew
 
     Supporting options:
-       - stream_conflict_test: Synthetic version (prefer h2d_memcpy_racing + datadist_racing)
        - skip_training_warmup: Skip training warmup to maximize timing variability
        - skip_rccl_warmup: Skip RCCL communicator warmup before FSDP init
        - nan_check_collectives: Enable NaN checking around RCCL collectives
@@ -71,33 +65,6 @@ class RaceConfig:
     """Step to start datadist racing (0 = aggressive, from first step)."""
 
     # =========================================================================
-    # Backward/clip race injection
-    # =========================================================================
-    race_force_async: bool = False
-    """Mechanism 1: Skip work.wait() in DistributedOpsInterceptor."""
-
-    race_fresh_stream: bool = False
-    """Mechanism 2: Use fresh CUDA stream for racing ranks (local 1, 2 on Node 0)."""
-
-    race_delay_safe_ranks: bool = False
-    """Mechanism 3: Add GPU delays to safe ranks to widen race window."""
-
-    # =========================================================================
-    # Stream conflict test (OLD synthetic version - prefer h2d_memcpy_racing)
-    # =========================================================================
-    stream_conflict_test: bool = False
-    """Enable stream conflict injection (synthetic, after batch is on GPU)."""
-
-    stream_conflict_memcpy_racing: bool = True
-    """Race memcpy stream with default stream."""
-
-    stream_conflict_datadist_racing: bool = True
-    """Race datadist stream (all_to_all) with default stream."""
-
-    stream_conflict_start_step: int = 0
-    """Step to start stream conflict racing."""
-
-    # =========================================================================
     # Supporting options
     # =========================================================================
     skip_training_warmup: bool = False
@@ -105,6 +72,14 @@ class RaceConfig:
 
     training_warmup_steps: int = 1
     """Number of training warmup steps to run (if not skipped)."""
+
+    warmup_batch_size: Optional[int] = None
+    """
+    Batch size for warmup steps. If None, uses the training batch_size.
+    Set this smaller than training batch_size to speed up warmup while
+    still exercising the collectives, then use larger batch during racing
+    for wider race windows.
+    """
 
     skip_rccl_warmup: bool = False
     """Skip RCCL communicator warmup before FSDP init to test race conditions."""
@@ -155,9 +130,6 @@ class RaceConfig:
         return (
             self.h2d_memcpy_racing
             or self.datadist_racing
-            or self.race_force_async
-            or self.race_fresh_stream
-            or self.stream_conflict_test
             or self.timing_skew_enabled
         )
 
@@ -168,10 +140,6 @@ class RaceConfig:
     def is_datadist_race_enabled(self) -> bool:
         """Check if datadist racing is enabled."""
         return self.datadist_racing and self.datadist_skip_sync_before_collective
-
-    def is_backward_race_enabled(self) -> bool:
-        """Check if backward/clip race is enabled."""
-        return self.race_force_async or self.race_fresh_stream
 
     def is_timing_skew_active(self, step: int) -> bool:
         """Check if timing skew should be applied at this step."""

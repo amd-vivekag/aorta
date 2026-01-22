@@ -38,19 +38,14 @@ def get_datadist_stream(device: torch.device) -> torch.cuda.Stream:
     It's created lazily and cached per device.
 
     Args:
-        device: CUDA device
+        device: GPU device
 
     Returns:
-        CUDA stream for datadist operations
+        GPU stream for datadist operations
     """
     if device not in _datadist_streams:
         _datadist_streams[device] = torch.cuda.Stream(device=device)
     return _datadist_streams[device]
-
-
-def clear_datadist_streams() -> None:
-    """Clear all cached datadist streams (for testing)."""
-    _datadist_streams.clear()
 
 
 def inject_datadist_racing(
@@ -79,7 +74,7 @@ def inject_datadist_racing(
 
     Args:
         batch: Batch tensors (already on GPU)
-        device: CUDA device
+        device: GPU device
         step: Current training step
         race_cfg: Race configuration
         rank: Current rank
