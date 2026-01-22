@@ -65,10 +65,31 @@ scripts/               # Launch scripts, profiling, analysis tools
 analysis/              # Overlap report generation
 ```
 
+## Installation
+
+We recommend using [uv](https://github.com/astral-sh/uv) for fast, reliable Python environment management.
+
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create and activate a virtual environment
+uv venv && source .venv/bin/activate
+
+# Install PyTorch nightly for ROCm 7.1
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+
+# Install remaining dependencies
+uv pip install -r requirements.txt
+
+# For full installation including hw_queue_eval
+uv pip install -e ".[hw-queue]"
+```
+
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+uv pip install -r requirements-dev.txt
 pre-commit install
 pytest tests/
 ```
