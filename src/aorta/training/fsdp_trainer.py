@@ -10,6 +10,7 @@ import os
 import random
 import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, Optional, Tuple
@@ -39,10 +40,18 @@ from aorta.race.injectors import (
     inject_timing_skew,
     should_skip_h2d_sync,
     should_skip_datadist_sync,
+    wait_pending_datadist_work,
+    is_datadist_work_pending,
+    check_nccl_async_behavior,
+    is_h2d_still_in_flight,
+    is_h2d_tensor_in_flight,
     check_loss_for_nan,
     check_gradients_for_nan,
+    schedule_inflight_check,
+    flush_inflight_checks,
 )
-from aorta.race.h2d_racing import move_batch_to_device
+from aorta.race.h2d_racing import move_batch_to_device, get_memcpy_stream
+from aorta.race.datadist_racing import get_datadist_stream
 from aorta.utils import (
     detect_accelerator,
     get_device,
@@ -839,7 +848,15 @@ def training_loop(
     # =========================================================================
     profiler_dir = training_cfg.output_dir / "torch_profiler"
 
-    with profiler.intercept_distributed_ops():
+    # Client stream layout: bypass DistributedOpsInterceptor so FSDP collectives
+    # run on the default stream (matches client's actual TorchRec architecture)
+    if race_cfg.client_stream_layout:
+        log.info("CLIENT STREAM LAYOUT: Bypassing DistributedOpsInterceptor - collectives on default stream")
+        dist_ops_context = contextlib.nullcontext()
+    else:
+        dist_ops_context = profiler.intercept_distributed_ops()
+
+    with dist_ops_context:
         with _torch_profiler_context(profiler_cfg, profiler_dir, rank, device) as torch_profiler:
             for epoch in range(training_cfg.epochs):
                 if hasattr(dataloader.sampler, "set_epoch"):
@@ -852,6 +869,22 @@ def training_loop(
                     # ---------------------------------------------------------
                     # H2D RACING INJECTION (before forward)
                     # ---------------------------------------------------------
+                    # Initialize timing variables for debug logs
+                    t_h2d_start = t_h2d_end = 0.0
+                    t_datadist_start = t_datadist_end = 0.0
+                    t_skew_start = t_skew_end = 0.0
+                    skew_delay = 0
+
+                    # GPU event-based timing (non-blocking, doesn't interfere with race)
+                    gpu_events_enabled = race_cfg.gpu_event_timing
+                    if gpu_events_enabled:
+                        h2d_start_evt = torch.cuda.Event(enable_timing=True)
+                        h2d_end_evt = torch.cuda.Event(enable_timing=True)
+                        dd_start_evt = torch.cuda.Event(enable_timing=True)
+                        dd_end_evt = torch.cuda.Event(enable_timing=True)
+                        fwd_start_evt = torch.cuda.Event(enable_timing=True)
+                        fwd_end_evt = torch.cuda.Event(enable_timing=True)
+
                     h2d_racing_active = race_cfg.h2d_memcpy_racing and step >= race_cfg.h2d_racing_start_step
 
                     if h2d_racing_active:
@@ -862,8 +895,28 @@ def training_loop(
                                 step, rank, race_cfg.h2d_skip_sync_before_forward,
                             )
 
+                        if race_cfg.timing_debug_logs:
+                            t_h2d_start = time.perf_counter()
+
+                        # Get memcpy stream upfront for accurate GPU event recording
+                        # Both start and end events must be on the SAME stream for accurate timing
+                        memcpy_stream_for_events = get_memcpy_stream(device)
+
+                        # Record GPU event before H2D (on memcpy_stream where H2D actually runs)
+                        if gpu_events_enabled:
+                            with torch.cuda.stream(memcpy_stream_for_events):
+                                h2d_start_evt.record()
+
                         with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
                             batch, memcpy_stream = inject_h2d_racing(cpu_batch, device, step, race_cfg, rank)
+
+                        # Record end event on memcpy_stream (same stream as start for accurate timing)
+                        if gpu_events_enabled:
+                            with torch.cuda.stream(memcpy_stream_for_events):
+                                h2d_end_evt.record()
+
+                        if race_cfg.timing_debug_logs:
+                            t_h2d_end = time.perf_counter()
 
                         if should_skip_h2d_sync(step, race_cfg):
                             # RACE: skip memcpy sync - forward may read incomplete H2D data
@@ -875,9 +928,28 @@ def training_loop(
                             profiler.stream("compute").wait_stream(profiler.stream("aux"))
                     else:
                         # Normal path (no H2D racing)
+                        if race_cfg.timing_debug_logs:
+                            t_h2d_start = time.perf_counter()
+
+                        if gpu_events_enabled:
+                            h2d_start_evt.record()
+
                         with profiler.range("aux", f"epoch{epoch}_step{step}_prefetch"):
                             batch = move_batch_to_device(cpu_batch, device)
+
+                        if gpu_events_enabled:
+                            h2d_end_evt.record()
+
+                        if race_cfg.timing_debug_logs:
+                            t_h2d_end = time.perf_counter()
+
                         profiler.stream("compute").wait_stream(profiler.stream("aux"))
+
+                    if race_cfg.timing_debug_logs:
+                        log.info(
+                            "TIMING: step=%d rank=%d H2D_START=%.6f H2D_END=%.6f H2D_DUR=%.3fms",
+                            step, rank, t_h2d_start, t_h2d_end, (t_h2d_end - t_h2d_start) * 1000
+                        )
 
                     # ---------------------------------------------------------
                     # DATADIST RACING INJECTION (before forward)
@@ -892,7 +964,27 @@ def training_loop(
                                 step, rank, race_cfg.datadist_skip_sync_before_collective,
                             )
 
+                        if race_cfg.timing_debug_logs:
+                            t_datadist_start = time.perf_counter()
+
+                        # Get datadist stream upfront for accurate GPU event recording
+                        # Both start and end events must be on the SAME stream for accurate timing
+                        datadist_stream_for_events = get_datadist_stream(device)
+
+                        # Record GPU event before datadist (on datadist_stream where all_to_all runs)
+                        if gpu_events_enabled:
+                            with torch.cuda.stream(datadist_stream_for_events):
+                                dd_start_evt.record()
+
                         batch, datadist_stream = inject_datadist_racing(batch, device, step, race_cfg, rank)
+
+                        # Record end event on datadist_stream (same stream as start for accurate timing)
+                        if gpu_events_enabled:
+                            with torch.cuda.stream(datadist_stream_for_events):
+                                dd_end_evt.record()
+
+                        if race_cfg.timing_debug_logs:
+                            t_datadist_end = time.perf_counter()
 
                         if should_skip_datadist_sync(step, race_cfg):
                             # RACE: skip datadist sync - FSDP collective may read incomplete data
@@ -901,11 +993,47 @@ def training_loop(
                             if datadist_stream is not None:
                                 torch.cuda.current_stream().wait_stream(datadist_stream)
 
+                        if race_cfg.timing_debug_logs:
+                            log.info(
+                                "TIMING: step=%d rank=%d DATADIST_START=%.6f DATADIST_END=%.6f DATADIST_DUR=%.3fms",
+                                step, rank, t_datadist_start, t_datadist_end, (t_datadist_end - t_datadist_start) * 1000
+                            )
+
+                        # ---------------------------------------------------------
+                        # NCCL ASYNC DIAGNOSTIC (non-blocking check)
+                        # ---------------------------------------------------------
+                        # Check if the all_to_all work is still in-flight BEFORE forward starts.
+                        # This verifies that the race window is actually open.
+                        # If work is already completed, NCCL may have internal sync that masks the race.
+                        if race_cfg.nccl_async_diagnostic:
+                            is_async, nccl_diag_msg = check_nccl_async_behavior(step, rank)
+                            if is_async:
+                                log.info(
+                                    "NCCL_DIAG: step=%d rank=%d all_to_all status=%s (race window OPEN)",
+                                    step, rank, nccl_diag_msg
+                                )
+                            else:
+                                log.warning(
+                                    "NCCL_DIAG: step=%d rank=%d all_to_all status=%s (race window may be CLOSED!)",
+                                    step, rank, nccl_diag_msg
+                                )
+
                     # ---------------------------------------------------------
                     # TIMING SKEW INJECTION (before forward)
                     # ---------------------------------------------------------
                     if race_cfg.is_timing_skew_active(step):
+                        if race_cfg.timing_debug_logs:
+                            t_skew_start = time.perf_counter()
+
                         skew_delay = inject_timing_skew(step, rank, race_cfg)
+
+                        if race_cfg.timing_debug_logs:
+                            t_skew_end = time.perf_counter()
+                            log.info(
+                                "TIMING: step=%d rank=%d SKEW_START=%.6f SKEW_END=%.6f SKEW_DUR=%.3fms SKEW_US=%d",
+                                step, rank, t_skew_start, t_skew_end, (t_skew_end - t_skew_start) * 1000, skew_delay
+                            )
+
                         if skew_delay > 0:
                             log.debug("TIMING SKEW: rank=%d step=%d delay=%.0f us", rank, step, skew_delay)
 
@@ -914,7 +1042,84 @@ def training_loop(
                     # ---------------------------------------------------------
                     optimizer.zero_grad(set_to_none=True)
 
-                    with profiler.range("compute", f"epoch{epoch}_step{step}_forward"):
+                    # ---------------------------------------------------------
+                    # H2D RACE WINDOW CHECK (right before forward)
+                    # ---------------------------------------------------------
+                    # Check if H2D copy is still in-flight when forward starts.
+                    # If yes, forward will read incomplete/torn data from batch tensors.
+                    #
+                    # IMPORTANT: We use is_h2d_still_in_flight() which calls event.query()
+                    # This is a NON-BLOCKING polling query that doesn't sync CUDA.
+                    # We do NOT check for NaN/Inf here as .item() would sync and mask the race!
+                    if race_cfg.nccl_async_diagnostic and h2d_racing_active:
+                        if race_cfg.h2d_split_dense_copy:
+                            h2d_in_flight = is_h2d_tensor_in_flight("dense")
+                            h2d_label = "H2D dense copy"
+                        else:
+                            h2d_in_flight = is_h2d_still_in_flight()
+                            h2d_label = "H2D copy"
+                        if h2d_in_flight:
+                            log.info(
+                                "H2D_RACE: step=%d rank=%d %s STILL IN-FLIGHT when forward starts - RACE CONFIRMED!",
+                                step, rank, h2d_label
+                            )
+                            # NOTE: We do NOT call check_batch_for_corruption() here!
+                            # That would use .item() which syncs CUDA and masks the race.
+                            # NaN will be detected in the loss check after forward.
+
+                            # Schedule repeated in-flight reads to detect instability
+                            if (race_cfg.inflight_read_check_enabled and
+                                race_cfg.inflight_read_repeats > 0 and
+                                "dense" in batch and isinstance(batch["dense"], torch.Tensor)):
+                                dense = batch["dense"]
+                                # Compute tail offset using same math as h2d_racing.py
+                                total = dense.numel()
+                                tail_frac = max(0.0, min(1.0, race_cfg.h2d_dense_tail_fraction))
+                                split_idx = int(total * (1.0 - tail_frac))
+                                split_idx = max(1, min(total - 1, split_idx))
+                                # Get tail region
+                                tail_tensor = dense.reshape(-1)[split_idx:]
+                                schedule_inflight_check(
+                                    name="h2d_dense",
+                                    tensor=tail_tensor,
+                                    sample_size=race_cfg.inflight_read_sample_size,
+                                    repeats=race_cfg.inflight_read_repeats,
+                                    step=step,
+                                    rank=rank,
+                                )
+                        else:
+                            log.warning(
+                                "H2D_RACE: step=%d rank=%d %s ALREADY COMPLETED before forward - NO RACE!",
+                                step, rank, h2d_label
+                            )
+
+                    # ---------------------------------------------------------
+                    # NCCL RACE WINDOW CHECK (right before forward)
+                    # ---------------------------------------------------------
+                    # This is the critical check: Is all_to_all still running when forward starts?
+                    # If yes, we have a true race condition. If no, NCCL completed before forward.
+                    if race_cfg.nccl_async_diagnostic and datadist_racing_active:
+                        work_pending = is_datadist_work_pending()
+                        if work_pending:
+                            log.info(
+                                "NCCL_RACE: step=%d rank=%d all_to_all STILL PENDING when forward starts - RACE CONFIRMED!",
+                                step, rank
+                            )
+                        else:
+                            log.warning(
+                                "NCCL_RACE: step=%d rank=%d all_to_all ALREADY COMPLETED before forward - NO RACE!",
+                                step, rank
+                            )
+
+                    if race_cfg.timing_debug_logs:
+                        t_forward_start = time.perf_counter()
+
+                    # Record GPU event before forward (on default stream)
+                    if gpu_events_enabled:
+                        fwd_start_evt.record()
+
+                    if race_cfg.client_stream_layout:
+                        # Client mode: forward on default stream (no profiler range)
                         if autocast_dtype:
                             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                                 scores = model(batch)
@@ -922,6 +1127,37 @@ def training_loop(
                         else:
                             scores = model(batch)
                             loss = compute_loss(scores, batch)
+                    else:
+                        # Normal mode: forward on compute stream via profiler
+                        with profiler.range("compute", f"epoch{epoch}_step{step}_forward"):
+                            if autocast_dtype:
+                                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                                    scores = model(batch)
+                                    loss = compute_loss(scores, batch)
+                            else:
+                                scores = model(batch)
+                                loss = compute_loss(scores, batch)
+
+                    # Record GPU event after forward (on default/compute stream)
+                    if gpu_events_enabled:
+                        fwd_end_evt.record()
+
+                    if race_cfg.timing_debug_logs:
+                        t_forward_end = time.perf_counter()
+                        log.info(
+                            "TIMING: step=%d rank=%d FORWARD_START=%.6f FORWARD_END=%.6f FORWARD_DUR=%.3fms",
+                            step, rank, t_forward_start, t_forward_end, (t_forward_end - t_forward_start) * 1000
+                        )
+
+                        # Calculate gaps (negative = overlap = race window)
+                        gap_h2d_to_forward = (t_forward_start - t_h2d_end) * 1000
+                        gap_datadist_to_forward = (t_forward_start - t_datadist_end) * 1000 if t_datadist_end > 0 else 0.0
+                        gap_skew_to_forward = (t_forward_start - t_skew_end) * 1000 if t_skew_end > 0 else 0.0
+
+                        log.info(
+                            "TIMING: step=%d rank=%d GAP_H2D_TO_FORWARD=%.3fms GAP_DATADIST_TO_FORWARD=%.3fms GAP_SKEW_TO_FORWARD=%.3fms",
+                            step, rank, gap_h2d_to_forward, gap_datadist_to_forward, gap_skew_to_forward
+                        )
 
                     # NaN check after forward
                     if race_cfg.nan_check_collectives:
@@ -931,30 +1167,48 @@ def training_loop(
                     # ---------------------------------------------------------
                     # BACKWARD PASS
                     # ---------------------------------------------------------
-                    with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
+                    if race_cfg.client_stream_layout:
+                        # Client mode: backward on default stream (FSDP collectives also here)
                         if scaler is not None:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
+                    else:
+                        # Normal mode: backward on compute stream via profiler
+                        with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
+                            if scaler is not None:
+                                scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
 
                     # NaN check after backward
                     if race_cfg.nan_check_collectives:
                         has_nan_grads, nan_count = check_gradients_for_nan(model, step, rank)
                         if has_nan_grads:
                             log.warning("NaN detected in gradients at step=%d rank=%d count=%d", step, rank, nan_count)
-                    profiler.stream("aux").wait_stream(profiler.stream("compute"))
+
+                    # Stream sync: only needed in normal mode (client mode uses default stream)
+                    if not race_cfg.client_stream_layout:
+                        profiler.stream("aux").wait_stream(profiler.stream("compute"))
+
                     # ---------------------------------------------------------
                     # GRADIENT CLIPPING
                     # ---------------------------------------------------------
                     grad_norm = None
                     if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
-                        with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
+                        if race_cfg.client_stream_layout:
+                            # Client mode: clip on default stream
                             grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
+                        else:
+                            # Normal mode: clip on aux stream via profiler
+                            with profiler.range("aux", f"epoch{epoch}_step{step}_grad_clip"):
+                                grad_norm = clip_grad_norm_(model.parameters(), training_cfg.grad_clip_norm)
 
                     # ---------------------------------------------------------
                     # OPTIMIZER STEP
                     # ---------------------------------------------------------
-                    with profiler.range("aux", f"epoch{epoch}_step{step}_optimizer"):
+                    if race_cfg.client_stream_layout:
+                        # Client mode: optimizer on default stream
                         try:
                             if scaler is not None:
                                 scaler.step(optimizer)
@@ -972,6 +1226,26 @@ def training_loop(
 
                         if scheduler is not None:
                             scheduler.step()
+                    else:
+                        # Normal mode: optimizer on aux stream via profiler
+                        with profiler.range("aux", f"epoch{epoch}_step{step}_optimizer"):
+                            try:
+                                if scaler is not None:
+                                    scaler.step(optimizer)
+                                    scaler.update()
+                                else:
+                                    optimizer.step()
+                            except AssertionError as e:
+                                if "NaN" in str(e) or "Inf" in str(e):
+                                    log.error("NaN/Inf detected in rank %d at step %d: %s", rank, global_step, e)
+                                    log.error("Stopping training to save traces")
+                                    stop_flag["stop"] = True
+                                    break
+                                else:
+                                    raise
+
+                            if scheduler is not None:
+                                scheduler.step()
 
                     # ---------------------------------------------------------
                     # OPTIONAL ALLREDUCE STRESS TEST
@@ -982,6 +1256,71 @@ def training_loop(
                     # ---------------------------------------------------------
                     # END ITERATION AND LOG METRICS
                     # ---------------------------------------------------------
+                    # Wait for any pending async datadist work to complete before next step
+                    # This prevents NCCL collective desync while preserving the race window
+                    # during forward/backward (the race already happened by now)
+                    if race_cfg.datadist_racing:
+                        wait_pending_datadist_work()
+
+                    # ---------------------------------------------------------
+                    # FLUSH IN-FLIGHT INSTABILITY CHECKS
+                    # ---------------------------------------------------------
+                    # After race window closes, flush and log any detected mismatches
+                    if race_cfg.inflight_read_check_enabled and race_cfg.inflight_read_repeats > 0:
+                        flush_inflight_checks(step, rank)
+
+                    # ---------------------------------------------------------
+                    # GPU EVENT TIMING (calculated after iteration completes)
+                    # ---------------------------------------------------------
+                    # WARNING: Cross-stream timing (e.g., DD->FWD, H2D->FWD) is INACCURATE!
+                    # Events on different streams measure enqueue time, not execution time.
+                    # For accurate race detection, use nccl_async_diagnostic instead.
+                    if gpu_events_enabled:
+                        # Synchronize to ensure all GPU work is complete before reading events
+                        torch.cuda.synchronize()
+
+                        # Calculate GPU-side durations
+                        # NOTE: Same-stream timing (H2D_DUR, FWD_DUR) is accurate.
+                        # Cross-stream timing (H2D_TO_FWD, DD_TO_FWD) is approximate/unreliable.
+                        try:
+                            gpu_h2d_dur = h2d_start_evt.elapsed_time(h2d_end_evt)
+                            gpu_fwd_dur = fwd_start_evt.elapsed_time(fwd_end_evt)
+
+                            # CAUTION: This is cross-stream timing and may be inaccurate!
+                            # The elapsed_time measures wall-clock between event recordings,
+                            # but events on different streams can have arbitrary GPU execution order.
+                            gpu_h2d_to_fwd = h2d_end_evt.elapsed_time(fwd_start_evt)
+
+                            log.info(
+                                "GPU_TIMING: step=%d rank=%d GPU_H2D_DUR=%.3fms GPU_FWD_DUR=%.3fms GPU_H2D_TO_FWD=%.3fms (CROSS-STREAM: may be inaccurate)",
+                                step, rank, gpu_h2d_dur, gpu_fwd_dur, gpu_h2d_to_fwd
+                            )
+
+                            # Datadist timing (only if active)
+                            if datadist_racing_active:
+                                gpu_dd_dur = dd_start_evt.elapsed_time(dd_end_evt)
+                                # CAUTION: dd_end_evt is recorded immediately after launching
+                                # async all_to_all, so GPU_DD_DUR measures launch time, NOT
+                                # actual collective duration. Use nccl_async_diagnostic for
+                                # accurate race window detection.
+                                gpu_dd_to_fwd = dd_end_evt.elapsed_time(fwd_start_evt)
+                                log.info(
+                                    "GPU_TIMING: step=%d rank=%d GPU_DD_DUR=%.3fms (launch only!) GPU_DD_TO_FWD=%.3fms (CROSS-STREAM: may be inaccurate)",
+                                    step, rank, gpu_dd_dur, gpu_dd_to_fwd
+                                )
+
+                                # Summary line showing overlap status
+                                # NOTE: These overlap/gap indicators are UNRELIABLE for cross-stream.
+                                # Use NCCL_RACE logs from nccl_async_diagnostic for accurate detection.
+                                h2d_overlap = "OVERLAP" if gpu_h2d_to_fwd < 0 else "GAP"
+                                dd_overlap = "OVERLAP" if gpu_dd_to_fwd < 0 else "GAP"
+                                log.info(
+                                    "GPU_OVERLAP: step=%d rank=%d H2D->FWD=%s(%.3fms) DD->FWD=%s(%.3fms) [CAUTION: cross-stream timing unreliable, use nccl_async_diagnostic]",
+                                    step, rank, h2d_overlap, gpu_h2d_to_fwd, dd_overlap, gpu_dd_to_fwd
+                                )
+                        except RuntimeError as e:
+                            log.warning("GPU_TIMING: Failed to calculate event times: %s", e)
+
                     profiler.record_marker("compute", f"epoch{epoch}_step{step}_end")
                     iteration_profile = profiler.end_iteration()
 

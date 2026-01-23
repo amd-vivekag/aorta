@@ -17,11 +17,18 @@ from aorta.race.h2d_racing import (
     get_memcpy_stream,
     move_batch_to_device_racing as _move_batch_racing,
     should_skip_h2d_sync,
+    is_h2d_still_in_flight,
+    is_h2d_tensor_in_flight,
+    check_h2d_race_status,
 )
 from aorta.race.datadist_racing import (
     get_datadist_stream,
     inject_datadist_racing as _inject_datadist_racing,
     should_skip_datadist_sync,
+    wait_pending_datadist_work,
+    is_datadist_work_pending,
+    check_nccl_async_behavior,
+    get_pending_datadist_work,
 )
 from aorta.race.timing_skew_experiment import (
     inject_timing_skew_from_race_config,
@@ -40,12 +47,22 @@ __all__ = [
     "inject_timing_skew",
     "should_skip_h2d_sync",
     "should_skip_datadist_sync",
+    "wait_pending_datadist_work",
+    "is_datadist_work_pending",
+    "check_nccl_async_behavior",
+    "get_pending_datadist_work",
+    "is_h2d_still_in_flight",
+    "is_h2d_tensor_in_flight",
+    "check_h2d_race_status",
     "get_memcpy_stream",
     "get_datadist_stream",
     "setup_gpu_max_hw_queues",
     "log_race_config_status",
     "check_loss_for_nan",
     "check_gradients_for_nan",
+    "schedule_inflight_check",
+    "flush_inflight_checks",
+    "clear_inflight_checks",
 ]
 
 
@@ -227,3 +244,13 @@ def inject_datadist_racing(
         Tuple of (batch, datadist_stream or None)
     """
     return _inject_datadist_racing(batch, device, step, race_cfg, rank)
+
+
+# =============================================================================
+# In-flight read instability checks (re-exported from inflight_checks module)
+# =============================================================================
+from aorta.race.inflight_checks import (
+    schedule_inflight_check,
+    flush_inflight_checks,
+    clear_inflight_checks,
+)

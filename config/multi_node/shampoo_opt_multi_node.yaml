@@ -1,52 +1,60 @@
-# Shampoo-only variant of the user workload.
-# NOTE: User reports this configuration produces NaNs when using Shampoo,
-# while AdamW and other optimizers remain healthy. Monitor loss closely.
+# Minimal config to reproduce NaN stream race (no debug instrumentation).
 
 logging:
   level: INFO
 
 training:
   epochs: 100
-  batch_size: 512
+  batch_size: 1024
   gradient_accumulation: 2
   mixed_precision: bf16
-  max_steps: 4400
+  max_steps: 500
   grad_clip_norm: 1.0
-  output_dir: artifacts/user_shampoo
   log_interval: 1
-  additional_compute_streams: 2
-  lightweight_op_waves: 3
+  output_dir: artifacts/nan_stream_race_minimal
 
 race_experiment:
+  # Client stream layout: default_stream (fwd/bwd/collectives), memcpy_stream, datadist_stream
+  client_stream_layout: true
+
   # H2D memcpy racing (realistic pattern)
   h2d_memcpy_racing: true
   h2d_skip_sync_before_forward: true
-  h2d_racing_start_step: 3    # Start after warmup
+  h2d_racing_start_step: 1
 
   # Datadist racing (TorchRec-style all_to_all on separate stream)
-  # NOTE: Disabled to avoid memory faults - H2D racing alone is sufficient
   datadist_racing: true
   datadist_skip_sync_before_collective: true
-  datadist_racing_start_step: 3
+  datadist_racing_start_step: 1
+  datadist_tensor_size: 10000000
+  datadist_use_real_dependency: true
+
+  h2d_split_dense_copy: true
+  h2d_dense_tail_fraction: 0.5
+  datadist_split_alltoall: true
+  datadist_tail_fraction: 0.5
+  datadist_read_tail_only: true
+  inflight_read_check_enabled: true
+  inflight_read_repeats: 5
+  inflight_read_sample_size: 4096
 
   # Warmup and detection
-  skip_training_warmup: false
-  training_warmup_steps: 1
-  warmup_batch_size: 64           # Small batch for fast warmup (training uses 512)
+  skip_training_warmup: true
+  training_warmup_steps: 0
   skip_rccl_warmup: false
   rccl_warmup_iterations: 5
   nan_check_collectives: true
 
-  # Hardware queues (4+ needed to expose race)
+  # Hardware queues (4+ for true parallelism)
   gpu_max_hw_queues: 4
 
-  # Timing skew experiment (demonstrates NaN progression)
-  # Shows: small skew → intermittent NaN, medium skew → consistent NaN, large skew → hang
-  timing_skew_enabled: true
-  timing_skew_mode: "fixed"        # none, fixed, progressive, random
-  timing_skew_us: 100             # Delay in microseconds (moderate, not too aggressive)
-  timing_skew_ranks: [0,  8] # More ranks delayed for faster manifestation
-  timing_skew_start_step: 3        # Step to start skew (after warmup)
+  # Timing skew experiment (disabled for minimal repro)
+  timing_skew_enabled: false
+
+  # Debug instrumentation (disabled to avoid extra sync/logging)
+  timing_debug_logs: false
+  gpu_event_timing: false
+  nccl_async_diagnostic: true
 
 optimizer:
   name: shampoo
@@ -62,7 +70,7 @@ scheduler:
 dataset:
   num_samples: 200000
   sequence_length: 160
-  dense_dim: 256
+  dense_dim: 1024
   sparse_features: 64
   vocab_size: 350000
   num_dense_features: 32
@@ -72,7 +80,7 @@ model:
   vocab_size: 350000
   embedding_dim: 256
   num_dense_features: 32
-  dense_dim: 256
+  dense_dim: 1024
   model_dim: 1024
   num_heads: 16
   num_layers: 18
@@ -89,7 +97,6 @@ fsdp:
   param_init_device: meta
 
 distributed:
-  backend: nccl
   mode: fsdp
   bucket_cap_mb: 128
   gradient_as_bucket_view: true
@@ -102,23 +109,7 @@ compile:
   mode: max-autotune
   fullgraph: false
   dynamic: false
-
-streams:
-  num_streams: 4
-  high_priority:
-    - allreduce
-    - reducescatter
-  stream_assignments:
-    compute:
-      - dev6_stream3
-      - dev6_stream9
-    communication:
-      - dev6_stream13
-      - dev6_stream17
-    reducescatter:
-      - dev6_stream22
-    aux:
-      - dev6_stream0
+  options: {}
 
 dataloader:
   num_workers: 0
@@ -135,8 +126,5 @@ profiling:
   with_stack: false
   with_flops: false
   tensorboard: false
-  chrome_trace: true
-  trace_filename: user_shampoo.json
-
-tracelens:
-  enabled: false
+  chrome_trace: false
+  trace_filename: nan_stream_race.json

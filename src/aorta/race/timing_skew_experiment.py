@@ -139,6 +139,10 @@ def _gpu_delay_kernel(delay_us: int) -> None:
     
     This is more realistic than CPU sleep because it actually
     occupies GPU resources and affects GPU stream scheduling.
+    
+    IMPORTANT: We do NOT synchronize here - the delay work is enqueued
+    to the GPU but the CPU continues immediately. This preserves the
+    race window between H2D/datadist and forward pass.
     """
     if delay_us <= 0:
         return
@@ -153,8 +157,9 @@ def _gpu_delay_kernel(delay_us: int) -> None:
     for _ in range(iterations // 1000 + 1):
         x = x * 1.0001  # Small multiply to prevent optimization
     
-    # Ensure kernel completes
-    torch.cuda.current_stream().synchronize()
+    # DO NOT synchronize - let GPU work run async to preserve race window
+    # Previously: torch.cuda.current_stream().synchronize() - this was
+    # blocking and serializing streams, hiding the NaN race condition
 
 
 # ============================================================================
