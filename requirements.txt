@@ -1,15 +1,17 @@
 # Dependencies for local analysis and processing scripts
 # (Training dependencies are managed in Docker - see docker/Dockerfile.*)
-# Install with: pip install -r requirements.txt
+#
+# Install with uv (two steps to avoid pulling nvidia packages):
+#   uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+#   uv pip install -r requirements.txt
 #
 # For full installation including hw_queue_eval:
-#   pip install -e ".[hw-queue]"
+#   uv pip install -e ".[hw-queue]"
 #
 # For development:
-#   pip install -e ".[all]"
+#   uv pip install -e ".[all]"
 
-# Base dependencies
-torch>=2.0.0
+# Base dependencies (PyTorch installed separately - see above)
 pyyaml>=6.0
 
 # For analysis scripts
