@@ -153,6 +153,30 @@ def move_batch_to_device_racing(
     # If h2d_skip_sync_before_forward=True, forward will race with H2D
     # This can result in torn reads where some data is still being copied
 
+    # Schedule repeated in-flight reads IMMEDIATELY after copies are enqueued
+    # This happens on the default stream while memcpy_stream is still writing
+    if (race_cfg.inflight_read_check_enabled and
+        race_cfg.inflight_read_repeats > 0 and
+        "dense" in result and isinstance(result["dense"], torch.Tensor)):
+        from aorta.race.inflight_checks import schedule_inflight_check
+        dense = result["dense"]
+        # Compute tail offset using same math as the split copy above
+        total = dense.numel()
+        tail_frac = max(0.0, min(1.0, race_cfg.h2d_dense_tail_fraction))
+        split_idx = int(total * (1.0 - tail_frac))
+        split_idx = max(1, min(total - 1, split_idx))
+        # Get tail region (the part being written last)
+        tail_tensor = dense.reshape(-1)[split_idx:]
+        schedule_inflight_check(
+            name="h2d_dense",
+            tensor=tail_tensor,
+            sample_size=race_cfg.inflight_read_sample_size,
+            repeats=race_cfg.inflight_read_repeats,
+            step=step,
+            rank=rank,
+            delay_work_size=race_cfg.inflight_read_delay_size,
+        )
+
     log.debug(
         "H2D RACING: rank=%d step=%d batch on memcpy_stream (NOT synced)",
         rank, step

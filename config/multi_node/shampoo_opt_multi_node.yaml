@@ -37,6 +37,7 @@ race_experiment:
   inflight_read_check_enabled: true
   inflight_read_repeats: 5
   inflight_read_sample_size: 4096
+  inflight_read_delay_size: 65536  # GPU delay work between reads
 
   # Warmup and detection
   skip_training_warmup: true

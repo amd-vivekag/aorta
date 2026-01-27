@@ -85,3 +85,7 @@ node_ip_list.txt
 *.json
 *.gz
 trace_*
+*.zip
+*.csv
+*.7z
+*.tar

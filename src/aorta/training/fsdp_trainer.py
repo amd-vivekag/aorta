@@ -47,7 +47,6 @@ from aorta.race.injectors import (
     is_h2d_tensor_in_flight,
     check_loss_for_nan,
     check_gradients_for_nan,
-    schedule_inflight_check,
     flush_inflight_checks,
 )
 from aorta.race.h2d_racing import move_batch_to_device, get_memcpy_stream
@@ -1066,27 +1065,8 @@ def training_loop(
                             # NOTE: We do NOT call check_batch_for_corruption() here!
                             # That would use .item() which syncs CUDA and masks the race.
                             # NaN will be detected in the loss check after forward.
-
-                            # Schedule repeated in-flight reads to detect instability
-                            if (race_cfg.inflight_read_check_enabled and
-                                race_cfg.inflight_read_repeats > 0 and
-                                "dense" in batch and isinstance(batch["dense"], torch.Tensor)):
-                                dense = batch["dense"]
-                                # Compute tail offset using same math as h2d_racing.py
-                                total = dense.numel()
-                                tail_frac = max(0.0, min(1.0, race_cfg.h2d_dense_tail_fraction))
-                                split_idx = int(total * (1.0 - tail_frac))
-                                split_idx = max(1, min(total - 1, split_idx))
-                                # Get tail region
-                                tail_tensor = dense.reshape(-1)[split_idx:]
-                                schedule_inflight_check(
-                                    name="h2d_dense",
-                                    tensor=tail_tensor,
-                                    sample_size=race_cfg.inflight_read_sample_size,
-                                    repeats=race_cfg.inflight_read_repeats,
-                                    step=step,
-                                    rank=rank,
-                                )
+                            # In-flight reads are scheduled immediately in h2d_racing.py
+                            # (not here, which is too late - copies may have finished)
                         else:
                             log.warning(
                                 "H2D_RACE: step=%d rank=%d %s ALREADY COMPLETED before forward - NO RACE!",

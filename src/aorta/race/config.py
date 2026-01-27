@@ -277,6 +277,17 @@ class RaceConfig:
     probability. The sample is taken from the start of the tail region.
     """
 
+    inflight_read_delay_size: int = 65536
+    """
+    Size of dummy tensor used for GPU-side delay work between reads.
+
+    Between each repeated read, we issue GPU work (D2D copy + reduction) to
+    spread reads across the race window. Larger values = more delay = higher
+    detection probability but more GPU overhead.
+
+    Recommended: 16384-131072 for typical workloads.
+    """
+
     datadist_tensor_size: Optional[int] = 1_000_000
     """
     Fixed tensor size for datadist all_to_all operation.

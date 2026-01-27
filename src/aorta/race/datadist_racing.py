@@ -259,6 +259,7 @@ def inject_datadist_racing(
                 repeats=race_cfg.inflight_read_repeats,
                 step=step,
                 rank=rank,
+                delay_work_size=race_cfg.inflight_read_delay_size,
             )
 
         output_numel = source_tensor.numel()

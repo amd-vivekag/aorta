@@ -29,6 +29,7 @@ def schedule_inflight_check(
     repeats: int,
     step: int,
     rank: int,
+    delay_work_size: int = 65536,
 ) -> None:
     """
     Schedule repeated reads on a tensor tail to detect instability.
@@ -40,6 +41,10 @@ def schedule_inflight_check(
     IMPORTANT: This does NOT add any cross-stream synchronization. The reads
     are issued on the default stream which is already racing with the write.
 
+    To increase detection probability, we insert GPU-side delays (dummy work)
+    between reads to spread them across the race window. Without delays, all
+    reads complete in microseconds and may miss the instability.
+
     Args:
         name: Identifier for this check (e.g., "h2d_dense", "datadist_tail")
         tensor: The tensor being read (should be the tail region)
@@ -47,6 +52,7 @@ def schedule_inflight_check(
         repeats: Number of repeated reads to perform
         step: Current training step
         rank: Current rank
+        delay_work_size: Size of dummy tensor for GPU-side delay work
     """
     global _pending_inflight_checks
 
@@ -64,8 +70,18 @@ def schedule_inflight_check(
     diff_detected = torch.zeros(1, dtype=torch.bool, device=tensor.device)
     max_abs_diff = torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
 
+    # Create dummy tensor for GPU-side delay work (reused across reads)
+    # This adds GPU work between reads to spread them across the race window
+    delay_tensor = torch.empty(delay_work_size, dtype=tensor.dtype, device=tensor.device)
+
     # Repeated reads: check for instability
-    for _ in range(repeats):
+    # We insert GPU-side delay work between reads to increase detection probability
+    for i in range(repeats):
+        # GPU-side delay: perform some work to space out reads
+        # This is a D2D copy + reduction that keeps the GPU busy without CPU sync
+        delay_tensor.copy_(delay_tensor)  # D2D copy
+        _ = delay_tensor.sum()  # Reduction (result discarded, no .item() sync)
+
         # Read the same slice again
         current_sample = sample_slice.clone()
 
