@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import DistributedWorkload
+from aorta.hw_queue_eval.workloads.base import DistributedWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -39,7 +39,7 @@ class CheckpointBlock(nn.Module):
 
 
 @WorkloadRegistry.register
-class ActivationCheckpointWorkload(DistributedWorkload):
+class ActivationCheckpointWorkload(MultiGPUMixin, DistributedWorkload):
     """
     Activation checkpointing with overlapped recomputation.
 
@@ -62,6 +62,7 @@ class ActivationCheckpointWorkload(DistributedWorkload):
     recommended_streams = 6
     switch_latency_sensitivity = "high"
     memory_requirements_gb = 2.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -71,6 +72,7 @@ class ActivationCheckpointWorkload(DistributedWorkload):
         batch_size: int = 4,
         seq_length: int = 512,
         simulate_collectives: bool = True,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize activation checkpointing workload.
@@ -82,6 +84,7 @@ class ActivationCheckpointWorkload(DistributedWorkload):
             batch_size: Batch size
             seq_length: Sequence length
             simulate_collectives: Mock collective operations
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__(simulate_collectives)
 
@@ -90,22 +93,20 @@ class ActivationCheckpointWorkload(DistributedWorkload):
         self.checkpoint_every = checkpoint_every
         self.batch_size = batch_size
         self.seq_length = seq_length
+        self.use_multi_gpu = use_multi_gpu
 
         self._blocks: List[CheckpointBlock] = []
         self._checkpoints: Dict[int, torch.Tensor] = {}
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup model blocks and stream assignments."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create blocks
-        self._blocks = []
-        for i in range(self.num_blocks):
-            block = CheckpointBlock(self.hidden_size).to(device)
-            block.eval()
-            self._blocks.append(block)
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         third = max(1, stream_count // 3)
@@ -119,10 +120,20 @@ class ActivationCheckpointWorkload(DistributedWorkload):
         if not self._gradient_streams:
             self._gradient_streams = [0]
 
+        # Use forward stream's device for model and data
+        forward_device = self._get_device_for_stream(self._forward_streams[0])
+
+        # Create blocks
+        self._blocks = []
+        for i in range(self.num_blocks):
+            block = CheckpointBlock(self.hidden_size).to(forward_device)
+            block.eval()
+            self._blocks.append(block)
+
         # Input tensor
         self._input = torch.randn(
             self.batch_size, self.seq_length, self.hidden_size,
-            dtype=torch.float32, device=device, requires_grad=True
+            dtype=torch.float32, device=forward_device, requires_grad=True
         )
         self._tensors["input"] = self._input
 
@@ -204,7 +215,7 @@ class ActivationCheckpointWorkload(DistributedWorkload):
         return (iterations * self.batch_size) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "num_blocks": self.num_blocks,
             "hidden_size": self.hidden_size,
@@ -217,6 +228,8 @@ class ActivationCheckpointWorkload(DistributedWorkload):
                 "gradient": self._gradient_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup model and checkpoints."""

@@ -28,6 +28,81 @@ class WorkloadInfo:
     multi_gpu_capable: bool = False
 
 
+class MultiGPUMixin:
+    """
+    Mixin providing multi-GPU setup utilities for workloads.
+
+    This mixin provides common functionality for distributing work across
+    multiple GPUs using round-robin stream-to-device assignment.
+
+    Usage:
+        class MyWorkload(MultiGPUMixin, BaseWorkload):
+            def __init__(self, use_multi_gpu: bool = True):
+                super().__init__()
+                self.use_multi_gpu = use_multi_gpu
+
+            def setup(self, stream_count: int, device: str = "cuda:0") -> None:
+                self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
+                # Now self._devices, self._stream_to_device are available
+    """
+
+    # These will be initialized by _setup_multi_gpu
+    _devices: List[str]
+    _stream_to_device: Dict[int, str]
+    _device: str
+    use_multi_gpu: bool
+
+    def _setup_multi_gpu(
+        self,
+        stream_count: int,
+        device: str,
+        use_multi_gpu: bool,
+    ) -> None:
+        """
+        Setup multi-GPU device mapping.
+
+        This method should be called at the beginning of setup() in subclasses.
+        It populates:
+        - self._devices: List of device strings to use
+        - self._stream_to_device: Dict mapping stream index to device string
+        - self._device: Primary device (first in the list)
+
+        Args:
+            stream_count: Total number of streams
+            device: Default/fallback device
+            use_multi_gpu: If True, use all available GPUs; if False, use only device
+        """
+        if use_multi_gpu and torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
+        else:
+            self._devices = [device]
+
+        self._device = self._devices[0]  # Primary device
+
+        # Create round-robin stream-to-device mapping
+        self._stream_to_device = {}
+        num_devices = len(self._devices)
+        for stream_idx in range(stream_count):
+            device_idx = stream_idx % num_devices
+            self._stream_to_device[stream_idx] = self._devices[device_idx]
+
+    def _get_device_for_stream(self, stream_idx: int) -> str:
+        """Get the device string for a given stream index."""
+        if hasattr(self, "_stream_to_device") and stream_idx in self._stream_to_device:
+            return self._stream_to_device[stream_idx]
+        return self._device
+
+    def _get_multi_gpu_config(self) -> Dict[str, Any]:
+        """Get multi-GPU configuration for inclusion in get_config()."""
+        return {
+            "use_multi_gpu": getattr(self, "use_multi_gpu", False),
+            "devices": getattr(self, "_devices", []),
+            "num_gpus": len(getattr(self, "_devices", [])),
+            "stream_to_device": getattr(self, "_stream_to_device", {}),
+        }
+
+
 class BaseWorkload(ABC):
     """
     Base class for all queue stress test workloads.

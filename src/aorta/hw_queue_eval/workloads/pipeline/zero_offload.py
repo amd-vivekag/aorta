@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import BaseWorkload
+from aorta.hw_queue_eval.workloads.base import BaseWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -34,7 +34,7 @@ class LargeLinearBlock(nn.Module):
 
 
 @WorkloadRegistry.register
-class ZeROOffloadWorkload(BaseWorkload):
+class ZeROOffloadWorkload(MultiGPUMixin, BaseWorkload):
     """
     ZeRO-Offload memory management patterns.
 
@@ -57,12 +57,14 @@ class ZeROOffloadWorkload(BaseWorkload):
     recommended_streams = 6
     switch_latency_sensitivity = "medium"
     memory_requirements_gb = 8.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
         num_layers: int = 4,
         layer_size: int = 4096,
         batch_size: int = 16,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize ZeRO-Offload workload.
@@ -71,22 +73,28 @@ class ZeROOffloadWorkload(BaseWorkload):
             num_layers: Number of layers
             layer_size: Size of each layer
             batch_size: Batch size
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.num_layers = num_layers
         self.layer_size = layer_size
         self.batch_size = batch_size
+        self.use_multi_gpu = use_multi_gpu
 
         self._layers: List[LargeLinearBlock] = []
         self._cpu_params: List[torch.Tensor] = []
         self._gpu_params: List[torch.Tensor] = []
         self._cpu_opt_states: List[torch.Tensor] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup layers and offload buffers."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
+
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         third = max(1, stream_count // 3)
@@ -99,10 +107,13 @@ class ZeROOffloadWorkload(BaseWorkload):
         if not self._compute_streams:
             self._compute_streams = [0]
 
+        # Use compute stream's device for layers
+        compute_device = self._get_device_for_stream(self._compute_streams[0])
+
         # Create layers (on GPU)
         self._layers = []
         for i in range(self.num_layers):
-            layer = LargeLinearBlock(self.layer_size).to(device)
+            layer = LargeLinearBlock(self.layer_size).to(compute_device)
             self._layers.append(layer)
 
         # CPU parameter storage (pinned memory)
@@ -118,7 +129,7 @@ class ZeROOffloadWorkload(BaseWorkload):
         for i in range(self.num_layers):
             buf = torch.empty(
                 self.layer_size, self.layer_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=compute_device
             )
             self._gpu_params.append(buf)
             self._tensors[f"gpu_param_{i}"] = buf
@@ -134,7 +145,7 @@ class ZeROOffloadWorkload(BaseWorkload):
         # Input tensor
         self._input = torch.randn(
             self.batch_size, self.layer_size,
-            dtype=torch.float32, device=device, requires_grad=True
+            dtype=torch.float32, device=compute_device, requires_grad=True
         )
         self._tensors["input"] = self._input
 
@@ -195,7 +206,7 @@ class ZeROOffloadWorkload(BaseWorkload):
         return (iterations * self.batch_size) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "num_layers": self.num_layers,
             "layer_size": self.layer_size,
@@ -206,6 +217,8 @@ class ZeROOffloadWorkload(BaseWorkload):
                 "compute": self._compute_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup layers and buffers."""

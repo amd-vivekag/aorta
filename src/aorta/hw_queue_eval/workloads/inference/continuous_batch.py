@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import InferenceWorkload
+from aorta.hw_queue_eval.workloads.base import InferenceWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -57,7 +57,7 @@ class AttentionBlock(nn.Module):
 
 
 @WorkloadRegistry.register
-class ContinuousBatchWorkload(InferenceWorkload):
+class ContinuousBatchWorkload(MultiGPUMixin, InferenceWorkload):
     """
     Continuous batching with prefill/decode overlap.
 
@@ -81,6 +81,7 @@ class ContinuousBatchWorkload(InferenceWorkload):
     recommended_streams = 8
     switch_latency_sensitivity = "high"
     memory_requirements_gb = 6.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -91,6 +92,7 @@ class ContinuousBatchWorkload(InferenceWorkload):
         prefill_seq_length: int = 512,
         decode_batch_size: int = 16,
         max_seq_length: int = 2048,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize continuous batching workload.
@@ -103,6 +105,7 @@ class ContinuousBatchWorkload(InferenceWorkload):
             prefill_seq_length: Sequence length for prefill
             decode_batch_size: Batch size for decode
             max_seq_length: Maximum sequence length for KV cache
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
 
@@ -113,21 +116,19 @@ class ContinuousBatchWorkload(InferenceWorkload):
         self.prefill_seq_length = prefill_seq_length
         self.decode_batch_size = decode_batch_size
         self.max_seq_length = max_seq_length
+        self.use_multi_gpu = use_multi_gpu
 
         self._layers: List[AttentionBlock] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup model and stream assignments."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create attention layers
-        self._layers = []
-        for _ in range(self.num_layers):
-            layer = AttentionBlock(self.hidden_size, self.num_heads).to(device)
-            layer.eval()
-            self._layers.append(layer)
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         third = max(1, stream_count // 3)
@@ -140,17 +141,27 @@ class ContinuousBatchWorkload(InferenceWorkload):
         if not self._cache_streams:
             self._cache_streams = [0]
 
+        # Use prefill stream's device for model and data
+        prefill_device = self._get_device_for_stream(self._prefill_streams[0])
+
+        # Create attention layers
+        self._layers = []
+        for _ in range(self.num_layers):
+            layer = AttentionBlock(self.hidden_size, self.num_heads).to(prefill_device)
+            layer.eval()
+            self._layers.append(layer)
+
         # Prefill input
         self._prefill_input = torch.randn(
             self.prefill_batch_size, self.prefill_seq_length, self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=prefill_device
         )
         self._tensors["prefill_input"] = self._prefill_input
 
         # Decode input (single token per request)
         self._decode_input = torch.randn(
             self.decode_batch_size, 1, self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=prefill_device
         )
         self._tensors["decode_input"] = self._decode_input
 
@@ -212,7 +223,7 @@ class ContinuousBatchWorkload(InferenceWorkload):
         return (iterations * self._tokens_per_iteration) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "hidden_size": self.hidden_size,
             "num_layers": self.num_layers,
@@ -227,6 +238,8 @@ class ContinuousBatchWorkload(InferenceWorkload):
                 "cache": self._cache_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup model and cache."""

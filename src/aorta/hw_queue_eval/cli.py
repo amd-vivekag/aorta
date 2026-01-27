@@ -482,13 +482,17 @@ def sweep(workload: str, streams: str, iterations: int, warmup: int,
 @click.option("--iterations", "-i", default=50, help="Measurement iterations")
 @click.option("--output-dir", "-o", default="results", help="Output directory")
 @click.option("--device", "-d", default="cuda:0", help="Target device")
+@click.option("--profile", "-p", is_flag=True, help="Enable PyTorch profiler for each workload")
+@click.option("--profile-dir", default="profiles", help="Output directory for profiler traces")
 def run_priority(priority: str, streams: str, iterations: int,
-                 output_dir: str, device: str):
+                 output_dir: str, device: str, profile: bool, profile_dir: str):
     """Run all workloads of a given priority level.
 
     PRIORITY: Priority level (P0, P1, P2, P3, or 'all')
     """
+    import torch
     from aorta.hw_queue_eval.core.harness import HarnessConfig, StreamHarness, save_sweep_results
+    from aorta.utils.device import get_driver_info
 
     # Get workloads for priority
     if priority == "all":
@@ -509,10 +513,31 @@ def run_priority(priority: str, streams: str, iterations: int,
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Print environment info
+    click.echo("=" * 70)
+    click.echo("ENVIRONMENT")
+    click.echo("=" * 70)
+    driver_info = get_driver_info()
+    click.echo(f"  Driver (DKMS):  {driver_info.get('dkms_version', 'unknown')}")
+    click.echo(f"  GPUs available: {torch.cuda.device_count()}")
+    click.echo(f"  Stream counts:  {stream_counts}")
+    click.echo(f"  Iterations:     {iterations}")
+    click.echo("=" * 70)
+    click.echo()
+
     click.echo(f"Running {len(workloads)} workloads at priority {priority}")
     click.echo(f"Stream counts: {stream_counts}")
     click.echo(f"Output directory: {output_path}")
+    if profile:
+        click.echo(f"Profiling enabled: {profile_dir}")
     click.echo()
+
+    # Setup profiler if enabled
+    profile_path = None
+    if profile:
+        from aorta.hw_queue_eval.core.torch_profiler import TorchProfilerWrapper
+        profile_path = Path(profile_dir)
+        profile_path.mkdir(parents=True, exist_ok=True)
 
     all_results = {}
     failed = []
@@ -539,6 +564,27 @@ def run_priority(priority: str, streams: str, iterations: int,
                     device=device,
                 )
                 harness = StreamHarness(config)
+
+                # Run with profiling if enabled
+                if profile and profile_path:
+                    from aorta.utils import create_streams
+                    profiler_wrapper = TorchProfilerWrapper(output_dir=str(profile_path))
+
+                    # Setup workload and streams
+                    wl.setup(count, device)
+                    cuda_streams = create_streams(count, device)
+
+                    def run_iteration():
+                        wl.run_iteration(cuda_streams)
+                        torch.cuda.synchronize()
+
+                    profiler_wrapper.profile_workload(
+                        run_iteration,
+                        name=f"{workload_name}_{count}s",
+                        iterations=min(iterations, 20),  # Limit profiled iterations
+                        warmup=5,
+                    )
+
                 result = harness.run_workload(wl)
                 results.append(result)
                 click.echo(f" {result.throughput:.2f} {result.throughput_unit}")

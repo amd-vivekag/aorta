@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import BaseWorkload
+from aorta.hw_queue_eval.workloads.base import BaseWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -37,7 +37,7 @@ class CompiledRegion(nn.Module):
 
 
 @WorkloadRegistry.register
-class TorchCompileWorkload(BaseWorkload):
+class TorchCompileWorkload(MultiGPUMixin, BaseWorkload):
     """
     Multi-region torch.compile execution.
 
@@ -64,6 +64,7 @@ class TorchCompileWorkload(BaseWorkload):
     recommended_streams = 8
     switch_latency_sensitivity = "medium"
     memory_requirements_gb = 2.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -72,6 +73,7 @@ class TorchCompileWorkload(BaseWorkload):
         seq_length: int = 256,
         use_compile: bool = False,  # Disabled by default (may not work in all envs)
         compile_mode: str = "reduce-overhead",  # "default", "reduce-overhead", "max-autotune"
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize torch.compile workload.
@@ -82,6 +84,7 @@ class TorchCompileWorkload(BaseWorkload):
             seq_length: Sequence length
             use_compile: Whether to use torch.compile
             compile_mode: Compilation mode
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.hidden_size = hidden_size
@@ -89,17 +92,22 @@ class TorchCompileWorkload(BaseWorkload):
         self.seq_length = seq_length
         self.use_compile = use_compile
         self.compile_mode = compile_mode
+        self.use_multi_gpu = use_multi_gpu
 
         self._region_a: Optional[nn.Module] = None
         self._region_b: Optional[nn.Module] = None
         self._region_c: Optional[nn.Module] = None
         self._merge_layer: Optional[nn.Module] = None
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup compiled regions."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
+
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         quarter = max(1, stream_count // 4)
@@ -112,11 +120,14 @@ class TorchCompileWorkload(BaseWorkload):
             if not stream_list:
                 stream_list.append(0)
 
+        # Use region A's device for all regions (they have dependencies)
+        region_a_device = self._get_device_for_stream(self._region_a_streams[0])
+
         # Create regions
-        self._region_a = CompiledRegion(self.hidden_size).to(device)
-        self._region_b = CompiledRegion(self.hidden_size).to(device)
-        self._region_c = CompiledRegion(self.hidden_size).to(device)
-        self._merge_layer = nn.Linear(self.hidden_size * 2, self.hidden_size).to(device)
+        self._region_a = CompiledRegion(self.hidden_size).to(region_a_device)
+        self._region_b = CompiledRegion(self.hidden_size).to(region_a_device)
+        self._region_c = CompiledRegion(self.hidden_size).to(region_a_device)
+        self._merge_layer = nn.Linear(self.hidden_size * 2, self.hidden_size).to(region_a_device)
 
         # Optionally compile
         if self.use_compile:
@@ -137,7 +148,7 @@ class TorchCompileWorkload(BaseWorkload):
         # Input tensor
         self._input = torch.randn(
             self.batch_size, self.seq_length, self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=region_a_device
         )
         self._tensors["input"] = self._input
 
@@ -194,7 +205,7 @@ class TorchCompileWorkload(BaseWorkload):
         return (iterations * self.batch_size) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "hidden_size": self.hidden_size,
             "batch_size": self.batch_size,
@@ -208,6 +219,8 @@ class TorchCompileWorkload(BaseWorkload):
                 "merge": self._merge_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup regions."""

@@ -241,6 +241,31 @@ def get_rocm_env_info() -> dict:
     return info
 
 
+def get_driver_info() -> dict:
+    """Get AMDGPU driver/DKMS version information.
+
+    Returns:
+        Dictionary with driver_version and dkms_version keys
+    """
+    import subprocess
+
+    info = {"driver_version": None, "dkms_version": None}
+    try:
+        result = subprocess.run(
+            ["dkms", "status"], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if "amdgpu" in line:
+                # Parse: amdgpu/6.14.14-2281817.22.04, 5.15.0-153-generic, x86_64: installed
+                parts = line.split(",")
+                if parts:
+                    info["dkms_version"] = parts[0].replace("amdgpu/", "").strip()
+                break
+    except Exception:
+        pass
+    return info
+
+
 __all__ = [
     # Type aliases
     "Accelerator",
@@ -258,4 +283,5 @@ __all__ = [
     "get_memory_stats",
     "reset_memory_stats",
     "get_rocm_env_info",
+    "get_driver_info",
 ]

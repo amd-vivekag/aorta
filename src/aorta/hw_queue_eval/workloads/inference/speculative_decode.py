@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import InferenceWorkload
+from aorta.hw_queue_eval.workloads.base import InferenceWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -63,7 +63,7 @@ class SimpleLM(nn.Module):
 
 
 @WorkloadRegistry.register
-class SpeculativeDecodeWorkload(InferenceWorkload):
+class SpeculativeDecodeWorkload(MultiGPUMixin, InferenceWorkload):
     """
     Draft + verify speculative decoding simulation.
 
@@ -88,6 +88,7 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
     recommended_streams = 6
     switch_latency_sensitivity = "high"
     memory_requirements_gb = 4.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -98,6 +99,7 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
         speculation_length: int = 4,
         batch_size: int = 1,
         vocab_size: int = 32000,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize speculative decoding workload.
@@ -110,6 +112,7 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
             speculation_length: Number of tokens to speculate
             batch_size: Batch size
             vocab_size: Vocabulary size
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
 
@@ -120,33 +123,21 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
         self.speculation_length = speculation_length
         self.batch_size = batch_size
         self.vocab_size = vocab_size
+        self.use_multi_gpu = use_multi_gpu
 
         self._draft_model: Optional[SimpleLM] = None
         self._main_model: Optional[SimpleLM] = None
         self._input_ids: Optional[torch.Tensor] = None
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup draft and main models."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create models
-        self._draft_model = SimpleLM(
-            vocab_size=self.vocab_size,
-            hidden_size=self.draft_hidden_size,
-            num_layers=self.draft_num_layers,
-            num_heads=4,
-        ).to(device)
-        self._draft_model.eval()
-
-        self._main_model = SimpleLM(
-            vocab_size=self.vocab_size,
-            hidden_size=self.main_hidden_size,
-            num_layers=self.main_num_layers,
-            num_heads=8,
-        ).to(device)
-        self._main_model.eval()
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         sixth = max(1, stream_count // 6)
@@ -158,18 +149,39 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
         if not self._verify_streams:
             self._verify_streams = [0]
 
-        # Input: some context tokens
+        # Use draft stream's device for draft model
+        draft_device = self._get_device_for_stream(self._draft_streams[0])
+        verify_device = self._get_device_for_stream(self._verify_streams[0])
+
+        # Create models
+        self._draft_model = SimpleLM(
+            vocab_size=self.vocab_size,
+            hidden_size=self.draft_hidden_size,
+            num_layers=self.draft_num_layers,
+            num_heads=4,
+        ).to(draft_device)
+        self._draft_model.eval()
+
+        self._main_model = SimpleLM(
+            vocab_size=self.vocab_size,
+            hidden_size=self.main_hidden_size,
+            num_layers=self.main_num_layers,
+            num_heads=8,
+        ).to(verify_device)
+        self._main_model.eval()
+
+        # Input: some context tokens (on draft device)
         context_len = 128
         self._input_ids = torch.randint(
             0, self.vocab_size, (self.batch_size, context_len),
-            dtype=torch.long, device=device
+            dtype=torch.long, device=draft_device
         )
         self._tensors["input_ids"] = self._input_ids
 
         # Buffers for speculated tokens
         self._draft_tokens = torch.zeros(
             self.batch_size, self.speculation_length,
-            dtype=torch.long, device=device
+            dtype=torch.long, device=draft_device
         )
         self._tensors["draft_tokens"] = self._draft_tokens
 
@@ -249,7 +261,7 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
         return (iterations * self._tokens_per_iteration) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "draft_hidden_size": self.draft_hidden_size,
             "draft_num_layers": self.draft_num_layers,
@@ -265,6 +277,8 @@ class SpeculativeDecodeWorkload(InferenceWorkload):
                 "cache": self._cache_stream,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup models."""

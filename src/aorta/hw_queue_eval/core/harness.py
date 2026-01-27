@@ -27,11 +27,14 @@ from aorta.hw_queue_eval.core.metrics import (
     ThroughputMetrics,
 )
 from aorta.utils import (
+    create_multi_gpu_streams,
     create_streams,
+    get_available_devices,
     get_device_properties,
     get_rocm_env_info,
     reset_memory_stats,
     sync_all_streams,
+    warmup_all_gpus,
     warmup_gpu,
 )
 
@@ -51,12 +54,17 @@ class HarnessConfig:
     collect_kernel_timings: bool = True
     warmup_gpu_before_run: bool = True
     reset_memory_stats_before_run: bool = True
+    use_multi_gpu: bool = True  # If True, distribute streams across all available GPUs
+    devices: Optional[List[str]] = None  # Explicit list of devices (auto-detected if None)
 
     def __post_init__(self):
         if self.stream_count < 1:
             raise ValueError("stream_count must be at least 1")
         if self.sync_mode not in ("per_iteration", "end_only", "none"):
             raise ValueError(f"Invalid sync_mode: {self.sync_mode}")
+        # Auto-detect devices if multi-GPU is enabled but no explicit list provided
+        if self.use_multi_gpu and self.devices is None:
+            self.devices = get_available_devices() or [self.device]
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -180,6 +188,8 @@ class StreamHarness:
         """
         self.config = config
         self.streams: List[torch.cuda.Stream] = []
+        self.stream_to_device: Dict[int, str] = {}  # Maps stream index to device
+        self.devices: List[str] = []  # List of devices in use
         self._initialized = False
         self._metrics_collector: Optional[MetricsCollector] = None
 
@@ -188,10 +198,19 @@ class StreamHarness:
         if self._initialized:
             return
 
-        # Create streams
-        self.streams = create_streams(self.config.stream_count, self.config.device)
+        # Create streams (single-GPU or multi-GPU based on config)
+        if self.config.use_multi_gpu and self.config.devices:
+            self.devices = self.config.devices
+            self.streams, self.stream_to_device = create_multi_gpu_streams(
+                total_stream_count=self.config.stream_count,
+                devices=self.config.devices,
+            )
+        else:
+            self.devices = [self.config.device]
+            self.streams = create_streams(self.config.stream_count, self.config.device)
+            self.stream_to_device = {i: self.config.device for i in range(self.config.stream_count)}
 
-        # Initialize metrics collector
+        # Initialize metrics collector (uses primary device)
         self._metrics_collector = MetricsCollector(
             num_streams=self.config.stream_count,
             device=self.config.device,
@@ -199,11 +218,15 @@ class StreamHarness:
 
         # GPU warmup if requested
         if self.config.warmup_gpu_before_run:
-            warmup_gpu(self.config.device)
+            if self.config.use_multi_gpu and len(self.devices) > 1:
+                warmup_all_gpus(devices=self.devices)
+            else:
+                warmup_gpu(self.config.device)
 
-        # Reset memory stats if requested
+        # Reset memory stats if requested (on all devices)
         if self.config.reset_memory_stats_before_run:
-            reset_memory_stats(self.config.device)
+            for device in self.devices:
+                reset_memory_stats(device)
 
         self._initialized = True
 
@@ -212,8 +235,13 @@ class StreamHarness:
         # Sync all streams
         sync_all_streams(self.streams)
 
+        # Synchronize all devices
+        for device in self.devices:
+            torch.cuda.synchronize(device)
+
         # Clear stream references
         self.streams = []
+        self.stream_to_device = {}
         self._initialized = False
 
     def run(
@@ -248,13 +276,15 @@ class StreamHarness:
             if self.config.sync_mode == "per_iteration":
                 sync_all_streams(self.streams)
 
-        # Sync after warmup
+        # Sync after warmup (all devices)
         sync_all_streams(self.streams)
-        torch.cuda.synchronize(self.config.device)
+        for device in self.devices:
+            torch.cuda.synchronize(device)
 
-        # Reset memory stats after warmup
+        # Reset memory stats after warmup (all devices)
         if self.config.reset_memory_stats_before_run:
-            reset_memory_stats(self.config.device)
+            for device in self.devices:
+                reset_memory_stats(device)
 
         # Measurement phase
         for _ in range(self.config.measurement_iterations):
@@ -267,12 +297,13 @@ class StreamHarness:
 
             collector.end_iteration(sync=(self.config.sync_mode == "per_iteration"))
 
-        # Final sync if using end_only mode
+        # Final sync if using end_only mode (all devices)
         if self.config.sync_mode in ("end_only", "none"):
             sync_all_streams(self.streams)
-            torch.cuda.synchronize(self.config.device)
+            for device in self.devices:
+                torch.cuda.synchronize(device)
 
-        # Compute metrics
+        # Compute metrics (capture from primary device, but note multi-GPU in metadata)
         latency_metrics = collector.compute_latency_metrics()
         switch_metrics = collector.compute_switch_latency()
         memory_metrics = MemoryMetrics.capture(self.config.device)
@@ -298,6 +329,12 @@ class StreamHarness:
             "config": self.config.to_dict(),
             "device_info": get_device_properties(self.config.device).__dict__,
             "rocm_info": get_rocm_env_info(),
+            "multi_gpu": {
+                "enabled": self.config.use_multi_gpu,
+                "devices": self.devices,
+                "num_gpus": len(self.devices),
+                "stream_to_device": self.stream_to_device,
+            },
         }
         if extra_metadata:
             metadata.update(extra_metadata)
@@ -345,13 +382,15 @@ class StreamHarness:
             if self.config.sync_mode == "per_iteration":
                 sync_all_streams(self.streams)
 
-        # Sync after warmup
+        # Sync after warmup (all devices)
         sync_all_streams(self.streams)
-        torch.cuda.synchronize(self.config.device)
+        for device in self.devices:
+            torch.cuda.synchronize(device)
 
-        # Reset memory stats after warmup
+        # Reset memory stats after warmup (all devices)
         if self.config.reset_memory_stats_before_run:
-            reset_memory_stats(self.config.device)
+            for device in self.devices:
+                reset_memory_stats(device)
 
         # Measurement phase
         for _ in range(self.config.measurement_iterations):
@@ -364,10 +403,11 @@ class StreamHarness:
 
             collector.end_iteration(sync=(self.config.sync_mode == "per_iteration"))
 
-        # Final sync
+        # Final sync (all devices)
         if self.config.sync_mode in ("end_only", "none"):
             sync_all_streams(self.streams)
-            torch.cuda.synchronize(self.config.device)
+            for device in self.devices:
+                torch.cuda.synchronize(device)
 
         # Compute metrics
         latency_metrics = collector.compute_latency_metrics()
@@ -393,6 +433,12 @@ class StreamHarness:
             "device_info": get_device_properties(self.config.device).__dict__,
             "rocm_info": get_rocm_env_info(),
             "workload_config": workload.get_config() if hasattr(workload, "get_config") else {},
+            "multi_gpu": {
+                "enabled": self.config.use_multi_gpu,
+                "devices": self.devices,
+                "num_gpus": len(self.devices),
+                "stream_to_device": self.stream_to_device,
+            },
         }
         if extra_metadata:
             metadata.update(extra_metadata)
@@ -448,6 +494,8 @@ class StreamHarness:
                 collect_kernel_timings=self.config.collect_kernel_timings,
                 warmup_gpu_before_run=self.config.warmup_gpu_before_run,
                 reset_memory_stats_before_run=self.config.reset_memory_stats_before_run,
+                use_multi_gpu=self.config.use_multi_gpu,
+                devices=self.config.devices,
             )
 
             harness = StreamHarness(config)
@@ -499,6 +547,8 @@ class StreamHarness:
                 collect_kernel_timings=self.config.collect_kernel_timings,
                 warmup_gpu_before_run=self.config.warmup_gpu_before_run,
                 reset_memory_stats_before_run=self.config.reset_memory_stats_before_run,
+                use_multi_gpu=self.config.use_multi_gpu,
+                devices=self.config.devices,
             )
 
             harness = StreamHarness(config)

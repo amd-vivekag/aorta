@@ -30,11 +30,15 @@ from .device import (
 )
 from .logging import setup_logging
 from .streams import (
+    create_multi_gpu_streams,
     create_streams,
+    create_streams_per_device,
     cuda_stream_context,
+    get_available_devices,
     get_stream_id,
     sync_all_streams,
     sync_stream,
+    warmup_all_gpus,
     warmup_gpu,
 )
 from .timing import (
@@ -68,11 +72,15 @@ __all__ = [
     "get_rocm_env_info",
     # Streams
     "create_streams",
+    "create_multi_gpu_streams",
+    "create_streams_per_device",
+    "get_available_devices",
     "sync_all_streams",
     "sync_stream",
     "cuda_stream_context",
     "get_stream_id",
     "warmup_gpu",
+    "warmup_all_gpus",
     # Timing
     "EventTiming",
     "TimingContext",
