@@ -34,9 +34,12 @@ def schedule_inflight_check(
     """
     Schedule repeated reads on a tensor tail to detect instability.
 
-    This reads a small sample from the tensor multiple times on the default
-    stream while the racing stream may still be writing. If values change
-    between reads, it indicates a torn read (race condition).
+    This reads a small sample from the END of the tensor multiple times on the
+    default stream while the racing stream may still be writing. If values
+    change between reads, it indicates a torn read (race condition).
+
+    We sample from the END of the tail because DMA writes sequentially - the
+    end of the tail is written LAST, maximizing detection probability.
 
     IMPORTANT: This does NOT add any cross-stream synchronization. The reads
     are issued on the default stream which is already racing with the write.
@@ -48,7 +51,7 @@ def schedule_inflight_check(
     Args:
         name: Identifier for this check (e.g., "h2d_dense", "datadist_tail")
         tensor: The tensor being read (should be the tail region)
-        sample_size: Number of elements to sample from the tensor
+        sample_size: Number of elements to sample from the END of the tensor
         repeats: Number of repeated reads to perform
         step: Current training step
         rank: Current rank
@@ -59,9 +62,10 @@ def schedule_inflight_check(
     if repeats <= 0 or tensor.numel() == 0:
         return
 
-    # Sample from the start of the tensor (which is the tail region)
+    # Sample from the END of the tensor (tail region) - this is written LAST by DMA
+    # DMA writes sequentially, so the end of the tail has highest detection probability
     actual_sample_size = min(sample_size, tensor.numel())
-    sample_slice = tensor.reshape(-1)[:actual_sample_size]
+    sample_slice = tensor.reshape(-1)[-actual_sample_size:]
 
     # First read: capture reference sample (on default stream)
     sample0 = sample_slice.clone()
@@ -78,8 +82,8 @@ def schedule_inflight_check(
     # We insert GPU-side delay work between reads to increase detection probability
     for i in range(repeats):
         # GPU-side delay: perform some work to space out reads
-        # This is a D2D copy + reduction that keeps the GPU busy without CPU sync
-        delay_tensor.copy_(delay_tensor)  # D2D copy
+        # Use add_ for guaranteed memory write (self-copy may be optimized away)
+        delay_tensor.add_(0.001)
         _ = delay_tensor.sum()  # Reduction (result discarded, no .item() sync)
 
         # Read the same slice again

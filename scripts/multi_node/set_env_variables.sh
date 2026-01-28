@@ -41,8 +41,8 @@ export HSA_ENABLE_SDMA=0                     # Disable SDMA for stability
 # NCCL Protocol and Channels
 # -----------------------------------------------------------------------------
 export NCCL_PROTO=Simple
-export NCCL_MIN_NCHANNELS=40
-export NCCL_MAX_NCHANNELS=40                 # Override via --channels
+#export NCCL_MIN_NCHANNELS=40
+export NCCL_MAX_NCHANNELS=56                 # Override via --channels
 
 # -----------------------------------------------------------------------------
 # Network Interface for MI350X cluster
@@ -52,12 +52,13 @@ export NCCL_SOCKET_IFNAME=enp49s0f0np0,fenic0
 # -----------------------------------------------------------------------------
 # Timeout and Error Handling
 # -----------------------------------------------------------------------------
-export NCCL_TIMEOUT_MS=12000                 # 12 second timeout
-export TORCH_DIST_INIT_TIMEOUT=60
+export NCCL_TIMEOUT_MS=12000                 # 12 second timeout (legacy, not used by PyTorch)
+export NCCL_TIMEOUT=150                      # 300 second (5 min) timeout - first backward can be slow due to JIT/init
+export TORCH_DIST_INIT_TIMEOUT=150           # Match collective timeout for consistency
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_TRACE_BUFFER_SIZE=10000
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1          # Critical for hang debugging
-
+export AMD_LOG_LEVEL=5
 # -----------------------------------------------------------------------------
 # PyTorch ROCm Profiler
 # -----------------------------------------------------------------------------
@@ -90,6 +91,7 @@ DOCKER_ENV_VARS=(
     NCCL_SOCKET_IFNAME
     # Timeout/Error Handling
     NCCL_TIMEOUT_MS
+    NCCL_TIMEOUT
     TORCH_DIST_INIT_TIMEOUT
     TORCH_NCCL_ASYNC_ERROR_HANDLING
     TORCH_NCCL_TRACE_BUFFER_SIZE

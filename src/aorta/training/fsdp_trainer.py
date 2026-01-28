@@ -407,6 +407,10 @@ def _create_hybrid_shard_process_groups(gpus_per_node: Optional[int] = None):
     rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+    # Get timeout from environment - same as init_process_group
+    timeout_seconds = int(os.environ.get("TORCH_DIST_INIT_TIMEOUT", "600"))
+    group_timeout = timedelta(seconds=timeout_seconds)
+
     # Auto-detect GPUs per node from environment if not provided
     if gpus_per_node is None:
         # torchrun sets LOCAL_WORLD_SIZE to the number of processes per node
@@ -437,21 +441,21 @@ def _create_hybrid_shard_process_groups(gpus_per_node: Optional[int] = None):
         return None
 
     log.info(
-        "Creating HYBRID_SHARD process groups | rank=%d world_size=%d num_nodes=%d gpus_per_node=%d node_id=%d",
-        rank, world_size, num_nodes, gpus_per_node, node_id
+        "Creating HYBRID_SHARD process groups | rank=%d world_size=%d num_nodes=%d gpus_per_node=%d node_id=%d timeout=%ds",
+        rank, world_size, num_nodes, gpus_per_node, node_id, timeout_seconds
     )
 
     # Intra-node groups: shard within each node
     for i in range(num_nodes):
         ranks_in_node = list(range(i * gpus_per_node, (i + 1) * gpus_per_node))
-        group = dist.new_group(ranks=ranks_in_node)
+        group = dist.new_group(ranks=ranks_in_node, timeout=group_timeout)
         if i == node_id:
             my_shard_group = group
 
     # Inter-node groups: replicate across nodes (same local_rank)
     for local_r in range(gpus_per_node):
         ranks_across_nodes = [node * gpus_per_node + local_r for node in range(num_nodes)]
-        group = dist.new_group(ranks=ranks_across_nodes)
+        group = dist.new_group(ranks=ranks_across_nodes, timeout=group_timeout)
         if local_r == local_rank:
             my_replicate_group = group
 

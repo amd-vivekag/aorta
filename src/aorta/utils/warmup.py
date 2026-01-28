@@ -49,6 +49,7 @@ def warmup_rccl_communicators(
     warmup_tensor = torch.ones(8192, device=device, dtype=torch.float32)
 
     log.info("Starting RCCL communicator warmup with %d iterations (rank=%d)...", num_warmup_ops, rank)
+    log.info("Warmup will test: all_reduce, broadcast, reduce_scatter, all_gather")
 
     # First, warmup the global world group
     log.info("Warming up global world group...")
@@ -61,11 +62,31 @@ def warmup_rccl_communicators(
     log.info("Global world group warmup complete")
 
     # Then warmup the shard and replicate groups
+    # IMPORTANT: Must test ALL collective types that FSDP uses:
+    # - reduce_scatter (FSDP backward gradient reduction)
+    # - all_gather (FSDP forward parameter gathering)
+    # - all_reduce (HYBRID_SHARD inter-node gradient sync)
+    # - broadcast (parameter sync)
     for i in range(num_warmup_ops):
         # Warmup intra-node shard group
         if shard_group is not None:
+            shard_size = dist.get_world_size(shard_group)
+            
+            # all_reduce (used in some FSDP operations)
             dist.all_reduce(warmup_tensor, group=shard_group)
-            # Also do broadcast from first rank in shard group
+            
+            # reduce_scatter - CRITICAL: this is what FSDP backward uses!
+            # Create input tensor that's shard_size times larger
+            rs_input = torch.ones(8192 * shard_size, device=device, dtype=torch.float32)
+            rs_output = torch.empty(8192, device=device, dtype=torch.float32)
+            dist.reduce_scatter_tensor(rs_output, rs_input, group=shard_group)
+            
+            # all_gather - used in FSDP forward
+            ag_input = torch.ones(8192, device=device, dtype=torch.float32)
+            ag_output = torch.empty(8192 * shard_size, device=device, dtype=torch.float32)
+            dist.all_gather_into_tensor(ag_output, ag_input, group=shard_group)
+            
+            # broadcast from first rank in shard group
             shard_ranks = dist.get_process_group_ranks(shard_group)
             dist.broadcast(warmup_tensor, src=shard_ranks[0], group=shard_group)
 

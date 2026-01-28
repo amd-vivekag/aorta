@@ -129,6 +129,7 @@ for var in "${DOCKER_ENV_VARS[@]}"; do
 done
 
 # Run with or without rocprofv3
+# Note: Output is already captured by master_launch.sh's redirection, no need for tee
 if [ "${ENABLE_ROCPROF}" = "true" ]; then
     ROCPROF_DIR="${OUTPUT_DIR}/rocprof_traces/node_${NODE_RANK}"
     mkdir -p "${ROCPROF_DIR}"
@@ -137,8 +138,7 @@ if [ "${ENABLE_ROCPROF}" = "true" ]; then
         log "Using rocprofv3 input file: ${ROCPROF_INPUT}"
         ${DOCKER_EXEC} bash -c "rocprofv3 -i ${ROCPROF_INPUT} -d ${ROCPROF_DIR} -- \
             ${BASE_CMD} ${BASE_OVERRIDES} \
-            --override training.output_dir=${OUTPUT_DIR_DOCKER}" \
-            2>&1 | tee -a "${LOG_FILE}"
+            --override training.output_dir=${OUTPUT_DIR_DOCKER}" 2>&1
     else
         ROCPROF_ARGS="--kernel-trace"
         if [ "${ROCPROF_STATS}" = "true" ]; then
@@ -148,18 +148,16 @@ if [ "${ENABLE_ROCPROF}" = "true" ]; then
         log "Running with rocprofv3 kernel tracing inside Docker"
         ${DOCKER_EXEC} bash -c "rocprofv3 ${ROCPROF_ARGS} -d ${ROCPROF_DIR} -- \
             ${BASE_CMD} ${BASE_OVERRIDES} \
-            --override training.output_dir=${OUTPUT_DIR_DOCKER}" \
-            2>&1 | tee -a "${LOG_FILE}"
+            --override training.output_dir=${OUTPUT_DIR_DOCKER}" 2>&1
     fi
 else
     log "Running inside Docker container"
     log "Command: ${BASE_CMD} ${BASE_OVERRIDES} --override training.output_dir=${OUTPUT_DIR_DOCKER}"
     ${DOCKER_EXEC} bash -c "${BASE_CMD} ${BASE_OVERRIDES} \
-        --override training.output_dir=${OUTPUT_DIR_DOCKER}" \
-        2>&1 | tee -a "${LOG_FILE}"
+        --override training.output_dir=${OUTPUT_DIR_DOCKER}" 2>&1
 fi
 
-EXIT_CODE=${PIPESTATUS[0]}
+EXIT_CODE=$?
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
