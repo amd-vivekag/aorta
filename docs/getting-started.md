@@ -47,18 +47,29 @@ This captures a profiler trace file locally.
 
 ## Local Installation (Analysis & Processing)
 
-For running analysis scripts and processing traces locally:
+For running analysis scripts and processing traces locally.
+
+We recommend using [uv](https://github.com/astral-sh/uv) for fast, reliable Python environment management.
 
 ```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Clone the repository
 git clone https://github.com/ROCm/aorta.git
 cd aorta
 
+# Create and activate a virtual environment
+uv venv && source .venv/bin/activate
+
+# Install PyTorch nightly for ROCm 7.1
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+
 # Install dependencies for analysis scripts
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 
 # For contributors: install development tools (pytest, pre-commit, etc.)
-pip install -r requirements-dev.txt
+uv pip install -r requirements-dev.txt
 pre-commit install
 ```
 
