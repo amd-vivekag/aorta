@@ -23,31 +23,44 @@ def pipeline(ctx):
 
 
 @pipeline.command("summary")
-@click.option("-b", "--baseline", required=True, type=click.Path(exists=True),
-              help="Baseline trace directory")
-@click.option("-t", "--test", required=True, type=click.Path(exists=True),
-              help="Test trace directory")
-@click.option("-o", "--output", required=True, type=click.Path(),
-              help="Output directory for results")
-@click.option("--baseline-label", default=None,
-              help="Label for baseline (default: directory name)")
-@click.option("--test-label", default=None,
-              help="Label for test (default: directory name)")
-@click.option("--skip-tracelens", is_flag=True,
-              help="Skip TraceLens analysis (if already done)")
-@click.option("--gpu-timeline/--no-gpu-timeline", default=True,
-              help="Enable/disable GPU timeline comparison")
-@click.option("--collective/--no-collective", default=True,
-              help="Enable/disable collective comparison")
-@click.option("--final-report/--no-final-report", default=True,
-              help="Enable/disable final Excel report")
-@click.option("--plots/--no-plots", default=True,
-              help="Enable/disable plot generation")
-@click.option("--html/--no-html", default=True,
-              help="Enable/disable HTML report generation")
+@click.option(
+    "-b", "--baseline", required=True, type=click.Path(exists=True), help="Baseline trace directory"
+)
+@click.option(
+    "-t", "--test", required=True, type=click.Path(exists=True), help="Test trace directory"
+)
+@click.option(
+    "-o", "--output", required=True, type=click.Path(), help="Output directory for results"
+)
+@click.option("--baseline-label", default=None, help="Label for baseline (default: directory name)")
+@click.option("--test-label", default=None, help="Label for test (default: directory name)")
+@click.option("--skip-tracelens", is_flag=True, help="Skip TraceLens analysis (if already done)")
+@click.option(
+    "--gpu-timeline/--no-gpu-timeline", default=True, help="Enable/disable GPU timeline comparison"
+)
+@click.option(
+    "--collective/--no-collective", default=True, help="Enable/disable collective comparison"
+)
+@click.option(
+    "--final-report/--no-final-report", default=True, help="Enable/disable final Excel report"
+)
+@click.option("--plots/--no-plots", default=True, help="Enable/disable plot generation")
+@click.option("--html/--no-html", default=True, help="Enable/disable HTML report generation")
 @click.pass_context
-def pipeline_summary(ctx, baseline, test, output, baseline_label, test_label,
-                     skip_tracelens, gpu_timeline, collective, final_report, plots, html):
+def pipeline_summary(
+    ctx,
+    baseline,
+    test,
+    output,
+    baseline_label,
+    test_label,
+    skip_tracelens,
+    gpu_timeline,
+    collective,
+    final_report,
+    plots,
+    html,
+):
     """Run complete summary analysis pipeline.
 
     Orchestrates the full TraceLens analysis workflow:
@@ -82,10 +95,15 @@ def pipeline_summary(ctx, baseline, test, output, baseline_label, test_label,
     verbose = ctx.obj.get("verbose", False)
     quiet = ctx.obj.get("quiet", False)
 
+    # Resolve paths to absolute to ensure all outputs go to correct location
+    baseline_path = Path(baseline).resolve()
+    test_path = Path(test).resolve()
+    output_path = Path(output).resolve()
+
     config = SummaryPipelineConfig(
-        baseline_path=Path(baseline),
-        test_path=Path(test),
-        output_dir=Path(output),
+        baseline_path=baseline_path,
+        test_path=test_path,
+        output_dir=output_path,
         baseline_label=baseline_label,
         test_label=test_label,
         skip_tracelens=skip_tracelens,
@@ -133,32 +151,49 @@ def pipeline_summary(ctx, baseline, test, output, baseline_label, test_label,
 
         if result.files_generated:
             click.echo(f"\nOutput directory: {result.output_dir}")
-            click.echo("Generated files:")
+            click.echo("\nGenerated files:")
             for name, path in result.files_generated.items():
                 if isinstance(path, Path):
-                    click.echo(f"  - {path.name}")
+                    click.echo(f"  - {path}")
 
     if not result.success:
         raise click.ClickException("Pipeline failed")
 
 
 @pipeline.command("gemm")
-@click.option("--sweep-dir", required=True, type=click.Path(exists=True),
-              help="Sweep directory containing tracelens_analysis/")
-@click.option("-o", "--output", required=True, type=click.Path(),
-              help="Output directory for results")
-@click.option("--top-k", default=5, type=int,
-              help="Number of top kernels to extract (default: 5)")
-@click.option("--threads", "-t", multiple=True, type=int, default=(256, 512),
-              help="Thread configurations (can specify multiple)")
-@click.option("--channels", "-c", multiple=True, type=int, default=(28, 42, 56, 70),
-              help="Channel configurations (can specify multiple)")
-@click.option("--timestamps/--no-timestamps", default=True,
-              help="Enhance with timestamps (default: True)")
-@click.option("--plots/--no-plots", default=True,
-              help="Generate plots (default: True)")
+@click.option(
+    "--sweep-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Sweep directory containing tracelens_analysis/",
+)
+@click.option(
+    "-o", "--output", required=True, type=click.Path(), help="Output directory for results"
+)
+@click.option("--top-k", default=5, type=int, help="Number of top kernels to extract (default: 5)")
+@click.option(
+    "--threads",
+    "-t",
+    multiple=True,
+    type=int,
+    default=(256, 512),
+    help="Thread configurations (can specify multiple)",
+)
+@click.option(
+    "--channels",
+    "-c",
+    multiple=True,
+    type=int,
+    default=(28, 42, 56, 70),
+    help="Channel configurations (can specify multiple)",
+)
+@click.option(
+    "--timestamps/--no-timestamps", default=True, help="Enhance with timestamps (default: True)"
+)
+@click.option("--plots/--no-plots", default=True, help="Generate plots (default: True)")
+@click.option("--html/--no-html", default=True, help="Generate HTML report (default: True)")
 @click.pass_context
-def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, plots):
+def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, plots, html):
     """Run GEMM variance analysis pipeline.
 
     Analyzes GEMM kernel time variance across configurations:
@@ -167,6 +202,7 @@ def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, 
     1. Analyze GEMM reports to extract top-K kernels with highest variance
     2. Enhance with timestamps (optional)
     3. Generate variance plots (optional)
+    4. Generate HTML report (optional)
 
     \b
     Examples:
@@ -176,8 +212,8 @@ def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, 
       # Custom top-k
       aorta-report pipeline gemm --sweep-dir /path/to/sweep -o ./output --top-k 10
 
-      # Skip plots
-      aorta-report pipeline gemm --sweep-dir /path/to/sweep -o ./output --no-plots
+      # Skip plots and HTML
+      aorta-report pipeline gemm --sweep-dir /path/to/sweep -o ./output --no-plots --no-html
 
       # Custom thread/channel configurations
       aorta-report pipeline gemm --sweep-dir /path/to/sweep -o ./output \\
@@ -188,14 +224,19 @@ def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, 
     verbose = ctx.obj.get("verbose", False)
     quiet = ctx.obj.get("quiet", False)
 
+    # Resolve paths to absolute to ensure all outputs go to correct location
+    sweep_path = Path(sweep_dir).resolve()
+    output_path = Path(output).resolve()
+
     config = GemmPipelineConfig(
-        sweep_dir=Path(sweep_dir),
-        output_dir=Path(output),
+        sweep_dir=sweep_path,
+        output_dir=output_path,
         top_k=top_k,
         threads=list(threads),
         channels=list(channels),
         timestamps=timestamps,
         plots=plots,
+        html=html,
         verbose=verbose,
     )
 
@@ -208,7 +249,7 @@ def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, 
         click.echo(f"Top-K: {top_k}")
         click.echo(f"Threads: {list(threads)}")
         click.echo(f"Channels: {list(channels)}")
-        click.echo(f"Options: timestamps={timestamps}, plots={plots}")
+        click.echo(f"Options: timestamps={timestamps}, plots={plots}, html={html}")
 
     result = run_gemm_pipeline(config)
 
@@ -233,13 +274,15 @@ def pipeline_gemm(ctx, sweep_dir, output, top_k, threads, channels, timestamps, 
                 click.echo(f"  ✗ {err}")
 
         click.echo(f"\nOutput directory: {result.output_dir}")
+        click.echo("\nGenerated files:")
         if result.csv_path:
-            click.echo(f"  - {result.csv_path.name}")
+            click.echo(f"  - {result.csv_path}")
         if result.csv_with_timestamps_path:
-            click.echo(f"  - {result.csv_with_timestamps_path.name}")
+            click.echo(f"  - {result.csv_with_timestamps_path}")
         if result.plots_dir:
-            click.echo(f"  - plots/ (5 files)")
+            click.echo(f"  - {result.plots_dir}/ (5 plots)")
+        if result.html_path:
+            click.echo(f"  - {result.html_path}")
 
     if not result.success:
         raise click.ClickException("Pipeline failed")
-

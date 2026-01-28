@@ -25,9 +25,9 @@ def plot_thread_channel_interaction(
         thread_channel_data[row["threads"]][row["channel"]].append(row["time_diff"])
     
     threads = sorted(thread_channel_data.keys())
-    channels = sorted(
-        set(ch for t_data in thread_channel_data.values() for ch in t_data.keys())
-    )
+    # Use ALL channels from data["channels"] to ensure all channels appear on X-axis
+    # even if some thread/channel combinations don't have data
+    channels = sorted(data["channels"].keys())
     
     markers = ["o", "s", "^", "D"]
     

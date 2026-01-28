@@ -23,6 +23,7 @@ class GemmPipelineConfig:
     ranks: List[int] = field(default_factory=lambda: list(range(8)))
     timestamps: bool = True
     plots: bool = True
+    html: bool = True
     verbose: bool = False
 
 
@@ -35,6 +36,7 @@ class GemmPipelineResult:
     csv_path: Optional[Path] = None
     csv_with_timestamps_path: Optional[Path] = None
     plots_dir: Optional[Path] = None
+    html_path: Optional[Path] = None
     steps_completed: List[str] = field(default_factory=list)
     steps_skipped: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
@@ -73,6 +75,14 @@ def run_gemm_pipeline(config: GemmPipelineConfig) -> GemmPipelineResult:
         else:
             result.steps_skipped.append("plots")
 
+        # Step 4: Generate HTML Report
+        if config.html and result.plots_dir:
+            _step_generate_html(config, result)
+        elif config.html:
+            result.steps_skipped.append("html (plots not generated)")
+        else:
+            result.steps_skipped.append("html")
+
     except Exception as e:
         result.success = False
         result.errors.append(str(e))
@@ -92,9 +102,7 @@ def _step_analyze_gemm(config: GemmPipelineConfig, result: GemmPipelineResult) -
     reports_dir = config.sweep_dir / "tracelens_analysis"
 
     if not reports_dir.exists():
-        raise FileNotFoundError(
-            f"TraceLens analysis directory not found: {reports_dir}"
-        )
+        raise FileNotFoundError(f"TraceLens analysis directory not found: {reports_dir}")
 
     output_file = f"top{config.top_k}_gemm_kernels_time_variance.csv"
     output_path = config.output_dir / output_file
@@ -124,9 +132,7 @@ def _step_analyze_gemm(config: GemmPipelineConfig, result: GemmPipelineResult) -
     result.steps_completed.append("analyze_gemm")
 
 
-def _step_enhance_timestamps(
-    config: GemmPipelineConfig, result: GemmPipelineResult
-) -> None:
+def _step_enhance_timestamps(config: GemmPipelineConfig, result: GemmPipelineResult) -> None:
     """Step 2: Enhance with timestamps."""
     from ..processing import enhance_gemm_variance
 
@@ -139,9 +145,7 @@ def _step_enhance_timestamps(
         result.steps_skipped.append("timestamps (no CSV path)")
         return
 
-    output_csv = result.csv_path.with_name(
-        result.csv_path.stem + "_with_timestamps.csv"
-    )
+    output_csv = result.csv_path.with_name(result.csv_path.stem + "_with_timestamps.csv")
 
     try:
         enhanced_path = enhance_gemm_variance(
@@ -161,9 +165,7 @@ def _step_enhance_timestamps(
         result.steps_skipped.append("timestamps (failed)")
 
 
-def _step_generate_plots(
-    config: GemmPipelineConfig, result: GemmPipelineResult
-) -> None:
+def _step_generate_plots(config: GemmPipelineConfig, result: GemmPipelineResult) -> None:
     """Step 3: Generate GEMM plots."""
     from ..generators import generate_gemm_plots
 
@@ -192,3 +194,38 @@ def _step_generate_plots(
 
     result.steps_completed.append("plots")
 
+
+def _step_generate_html(config: GemmPipelineConfig, result: GemmPipelineResult) -> None:
+    """Step 4: Generate HTML report."""
+    from ..generators import generate_html
+
+    if config.verbose:
+        print("\n" + "=" * 60)
+        print("STEP 4: Generate HTML Report")
+        print("=" * 60)
+
+    if result.plots_dir is None:
+        result.steps_skipped.append("html (no plots directory)")
+        return
+
+    output_html = config.output_dir / "gemm_variance_report.html"
+
+    try:
+        html_path = generate_html(
+            mode="gemm",
+            output=output_html,
+            plots_dir=result.plots_dir,
+            sweep_dir=config.sweep_dir,
+            label=config.sweep_dir.name,
+            csv_path=result.csv_path,
+            verbose=config.verbose,
+        )
+        result.html_path = html_path
+
+        if config.verbose:
+            print(f"  Output: {html_path}")
+
+        result.steps_completed.append("html")
+    except Exception as e:
+        result.errors.append(f"HTML generation failed: {e}")
+        result.steps_skipped.append("html (failed)")
