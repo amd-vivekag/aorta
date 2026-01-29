@@ -52,13 +52,13 @@ simulate_compute: true
 # Add GEMM work between collectives.
 # Without this, reproducer runs ~100x faster than real training.
 
-gemm_size: 4096
-# GEMM matrix size (4096x4096).
-# ~7ms per GEMM on MI300.
+gemm_size: 5120
+# GEMM matrix size (5120x5120).
+# ~14ms per GEMM on MI300X (1.95x compute vs 4096).
 
-gemm_layers: 20
-# Number of GEMM layers (20 × 7ms = ~140ms per phase).
-# Total step time: ~500ms (matches client's training profile).
+gemm_layers: 26
+# Number of GEMM layers (26 × 14ms = ~364ms per phase).
+# With forward + backward: ~500ms/step (matches client's training profile).
 
 include_backward_compute: true
 # Also simulate backward pass GEMMs.

@@ -1,176 +1,135 @@
-# Race Condition Injection Module
+# RCCL Runtime Race Condition Reproducer
 
-This module provides tools to inject controlled race conditions for testing distributed training robustness. It simulates scenarios where H2D memcpy and RCCL collectives race on different GPU streams.
+A standalone tool to detect **runtime-level bugs** in RCCL/HIP that can manifest in multi-node distributed training with overlapping streams.
 
-## Overview
+## Purpose
 
-Race conditions in distributed training can cause:
-- Silent data corruption
-- NaN values in loss/gradients
-- Training hangs
-- Non-deterministic behavior
+Distributed training workloads use multiple concurrent streams for overlapping compute, communication, and data movement. This module:
 
-This module enables controlled injection of race conditions to:
-- Reproduce issues seen in production
-- Test robustness of synchronization patterns
-- Validate fixes for race-related bugs
+- Tests for RCCL/HIP runtime ordering violations
+- Uses known-pattern data to detect ANY data corruption
+- Simulates realistic training timing profiles
+- Provides minimal reproducers for runtime bug reports
 
-## Race Categories
+## Quick Start
 
-### 1. H2D Race (Host-to-Device Memory Copy)
+```bash
+# Single-node validation (8 GPUs)
+GPU_MAX_HW_QUEUES=4 torchrun --nproc_per_node=8 -m aorta.race \
+    --warmup 10 --verify 100
 
-Simulates race conditions between H2D memory transfers and forward pass computation.
+# Multi-node test (via launch script)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker <container-name> \
+    --hw-queues 4 \
+    --warmup 100 \
+    --verify 10000
 
-**How it works:**
-- Batch data is copied to GPU on a separate `memcpy_stream`
-- If `h2d_skip_sync_before_forward=True`, the forward pass starts before H2D completes
-- This creates a race window where the model reads uninitialized/partial data
-
-**Configuration:**
-```yaml
-race_experiment:
-  h2d_memcpy_racing: true           # Enable separate memcpy stream
-  h2d_skip_sync_before_forward: true # Skip synchronization (causes race!)
-  h2d_racing_start_step: 3          # Start racing after warmup
+# Same-stream mode (definitive runtime bug test)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker <container-name> \
+    --hw-queues 4 \
+    --same-stream
 ```
 
-### 2. Datadist Race (TorchRec-style all_to_all)
+## Test Configurations
 
-Simulates race conditions in sparse data distribution patterns like TorchRec's `SparseDataDistributedAllToAll`.
+| Test | Command | Purpose |
+|------|---------|---------|
+| **Baseline** | `--hw-queues 4` | True stream parallelism |
+| **Serialized** | `--hw-queues 2` | Reduced parallelism (comparison) |
+| **Same-Stream** | `--same-stream` | Definitive runtime bug test |
+| **No Compute** | `--no-compute` | Fast iteration (~5ms/step) |
+| **NCCL Implicit** | `--nccl-implicit` | Serialized NCCL ordering |
 
-**How it works:**
-- `all_to_all` operations run on a separate `datadist_stream`
-- If `datadist_skip_sync_before_collective=True`, FSDP collectives start before `all_to_all` completes
-- This creates a race between data distribution and model parameter synchronization
+## Command-Line Options
 
-**Configuration:**
-```yaml
-race_experiment:
-  datadist_racing: true                      # Enable separate datadist stream
-  datadist_skip_sync_before_collective: true # Skip synchronization (causes race!)
-  datadist_racing_start_step: 3              # Start racing after warmup
+### Basic Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--warmup N` | 100 | Warmup iterations (no verification) |
+| `--verify N` | 10000 | Verification iterations |
+| `--no-compute` | - | Skip compute simulation |
+| `--same-stream` | - | H2D + datadist on same stream |
+| `--no-stop-on-first` | - | Continue after first corruption |
+| `--gemm-size N` | 5120 | GEMM matrix size |
+| `--gemm-layers N` | 26 | Number of GEMM layers |
+
+### Environment Variable Flags
+
+| Flag | Env Variable | Effect |
+|------|--------------|--------|
+| `--hw-queues N` | `GPU_MAX_HW_QUEUES=N` | Control HW queue count |
+| `--nccl-implicit-order` | `NCCL_LAUNCH_ORDER_IMPLICIT=1` | Serialize NCCL ops |
+| `--disable-sdma` | `HSA_ENABLE_SDMA=0` | Disable SDMA engine |
+| `--signal-pool-size N` | `ROC_SIGNAL_POOL_SIZE=N` | HSA signal pool size |
+| `--disable-cheap-fence` | `RCCL_GFX9_CHEAP_FENCE_OFF=1` | Disable fence optimization |
+
+## Output
+
+### Pass
+```
+PASSED: No corruption in 10100 iterations with proper synchronization
+VERDICT: No runtime bug detected with current settings.
 ```
 
-### 3. Timing Skew Experiment
-
-Introduces controlled timing delays to demonstrate how timing variations affect training.
-
-**Modes:**
-- `none`: No artificial skew
-- `fixed`: Fixed delay in microseconds
-- `progressive`: Delay increases each step (`skew_us * step`)
-- `random`: Random delay within range
-
-**Configuration:**
-```yaml
-race_experiment:
-  timing_skew_enabled: true
-  timing_skew_mode: "fixed"    # none, fixed, progressive, random
-  timing_skew_us: 500          # Delay in microseconds
-  timing_skew_ranks: [0]       # Which ranks get delayed (empty = all)
-  timing_skew_start_step: 3    # Start after warmup
+### Fail (Runtime Bug Detected)
+```
+RUNTIME BUG DETECTED: 15 corruptions in 5432 iterations
+Corruption occurred DESPITE proper synchronization - this is a bug in RCCL/HIP runtime
+VERDICT: RUNTIME BUG DETECTED!
 ```
 
-## GPU Hardware Queue Settings
+### Experiment Directory
 
-The `GPU_MAX_HW_QUEUES` environment variable controls hardware queue parallelism and is critical for race exposure:
+Each run saves results to `experiments/reproducer_hw<N>_<timestamp>_<label>/`:
 
-| Value | Behavior | Race Exposure |
-|-------|----------|---------------|
-| 1-2 | Streams share HW queues | Implicit serialization masks races |
-| 4+ | Each stream gets own HW queue | True parallelism exposes races |
-
-**Configuration:**
-```yaml
-race_experiment:
-  gpu_max_hw_queues: 4  # Set before GPU initialization
+```
+experiments/reproducer_hw4_20260129_211127_test/
+├── logs/
+│   ├── node_0.txt
+│   └── node_1.txt
+├── config/
+│   ├── run_config.yaml      # Actual config used
+│   ├── minimal_reproducer.yaml
+│   └── set_env_variables.sh
+└── experiment_info.txt
 ```
 
-## Supporting Options
+## Interpreting Results
 
-### Warmup Control
+| Baseline (HW=4) | Serialized (HW=2) | Same-Stream | Conclusion |
+|-----------------|-------------------|-------------|------------|
+| Fail | Pass | Pass | Runtime bug triggered by parallelism |
+| Fail | Pass | Fail | Runtime bug in stream ordering |
+| Pass | Pass | Pass | No runtime bug detected |
+| Fail | Fail | Fail | Possible hardware issue |
 
-```yaml
-race_experiment:
-  skip_training_warmup: false  # Skip training warmup for timing variability
-  training_warmup_steps: 1     # Number of warmup steps
-  skip_rccl_warmup: false      # Skip RCCL communicator warmup
-  rccl_warmup_iterations: 10   # RCCL warmup iterations
+## Architecture
+
+```
+src/aorta/race/
+├── __init__.py
+├── __main__.py              # CLI entry point
+├── minimal_reproducer.py    # Core reproducer logic
+├── config.py                # Configuration dataclass
+└── README.md
 ```
 
-### NaN Checking
+### Data Flow
 
-```yaml
-race_experiment:
-  nan_check_collectives: true  # Check for NaN before/after RCCL collectives
+```
+memcpy_stream:  [H2D] → batch_gpu
+                          ↓ (Forward READS batch_gpu)
+default_stream:          [Forward] → [Backward] → [all_reduce]
+
+datadist_stream:         [all_to_all]
+                          (overlaps with backward)
 ```
 
-## Configuration Reference
+## References
 
-All options are set under the `race_experiment:` section in YAML config files.
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `h2d_memcpy_racing` | bool | false | Use separate memcpy stream for H2D |
-| `h2d_skip_sync_before_forward` | bool | false | Skip sync before forward (causes race) |
-| `h2d_racing_start_step` | int | 0 | Step to start H2D racing |
-| `datadist_racing` | bool | false | Use separate stream for all_to_all |
-| `datadist_skip_sync_before_collective` | bool | false | Skip sync before collective (causes race) |
-| `datadist_racing_start_step` | int | 0 | Step to start datadist racing |
-| `timing_skew_enabled` | bool | false | Enable timing skew experiment |
-| `timing_skew_mode` | str | "none" | Skew mode (none/fixed/progressive/random) |
-| `timing_skew_us` | int | 0 | Delay in microseconds |
-| `timing_skew_ranks` | list | [] | Ranks to delay (empty = all) |
-| `timing_skew_start_step` | int | 3 | Step to start timing skew |
-| `skip_training_warmup` | bool | false | Skip training warmup |
-| `training_warmup_steps` | int | 1 | Training warmup steps |
-| `skip_rccl_warmup` | bool | false | Skip RCCL warmup |
-| `rccl_warmup_iterations` | int | 10 | RCCL warmup iterations |
-| `nan_check_collectives` | bool | false | Enable NaN checking |
-| `gpu_max_hw_queues` | int | null | Set GPU_MAX_HW_QUEUES env var |
-
-## Example Configurations
-
-### Aggressive H2D Race Testing
-
-```yaml
-race_experiment:
-  gpu_max_hw_queues: 4
-  h2d_memcpy_racing: true
-  h2d_skip_sync_before_forward: true
-  h2d_racing_start_step: 0
-  nan_check_collectives: true
-```
-
-### TorchRec-style Datadist Race
-
-```yaml
-race_experiment:
-  gpu_max_hw_queues: 4
-  datadist_racing: true
-  datadist_skip_sync_before_collective: true
-  datadist_racing_start_step: 3
-  nan_check_collectives: true
-```
-
-### Combined Race Testing
-
-```yaml
-race_experiment:
-  gpu_max_hw_queues: 4
-  h2d_memcpy_racing: true
-  h2d_skip_sync_before_forward: true
-  datadist_racing: true
-  datadist_skip_sync_before_collective: true
-  nan_check_collectives: true
-```
-
-## Module Structure
-
-- `config.py` - `RaceConfig` dataclass with all configuration options
-- `h2d_racing.py` - H2D memory copy racing implementation
-- `datadist_racing.py` - Datadist/all_to_all racing implementation
-- `timing_skew_experiment.py` - Controlled timing skew injection
-- `injectors.py` - High-level injection interface for the trainer
-- `inflight_checks.py` - Repeated in-flight reads to detect torn reads
-- `correctness_verification.py` - Manual verification to detect silent corruption
+- **Config Reference:** `config/race/minimal_reproducer.yaml`
+- **Multi-node Scripts:** `scripts/multi_node/`
+- **NCCL/RCCL Settings:** `scripts/multi_node/set_env_variables.sh`

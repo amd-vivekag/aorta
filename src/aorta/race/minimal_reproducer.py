@@ -1,20 +1,31 @@
 """
-Minimal RCCL Race Condition Reproducer.
+RCCL Runtime Race Condition Reproducer.
 
-This module provides a minimal reproducer for the TorchRec + FSDP runtime race
-condition that manifests as NaN in training. Unlike the full training tests,
-this reproducer:
+This module provides a minimal reproducer for detecting runtime-level race
+conditions in RCCL/HIP during multi-stream distributed training. The reproducer:
 
 1. Uses PROPER synchronization everywhere - if corruption occurs, it's a RUNTIME BUG
-2. Uses known-pattern data to detect ANY corruption (not just NaN)
+2. Uses known-pattern data to detect ANY data corruption
 3. Simulates training timing profile with interleaved compute
 4. Supports warmup phase to build up RCCL/runtime state
+5. Creates REAL data dependencies between streams
 
-Key insight: The client's bug manifests DESPITE proper synchronization, indicating
-a bug in RCCL/HIP runtime, not application-level missing syncs. This reproducer
-tests for that runtime-level bug.
+Data Flow Architecture (with compute simulation):
+  memcpy_stream:  [H2D] → batch_gpu
+                            ↓ (Forward READS batch_gpu - DATA DEPENDENCY)
+  default_stream:          [Forward] → [Backward] → [all_reduce]
+                                         (same stream, naturally ordered)
 
-Reference: nan_stream_race_investigation.md (2026-01-29)
+  datadist_stream:         [all_to_all]
+                            (overlaps with backward - TIMING PRESSURE)
+
+  All buffers use known patterns for verification:
+    - batch_gpu: iteration % 1000
+    - send_buf/recv_buf: rank ID
+    - reduce_buf: rank + 1
+
+Key insight: If corruption occurs despite proper synchronization, it indicates
+a bug in RCCL/HIP runtime, not application-level missing syncs.
 """
 
 import logging
@@ -50,8 +61,8 @@ class ReproducerConfig:
     Number of iterations to run WITHOUT verification.
     
     Builds up RCCL/runtime state before checking for corruption.
-    The client's bug manifests after ~100 steps, so we need warmup
-    to reach the same internal state.
+    Runtime bugs may manifest after ~100+ steps due to internal state
+    accumulation. Warmup helps reach similar conditions.
     """
     
     verify_iterations: int = 10000
@@ -91,7 +102,7 @@ class ReproducerConfig:
     """
     Size of all_reduce tensor (number of elements).
     
-    Simulates FSDP gradient synchronization.
+    Simulates gradient synchronization (e.g., FSDP-style).
     """
     
     dtype: str = "bfloat16"
@@ -108,18 +119,20 @@ class ReproducerConfig:
     which may not trigger the same timing conditions.
     """
     
-    gemm_size: int = 4096
+    gemm_size: int = 5120
     """
     Matrix size for GEMM operations.
     
-    4096x4096 GEMM takes ~7ms on MI300. Adjust based on GPU.
+    5120x5120 GEMM takes ~14ms on MI300X (1.95x compute vs 4096).
+    Adjust based on GPU to achieve ~500ms/step target.
     """
     
-    gemm_layers: int = 20
+    gemm_layers: int = 26
     """
     Number of GEMM layers to simulate forward/backward.
     
-    20 layers × 7ms = ~140ms per forward/backward pass.
+    26 layers × 14ms = ~364ms per forward/backward pass.
+    With forward + backward: ~500ms/step (configurable timing profile).
     """
     
     include_backward_compute: bool = True
@@ -146,28 +159,25 @@ class ReproducerConfig:
     """
     Put H2D and datadist on the SAME new stream (not separate streams).
     
-    This replicates customer experiment (4). If corruption still occurs
-    in this mode, it's DEFINITIVE proof of a runtime bug because
-    operations on the same stream are guaranteed to be ordered.
+    If corruption occurs in this mode, it's DEFINITIVE proof of a 
+    runtime bug because operations on the same stream are guaranteed 
+    to be ordered by CUDA/HIP specification.
     """
     
     # =========================================================================
-    # Environment variables (customer experiments)
+    # Environment variables
     # =========================================================================
     gpu_max_hw_queues: Optional[int] = 4
     """
     Set GPU_MAX_HW_QUEUES environment variable.
     
-    - 2: Masks bug (serialization) - customer workaround
-    - 4+: Exposes bug (true parallelism)
+    - 2: Reduced parallelism (may mask bugs)
+    - 4+: Full parallelism (exposes timing-sensitive bugs)
     """
     
-    # These are set via environment before running, documented here for reference
-    # ROC_SIGNAL_POOL_SIZE: Optional[int] = None  # Customer tried 16384
-    # HSA_ENABLE_SDMA: Optional[int] = None  # Customer tried 0
-    # GPU_FORCE_BLIT_COPY_SIZE: Optional[int] = None  # Customer tried 128
-    # NCCL_LAUNCH_ORDER_IMPLICIT: Optional[int] = None  # 1 = no NaN but slow
-    # RCCL_GFX9_CHEAP_FENCE_OFF: Optional[int] = None  # Customer tried 1
+    # Additional env vars can be set via CLI or environment:
+    # ROC_SIGNAL_POOL_SIZE, HSA_ENABLE_SDMA, GPU_FORCE_BLIT_COPY_SIZE,
+    # NCCL_LAUNCH_ORDER_IMPLICIT, RCCL_GFX9_CHEAP_FENCE_OFF, etc.
 
 
 @dataclass
@@ -198,12 +208,12 @@ class ReproducerResult:
 
 class MinimalReproducer:
     """
-    Minimal reproducer for TorchRec + FSDP runtime race condition.
+    Minimal reproducer for RCCL/HIP runtime race conditions.
     
-    This class implements the 3-stream pattern with PROPER synchronization:
+    This class implements a 3-stream pattern with PROPER synchronization:
     - memcpy_stream: H2D data transfers
-    - datadist_stream: all_to_all (TorchRec-style)
-    - default_stream: compute + all_reduce (FSDP-style)
+    - datadist_stream: all_to_all collectives
+    - default_stream: compute + all_reduce
     
     If corruption occurs despite proper syncs, it indicates a RUNTIME BUG
     in RCCL/HIP, not an application-level issue.
@@ -266,15 +276,15 @@ class MinimalReproducer:
     def setup(self) -> None:
         """Allocate streams and buffers."""
         cfg = self.config
-        
+
         # Set GPU_MAX_HW_QUEUES if specified
         if cfg.gpu_max_hw_queues is not None:
             os.environ["GPU_MAX_HW_QUEUES"] = str(cfg.gpu_max_hw_queues)
             log.info(f"Set GPU_MAX_HW_QUEUES={cfg.gpu_max_hw_queues}")
-        
+
         # Create streams
         if cfg.same_stream_mode:
-            # Same stream for H2D and datadist (replicates customer experiment 4)
+            # Same stream for H2D and datadist (definitive runtime bug test)
             shared_stream = torch.cuda.Stream()
             self.memcpy_stream = shared_stream
             self.datadist_stream = shared_stream
@@ -283,9 +293,19 @@ class MinimalReproducer:
             self.memcpy_stream = torch.cuda.Stream()
             self.datadist_stream = torch.cuda.Stream()
             log.info("Using separate streams for H2D and datadist")
-        
+
         self.default_stream = torch.cuda.current_stream()
-        
+
+        # Validate buffer sizes for compute simulation
+        if cfg.simulate_compute:
+            min_h2d_size = cfg.gemm_size * cfg.gemm_size
+            if cfg.h2d_tensor_size < min_h2d_size:
+                log.warning(
+                    f"h2d_tensor_size ({cfg.h2d_tensor_size}) < gemm_size² ({min_h2d_size}). "
+                    f"Increasing to {min_h2d_size} for compute simulation."
+                )
+                cfg.h2d_tensor_size = min_h2d_size
+
         # Allocate H2D buffers
         if cfg.pin_memory:
             self.batch_cpu = torch.empty(
@@ -293,7 +313,7 @@ class MinimalReproducer:
             )
         else:
             self.batch_cpu = torch.empty(cfg.h2d_tensor_size, dtype=self.dtype)
-        
+
         self.batch_gpu = torch.empty(
             cfg.h2d_tensor_size, dtype=self.dtype, device="cuda"
         )
@@ -349,12 +369,19 @@ class MinimalReproducer:
         """Simulate forward pass with GEMMs on default stream."""
         if not self.config.simulate_compute:
             return
-        
-        x = self.activation_buffer
+
+        # CRITICAL: Create real data dependency on H2D transfer
+        # Forward MUST read batch_gpu to create H2D→Forward race opportunity
+        # Reshape batch_gpu slice to match activation size (simulates embedding output)
+        batch_slice = self.batch_gpu[:self.config.gemm_size * self.config.gemm_size]
+        batch_reshaped = batch_slice.view(self.config.gemm_size, self.config.gemm_size)
+
+        # Start forward pass with batch data
+        x = batch_reshaped
         for layer_idx in range(self.config.gemm_layers):
             x = torch.mm(self.weight_matrices[layer_idx], x)
             x = torch.nn.functional.gelu(x)
-        
+
         # Store result to prevent optimization
         self.activation_buffer = x
     
@@ -370,13 +397,21 @@ class MinimalReproducer:
         """Simulate backward pass with GEMMs on default stream."""
         if not self.config.simulate_compute or not self.config.include_backward_compute:
             return
-        
+
         grad = self.grad_buffer
         for layer_idx in reversed(range(self.config.gemm_layers)):
             grad = torch.mm(self.weight_matrices[layer_idx].T, grad)
-        
+
         # Store result to prevent optimization
         self.grad_buffer = grad
+
+        # NOTE: We do NOT write grad to reduce_buf because:
+        # 1. Chained GEMMs produce numerically unstable gradients
+        # 2. This would overwrite the known pattern needed for verification
+        # 3. Backward and all_reduce are on same stream (naturally ordered)
+        #
+        # The critical race opportunity is H2D→Forward (different streams)
+        # not Backward→all_reduce (same stream)
     
     def _run_allreduce(self) -> None:
         """Run all_reduce on default stream."""
@@ -451,58 +486,89 @@ class MinimalReproducer:
     def run_iteration(self, iteration: int) -> bool:
         """
         Run one iteration of the reproducer.
-        
+
         Uses PROPER synchronization everywhere. If corruption occurs,
         it's a RUNTIME BUG in RCCL/HIP.
-        
+
+        Data Flow Chain (with compute simulation):
+          memcpy_stream:  [H2D] → batch_gpu
+                                    ↓ (Forward READS - DATA DEPENDENCY)
+          default_stream:          [Forward READS batch_gpu]
+                                    ↓
+                                   [Backward] (computes but doesn't write to reduce_buf)
+                                    ↓
+                                   [all_reduce READS reduce_buf (known pattern)]
+
+          datadist_stream:         [all_to_all]
+                                    (overlaps with backward)
+
+        Note: reduce_buf maintains its known pattern (rank+1) throughout.
+        Backward does NOT overwrite it to avoid numerical instability from GEMMs.
+
         Returns True if patterns verified correctly (or not in verification phase).
         """
         # Fill buffers with known patterns
         self._fill_known_patterns(iteration)
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 1: H2D on memcpy_stream
+        #   Writes: batch_gpu
         # ─────────────────────────────────────────────────────────────
         self._run_h2d()
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 2: PROPER SYNC - wait for H2D
+        #   Ensures: batch_gpu ready before forward reads it
         # ─────────────────────────────────────────────────────────────
         self.default_stream.wait_stream(self.memcpy_stream)
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 3: Simulate forward pass (if enabled)
+        #   Reads: batch_gpu (created by H2D)
+        #   Creates: H2D→Forward data dependency
         # ─────────────────────────────────────────────────────────────
         self._run_forward_compute()
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 4: all_to_all on datadist_stream
+        #   Overlaps with backward (timing pressure)
         # ─────────────────────────────────────────────────────────────
         work_a2a = self._run_alltoall()
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 5: Simulate backward pass (if enabled)
+        #   Adds compute work to match training timing profile
+        #   Does NOT write to reduce_buf (keeps known pattern)
         # ─────────────────────────────────────────────────────────────
         self._run_backward_compute()
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 6: PROPER SYNC - wait for all_to_all
+        #   Ensures: all_to_all completes before all_reduce
         # ─────────────────────────────────────────────────────────────
         self.default_stream.wait_stream(self.datadist_stream)
         work_a2a.wait()
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 7: all_reduce on default stream
+        #   Reads: reduce_buf (known pattern: rank+1)
         # ─────────────────────────────────────────────────────────────
         self._run_allreduce()
-        
+
         # ─────────────────────────────────────────────────────────────
         # Phase 8: Verify patterns (only during verification phase)
+        #   Checks all buffers for corruption:
+        #     - batch_gpu: H2D corruption (if H2D raced with forward)
+        #     - recv_buf: all_to_all corruption
+        #     - reduce_buf: all_reduce corruption (should be sum of rank+1)
+        #
+        #   Note: reduce_buf was NOT modified by backward, so any corruption
+        #   indicates an all_reduce bug, not gradient instability.
         # ─────────────────────────────────────────────────────────────
         if self.in_verification_phase:
             torch.cuda.synchronize()
             return self._verify_patterns(iteration)
-        
+
         return True
     
     def run(self) -> ReproducerResult:
@@ -527,15 +593,41 @@ class MinimalReproducer:
         # ─────────────────────────────────────────────────────────────
         self.in_verification_phase = False
         log.info(f"Starting warmup phase: {cfg.warmup_iterations} iterations")
-        
+
+        warmup_start = time.time()
         for i in range(cfg.warmup_iterations):
+            iter_start = time.time()
+
             self.run_iteration(i)
+
+            # CRITICAL: Synchronize during warmup to actually execute GPU work
+            # Without this, iterations just queue work and finish instantly
+            torch.cuda.synchronize()
+
             total_iterations += 1
-            
+            iter_elapsed = time.time() - iter_start
+
             if (i + 1) % cfg.log_interval == 0:
-                log.info(f"Warmup progress: {i + 1}/{cfg.warmup_iterations}")
-        
-        log.info("Warmup complete, starting verification phase")
+                warmup_elapsed = time.time() - warmup_start
+                avg_iter_ms = (warmup_elapsed * 1000) / (i + 1)
+                log.info(
+                    f"Warmup progress: {i + 1}/{cfg.warmup_iterations}, "
+                    f"avg_step_time: {avg_iter_ms:.1f}ms"
+                )
+
+        warmup_total = time.time() - warmup_start
+        warmup_avg_ms = (warmup_total * 1000) / cfg.warmup_iterations if cfg.warmup_iterations > 0 else 0
+        log.info(
+            f"Warmup complete: {warmup_total:.1f}s total, "
+            f"{warmup_avg_ms:.1f}ms avg per step"
+        )
+
+        # Warn if timing is too fast (may not trigger timing-sensitive bugs)
+        if cfg.simulate_compute and warmup_avg_ms < 400:
+            log.warning(
+                f"Step time ({warmup_avg_ms:.1f}ms) is faster than target (~500ms/step). "
+                f"Consider increasing gemm_size or gemm_layers to match timing profile."
+            )
         
         # ─────────────────────────────────────────────────────────────
         # Phase 2: Verification
@@ -584,8 +676,8 @@ class MinimalReproducer:
                 f"with proper synchronization"
             )
             log.info(
-                "If client still sees corruption, their bug is likely "
-                "application-level (missing syncs in TorchRec)"
+                "If corruption still occurs in real workloads, check for "
+                "application-level synchronization issues."
             )
         
         return ReproducerResult(

@@ -12,19 +12,19 @@ Usage:
         --simulate-compute \
         --gemm-layers 20
     
-    # Run in same-stream mode (replicates customer experiment 4)
+    # Run in same-stream mode (definitive runtime bug test)
     torchrun --nproc_per_node=8 -m aorta.race --same-stream
     
-    # Run with settings that mask the bug (for comparison)
+    # Run with reduced parallelism (for comparison)
     GPU_MAX_HW_QUEUES=2 torchrun --nproc_per_node=8 -m aorta.race
 
-Environment variables to test (from customer experiments):
-    GPU_MAX_HW_QUEUES=4          # Exposes bug (use 2 to mask)
-    ROC_SIGNAL_POOL_SIZE=16384   # Customer tried, didn't help
-    HSA_ENABLE_SDMA=0            # Customer tried, didn't help
-    GPU_FORCE_BLIT_COPY_SIZE=128 # Customer tried, didn't help
-    NCCL_LAUNCH_ORDER_IMPLICIT=1 # No NaN but slow
-    RCCL_GFX9_CHEAP_FENCE_OFF=1  # Customer tried, didn't help
+Environment variables to test:
+    GPU_MAX_HW_QUEUES=4          # Full parallelism (use 2 to reduce)
+    ROC_SIGNAL_POOL_SIZE=16384   # HSA signal pool size
+    HSA_ENABLE_SDMA=0            # Disable SDMA engine
+    GPU_FORCE_BLIT_COPY_SIZE=128 # Force blit copy threshold
+    NCCL_LAUNCH_ORDER_IMPLICIT=1 # Serialize NCCL operations
+    RCCL_GFX9_CHEAP_FENCE_OFF=1  # Disable fence optimization
 """
 
 import argparse
@@ -90,22 +90,18 @@ def parse_args() -> argparse.Namespace:
         help="Data type. Default: bfloat16"
     )
     
-    # Compute simulation
-    parser.add_argument(
-        "--simulate-compute", action="store_true", default=True,
-        help="Add GEMM work between collectives (default: enabled)"
-    )
+    # Compute simulation (enabled by default, use --no-compute to disable)
     parser.add_argument(
         "--no-compute", action="store_true",
         help="Disable compute simulation (fast but may not trigger bug)"
     )
     parser.add_argument(
-        "--gemm-size", type=int, default=4096,
-        help="GEMM matrix size. Default: 4096"
+        "--gemm-size", type=int, default=5120,
+        help="GEMM matrix size. Default: 5120 (~500ms/step on MI300X)"
     )
     parser.add_argument(
-        "--gemm-layers", type=int, default=20,
-        help="Number of GEMM layers. Default: 20"
+        "--gemm-layers", type=int, default=26,
+        help="Number of GEMM layers. Default: 26 (~500ms/step on MI300X)"
     )
     parser.add_argument(
         "--no-backward", action="store_true",
@@ -118,10 +114,40 @@ def parse_args() -> argparse.Namespace:
         help="Put H2D and datadist on same stream (replicates experiment 4)"
     )
     
-    # Hardware settings
+    # Hardware settings (GPU_MAX_HW_QUEUES)
     parser.add_argument(
         "--hw-queues", type=int, default=None,
         help="Set GPU_MAX_HW_QUEUES (4 exposes bug, 2 masks it)"
+    )
+    
+    # ==========================================================================
+    # Environment variable flags
+    # These can be set via CLI for convenience, or via env vars directly
+    # ==========================================================================
+    
+    parser.add_argument(
+        "--signal-pool-size", type=int, default=None,
+        help="Set ROC_SIGNAL_POOL_SIZE (default 64)"
+    )
+    parser.add_argument(
+        "--disable-sdma", action="store_true",
+        help="Set HSA_ENABLE_SDMA=0 (disable SDMA engine)"
+    )
+    parser.add_argument(
+        "--blit-copy-size", type=int, default=None,
+        help="Set GPU_FORCE_BLIT_COPY_SIZE threshold"
+    )
+    parser.add_argument(
+        "--nccl-implicit-order", action="store_true",
+        help="Set NCCL_LAUNCH_ORDER_IMPLICIT=1 (serializes NCCL ops)"
+    )
+    parser.add_argument(
+        "--disable-cheap-fence", action="store_true",
+        help="Set RCCL_GFX9_CHEAP_FENCE_OFF=1 and RCCL_GFX942_CHEAP_FENCE_OFF=1"
+    )
+    parser.add_argument(
+        "--disable-clr-batch", action="store_true",
+        help="Set DEBUG_CLR_BATCH_CPU_SYNC_SIZE=0 (disable CLR batching)"
     )
     
     return parser.parse_args()
@@ -142,9 +168,52 @@ def init_distributed() -> tuple[int, int]:
     return rank, world_size
 
 
+def apply_env_vars(args: argparse.Namespace) -> dict[str, str]:
+    """Apply environment variables from CLI flags.
+    
+    Returns dict of variables that were set for logging.
+    """
+    applied = {}
+    
+    if args.hw_queues is not None:
+        os.environ["GPU_MAX_HW_QUEUES"] = str(args.hw_queues)
+        applied["GPU_MAX_HW_QUEUES"] = str(args.hw_queues)
+    
+    if args.signal_pool_size is not None:
+        os.environ["ROC_SIGNAL_POOL_SIZE"] = str(args.signal_pool_size)
+        applied["ROC_SIGNAL_POOL_SIZE"] = str(args.signal_pool_size)
+    
+    if args.disable_sdma:
+        os.environ["HSA_ENABLE_SDMA"] = "0"
+        applied["HSA_ENABLE_SDMA"] = "0"
+    
+    if args.blit_copy_size is not None:
+        os.environ["GPU_FORCE_BLIT_COPY_SIZE"] = str(args.blit_copy_size)
+        applied["GPU_FORCE_BLIT_COPY_SIZE"] = str(args.blit_copy_size)
+    
+    if args.nccl_implicit_order:
+        os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
+        applied["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
+    
+    if args.disable_cheap_fence:
+        os.environ["RCCL_GFX9_CHEAP_FENCE_OFF"] = "1"
+        os.environ["RCCL_GFX942_CHEAP_FENCE_OFF"] = "1"
+        applied["RCCL_GFX9_CHEAP_FENCE_OFF"] = "1"
+        applied["RCCL_GFX942_CHEAP_FENCE_OFF"] = "1"
+    
+    if args.disable_clr_batch:
+        os.environ["DEBUG_CLR_BATCH_CPU_SYNC_SIZE"] = "0"
+        applied["DEBUG_CLR_BATCH_CPU_SYNC_SIZE"] = "0"
+    
+    return applied
+
+
 def main():
     """Main entry point."""
     args = parse_args()
+    
+    # Apply environment variables from CLI flags (before any CUDA init)
+    applied_env = apply_env_vars(args)
     
     # Initialize distributed
     rank, world_size = init_distributed()
@@ -161,7 +230,7 @@ def main():
         log.info(f"World size: {world_size}")
         log.info(f"Warmup iterations: {args.warmup}")
         log.info(f"Verify iterations: {args.verify}")
-        log.info(f"Simulate compute: {args.simulate_compute and not args.no_compute}")
+        log.info(f"Simulate compute: {not args.no_compute}")
         log.info(f"Same stream mode: {args.same_stream}")
         log.info("")
         
@@ -174,11 +243,13 @@ def main():
             "NCCL_LAUNCH_ORDER_IMPLICIT",
             "RCCL_GFX9_CHEAP_FENCE_OFF",
             "RCCL_GFX942_CHEAP_FENCE_OFF",
+            "DEBUG_CLR_BATCH_CPU_SYNC_SIZE",
         ]
         log.info("Environment variables:")
         for var in env_vars:
             value = os.environ.get(var, "(not set)")
-            log.info(f"  {var}={value}")
+            source = " (via CLI)" if var in applied_env else ""
+            log.info(f"  {var}={value}{source}")
         log.info("")
         log.info("=" * 70)
     
@@ -192,7 +263,7 @@ def main():
         alltoall_tensor_size=args.a2a_size,
         allreduce_tensor_size=args.ar_size,
         dtype=args.dtype,
-        simulate_compute=args.simulate_compute and not args.no_compute,
+        simulate_compute=not args.no_compute,
         gemm_size=args.gemm_size,
         gemm_layers=args.gemm_layers,
         include_backward_compute=not args.no_backward,
@@ -224,8 +295,8 @@ def main():
         if result.passed:
             log.info("")
             log.info("VERDICT: No runtime bug detected with current settings.")
-            log.info("If client still sees corruption, their bug is likely")
-            log.info("application-level (missing syncs in TorchRec).")
+            log.info("If corruption still occurs in real workloads, check for")
+            log.info("application-level synchronization issues.")
         else:
             log.info("")
             log.info("VERDICT: RUNTIME BUG DETECTED!")
