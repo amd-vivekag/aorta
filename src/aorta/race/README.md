@@ -172,3 +172,5 @@ race_experiment:
 - `datadist_racing.py` - Datadist/all_to_all racing implementation
 - `timing_skew_experiment.py` - Controlled timing skew injection
 - `injectors.py` - High-level injection interface for the trainer
+- `inflight_checks.py` - Repeated in-flight reads to detect torn reads
+- `correctness_verification.py` - Manual verification to detect silent corruption
