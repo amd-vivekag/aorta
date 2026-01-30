@@ -288,4 +288,3 @@ def generate_plots_cmd(ctx, input_file, excel_input, gemm_csv, output, plot_type
         raise click.ClickException(str(e))
     except Exception as e:
         raise click.ClickException(f"Error generating plots: {e}")
-

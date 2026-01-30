@@ -66,4 +66,3 @@ def save_figure(
 def get_improvement_colors(values) -> List[str]:
     """Return green/red colors based on positive/negative values."""
     return [COLORS["positive"] if v > 0 else COLORS["negative"] for v in values]
-

@@ -13,8 +13,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.worksheet import Worksheet
 
 
 # =============================================================================
@@ -44,28 +46,9 @@ WHITE = "FFFFFF"
 GREEN = "63BE7B"
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
-
-def get_column_letter(col_num: int) -> str:
-    """Convert column number (1-based) to Excel column letter."""
-    result = ""
-    while col_num > 0:
-        col_num -= 1
-        result = chr(65 + (col_num % 26)) + result
-        col_num //= 26
-    return result
-
-
 def sanitize_table_name(sheet_name: str) -> str:
     """Create valid Excel table name from sheet name."""
-    table_name = (
-        sheet_name.replace(" ", "_")
-        .replace("-", "_")
-        .replace("(", "")
-        .replace(")", "")
-    )
+    table_name = sheet_name.replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
     # Ensure name starts with letter
     if not table_name[0].isalpha():
         table_name = "Tbl_" + table_name
@@ -73,9 +56,9 @@ def sanitize_table_name(sheet_name: str) -> str:
     return table_name[:255]
 
 
-def add_excel_table(worksheet, table_name: str, start_row: int = 1) -> bool:
+def add_excel_table(worksheet: Worksheet, table_name: str, start_row: int = 1) -> bool:
     """Convert worksheet data to Excel table format.
-    
+
     Returns True if table was added, False otherwise.
     """
     max_row = worksheet.max_row
@@ -117,6 +100,7 @@ def add_excel_table(worksheet, table_name: str, start_row: int = 1) -> bool:
 # Sheet Processing Functions
 # =============================================================================
 
+
 def _add_gpu_sheets(
     writer: pd.ExcelWriter,
     gpu_combined_path: Path,
@@ -124,7 +108,7 @@ def _add_gpu_sheets(
     verbose: bool,
 ) -> Tuple[List[str], List[str]]:
     """Add GPU timeline sheets.
-    
+
     Returns (raw_sheets, comparison_sheets).
     """
     raw_sheets = []
@@ -164,7 +148,7 @@ def _add_collective_sheets(
     verbose: bool,
 ) -> Tuple[List[str], List[str]]:
     """Add collective/NCCL sheets.
-    
+
     Returns (raw_sheets, comparison_sheets).
     """
     raw_sheets = []
@@ -221,7 +205,7 @@ def _create_summary_dashboard(
     verbose: bool,
 ) -> str:
     """Create Summary_Dashboard sheet with key metrics.
-    
+
     Returns sheet name.
     """
     if verbose:
@@ -238,14 +222,14 @@ def _create_summary_dashboard(
     # Add GPU metrics
     try:
         gpu_summary = pd.read_excel(gpu_comparison_path, sheet_name="Summary_Comparison")
-        
+
         # Find the actual column names for time values
         time_cols = [
             col
             for col in gpu_summary.columns
             if "time_ms" in col and "diff" not in col and "percent" not in col
         ]
-        
+
         if len(time_cols) >= 2:
             baseline_col = time_cols[0]
             test_col = time_cols[1]
@@ -267,10 +251,10 @@ def _create_summary_dashboard(
                 dashboard_data["Metric"].append(f"GPU_{metric_type}")
                 dashboard_data[baseline_label].append(round(row[baseline_col], 2))
                 dashboard_data[test_label].append(round(row[test_col], 2))
-                
+
                 pct_val = row.get("percent_change", 0)
                 dashboard_data["Improvement (%)"].append(round(pct_val, 2))
-                
+
                 if pct_val > 1:
                     status = "Better"
                 elif pct_val < -1:
@@ -287,38 +271,43 @@ def _create_summary_dashboard(
         # Try to read NCCL comparison sheets
         coll_xl = pd.ExcelFile(coll_comparison_path)
         nccl_cmp_sheets = [s for s in coll_xl.sheet_names if "_cmp" in s.lower()]
-        
+
         for sheet_name in nccl_cmp_sheets:
             nccl_df = pd.read_excel(coll_comparison_path, sheet_name=sheet_name)
-            
+
             # Find latency columns
             latency_cols = [
-                col for col in nccl_df.columns 
+                col
+                for col in nccl_df.columns
                 if "comm_latency" in col.lower() and "percent_change" not in col.lower()
             ]
-            
+
             if len(latency_cols) >= 2:
                 base_col = latency_cols[0]
                 test_col = latency_cols[1]
-                pct_col = [c for c in nccl_df.columns if "percent_change" in c.lower() and "latency" in c.lower()]
-                
+                pct_col = [
+                    c
+                    for c in nccl_df.columns
+                    if "percent_change" in c.lower() and "latency" in c.lower()
+                ]
+
                 # Aggregate across all rows (mean)
                 base_val = nccl_df[base_col].mean()
                 test_val = nccl_df[test_col].mean()
-                
+
                 if pct_col:
                     pct_val = nccl_df[pct_col[0]].mean()
                 else:
                     pct_val = (base_val - test_val) / base_val * 100 if base_val != 0 else 0
-                
+
                 # Create metric name from sheet name
                 metric_name = sheet_name.replace("nccl_", "NCCL_").replace("_cmp", "_latency")
-                
+
                 dashboard_data["Metric"].append(metric_name)
                 dashboard_data[baseline_label].append(round(base_val, 2))
                 dashboard_data[test_label].append(round(test_val, 2))
                 dashboard_data["Improvement (%)"].append(round(pct_val, 2))
-                
+
                 if pct_val > 1:
                     status = "Better"
                 elif pct_val < -1:
@@ -326,7 +315,7 @@ def _create_summary_dashboard(
                 else:
                     status = "Similar"
                 dashboard_data["Status"].append(status)
-                
+
     except Exception as e:
         if verbose:
             print(f"  Warning: Could not add NCCL metrics to dashboard: {e}")
@@ -334,10 +323,10 @@ def _create_summary_dashboard(
     dashboard_df = pd.DataFrame(dashboard_data)
     sheet_name = "Summary_Dashboard"
     dashboard_df.to_excel(writer, sheet_name=sheet_name, index=False)
-    
+
     if verbose:
         print(f"  Added {sheet_name} ({len(dashboard_df)} metrics)")
-    
+
     return sheet_name
 
 
@@ -348,7 +337,7 @@ def _apply_post_processing(
     verbose: bool,
 ) -> None:
     """Apply Excel formatting: hide sheets, add tables, color formatting."""
-    
+
     if verbose:
         print("\nStep 4: Applying formatting")
 
@@ -371,7 +360,7 @@ def _apply_post_processing(
 
         # Create unique table name
         table_name = sanitize_table_name(sheet_name)
-        
+
         if add_excel_table(ws, table_name):
             if verbose:
                 print(f"  Converted to table: {sheet_name}")
@@ -422,6 +411,7 @@ def _apply_post_processing(
 # Main Function
 # =============================================================================
 
+
 def create_final_excel_report(
     gpu_combined_path: Path,
     gpu_comparison_path: Path,
@@ -434,7 +424,7 @@ def create_final_excel_report(
 ) -> Dict[str, any]:
     """
     Create comprehensive final Excel report.
-    
+
     Args:
         gpu_combined_path: Path to GPU combined file
         gpu_comparison_path: Path to GPU comparison file
@@ -444,7 +434,7 @@ def create_final_excel_report(
         baseline_label: Label for baseline column
         test_label: Label for test column
         verbose: Print progress
-    
+
     Returns:
         Dictionary with report metadata:
         - output_path: Path to created report
@@ -471,9 +461,7 @@ def create_final_excel_report(
     # Create report
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         # Add GPU sheets
-        gpu_raw, gpu_cmp = _add_gpu_sheets(
-            writer, gpu_combined_path, gpu_comparison_path, verbose
-        )
+        gpu_raw, gpu_cmp = _add_gpu_sheets(writer, gpu_combined_path, gpu_comparison_path, verbose)
         all_raw_sheets.extend(gpu_raw)
         all_comparison_sheets.extend(gpu_cmp)
 
@@ -502,4 +490,3 @@ def create_final_excel_report(
         "visible_sheets": [dashboard_sheet] + all_comparison_sheets,
         "hidden_sheets": all_raw_sheets,
     }
-

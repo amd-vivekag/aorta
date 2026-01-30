@@ -20,11 +20,11 @@ def _create_boxplot(
 ) -> Path:
     """Generic boxplot creation helper."""
     fig, ax = plt.subplots(figsize=figsize)
-    
+
     keys_list = sorted(data_dict.keys())
     plot_data = [data_dict[k] for k in keys_list]
     labels = [label_fmt.format(k) for k in keys_list]
-    
+
     bp = ax.boxplot(
         plot_data,
         tick_labels=labels,
@@ -32,7 +32,7 @@ def _create_boxplot(
         showmeans=True,
         meanline=True,
     )
-    
+
     # Handle color assignment
     if colors == "viridis":
         color_list = plt.cm.viridis(
@@ -40,15 +40,15 @@ def _create_boxplot(
         )
     else:
         color_list = colors
-    
+
     for patch, color in zip(bp["boxes"], color_list):
         patch.set_facecolor(color)
-    
+
     ax.set_ylabel("Time Difference (us)", fontsize=14, fontweight="bold")
     ax.set_xlabel(xlabel, fontsize=14, fontweight="bold")
     ax.set_title(title, fontsize=16, fontweight="bold", pad=20)
     ax.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     return save_figure(fig, output_path, dpi)
 
@@ -105,4 +105,3 @@ def plot_variance_by_ranks(
         figsize=(14, 6),
         dpi=dpi,
     )
-

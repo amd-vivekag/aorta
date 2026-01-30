@@ -36,32 +36,32 @@ def generate_summary_plots(
 ) -> List[Path]:
     """
     Generate all summary plots from Excel report.
-    
+
     Args:
         excel_path: Path to final Excel report
         output_dir: Output directory for PNG files
         dpi: DPI for output images
         verbose: Print progress
-    
+
     Returns:
         List of generated file paths.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     output_files: List[Path] = []
-    
+
     if verbose:
         print(f"\nGenerating summary plots from: {excel_path}")
-    
+
     labels = get_labels_from_excel(excel_path)
     if verbose:
         print(f"  Labels: {labels}")
-    
+
     # Dashboard plots
     if verbose:
         print("  Creating dashboard plots...")
     output_files.append(plot_improvement_chart(excel_path, output_dir, dpi))
     output_files.append(plot_abs_time_comparison(excel_path, output_dir, labels, dpi))
-    
+
     # GPU plots
     if verbose:
         print("  Creating GPU plots...")
@@ -70,20 +70,20 @@ def generate_summary_plots(
     )
     output_files.append(plot_gpu_percent_change_grid(excel_path, output_dir, dpi))
     output_files.append(plot_gpu_heatmap(excel_path, output_dir, dpi))
-    
+
     # NCCL plots
     if verbose:
         print("  Creating NCCL plots...")
     nccl_files = plot_nccl_comparison(excel_path, output_dir, labels, dpi)
     output_files.extend(nccl_files)
-    
+
     nccl_pct_file = plot_nccl_percent_change(excel_path, output_dir, dpi)
     if nccl_pct_file:
         output_files.append(nccl_pct_file)
-    
+
     if verbose:
         print(f"  Generated {len(output_files)} summary plots")
-    
+
     return output_files
 
 
@@ -95,44 +95,44 @@ def generate_gemm_plots(
 ) -> List[Path]:
     """
     Generate all GEMM variance plots from CSV.
-    
+
     Args:
         csv_path: Path to GEMM variance CSV
         output_dir: Output directory for PNG files
         dpi: DPI for output images
         verbose: Print progress
-    
+
     Returns:
         List of generated file paths.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     output_files: List[Path] = []
-    
+
     if verbose:
         print(f"\nGenerating GEMM plots from: {csv_path}")
-    
+
     data = read_gemm_csv_data(csv_path)
-    
+
     if verbose:
         print(f"  Total data points: {len(data['all'])}")
         print_gemm_statistics(data)
-    
+
     # Boxplots
     if verbose:
         print("  Creating boxplots...")
     output_files.append(plot_variance_by_threads(data, output_dir, dpi))
     output_files.append(plot_variance_by_channels(data, output_dir, dpi))
     output_files.append(plot_variance_by_ranks(data, output_dir, dpi))
-    
+
     # Violin and interaction
     if verbose:
         print("  Creating violin and interaction plots...")
     output_files.append(plot_variance_violin_combined(data, output_dir, dpi))
     output_files.append(plot_thread_channel_interaction(data, output_dir, dpi))
-    
+
     if verbose:
         print(f"  Generated {len(output_files)} GEMM plots")
-    
+
     return output_files
 
 
@@ -146,7 +146,7 @@ def generate_plots(
 ) -> Dict[str, List[Path]]:
     """
     Generate plots based on type.
-    
+
     Args:
         plot_type: "summary", "gemm", or "all"
         output_dir: Output directory for PNG files
@@ -154,17 +154,17 @@ def generate_plots(
         gemm_csv: Path to GEMM CSV (for gemm/all)
         dpi: DPI for output images
         verbose: Print progress
-    
+
     Returns:
         Dict mapping category to list of generated file paths
-    
+
     Raises:
         ValueError: If required inputs not provided for plot_type
         FileNotFoundError: If input files don't exist
     """
     configure_style()
     results: Dict[str, List[Path]] = {}
-    
+
     if plot_type in ("summary", "all"):
         if excel_input is None:
             raise ValueError("Excel input required for summary plots")
@@ -173,13 +173,12 @@ def generate_plots(
         results["summary"] = generate_summary_plots(
             excel_input, output_dir, dpi, verbose
         )
-    
+
     if plot_type in ("gemm", "all"):
         if gemm_csv is None:
             raise ValueError("GEMM CSV required for gemm plots")
         if not gemm_csv.exists():
             raise FileNotFoundError(f"CSV file not found: {gemm_csv}")
         results["gemm"] = generate_gemm_plots(gemm_csv, output_dir, dpi, verbose)
-    
-    return results
 
+    return results

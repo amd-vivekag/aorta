@@ -47,4 +47,3 @@ __all__ = [
     "plot_variance_violin_combined",
     "plot_thread_channel_interaction",
 ]
-

@@ -125,4 +125,3 @@ implementations across 8 ranks.</p>
     print(f"  File size: {file_size:.2f} MB")
 
     return output
-

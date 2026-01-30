@@ -93,4 +93,3 @@ def generate_sweep_comparison(
     print(f"  File size: {file_size:.2f} MB")
 
     return output
-

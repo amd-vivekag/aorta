@@ -12,4 +12,3 @@ __all__ = [
     "generate_summary_plots",
     "generate_gemm_plots",
 ]
-

@@ -27,7 +27,7 @@ def plot_variance_violin_combined(
 ) -> Path:
     """Create combined violin plot (1x3 grid) for all dimensions."""
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    
+
     configs = [
         {
             "data": _prepare_violin_data(data["threads"], "{}t"),
@@ -51,13 +51,13 @@ def plot_variance_violin_combined(
             "title": "By Rank",
         },
     ]
-    
+
     for ax, cfg in zip(axes, configs):
         violin_data = cfg["data"]
         if not violin_data:
             ax.set_visible(False)
             continue
-        
+
         configs_list = sorted(
             set(d["config"] for d in violin_data),
             key=cfg["sort_key"],
@@ -66,7 +66,7 @@ def plot_variance_violin_combined(
             [d["time_diff"] for d in violin_data if d["config"] == c]
             for c in configs_list
         ]
-        
+
         parts = ax.violinplot(
             values,
             positions=range(len(configs_list)),
@@ -76,21 +76,20 @@ def plot_variance_violin_combined(
         for pc in parts["bodies"]:
             pc.set_facecolor(cfg["color"])
             pc.set_alpha(0.7)
-        
+
         ax.set_xticks(range(len(configs_list)))
         ax.set_xticklabels(configs_list)
         ax.set_ylabel("Time Difference (us)", fontsize=12, fontweight="bold")
         ax.set_xlabel(cfg["xlabel"], fontsize=12, fontweight="bold")
         ax.set_title(cfg["title"], fontsize=14, fontweight="bold")
         ax.grid(True, alpha=0.3, axis="y")
-    
+
     fig.suptitle(
         "GEMM Kernel Time Variance Distribution",
         fontsize=18,
         fontweight="bold",
         y=1.02,
     )
-    
+
     plt.tight_layout()
     return save_figure(fig, output_dir / "variance_violin_combined.png", dpi)
-
