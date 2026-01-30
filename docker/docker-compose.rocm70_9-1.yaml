@@ -4,7 +4,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.rocm70_9-1
-      network: host
     user: root
     privileged: true
     network_mode: host
@@ -21,9 +20,8 @@ services:
       - TORCH_NCCL_HIGH_PRIORITY=1
 
     volumes:
-      # Mount parent directory (aorta/) to /workspace/aorta
-      # Use AORTA_WORKSPACE env var if set, otherwise default to parent dir (..)
-      - ${AORTA_WORKSPACE:-..}:/workspace/aorta
+      - /home/manrao:/manrao
+      - /home/oyazdanb/aorta:/workspace/aorta
     devices:
       - /dev/kfd
       - /dev/dri

@@ -22,7 +22,8 @@ services:
 
     volumes:
       - /home/manrao:/manrao
-      - /home/oyazdanb/aorta:/workspace/aorta
+      - /apps/oyazdanb/rccl:/rccl
+      - /apps/oyazdanb/aorta:/workspace/aorta
     devices:
       - /dev/kfd
       - /dev/dri
