@@ -1,7 +1,7 @@
 # `generate excel` Command - Developer Documentation
 
-**Version:** 1.0  
-**Date:** January 2026  
+**Version:** 1.0
+**Date:** January 2026
 **Status:** ✅ Implemented
 
 ---
@@ -102,48 +102,48 @@ The script requires 4 Excel files:
 def create_final_report(gpu_combined, gpu_comparison, coll_combined, coll_comparison, output_file):
     # 1. Create workbook and add sheets
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        
+
         # 2. Add GPU Timeline sheets (raw → hidden)
         for sheet in gpu_combined:
             rename_and_add(sheet, "GPU_*_Raw")
             mark_as_hidden(sheet)
-        
+
         # 3. Add GPU Comparison sheets (visible)
         for sheet in gpu_comparison:
             if "Comparison" in sheet:
                 rename_and_add(sheet, "GPU_*_Cmp")
-        
+
         # 4. Add Collective sheets (raw → hidden)
         for sheet in coll_combined:
             if "summary" in sheet:
                 rename_and_add(sheet, "NCCL_*_Raw")
                 mark_as_hidden(sheet)
-        
+
         # 5. Add Collective Comparison sheets (visible)
         for sheet in coll_comparison:
             rename_and_add(sheet, "NCCL_*")
-        
+
         # 6. Create Summary Dashboard
         create_dashboard_from_gpu_comparison()
-    
+
     # 7. Post-processing with openpyxl
     wb = load_workbook(output_file)
-    
+
     # 8. Hide raw data sheets
     for sheet in raw_sheets:
         wb[sheet].sheet_state = "hidden"
-    
+
     # 9. Convert all sheets to Excel tables
     for sheet in wb.sheetnames:
         add_excel_table(sheet)
-    
+
     # 10. Add conditional formatting to comparison sheets
     for sheet in comparison_sheets:
         apply_color_scale_to_percent_change_columns(sheet)
-    
+
     # 11. Move Summary_Dashboard to first position
     wb.move_sheet("Summary_Dashboard", offset=-(len(wb.sheetnames)-1))
-    
+
     wb.save(output_file)
 ```
 
@@ -199,7 +199,7 @@ for sheet in ['nccl_implicit_sync_cmp', 'nccl_long_cmp']:
 def add_excel_table(worksheet, table_name):
     # Create table reference: A1:Z100
     table_ref = f"A1:{get_column_letter(max_col)}{max_row}"
-    
+
     tab = Table(displayName=table_name, ref=table_ref)
     style = TableStyleInfo(
         name="TableStyleMedium2",
@@ -319,7 +319,7 @@ def create_final_excel_report(
 ) -> Path:
     """
     Create comprehensive final Excel report.
-    
+
     Args:
         gpu_comparison_path: Path to GPU comparison file
         coll_comparison_path: Path to collective comparison file
@@ -329,7 +329,7 @@ def create_final_excel_report(
         gpu_combined_path: Optional separate GPU combined file
         coll_combined_path: Optional separate collective combined file
         verbose: Print progress
-    
+
     Returns:
         Path to created report
     """
@@ -570,16 +570,16 @@ Features:
 @click.pass_context
 def generate_excel(ctx, gpu_comparison, coll_comparison, baseline_label, test_label, output):
     """Generate comprehensive final Excel report.
-    
+
     Combines GPU timeline and collective comparison data into a single
     well-organized Excel report with:
-    
+
     \b
     - Summary Dashboard (first sheet, key metrics at a glance)
     - Comparison sheets (visible, with color-coded changes)
     - Raw data sheets (hidden, accessible via Unhide)
     - Excel table formatting with filters
-    
+
     \b
     Examples:
       aorta-report generate excel \\
@@ -615,4 +615,3 @@ def generate_excel(ctx, gpu_comparison, coll_comparison, baseline_label, test_la
 3. **Table Style:** Use `TableStyleMedium2` (standard)
 
 4. **Sheet Order:** Dashboard → GPU Comparison → NCCL Comparison → (hidden)
-
