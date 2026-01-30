@@ -35,6 +35,7 @@ def image_to_base64(image_path: Path) -> Optional[str]:
             mime = mime_types.get(suffix, "image/png")
             return f"data:{mime};base64,{b64_data}"
     except FileNotFoundError:
+        print(f"Warning: Failed to encode image {image_path}: File not found")
         return None
     except Exception as e:
         print(f"Warning: Failed to encode image {image_path}: {e}")
@@ -227,15 +228,11 @@ def _generate_sweep_mode(
 
     # Check and report plot status for sweep 1
     found1, missing1 = check_plots_status(plots1, SWEEP_PLOT_FILES)
-    print_plot_status(
-        SWEEP_PLOT_FILES, found1, missing1, plots1, label=f"Sweep 1: {label1}"
-    )
+    print_plot_status(SWEEP_PLOT_FILES, found1, missing1, plots1, label=f"Sweep 1: {label1}")
 
     # Check and report plot status for sweep 2
     found2, missing2 = check_plots_status(plots2, SWEEP_PLOT_FILES)
-    print_plot_status(
-        SWEEP_PLOT_FILES, found2, missing2, plots2, label=f"Sweep 2: {label2}"
-    )
+    print_plot_status(SWEEP_PLOT_FILES, found2, missing2, plots2, label=f"Sweep 2: {label2}")
 
     # Delegate to sweep comparison generator
     return generate_sweep_comparison(
@@ -271,9 +268,7 @@ def _generate_performance_mode(
 
     # Check and report plot status
     found, missing = check_plots_status(plots_dir, PERFORMANCE_PLOT_FILES)
-    print_plot_status(
-        PERFORMANCE_PLOT_FILES, found, missing, plots_dir, label="Performance Report"
-    )
+    print_plot_status(PERFORMANCE_PLOT_FILES, found, missing, plots_dir, label="Performance Report")
 
     # Delegate to performance report generator
     return generate_performance_report(
@@ -316,9 +311,7 @@ def _generate_gemm_mode(
 
     # Check and report plot status
     found, missing = check_plots_status(plots_dir, GEMM_PLOT_FILES)
-    print_plot_status(
-        GEMM_PLOT_FILES, found, missing, plots_dir, label=f"GEMM Analysis: {label}"
-    )
+    print_plot_status(GEMM_PLOT_FILES, found, missing, plots_dir, label=f"GEMM Analysis: {label}")
 
     # Delegate to GEMM report generator
     return generate_gemm_report(
