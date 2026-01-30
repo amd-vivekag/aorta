@@ -78,9 +78,9 @@ def process_excel_file(
         sheet = wb["GEMM"]
 
         # Expected column positions (0-based indices)
-        col_kernel_info = column_letter_to_index("X")  # Column X
-        col_time_min = column_letter_to_index("AG")  # Column AG
-        col_time_max = column_letter_to_index("AH")  # Column AH
+        col_kernel_info = column_letter_to_index("Y")  # Column X
+        col_time_min = column_letter_to_index("AH")  # Column AG
+        col_time_max = column_letter_to_index("AI")  # Column AH
 
         # Read header row to validate column names
         rows_data = []
