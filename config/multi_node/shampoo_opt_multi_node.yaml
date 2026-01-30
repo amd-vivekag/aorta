@@ -5,11 +5,11 @@ logging:
 
 training:
   epochs: 1
-  batch_size: 1024
-  gradient_accumulation: 2
-  mixed_precision: bf16
-  max_steps: 10
-  grad_clip_norm: 1.0
+  batch_size: 16
+  gradient_accumulation: 1
+  mixed_precision: fp32    # Avoid bf16 cast overhead
+  max_steps: 2             # 2 steps for comparison
+  grad_clip_norm: null     # Skip grad clipping
   log_interval: 1
   output_dir: artifacts/nan_stream_race_minimal
 
@@ -40,11 +40,11 @@ race_experiment:
   inflight_read_delay_size: 65536  # GPU delay work between reads
 
   # Warmup and detection
-  skip_training_warmup: false
-  training_warmup_steps: 1
-  warmup_batch_size: 64  # Small batch for fast warmup, then 1024 for racing
-  skip_rccl_warmup: false
-  rccl_warmup_iterations: 5
+  skip_training_warmup: true   # Skip warmup for faster debug
+  training_warmup_steps: 0
+  warmup_batch_size: 16
+  skip_rccl_warmup: true       # Skip RCCL warmup
+  rccl_warmup_iterations: 0
   nan_check_collectives: true
 
   # Hardware queues (4+ for true parallelism)
@@ -59,35 +59,35 @@ race_experiment:
   nccl_async_diagnostic: false
 
 optimizer:
-  name: shampoo
+  name: adamw
   lr: 0.0002
   weight_decay: 0.01
-  betas: [0.9, 0.985]
+  betas: [0.9, 0.999]
   eps: 1.0e-8
 
 scheduler:
-  warmup_steps: 200
-  total_steps: 2200
+  warmup_steps: 1
+  total_steps: 10
 
 dataset:
-  num_samples: 200000
-  sequence_length: 160
-  dense_dim: 1024       # Keep large for wide H2D race window
-  sparse_features: 64
-  vocab_size: 100000    # Match model vocab_size
-  num_dense_features: 32
+  num_samples: 1024     # Enough samples for 8 GPUs with batch_size 16 (need at least 8*16*max_steps)
+  sequence_length: 16   # Short sequences
+  dense_dim: 64         # Match model
+  sparse_features: 8
+  vocab_size: 1000      # Match model vocab_size
+  num_dense_features: 4
   seed: 42
 
 model:
-  vocab_size: 100000    # Reduced from 350000
-  embedding_dim: 128    # Reduced from 256
-  num_dense_features: 32
-  dense_dim: 1024       # Keep large for wide H2D race window
-  model_dim: 512        # Reduced from 1024
-  num_heads: 8          # Reduced from 16
-  num_layers: 6         # Reduced from 18 - much faster forward
-  dropout: 0.1
-  mlp_hidden_dim: 2048  # Reduced from 4096
+  vocab_size: 1000      # Minimal for stream debug
+  embedding_dim: 32     # Minimal for stream debug
+  num_dense_features: 4
+  dense_dim: 64         # Minimal for stream debug
+  model_dim: 64         # Minimal for stream debug
+  num_heads: 2          # Minimal for stream debug
+  num_layers: 1         # Single layer
+  dropout: 0.0
+  mlp_hidden_dim: 128   # Minimal for stream debug
 
 fsdp:
   sharding_strategy: hybrid_shard
@@ -121,10 +121,10 @@ profiling:
   enabled: true
   wait: 0
   warmup: 0
-  active: 5
+  active: 2
   repeat: 1
   record_shapes: true
-  profile_memory: true
+  profile_memory: false     # Skip memory profiling for speed
   with_stack: false
   with_flops: false
   tensorboard: false

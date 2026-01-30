@@ -36,6 +36,10 @@ fi
 export NCCL_MAX_NCHANNELS="${CHANNELS}"
 export RCCL_THREADS_PER_BLOCK="${THREADS}"
 
+# Set AMD_LOG_LEVEL_FILE to experiment directory (will be converted to Docker path later)
+# This ensures AMD logs go to the experiment folder instead of current directory
+export AMD_LOG_LEVEL_FILE="${EXPERIMENT_DIR}/${THREADS}thread_${CHANNELS}channels/trace_amd_node${NODE_RANK}.log"
+
 echo "=========================================="
 echo "Local Launch Configuration"
 echo "=========================================="
@@ -71,6 +75,9 @@ if [[ "$CONFIG_FILE" =~ ^/ ]]; then
 else
     CONFIG_FILE_DOCKER="$CONFIG_FILE"
 fi
+
+# Convert AMD_LOG_LEVEL_FILE to Docker path
+export AMD_LOG_LEVEL_FILE=$(echo "$AMD_LOG_LEVEL_FILE" | sed "s|^${AORTA_ROOT_FROM_EXP}|/workspace/aorta|")
 
 # Function to log with timestamp
 log() {
