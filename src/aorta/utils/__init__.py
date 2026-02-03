@@ -24,17 +24,24 @@ from .device import (
     # Extended device utilities
     get_device_properties,
     get_distributed_backend,
+    get_driver_info,
     get_memory_stats,
     get_rocm_env_info,
+    get_system_info,
+    log_environment_info,
     reset_memory_stats,
 )
 from .logging import setup_logging
 from .streams import (
+    create_multi_gpu_streams,
     create_streams,
+    create_streams_per_device,
     cuda_stream_context,
+    get_available_devices,
     get_stream_id,
     sync_all_streams,
     sync_stream,
+    warmup_all_gpus,
     warmup_gpu,
 )
 from .timing import (
@@ -66,13 +73,20 @@ __all__ = [
     "get_memory_stats",
     "reset_memory_stats",
     "get_rocm_env_info",
+    "get_driver_info",
+    "get_system_info",
+    "log_environment_info",
     # Streams
     "create_streams",
+    "create_multi_gpu_streams",
+    "create_streams_per_device",
+    "get_available_devices",
     "sync_all_streams",
     "sync_stream",
     "cuda_stream_context",
     "get_stream_id",
     "warmup_gpu",
+    "warmup_all_gpus",
     # Timing
     "EventTiming",
     "TimingContext",

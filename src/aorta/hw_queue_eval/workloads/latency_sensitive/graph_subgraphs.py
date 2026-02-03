@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import BaseWorkload
+from aorta.hw_queue_eval.workloads.base import BaseWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -40,7 +40,7 @@ class Subgraph(nn.Module):
 
 
 @WorkloadRegistry.register
-class GraphSubgraphsWorkload(BaseWorkload):
+class GraphSubgraphsWorkload(MultiGPUMixin, BaseWorkload):
     """
     Independent subgraph execution pattern.
 
@@ -71,6 +71,7 @@ class GraphSubgraphsWorkload(BaseWorkload):
     recommended_streams = 8
     switch_latency_sensitivity = "high"
     memory_requirements_gb = 2.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -80,6 +81,7 @@ class GraphSubgraphsWorkload(BaseWorkload):
         output_size: int = 512,
         batch_size: int = 32,
         subgraph_layers: int = 3,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize subgraph workload.
@@ -91,6 +93,7 @@ class GraphSubgraphsWorkload(BaseWorkload):
             output_size: Output dimension per subgraph
             batch_size: Batch size
             subgraph_layers: Number of layers per subgraph
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.num_subgraphs = num_subgraphs
@@ -99,34 +102,21 @@ class GraphSubgraphsWorkload(BaseWorkload):
         self.output_size = output_size
         self.batch_size = batch_size
         self.subgraph_layers = subgraph_layers
+        self.use_multi_gpu = use_multi_gpu
 
         self._subgraphs: List[Subgraph] = []
         self._aggregator: nn.Module = None
         self._subgraph_outputs: List[torch.Tensor] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup subgraphs and stream assignments."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create subgraphs
-        self._subgraphs = []
-        for i in range(self.num_subgraphs):
-            subgraph = Subgraph(
-                self.input_size,
-                self.hidden_size,
-                self.output_size,
-                self.subgraph_layers,
-            ).to(device)
-            subgraph.eval()
-            self._subgraphs.append(subgraph)
-
-        # Aggregation layer
-        self._aggregator = nn.Linear(
-            self.output_size * self.num_subgraphs, self.output_size
-        ).to(device)
-        self._aggregator.eval()
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         # Reserve first and last for input/aggregate
@@ -141,19 +131,43 @@ class GraphSubgraphsWorkload(BaseWorkload):
 
         self._aggregate_stream = stream_count - 1
 
-        # Input tensor
+        # Create subgraphs - each on its stream's device
+        self._subgraphs = []
+        for i in range(self.num_subgraphs):
+            stream_idx = self._subgraph_streams[i]
+            target_device = self._get_device_for_stream(stream_idx)
+            subgraph = Subgraph(
+                self.input_size,
+                self.hidden_size,
+                self.output_size,
+                self.subgraph_layers,
+            ).to(target_device)
+            subgraph.eval()
+            self._subgraphs.append(subgraph)
+
+        # Aggregation layer on aggregate stream's device
+        aggregate_device = self._get_device_for_stream(self._aggregate_stream)
+        self._aggregator = nn.Linear(
+            self.output_size * self.num_subgraphs, self.output_size
+        ).to(aggregate_device)
+        self._aggregator.eval()
+
+        # Input tensor on input stream's device
+        input_device = self._get_device_for_stream(self._input_stream)
         self._input = torch.randn(
             self.batch_size, self.input_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=input_device
         )
         self._tensors["input"] = self._input
 
-        # Output buffers for each subgraph
+        # Output buffers for each subgraph (on their respective devices)
         self._subgraph_outputs = []
         for i in range(self.num_subgraphs):
+            stream_idx = self._subgraph_streams[i]
+            target_device = self._get_device_for_stream(stream_idx)
             buf = torch.empty(
                 self.batch_size, self.output_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=target_device
             )
             self._subgraph_outputs.append(buf)
             self._tensors[f"subgraph_out_{i}"] = buf
@@ -164,6 +178,7 @@ class GraphSubgraphsWorkload(BaseWorkload):
         """
         input_stream = streams[self._input_stream]
         aggregate_stream = streams[self._aggregate_stream]
+        aggregate_device = self._get_device_for_stream(self._aggregate_stream)
 
         # Input processing (could include splitting/routing)
         with torch.cuda.stream(input_stream):
@@ -176,17 +191,24 @@ class GraphSubgraphsWorkload(BaseWorkload):
         ):
             subgraph_stream = streams[stream_idx]
             subgraph_stream.wait_stream(input_stream)
+            target_device = self._get_device_for_stream(stream_idx)
 
             with torch.cuda.stream(subgraph_stream):
-                self._subgraph_outputs[i] = subgraph(x)
+                # Move input to subgraph's device if needed
+                x_local = x.to(target_device, non_blocking=True) if x.device != torch.device(target_device) else x
+                self._subgraph_outputs[i] = subgraph(x_local)
 
         # Aggregate: wait for all subgraphs
         for stream_idx in set(self._subgraph_streams):
             aggregate_stream.wait_stream(streams[stream_idx])
 
         with torch.cuda.stream(aggregate_stream):
-            # Concatenate all outputs
-            concatenated = torch.cat(self._subgraph_outputs, dim=-1)
+            # Move outputs to aggregation device and concatenate
+            outputs_on_device = [
+                out.to(aggregate_device, non_blocking=True) if out.device != torch.device(aggregate_device) else out
+                for out in self._subgraph_outputs
+            ]
+            concatenated = torch.cat(outputs_on_device, dim=-1)
             output = self._aggregator(concatenated)
 
     def get_throughput_unit(self) -> str:
@@ -198,7 +220,7 @@ class GraphSubgraphsWorkload(BaseWorkload):
         return (iterations * self.batch_size) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "num_subgraphs": self.num_subgraphs,
             "input_size": self.input_size,
@@ -212,6 +234,8 @@ class GraphSubgraphsWorkload(BaseWorkload):
                 "aggregate": self._aggregate_stream,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup subgraphs."""

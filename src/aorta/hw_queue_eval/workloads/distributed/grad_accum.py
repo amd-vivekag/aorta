@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import DistributedWorkload
+from aorta.hw_queue_eval.workloads.base import DistributedWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -36,7 +36,7 @@ class SimpleMLP(nn.Module):
 
 
 @WorkloadRegistry.register
-class GradientAccumulationWorkload(DistributedWorkload):
+class GradientAccumulationWorkload(MultiGPUMixin, DistributedWorkload):
     """
     Gradient accumulation with early reduction pattern.
 
@@ -58,6 +58,7 @@ class GradientAccumulationWorkload(DistributedWorkload):
     recommended_streams = 6
     switch_latency_sensitivity = "medium"
     memory_requirements_gb = 2.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -67,6 +68,7 @@ class GradientAccumulationWorkload(DistributedWorkload):
         input_size: int = 1024,
         output_size: int = 1000,
         simulate_collectives: bool = True,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize gradient accumulation workload.
@@ -78,6 +80,7 @@ class GradientAccumulationWorkload(DistributedWorkload):
             input_size: Input feature size
             output_size: Output size
             simulate_collectives: Mock collective operations
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__(simulate_collectives)
 
@@ -86,21 +89,21 @@ class GradientAccumulationWorkload(DistributedWorkload):
         self.batch_size = batch_size
         self.input_size = input_size
         self.output_size = output_size
+        self.use_multi_gpu = use_multi_gpu
 
         self._model: nn.Module = None
         self._inputs: List[torch.Tensor] = []
         self._grad_buffers: Dict[str, torch.Tensor] = {}
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup model and gradient buffers."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create model
-        self._model = SimpleMLP(
-            self.input_size, self.hidden_size, self.output_size
-        ).to(device)
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         half = max(1, stream_count // 2)
@@ -110,12 +113,20 @@ class GradientAccumulationWorkload(DistributedWorkload):
         if not self._reduce_streams:
             self._reduce_streams = [0]
 
+        # Use compute stream's device for model and data
+        compute_device = self._get_device_for_stream(self._compute_streams[0])
+
+        # Create model
+        self._model = SimpleMLP(
+            self.input_size, self.hidden_size, self.output_size
+        ).to(compute_device)
+
         # Create input tensors for each microbatch
         self._inputs = []
         for i in range(self.num_microbatches):
             inp = torch.randn(
                 self.batch_size, self.input_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=compute_device
             )
             self._inputs.append(inp)
             self._tensors[f"input_{i}"] = inp
@@ -191,7 +202,7 @@ class GradientAccumulationWorkload(DistributedWorkload):
         return total_samples / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "num_microbatches": self.num_microbatches,
             "hidden_size": self.hidden_size,
@@ -203,6 +214,8 @@ class GradientAccumulationWorkload(DistributedWorkload):
                 "reduce": self._reduce_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup model and buffers."""

@@ -55,6 +55,7 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
         small_kernel_size: int = 1024,
         large_to_small_ratio: int = 10,  # small kernels per large GEMM
         interleave_pattern: str = "alternating",  # "alternating", "batched", "random"
+        use_multi_gpu: bool = True,  # Use all available GPUs by default
     ):
         """
         Initialize the heterogeneous kernel workload.
@@ -64,12 +65,14 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
             small_kernel_size: Size of elementwise tensors
             large_to_small_ratio: Number of small kernels per large GEMM
             interleave_pattern: How to interleave operations
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.large_gemm_size = large_gemm_size
         self.small_kernel_size = small_kernel_size
         self.large_to_small_ratio = large_to_small_ratio
         self.interleave_pattern = interleave_pattern
+        self.use_multi_gpu = use_multi_gpu
 
         # Will be set in setup()
         self._large_tensors_a: List[torch.Tensor] = []
@@ -77,6 +80,8 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
         self._small_tensors: List[torch.Tensor] = []
         self._num_large_streams = 0
         self._num_small_streams = 0
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """
@@ -84,11 +89,27 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
 
         Args:
             stream_count: Number of streams to use
-            device: Target device
+            device: Target device (ignored if use_multi_gpu is True)
         """
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
+
+        # Determine devices to use
+        if self.use_multi_gpu and torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
+            print(f"Multi-GPU mode: Using {num_gpus} GPUs")
+        else:
+            self._devices = [device]
+            print(f"Single-GPU mode: Using {device}")
+
+        self._device = self._devices[0]  # Primary device
+
+        # Create stream-to-device mapping (round-robin distribution)
+        self._stream_to_device = {}
+        for stream_idx in range(stream_count):
+            device_idx = stream_idx % len(self._devices)
+            self._stream_to_device[stream_idx] = self._devices[device_idx]
 
         # Split streams between large and small kernels
         self._num_large_streams = max(1, stream_count // 2)
@@ -100,8 +121,9 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
         self._large_tensors_a = []
         self._large_tensors_b = []
         for i in range(self._num_large_streams):
-            a = torch.randn(m, k, dtype=torch.float32, device=device)
-            b = torch.randn(k, n, dtype=torch.float32, device=device)
+            target_device = self._stream_to_device[i]
+            a = torch.randn(m, k, dtype=torch.float32, device=target_device)
+            b = torch.randn(k, n, dtype=torch.float32, device=target_device)
             self._large_tensors_a.append(a)
             self._large_tensors_b.append(b)
             self._tensors[f"large_a_{i}"] = a
@@ -112,7 +134,10 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
         self._small_tensors = []
         num_small_tensors = self._num_small_streams * self.large_to_small_ratio
         for i in range(num_small_tensors):
-            t = torch.randn(self.small_kernel_size, dtype=torch.float32, device=device)
+            # Map to small stream and then to device
+            small_stream_idx = i % self._num_small_streams
+            target_device = self._stream_to_device[self._num_large_streams + small_stream_idx]
+            t = torch.randn(self.small_kernel_size, dtype=torch.float32, device=target_device)
             self._small_tensors.append(t)
             self._tensors[f"small_{i}"] = t
 
@@ -222,6 +247,9 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
             "num_small_streams": self._num_small_streams,
             "stream_count": self._stream_count,
             "device": self._device,
+            "use_multi_gpu": self.use_multi_gpu,
+            "devices": self._devices,
+            "num_gpus": len(self._devices),
         }
 
     def validate_correctness(
@@ -282,6 +310,7 @@ class TinyKernelStressWorkload(SyntheticWorkload):
         self,
         tensor_size: int = 256,
         ops_per_stream: int = 100,
+        use_multi_gpu: bool = True,  # Use all available GPUs by default
     ):
         """
         Initialize tiny kernel stress workload.
@@ -289,23 +318,44 @@ class TinyKernelStressWorkload(SyntheticWorkload):
         Args:
             tensor_size: Size of each tensor
             ops_per_stream: Operations per stream per iteration
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.tensor_size = tensor_size
         self.ops_per_stream = ops_per_stream
+        self.use_multi_gpu = use_multi_gpu
         self._per_stream_tensors: List[List[torch.Tensor]] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup tensors for each stream."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
+
+        # Determine devices to use
+        if self.use_multi_gpu and torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
+            print(f"Multi-GPU mode: Using {num_gpus} GPUs")
+        else:
+            self._devices = [device]
+            print(f"Single-GPU mode: Using {device}")
+
+        self._device = self._devices[0]  # Primary device
+
+        # Create stream-to-device mapping (round-robin distribution)
+        self._stream_to_device = {}
+        for stream_idx in range(stream_count):
+            device_idx = stream_idx % len(self._devices)
+            self._stream_to_device[stream_idx] = self._devices[device_idx]
 
         self._per_stream_tensors = []
         for stream_idx in range(stream_count):
+            target_device = self._stream_to_device[stream_idx]
             stream_tensors = []
             for op_idx in range(self.ops_per_stream):
-                t = torch.randn(self.tensor_size, dtype=torch.float32, device=device)
+                t = torch.randn(self.tensor_size, dtype=torch.float32, device=target_device)
                 stream_tensors.append(t)
                 self._tensors[f"s{stream_idx}_op{op_idx}"] = t
             self._per_stream_tensors.append(stream_tensors)
@@ -354,23 +404,44 @@ class LargeGEMMOnlyWorkload(SyntheticWorkload):
     def __init__(
         self,
         gemm_size: Tuple[int, int, int] = (8192, 8192, 8192),
+        use_multi_gpu: bool = True,  # Use all available GPUs by default
     ):
         """
         Initialize large GEMM workload.
 
         Args:
             gemm_size: (M, N, K) dimensions
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.gemm_size = gemm_size
+        self.use_multi_gpu = use_multi_gpu
         self._matrices_a: List[torch.Tensor] = []
         self._matrices_b: List[torch.Tensor] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup GEMM matrices."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
+
+        # Determine devices to use
+        if self.use_multi_gpu and torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
+            print(f"Multi-GPU mode: Using {num_gpus} GPUs")
+        else:
+            self._devices = [device]
+            print(f"Single-GPU mode: Using {device}")
+
+        self._device = self._devices[0]  # Primary device
+
+        # Create stream-to-device mapping (round-robin distribution)
+        self._stream_to_device = {}
+        for stream_idx in range(stream_count):
+            device_idx = stream_idx % len(self._devices)
+            self._stream_to_device[stream_idx] = self._devices[device_idx]
 
         m, n, k = self.gemm_size
 
@@ -378,8 +449,9 @@ class LargeGEMMOnlyWorkload(SyntheticWorkload):
         self._matrices_b = []
 
         for i in range(stream_count):
-            a = torch.randn(m, k, dtype=torch.float32, device=device)
-            b = torch.randn(k, n, dtype=torch.float32, device=device)
+            target_device = self._stream_to_device[i]
+            a = torch.randn(m, k, dtype=torch.float32, device=target_device)
+            b = torch.randn(k, n, dtype=torch.float32, device=target_device)
             self._matrices_a.append(a)
             self._matrices_b.append(b)
             self._tensors[f"a_{i}"] = a

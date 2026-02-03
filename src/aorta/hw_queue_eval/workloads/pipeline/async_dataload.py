@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import BaseWorkload
+from aorta.hw_queue_eval.workloads.base import BaseWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -45,7 +45,7 @@ class SimpleConvNet(nn.Module):
 
 
 @WorkloadRegistry.register
-class AsyncDataLoadWorkload(BaseWorkload):
+class AsyncDataLoadWorkload(MultiGPUMixin, BaseWorkload):
     """
     Async data loading with GPU preprocessing overlap.
 
@@ -70,6 +70,7 @@ class AsyncDataLoadWorkload(BaseWorkload):
     recommended_streams = 6
     switch_latency_sensitivity = "medium"
     memory_requirements_gb = 4.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -77,6 +78,7 @@ class AsyncDataLoadWorkload(BaseWorkload):
         image_size: int = 224,
         num_prefetch: int = 2,
         num_classes: int = 1000,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize async data loading workload.
@@ -86,27 +88,29 @@ class AsyncDataLoadWorkload(BaseWorkload):
             image_size: Image dimensions (square)
             num_prefetch: Number of batches to prefetch
             num_classes: Number of output classes
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
         self.batch_size = batch_size
         self.image_size = image_size
         self.num_prefetch = num_prefetch
         self.num_classes = num_classes
+        self.use_multi_gpu = use_multi_gpu
 
         self._model = None
         self._cpu_data: List[torch.Tensor] = []
         self._gpu_buffers: List[torch.Tensor] = []
         self._preprocessed: List[torch.Tensor] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup model, CPU data, and GPU buffers."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create model
-        self._model = SimpleConvNet(num_classes=self.num_classes).to(device)
-        self._model.eval()
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         third = max(1, stream_count // 3)
@@ -119,6 +123,13 @@ class AsyncDataLoadWorkload(BaseWorkload):
         if not self._compute_streams:
             self._compute_streams = [0]
 
+        # Use compute stream's device for model
+        compute_device = self._get_device_for_stream(self._compute_streams[0])
+
+        # Create model
+        self._model = SimpleConvNet(num_classes=self.num_classes).to(compute_device)
+        self._model.eval()
+
         # Create CPU data (pinned memory for async transfer)
         self._cpu_data = []
         for i in range(self.num_prefetch):
@@ -128,12 +139,12 @@ class AsyncDataLoadWorkload(BaseWorkload):
             ).pin_memory()
             self._cpu_data.append(data)
 
-        # GPU buffers for receiving data
+        # GPU buffers for receiving data (on compute device)
         self._gpu_buffers = []
         for i in range(self.num_prefetch):
             buf = torch.empty(
                 self.batch_size, 3, self.image_size, self.image_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=compute_device
             )
             self._gpu_buffers.append(buf)
             self._tensors[f"gpu_buffer_{i}"] = buf
@@ -143,7 +154,7 @@ class AsyncDataLoadWorkload(BaseWorkload):
         for i in range(self.num_prefetch):
             buf = torch.empty(
                 self.batch_size, 3, self.image_size, self.image_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=compute_device
             )
             self._preprocessed.append(buf)
             self._tensors[f"preprocessed_{i}"] = buf
@@ -202,7 +213,7 @@ class AsyncDataLoadWorkload(BaseWorkload):
         return total_images / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "batch_size": self.batch_size,
             "image_size": self.image_size,
@@ -214,6 +225,8 @@ class AsyncDataLoadWorkload(BaseWorkload):
                 "compute": self._compute_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup model and buffers."""

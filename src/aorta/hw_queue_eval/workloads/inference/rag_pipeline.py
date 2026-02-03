@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from aorta.hw_queue_eval.workloads.base import InferenceWorkload
+from aorta.hw_queue_eval.workloads.base import InferenceWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -84,7 +84,7 @@ class GeneratorModel(nn.Module):
 
 
 @WorkloadRegistry.register
-class RAGPipelineWorkload(InferenceWorkload):
+class RAGPipelineWorkload(MultiGPUMixin, InferenceWorkload):
     """
     Multi-model RAG pipeline simulation.
 
@@ -109,6 +109,7 @@ class RAGPipelineWorkload(InferenceWorkload):
     recommended_streams = 8
     switch_latency_sensitivity = "high"
     memory_requirements_gb = 4.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -120,6 +121,7 @@ class RAGPipelineWorkload(InferenceWorkload):
         num_docs: int = 100,
         top_k: int = 10,
         generation_length: int = 128,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize RAG pipeline workload.
@@ -133,6 +135,7 @@ class RAGPipelineWorkload(InferenceWorkload):
             num_docs: Number of documents in corpus
             top_k: Number of documents to retrieve
             generation_length: Output generation length
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__()
 
@@ -144,30 +147,21 @@ class RAGPipelineWorkload(InferenceWorkload):
         self.num_docs = num_docs
         self.top_k = top_k
         self.generation_length = generation_length
+        self.use_multi_gpu = use_multi_gpu
 
         self._embedding_model: Optional[EmbeddingModel] = None
         self._reranker_model: Optional[RerankerModel] = None
         self._generator_model: Optional[GeneratorModel] = None
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup models and document corpus."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create models
-        self._embedding_model = EmbeddingModel(
-            self.hidden_size, self.embedding_dim
-        ).to(device)
-        self._embedding_model.eval()
-
-        self._reranker_model = RerankerModel(self.hidden_size).to(device)
-        self._reranker_model.eval()
-
-        self._generator_model = GeneratorModel(
-            self.hidden_size, self.vocab_size
-        ).to(device)
-        self._generator_model.eval()
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
         quarter = max(1, stream_count // 4)
@@ -181,24 +175,41 @@ class RAGPipelineWorkload(InferenceWorkload):
             if not stream_list:
                 stream_list.append(0)
 
+        # Use embed stream's device for all models and data
+        embed_device = self._get_device_for_stream(self._embed_streams[0])
+
+        # Create models
+        self._embedding_model = EmbeddingModel(
+            self.hidden_size, self.embedding_dim
+        ).to(embed_device)
+        self._embedding_model.eval()
+
+        self._reranker_model = RerankerModel(self.hidden_size).to(embed_device)
+        self._reranker_model.eval()
+
+        self._generator_model = GeneratorModel(
+            self.hidden_size, self.vocab_size
+        ).to(embed_device)
+        self._generator_model.eval()
+
         # Query input
         self._query_input = torch.randn(
             self.batch_size, self.query_length, self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=embed_device
         )
         self._tensors["query_input"] = self._query_input
 
         # Document corpus (pre-embedded)
         self._doc_embeddings = torch.randn(
             self.num_docs, self.embedding_dim,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=embed_device
         )
         self._tensors["doc_embeddings"] = self._doc_embeddings
 
         # Document representations for reranking
         self._doc_hidden = torch.randn(
             self.num_docs, self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=embed_device
         )
         self._tensors["doc_hidden"] = self._doc_hidden
 
@@ -282,7 +293,7 @@ class RAGPipelineWorkload(InferenceWorkload):
         return (iterations * self.batch_size) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "hidden_size": self.hidden_size,
             "embedding_dim": self.embedding_dim,
@@ -299,6 +310,8 @@ class RAGPipelineWorkload(InferenceWorkload):
                 "generate": self._generate_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup models."""

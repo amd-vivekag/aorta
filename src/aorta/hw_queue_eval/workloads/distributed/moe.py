@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from aorta.hw_queue_eval.workloads.base import DistributedWorkload
+from aorta.hw_queue_eval.workloads.base import DistributedWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -58,7 +58,7 @@ class GatingNetwork(nn.Module):
 
 
 @WorkloadRegistry.register
-class MoEWorkload(DistributedWorkload):
+class MoEWorkload(MultiGPUMixin, DistributedWorkload):
     """
     Mixture of Experts with parallel expert execution.
 
@@ -86,6 +86,7 @@ class MoEWorkload(DistributedWorkload):
     recommended_streams = 16
     switch_latency_sensitivity = "critical"
     memory_requirements_gb = 8.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -96,6 +97,7 @@ class MoEWorkload(DistributedWorkload):
         batch_size: int = 4,
         seq_length: int = 512,
         simulate_collectives: bool = True,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize MoE workload.
@@ -108,6 +110,7 @@ class MoEWorkload(DistributedWorkload):
             batch_size: Batch size
             seq_length: Sequence length
             simulate_collectives: Mock all-to-all operations
+            use_multi_gpu: If True, distribute experts across all available GPUs
         """
         super().__init__(simulate_collectives)
 
@@ -117,27 +120,21 @@ class MoEWorkload(DistributedWorkload):
         self.top_k = top_k
         self.batch_size = batch_size
         self.seq_length = seq_length
+        self.use_multi_gpu = use_multi_gpu
 
         self._gating: Optional[GatingNetwork] = None
         self._experts: List[ExpertMLP] = []
         self._expert_streams: List[int] = []
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
 
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup gating network and experts."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
 
-        # Create gating network
-        self._gating = GatingNetwork(self.hidden_size, self.num_experts).to(device)
-        self._gating.eval()
-
-        # Create experts
-        self._experts = []
-        for i in range(self.num_experts):
-            expert = ExpertMLP(self.hidden_size, self.intermediate_size).to(device)
-            expert.eval()
-            self._experts.append(expert)
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Assign streams to experts
         # Stream 0 for gating, rest for experts (round-robin if fewer streams than experts)
@@ -149,19 +146,35 @@ class MoEWorkload(DistributedWorkload):
             stream_idx = 1 + (i % max(1, available_expert_streams))
             self._expert_streams.append(stream_idx)
 
-        # Input tensor
+        # Create gating network on gating stream's device
+        gating_device = self._get_device_for_stream(self._gating_stream)
+        self._gating = GatingNetwork(self.hidden_size, self.num_experts).to(gating_device)
+        self._gating.eval()
+
+        # Create experts - each on its stream's device
+        self._experts = []
+        for i in range(self.num_experts):
+            stream_idx = self._expert_streams[i]
+            expert_device = self._get_device_for_stream(stream_idx)
+            expert = ExpertMLP(self.hidden_size, self.intermediate_size).to(expert_device)
+            expert.eval()
+            self._experts.append(expert)
+
+        # Input tensor on gating device
         self._input = torch.randn(
             self.batch_size, self.seq_length, self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=gating_device
         )
         self._tensors["input"] = self._input
 
-        # Buffers for expert outputs
+        # Buffers for expert outputs (on their respective devices)
         self._expert_outputs = []
         for i in range(self.num_experts):
+            stream_idx = self._expert_streams[i]
+            expert_device = self._get_device_for_stream(stream_idx)
             out = torch.zeros(
                 self.batch_size, self.seq_length, self.hidden_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=expert_device
             )
             self._expert_outputs.append(out)
             self._tensors[f"expert_out_{i}"] = out
@@ -175,6 +188,7 @@ class MoEWorkload(DistributedWorkload):
         3. Results are combined
         """
         gating_stream = streams[self._gating_stream]
+        gating_device = self._get_device_for_stream(self._gating_stream)
         x = self._input
 
         # Step 1: Compute routing weights
@@ -193,22 +207,28 @@ class MoEWorkload(DistributedWorkload):
         for expert_idx, expert in enumerate(self._experts):
             stream_idx = self._expert_streams[expert_idx]
             expert_stream = streams[stream_idx]
+            expert_device = self._get_device_for_stream(stream_idx)
 
             with torch.cuda.stream(expert_stream):
+                # Move input and routing info to expert's device if needed
+                x_local = x.to(expert_device, non_blocking=True) if x.device != torch.device(expert_device) else x
+                routing_weights_local = routing_weights.to(expert_device, non_blocking=True) if routing_weights.device != torch.device(expert_device) else routing_weights
+                expert_indices_local = expert_indices.to(expert_device, non_blocking=True) if expert_indices.device != torch.device(expert_device) else expert_indices
+
                 # Find tokens routed to this expert
                 # Simplified: process all tokens, will be masked by routing weights
-                expert_out = expert(x)
+                expert_out = expert(x_local)
 
                 # Compute contribution from this expert
                 # Get mask for tokens using this expert
-                expert_mask = (expert_indices == expert_idx).any(dim=-1)  # [batch, seq]
+                expert_mask = (expert_indices_local == expert_idx).any(dim=-1)  # [batch, seq]
 
                 # Get weights for this expert (where it's selected)
                 expert_weight = torch.zeros_like(expert_mask, dtype=torch.float32)
                 for k in range(self.top_k):
-                    mask_k = expert_indices[..., k] == expert_idx
+                    mask_k = expert_indices_local[..., k] == expert_idx
                     expert_weight = torch.where(
-                        mask_k, routing_weights[..., k], expert_weight
+                        mask_k, routing_weights_local[..., k], expert_weight
                     )
 
                 # Weight the output
@@ -224,7 +244,9 @@ class MoEWorkload(DistributedWorkload):
         with torch.cuda.stream(gating_stream):
             combined = torch.zeros_like(x)
             for expert_out in self._expert_outputs:
-                combined = combined + expert_out
+                # Move expert outputs to gating device for combination
+                expert_out_local = expert_out.to(gating_device, non_blocking=True) if expert_out.device != torch.device(gating_device) else expert_out
+                combined = combined + expert_out_local
 
     def get_throughput_unit(self) -> str:
         return "tokens/sec"
@@ -236,7 +258,7 @@ class MoEWorkload(DistributedWorkload):
         return tokens / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "num_experts": self.num_experts,
             "hidden_size": self.hidden_size,
@@ -247,6 +269,8 @@ class MoEWorkload(DistributedWorkload):
             "expert_stream_assignment": self._expert_streams,
             "simulate_collectives": self._simulate_collectives,
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup experts and buffers."""

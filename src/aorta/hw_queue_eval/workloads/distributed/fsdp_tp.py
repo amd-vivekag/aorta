@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from aorta.hw_queue_eval.workloads.base import DistributedWorkload
+from aorta.hw_queue_eval.workloads.base import DistributedWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
 
 
@@ -58,7 +58,7 @@ class SimpleTransformerBlock(nn.Module):
 
 
 @WorkloadRegistry.register
-class FSDPTPWorkload(DistributedWorkload):
+class FSDPTPWorkload(MultiGPUMixin, DistributedWorkload):
     """
     FSDP + Tensor Parallelism with overlapped comm/compute.
 
@@ -84,6 +84,7 @@ class FSDPTPWorkload(DistributedWorkload):
     recommended_streams = 10
     switch_latency_sensitivity = "high"
     memory_requirements_gb = 4.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -93,6 +94,7 @@ class FSDPTPWorkload(DistributedWorkload):
         num_layers: int = 4,
         batch_size: int = 8,
         seq_length: int = 512,
+        use_multi_gpu: bool = True,
     ):
         """
         Initialize FSDP+TP workload.
@@ -104,6 +106,7 @@ class FSDPTPWorkload(DistributedWorkload):
             num_layers: Number of transformer layers
             batch_size: Batch size
             seq_length: Sequence length
+            use_multi_gpu: If True, distribute work across all available GPUs
         """
         super().__init__(simulate_collectives)
 
@@ -112,6 +115,7 @@ class FSDPTPWorkload(DistributedWorkload):
         self.num_layers = num_layers
         self.batch_size = batch_size
         self.seq_length = seq_length
+        self.use_multi_gpu = use_multi_gpu
 
         # Size presets
         size_configs = {
@@ -133,11 +137,17 @@ class FSDPTPWorkload(DistributedWorkload):
         self._layers: List[SimpleTransformerBlock] = []
         self._layer_weights: List[torch.Tensor] = []
 
+        # Multi-GPU state
+        self._devices: List[str] = []
+        self._stream_to_device: Dict[int, str] = {}
+
     def setup(self, stream_count: int, device: str = "cuda:0") -> None:
         """Setup model layers and stream assignments."""
         self._stream_count = stream_count
-        self._device = device
         self._is_setup = True
+
+        # Setup multi-GPU device mapping
+        self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Assign streams to different roles
         # Compute gets priority (first 1/4)
@@ -159,6 +169,9 @@ class FSDPTPWorkload(DistributedWorkload):
         if not self._p2p_streams:
             self._p2p_streams = [0]
 
+        # Use compute stream's device for model and data
+        compute_device = self._get_device_for_stream(self._compute_streams[0])
+
         # Create model layers
         self._layers = []
         self._layer_weights = []
@@ -166,14 +179,14 @@ class FSDPTPWorkload(DistributedWorkload):
         for i in range(self.num_layers):
             layer = SimpleTransformerBlock(
                 self.hidden_size, self.num_heads
-            ).to(device)
+            ).to(compute_device)
             layer.eval()  # No dropout for determinism
             self._layers.append(layer)
 
             # Create "shard" weights to gather (simulating FSDP)
             shard = torch.randn(
                 self.hidden_size, self.hidden_size,
-                dtype=torch.float32, device=device
+                dtype=torch.float32, device=compute_device
             )
             self._layer_weights.append(shard)
             self._tensors[f"shard_{i}"] = shard
@@ -181,14 +194,14 @@ class FSDPTPWorkload(DistributedWorkload):
         # Input tensor
         self._input = torch.randn(
             self.batch_size, self.seq_length, self.hidden_size,
-            dtype=torch.float32, device=device, requires_grad=True
+            dtype=torch.float32, device=compute_device, requires_grad=True
         )
         self._tensors["input"] = self._input
 
         # Gradient buffer
         self._grad_buffer = torch.zeros(
             self.hidden_size * self.hidden_size,
-            dtype=torch.float32, device=device
+            dtype=torch.float32, device=compute_device
         )
         self._tensors["grad_buffer"] = self._grad_buffer
 
@@ -281,7 +294,7 @@ class FSDPTPWorkload(DistributedWorkload):
         return (iterations * self.batch_size) / total_time_sec
 
     def get_config(self) -> Dict[str, Any]:
-        return {
+        config = {
             "name": self.name,
             "model_size": self.model_size,
             "hidden_size": self.hidden_size,
@@ -297,6 +310,8 @@ class FSDPTPWorkload(DistributedWorkload):
                 "p2p": self._p2p_streams,
             },
         }
+        config.update(self._get_multi_gpu_config())
+        return config
 
     def cleanup(self) -> None:
         """Cleanup model and tensors."""

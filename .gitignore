@@ -81,6 +81,10 @@ overlap.*
 .*repro.*
 *.gz
 trace_*
+*.zip
 
 # Multi-node IP configuration (should be customized per deployment)
 node_ip_list.txt
+
+# Experiment results
+results/
