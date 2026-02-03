@@ -19,6 +19,9 @@ services:
       - RCCL_FOLDER=/rccl
       - LD_LIBRARY_PATH=/rccl/build/release:${LD_LIBRARY_PATH:-}
       - TORCH_NCCL_HIGH_PRIORITY=1
+      # Set driver variant for environment_info.json (since host /usr/src isn't visible)
+      # Example values: "patched", "base", "mqd_vram", "default"
+      - AMDGPU_DRIVER_VARIANT=${AMDGPU_DRIVER_VARIANT:-}
 
     volumes:
       # Mount parent directory (aorta/) to /workspace/aorta

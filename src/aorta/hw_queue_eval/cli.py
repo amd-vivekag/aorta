@@ -492,7 +492,7 @@ def run_priority(priority: str, streams: str, iterations: int,
     """
     import torch
     from aorta.hw_queue_eval.core.harness import HarnessConfig, StreamHarness, save_sweep_results
-    from aorta.utils.device import get_driver_info
+    from aorta.utils.device import log_environment_info
 
     # Get workloads for priority
     if priority == "all":
@@ -513,16 +513,12 @@ def run_priority(priority: str, streams: str, iterations: int,
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Print environment info
-    click.echo("=" * 70)
-    click.echo("ENVIRONMENT")
-    click.echo("=" * 70)
-    driver_info = get_driver_info()
-    click.echo(f"  Driver (DKMS):  {driver_info.get('dkms_version', 'unknown')}")
-    click.echo(f"  GPUs available: {torch.cuda.device_count()}")
-    click.echo(f"  Stream counts:  {stream_counts}")
-    click.echo(f"  Iterations:     {iterations}")
-    click.echo("=" * 70)
+    # Log comprehensive environment info (also saves to output_dir/environment_info.json)
+    env_info = log_environment_info(
+        stream_counts=stream_counts,
+        iterations=iterations,
+        output_dir=output_dir,
+    )
     click.echo()
 
     click.echo(f"Running {len(workloads)} workloads at priority {priority}")

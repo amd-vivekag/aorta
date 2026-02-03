@@ -24,8 +24,11 @@ from .device import (
     # Extended device utilities
     get_device_properties,
     get_distributed_backend,
+    get_driver_info,
     get_memory_stats,
     get_rocm_env_info,
+    get_system_info,
+    log_environment_info,
     reset_memory_stats,
 )
 from .logging import setup_logging
@@ -70,6 +73,9 @@ __all__ = [
     "get_memory_stats",
     "reset_memory_stats",
     "get_rocm_env_info",
+    "get_driver_info",
+    "get_system_info",
+    "log_environment_info",
     # Streams
     "create_streams",
     "create_multi_gpu_streams",

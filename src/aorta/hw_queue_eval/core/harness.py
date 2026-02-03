@@ -31,7 +31,9 @@ from aorta.utils import (
     create_streams,
     get_available_devices,
     get_device_properties,
+    get_driver_info,
     get_rocm_env_info,
+    get_system_info,
     reset_memory_stats,
     sync_all_streams,
     warmup_all_gpus,
@@ -324,11 +326,18 @@ class StreamHarness:
             duration_sec=total_time_sec,
         )
 
-        # Build result
+        # Build result with comprehensive system info
+        system_info = get_system_info()
         metadata = {
             "config": self.config.to_dict(),
             "device_info": get_device_properties(self.config.device).__dict__,
             "rocm_info": get_rocm_env_info(),
+            "driver_info": get_driver_info(),
+            "system_info": {
+                "hostname": system_info.get("hostname"),
+                "kernel": system_info.get("driver", {}).get("kernel"),
+                "driver_type": system_info.get("driver", {}).get("driver_type"),
+            },
             "multi_gpu": {
                 "enabled": self.config.use_multi_gpu,
                 "devices": self.devices,
@@ -427,11 +436,18 @@ class StreamHarness:
             duration_sec=total_time_sec,
         )
 
-        # Build result
+        # Build result with comprehensive system info
+        system_info = get_system_info()
         metadata = {
             "config": self.config.to_dict(),
             "device_info": get_device_properties(self.config.device).__dict__,
             "rocm_info": get_rocm_env_info(),
+            "driver_info": get_driver_info(),
+            "system_info": {
+                "hostname": system_info.get("hostname"),
+                "kernel": system_info.get("driver", {}).get("kernel"),
+                "driver_type": system_info.get("driver", {}).get("driver_type"),
+            },
             "workload_config": workload.get_config() if hasattr(workload, "get_config") else {},
             "multi_gpu": {
                 "enabled": self.config.use_multi_gpu,
@@ -603,6 +619,7 @@ def save_sweep_results(
     results: List[HarnessResult],
     filepath: str | Path,
     include_analysis: bool = True,
+    include_system_info: bool = True,
 ) -> None:
     """
     Save sweep results to JSON file.
@@ -611,12 +628,26 @@ def save_sweep_results(
         results: List of HarnessResult from a sweep
         filepath: Path to output file
         include_analysis: If True, include scaling analysis
+        include_system_info: If True, include system/driver info at top level
     """
     data = {
         "timestamp": datetime.now().isoformat(),
         "workload": results[0].workload_name if results else "unknown",
         "results": [r.to_dict() for r in results],
     }
+
+    if include_system_info:
+        system_info = get_system_info()
+        data["environment"] = {
+            "hostname": system_info.get("hostname"),
+            "kernel": system_info.get("driver", {}).get("kernel"),
+            "dkms_version": system_info.get("driver", {}).get("dkms_version"),
+            "driver_type": system_info.get("driver", {}).get("driver_type"),
+            "hip_version": system_info.get("rocm", {}).get("hip_version"),
+            "torch_version": system_info.get("rocm", {}).get("torch_version"),
+            "gpu_count": system_info.get("gpu_count"),
+            "gpus": system_info.get("gpus", []),
+        }
 
     if include_analysis:
         analysis = analyze_sweep_results(results)
