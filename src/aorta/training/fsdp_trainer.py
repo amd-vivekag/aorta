@@ -282,12 +282,13 @@ def init_distributed(training_cfg: TrainingConfig, race_cfg: RaceConfig, log_lev
     setup_logging(level=log_level, log_file=training_cfg.output_dir / f"rank{rank}.log", rank=rank)
 
     log.info(
-        "Initialised distributed training | backend=%s rank=%s world=%s local_rank=%s device=%s",
+        "Initialised distributed training | backend=%s rank=%s world=%s local_rank=%s device=%s timeout=%ds",
         backend,
         rank,
         world_size,
         local_rank,
         device,
+        timeout_seconds,
     )
 
     return {
@@ -1484,7 +1485,7 @@ def _torch_profiler_context(
         prof.__exit__(None, None, None)
         produce_tb = cfg.tensorboard
         produce_chrome = cfg.chrome_trace
-        
+
         if produce_tb:
             try:
                 handler = tensorboard_trace_handler(str(rank_dir))
