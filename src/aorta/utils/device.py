@@ -328,7 +328,7 @@ def get_driver_info() -> dict:
 
     # If loaded version differs from DKMS version, prefer loaded version for source dir
     # This handles the container case where dkms reports container packages
-    if loaded_version and (info["dkms_version"] is None or 
+    if loaded_version and (info["dkms_version"] is None or
                            not info["dkms_version"].startswith(loaded_version)):
         # Search for source directory matching the loaded version
         matching_dirs = glob.glob(f"/usr/src/amdgpu-{loaded_version}*")
@@ -379,7 +379,7 @@ def get_driver_info() -> dict:
                     info["active_variant"] = variant
                     info["driver_type"] = variant
                     break
-        
+
         # If no match found, it's a custom/modified version
         if info["active_variant"] is None:
             info["active_variant"] = "custom"
@@ -451,7 +451,7 @@ def set_driver_variant_marker(variant_name: str, source_dir: str = None) -> bool
         # Find active source directory
         dirs = glob.glob("/usr/src/amdgpu-[0-9]*")
         # Filter out backup directories (those with -suffix)
-        dirs = [d for d in dirs if not any(d.endswith(f"-{v}") for v in 
+        dirs = [d for d in dirs if not any(d.endswith(f"-{v}") for v in
                 ["base", "patched", "custom"] + [d.split("-")[-1] for d in glob.glob("/usr/src/amdgpu-*-*")])]
         if dirs:
             source_dir = sorted(dirs)[0]
