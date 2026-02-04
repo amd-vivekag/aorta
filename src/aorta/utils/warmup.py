@@ -67,6 +67,14 @@ def warmup_rccl_communicators(
     # - all_gather (FSDP forward parameter gathering)
     # - all_reduce (HYBRID_SHARD inter-node gradient sync)
     # - broadcast (parameter sync)
+    if shard_group is None and replicate_group is None:
+        log.warning(
+            "No shard_group or replicate_group provided; only the global world "
+            "process group will be warmed up. Subsequent iterations will run "
+            "only barriers and CUDA synchronizations without group-specific "
+            "collective operations (rank=%d).",
+            rank,
+        )
     for i in range(num_warmup_ops):
         # Warmup intra-node shard group
         if shard_group is not None:
