@@ -93,8 +93,8 @@ cleanup() {
     log "Cleaning up training processes on node ${NODE_RANK}..."
 
     # Try to kill processes inside Docker container
-    docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f "train.py" 2>/dev/null || true
-    docker exec training-overlap-bugs-rocm70_9-1 pkill -9 -f "torchrun" 2>/dev/null || true
+    docker exec "${DOCKER_CONTAINER}" pkill -9 -f "train.py" 2>/dev/null || true
+    docker exec "${DOCKER_CONTAINER}" pkill -9 -f "torchrun" 2>/dev/null || true
 
     # Also try on host (in case anything leaked)
     sudo pkill -9 -f "train.py" 2>/dev/null || true
