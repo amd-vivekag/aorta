@@ -1,0 +1,373 @@
+# Developer Guide - RCCL Race Condition Reproducer
+
+This guide explains the modular architecture and how to extend the reproducer with new modes and compute types.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        __main__.py                              │
+│                    (CLI entry point)                            │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     modes/__init__.py                           │
+│                  create_reproducer(config)                      │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┬───────────────────┐
+              ▼               ▼               ▼                   ▼
+┌───────────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│ modes/default.py  │ │ modes/ddp.py  │ │ modes/fsdp.py │ │    [future]   │
+│ DefaultMode       │ │ DDPMode       │ │ FSDPMode      │ │  PipelineMode │
+│ (all_to_all +     │ │ (gradient     │ │ (sharded      │ │  etc.         │
+│  all_reduce)      │ │  all_reduce)  │ │  gradients)   │ │               │
+└────────┬──────────┘ └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
+         │                    │                 │                 │
+         └────────────────────┴─────────────────┴─────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         base.py                                 │
+│                     BaseReproducer                              │
+│  (streams, compute, optimizer, run loop, verification)         │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        compute.py                               │
+│              BaseCompute → GEMMCompute → [AttentionCompute]     │
+│         (forward/backward simulation)      [future]             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Future Work
+
+| Component | Description | Status |
+|-----------|-------------|--------|
+| `modes/fsdp.py` | FSDP mode with sharded gradients | Planned |
+| `modes/pipeline.py` | Pipeline parallel mode | Planned |
+| `AttentionCompute` | Transformer attention compute | Planned |
+| `EmbeddingCompute` | Sparse embedding lookup | Planned |
+
+## File Structure
+
+```
+src/aorta/race/
+├── __init__.py              # Public API exports
+├── __main__.py              # CLI entry point
+├── config.py                # ReproducerConfig, ReproducerResult
+├── minimal_reproducer.py    # Legacy reproducer (backward compat)
+├── base.py                  # BaseReproducer abstract class
+├── compute.py               # Pluggable compute simulation
+├── modes/                   # Mode implementations
+│   ├── __init__.py          # Factory function + MODE_REGISTRY
+│   ├── default.py           # TorchRec-like mode (all_to_all + all_reduce)
+│   └── ddp.py               # DDP mode (gradient all_reduce)
+├── README.md                # Usage documentation
+└── developer_guide.md       # This file
+```
+
+## Available Modes
+
+| Mode | Description | Data Flow |
+|------|-------------|-----------|
+| `default` | TorchRec-like pattern | H2D → Forward → Backward + all_to_all → all_reduce |
+| `ddp` | DDP gradient sync | H2D (double-buffered) → Forward → Backward → gradient all_reduce |
+
+---
+
+## Adding a New Mode
+
+To add a new reproducer mode (e.g., FSDP, Pipeline Parallel):
+
+### Step 1: Create the mode file
+
+Create `src/aorta/race/modes/your_mode.py`:
+
+```python
+"""Your mode description."""
+
+import torch
+import torch.distributed as dist
+
+from aorta.race.base import BaseReproducer
+
+
+class YourModeReproducer(BaseReproducer):
+    """Your mode reproducer implementation."""
+
+    def setup_buffers(self) -> None:
+        """Allocate mode-specific buffers."""
+        # Required: Create your GPU buffers
+        self.my_buffer = torch.zeros(
+            self.config.tensor_size,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        # ... more buffers as needed
+
+    def run_iteration(self, iteration: int) -> bool:
+        """
+        Run one iteration of the mode-specific data flow.
+        
+        Args:
+            iteration: Current iteration number
+            
+        Returns:
+            True if verification passed, False if corruption detected
+        """
+        # 1. Prepare data with known pattern
+        expected_value = float(iteration % 1000)
+        self.batch_cpu.fill_(expected_value)
+        
+        # 2. H2D transfer on memcpy_stream
+        with torch.cuda.stream(self.memcpy_stream):
+            self.batch_gpu.copy_(self.batch_cpu, non_blocking=True)
+        
+        # 3. Record event for synchronization
+        self.h2d_complete.record(self.memcpy_stream)
+        
+        # 4. Wait for H2D before compute
+        self.default_stream.wait_event(self.h2d_complete)
+        
+        # 5. Run your compute/communication pattern
+        # ... your mode-specific logic here
+        
+        # 6. Verify data integrity (during verification phase)
+        if iteration >= self.config.warmup_iterations:
+            return self._verify_my_data(expected_value)
+        
+        return True
+
+    def _verify_my_data(self, expected: float) -> bool:
+        """Verify your mode-specific data."""
+        # Check for corruption
+        if not torch.allclose(self.my_buffer, expected_tensor):
+            self.corruption_count += 1
+            return False
+        return True
+
+
+__all__ = ["YourModeReproducer"]
+```
+
+### Step 2: Register the mode
+
+Edit `src/aorta/race/modes/__init__.py`:
+
+```python
+from aorta.race.modes.your_mode import YourModeReproducer
+
+MODE_REGISTRY = {
+    "default": DefaultModeReproducer,
+    "ddp": DDPModeReproducer,
+    "your_mode": YourModeReproducer,  # Add your mode
+}
+```
+
+### Step 3: Use your mode
+
+```bash
+torchrun --nproc_per_node=8 -m aorta.race -o mode=your_mode
+```
+
+---
+
+## Adding a New Compute Type
+
+To add a new compute pattern (e.g., Attention, Embedding Lookup):
+
+### Step 1: Create the compute class
+
+Edit `src/aorta/race/compute.py`:
+
+```python
+class AttentionCompute(BaseCompute):
+    """Attention-based compute simulation."""
+
+    def setup(self, requires_grad: bool = False) -> None:
+        """Initialize attention layers."""
+        self.query = torch.nn.Linear(
+            self.config.gemm_size, self.config.gemm_size
+        ).to(self.device, dtype=self.dtype)
+        self.key = torch.nn.Linear(
+            self.config.gemm_size, self.config.gemm_size
+        ).to(self.device, dtype=self.dtype)
+        self.value = torch.nn.Linear(
+            self.config.gemm_size, self.config.gemm_size
+        ).to(self.device, dtype=self.dtype)
+        
+        if requires_grad:
+            for p in self.parameters():
+                p.requires_grad_(True)
+
+    def forward(self, batch_gpu: torch.Tensor) -> torch.Tensor:
+        """Run attention forward pass."""
+        # Reshape input for attention
+        x = batch_gpu.view(-1, self.config.gemm_size)
+        
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.config.gemm_size ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+        output = torch.matmul(attn, v)
+        
+        return output.sum()
+
+    def backward(self, output: torch.Tensor, use_autograd: bool = False) -> None:
+        """Run attention backward pass."""
+        if use_autograd:
+            output.backward()
+        else:
+            # Manual backward simulation
+            for _ in range(self.config.gemm_layers):
+                dummy = torch.matmul(
+                    torch.randn(self.config.gemm_size, self.config.gemm_size, 
+                               device=self.device, dtype=self.dtype),
+                    torch.randn(self.config.gemm_size, self.config.gemm_size,
+                               device=self.device, dtype=self.dtype)
+                )
+
+    def parameters(self):
+        """Return trainable parameters."""
+        return list(self.query.parameters()) + \
+               list(self.key.parameters()) + \
+               list(self.value.parameters())
+```
+
+### Step 2: Register the compute type
+
+At the bottom of `compute.py`:
+
+```python
+register_compute("attention", AttentionCompute)
+```
+
+### Step 3: Use your compute type
+
+Update `config/race/minimal_reproducer.yaml`:
+
+```yaml
+compute_type: attention  # instead of "gemm"
+```
+
+---
+
+## Key Design Patterns
+
+### 1. Template Method Pattern
+
+`BaseReproducer.run()` defines the algorithm structure:
+
+```python
+def run(self):
+    self.setup_buffers()      # Subclass implements
+    for i in range(iterations):
+        self.run_iteration(i)  # Subclass implements
+    return self.result
+```
+
+Subclasses implement `setup_buffers()` and `run_iteration()`.
+
+### 2. Pluggable Compute
+
+Compute is separate from the reproducer so different compute patterns can be tested without modifying mode logic:
+
+```python
+# In base.py
+self.compute = create_compute(config.compute_type, config, dtype)
+self.compute.setup(requires_grad=True)
+
+# In run_iteration
+output = self.compute.forward(batch_gpu)
+self.compute.backward(output, use_autograd=True)
+```
+
+### 3. Registry Pattern
+
+`MODE_REGISTRY` and `COMPUTE_REGISTRY` allow adding new types without modifying existing code:
+
+```python
+# modes/__init__.py
+MODE_REGISTRY = {
+    "default": DefaultModeReproducer,
+    "ddp": DDPModeReproducer,
+}
+
+def create_reproducer(config, rank, world_size):
+    cls = MODE_REGISTRY[config.mode]
+    return cls(config, rank, world_size)
+```
+
+### 4. Verification in Base Class
+
+`_verify_h2d()` is shared since all modes need H2D verification. Mode-specific verification (all_to_all, gradient consistency) is in subclasses.
+
+---
+
+## BaseReproducer Provided Utilities
+
+The `BaseReproducer` class provides these utilities for subclasses:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `self.config` | `ReproducerConfig` | Configuration object |
+| `self.rank` | `int` | Current process rank |
+| `self.world_size` | `int` | Total number of processes |
+| `self.device` | `torch.device` | CUDA device for this rank |
+| `self.dtype` | `torch.dtype` | Data type (e.g., bfloat16) |
+| `self.memcpy_stream` | `torch.cuda.Stream` | Stream for H2D transfers |
+| `self.default_stream` | `torch.cuda.Stream` | Default stream for compute |
+| `self.h2d_complete` | `torch.cuda.Event` | Event for H2D sync |
+| `self.batch_cpu` | `torch.Tensor` | Pinned CPU tensor (H2D source) |
+| `self.batch_gpu` | `torch.Tensor` | GPU tensor (H2D destination) |
+| `self.compute` | `BaseCompute` | Compute simulator instance |
+| `self.optimizer` | `torch.optim.Optimizer` | Optimizer (if configured) |
+| `self.corruption_count` | `int` | Counter for detected corruptions |
+| `self.corruption_details` | `list` | Details of each corruption |
+
+| Method | Description |
+|--------|-------------|
+| `_verify_h2d(expected)` | Verify H2D data integrity, returns bool |
+| `_log_progress(iteration)` | Log iteration progress if at log interval |
+| `_setup_deterministic()` | Set seeds for reproducibility |
+
+---
+
+## Data Flow Examples
+
+### Default Mode (TorchRec-like)
+
+```
+memcpy_stream:  [H2D] → batch_gpu
+                          ↓ (Forward READS batch_gpu)
+default_stream:          [Forward] → [Backward] → [all_reduce]
+
+datadist_stream:         [all_to_all]
+                          (overlaps with backward)
+```
+
+**Verification checks:**
+- H2D: `batch_gpu == iteration % 1000`
+- all_to_all: `recv_buf[j] == j` (data from rank j)
+- all_reduce: `reduce_buf == sum(1..world_size)`
+
+### DDP Mode
+
+```
+Iteration N:
+    memcpy_stream:  [H2D batch_N+1] ────────────────────────┐
+                                                            │ (prefetch)
+    default_stream: [Forward(batch_N)] → [Backward] → [all_reduce grads]
+                                                            │
+                    ← swap buffers ─────────────────────────┘
+```
+
+**Verification checks:**
+- H2D: `batch_gpu == iteration % 1000`
+- Gradient consistency: All ranks have identical gradient checksums
