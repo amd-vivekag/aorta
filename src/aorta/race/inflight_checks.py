@@ -1,0 +1,164 @@
+"""
+In-flight read instability checks.
+
+This module provides utilities for detecting torn reads by performing
+repeated reads on tensor regions that may be actively being written.
+If values change between reads, it indicates a race condition.
+
+These checks do NOT add any cross-stream synchronization - they only
+issue reads on the current stream (typically default stream) while
+the racing stream may still be writing.
+"""
+
+import logging
+from typing import List, Dict, Any
+
+import torch
+
+log = logging.getLogger(__name__)
+
+
+# Pending check results: list of dicts with name, diff, max_diff, step, rank, etc.
+_pending_inflight_checks: List[Dict[str, Any]] = []
+
+
+def schedule_inflight_check(
+    name: str,
+    tensor: torch.Tensor,
+    sample_size: int,
+    repeats: int,
+    step: int,
+    rank: int,
+    delay_work_size: int = 65536,
+) -> None:
+    """
+    Schedule repeated reads on a tensor tail to detect instability.
+
+    This reads a small sample from the END of the tensor multiple times on the
+    default stream while the racing stream may still be writing. If values
+    change between reads, it indicates a torn read (race condition).
+
+    We sample from the END of the tail because DMA writes sequentially - the
+    end of the tail is written LAST, maximizing detection probability.
+
+    IMPORTANT: This does NOT add any cross-stream synchronization. The reads
+    are issued on the default stream which is already racing with the write.
+
+    To increase detection probability, we insert GPU-side delays (dummy work)
+    between reads to spread them across the race window. Without delays, all
+    reads complete in microseconds and may miss the instability.
+
+    Args:
+        name: Identifier for this check (e.g., "h2d_dense", "datadist_tail")
+        tensor: The tensor being read (should be the tail region)
+        sample_size: Number of elements to sample from the END of the tensor
+        repeats: Number of repeated reads to perform
+        step: Current training step
+        rank: Current rank
+        delay_work_size: Size of dummy tensor for GPU-side delay work
+    """
+    global _pending_inflight_checks
+
+    if repeats <= 0 or tensor.numel() == 0:
+        return
+
+    # Sample from the END of the tensor (tail region) - this is written LAST by DMA
+    # DMA writes sequentially, so the end of the tail has highest detection probability
+    actual_sample_size = min(sample_size, tensor.numel())
+    sample_slice = tensor.reshape(-1)[-actual_sample_size:]
+
+    # First read: capture reference sample (on default stream)
+    sample0 = sample_slice.clone()
+
+    # Track if any difference is detected
+    diff_detected = torch.zeros(1, dtype=torch.bool, device=tensor.device)
+    max_abs_diff = torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
+
+    # Create dummy tensor for GPU-side delay work (reused across reads)
+    # This adds GPU work between reads to spread them across the race window
+    delay_tensor = torch.empty(delay_work_size, dtype=tensor.dtype, device=tensor.device)
+
+    # Repeated reads: check for instability
+    # We insert GPU-side delay work between reads to increase detection probability
+    for i in range(repeats):
+        # GPU-side delay: perform some work to space out reads
+        # Use add_ for guaranteed memory write (self-copy may be optimized away)
+        delay_tensor.add_(0.001)
+        _ = delay_tensor.sum()  # Reduction (result discarded, no .item() sync)
+
+        # Read the same slice again
+        current_sample = sample_slice.clone()
+
+        # Check for any difference (bitwise comparison)
+        diff = (current_sample != sample0).any()
+        diff_detected = diff_detected | diff
+
+        # Track maximum absolute difference
+        if tensor.is_floating_point():
+            abs_diff = (current_sample - sample0).abs().max()
+            max_abs_diff = torch.maximum(max_abs_diff, abs_diff)
+
+    # Store results for later logging (after race window closes)
+    _pending_inflight_checks.append({
+        "name": name,
+        "diff": diff_detected,
+        "max_diff": max_abs_diff,
+        "step": step,
+        "rank": rank,
+        "sample_size": actual_sample_size,
+        "repeats": repeats,
+    })
+
+
+def flush_inflight_checks(step: int, rank: int) -> int:
+    """
+    Flush and log any pending in-flight check results.
+
+    This should be called at the end of each training step, after the
+    race window has closed (e.g., after wait_pending_datadist_work()).
+    It performs a minimal sync to read the result tensors and logs any
+    detected mismatches.
+
+    Args:
+        step: Current training step
+        rank: Current rank
+
+    Returns:
+        Number of mismatches detected
+    """
+    global _pending_inflight_checks
+
+    if not _pending_inflight_checks:
+        return 0
+
+    mismatch_count = 0
+
+    for check in _pending_inflight_checks:
+        # Sync to read the boolean result (minimal overhead)
+        diff_val = check["diff"].item()
+        max_diff_val = check["max_diff"].item() if check["max_diff"].numel() > 0 else 0.0
+
+        if diff_val:
+            mismatch_count += 1
+            log.info(
+                "INFLIGHT_MISMATCH: step=%d rank=%d path=%s diff=True max_abs_diff=%.6e "
+                "sample_size=%d repeats=%d - TORN READ DETECTED!",
+                check["step"], check["rank"], check["name"],
+                max_diff_val, check["sample_size"], check["repeats"]
+            )
+        else:
+            log.debug(
+                "INFLIGHT_CHECK: step=%d rank=%d path=%s diff=False (no instability detected)",
+                check["step"], check["rank"], check["name"]
+            )
+
+    # Clear pending checks
+    _pending_inflight_checks = []
+
+    return mismatch_count
+
+
+def clear_inflight_checks() -> None:
+    """Clear any pending in-flight checks without logging."""
+    global _pending_inflight_checks
+    _pending_inflight_checks = []
