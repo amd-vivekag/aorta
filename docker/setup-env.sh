@@ -96,13 +96,16 @@ AORTA_WORKSPACE=${AORTA_WORKSPACE:-..}
 echo -e "${GREEN}Aorta workspace: $AORTA_WORKSPACE${NC}"
 echo ""
 
-# Step 4: RCCL Path
-echo -e "${GREEN}Step 4: RCCL Build Path${NC}"
+# Step 4: RCCL Path (optional)
+echo -e "${GREEN}Step 4: Custom RCCL Build (Optional)${NC}"
 echo "Path to your custom RCCL build directory."
-echo "Default: /tmp/rccl_placeholder (use if you don't have a custom RCCL build)"
-read -p "Enter path (or press Enter for default): " RCCL_PATH
-RCCL_PATH=${RCCL_PATH:-/tmp/rccl_placeholder}
-echo -e "${GREEN}RCCL path: $RCCL_PATH${NC}"
+echo "Press Enter to use the RCCL bundled in the image (no custom build)."
+read -p "Enter path (or press Enter to skip): " RCCL_PATH
+if [[ -n "$RCCL_PATH" ]]; then
+    echo -e "${GREEN}RCCL path: $RCCL_PATH (use -f docker-compose.rccl.yaml when starting)${NC}"
+else
+    echo -e "${GREEN}Using image RCCL (no custom path)${NC}"
+fi
 echo ""
 
 # Step 5: AMD GPU Driver Variant (optional)
@@ -165,9 +168,13 @@ CONTAINER_NAME=$CONTAINER_NAME
 # VOLUME MOUNTS
 # ==============================================================================
 AORTA_WORKSPACE=$AORTA_WORKSPACE
-RCCL_PATH=$RCCL_PATH
+# RCCL: leave unset to use image RCCL. To use custom RCCL, set RCCL_PATH and run with -f docker-compose.rccl.yaml
 
 EOF
+if [[ -n "$RCCL_PATH" ]]; then
+    echo "RCCL_PATH=$RCCL_PATH" >> "$ENV_FILE"
+fi
+echo "" >> "$ENV_FILE"
 
 # Add extra mounts if any
 if [ -n "$EXTRA_MOUNTS" ]; then
@@ -185,6 +192,14 @@ EOF
 
 echo -e "${GREEN}✓ Successfully created .env file at: $ENV_FILE${NC}"
 echo ""
+if [[ -n "$EXTRA_MOUNTS" ]]; then
+    echo -e "${YELLOW}You configured extra volume mounts.${NC}"
+    echo -e "${YELLOW}docker-compose.build.yaml currently supports up to two extra mounts via${NC}"
+    echo -e "${YELLOW}EXTRA_MOUNT_SRC_1 / EXTRA_MOUNT_DST_1 and OPTIONAL EXTRA_MOUNT_SRC_2 / EXTRA_MOUNT_DST_2.${NC}"
+    echo -e "${YELLOW}If you configured more than two extra mounts, you will need to manually${NC}"
+    echo -e "${YELLOW}extend docker-compose.build.yaml to use EXTRA_MOUNT_SRC_3 / DST_3, etc.${NC}"
+    echo ""
+fi
 echo -e "${BLUE}========================================${NC}"
 echo -e "${GREEN}Setup Complete!${NC}"
 echo -e "${BLUE}========================================${NC}"
