@@ -1,21 +1,24 @@
 """
-CLI entry point for the minimal RCCL race condition reproducer.
+CLI entry point for the RCCL race condition reproducer.
+
+Supports multiple workload modes via --mode:
+  - default: TorchRec-like pattern (H2D + all_to_all + all_reduce)
+  - ddp:     DDP pattern (H2D prefetch + gradient all_reduce)
+  - minimal: Legacy monolithic reproducer (backward compat)
 
 Usage:
-    # Run with default settings (GPU_MAX_HW_QUEUES=4, warmup=100, verify=10000)
-    GPU_MAX_HW_QUEUES=4 torchrun --nproc_per_node=8 -m aorta.race
-    
-    # Run with custom settings
-    torchrun --nproc_per_node=8 -m aorta.race \
-        --warmup 100 \
-        --verify 10000 \
-        --simulate-compute \
-        --gemm-layers 20
-    
-    # Run in same-stream mode (definitive runtime bug test)
+    # Default mode (TorchRec-like)
+    GPU_MAX_HW_QUEUES=4 torchrun --nproc_per_node=8 -m aorta.race \
+        --warmup 100 --verify 10000
+
+    # DDP mode (gradient all_reduce + H2D prefetch)
+    torchrun --nproc_per_node=8 -m aorta.race --mode ddp \
+        --warmup 100 --verify 10000
+
+    # Same-stream mode (definitive runtime bug test)
     torchrun --nproc_per_node=8 -m aorta.race --same-stream
-    
-    # Run with reduced parallelism (for comparison)
+
+    # Reduced parallelism (comparison baseline)
     GPU_MAX_HW_QUEUES=2 torchrun --nproc_per_node=8 -m aorta.race
 
 Environment variables to test:
@@ -35,7 +38,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-from aorta.race.minimal_reproducer import ReproducerConfig, run_reproducer
+from aorta.race.config import ReproducerConfig, ReproducerResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,11 +51,24 @@ log = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Minimal RCCL race condition reproducer",
+        description="RCCL race condition reproducer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    
+
+    # Mode selection
+    parser.add_argument(
+        "--mode", type=str, default="default",
+        choices=["default", "ddp", "fsdp"],
+        help=(
+            "Workload mode. "
+            "default: TorchRec-like (H2D + all_to_all + all_reduce). "
+            "ddp: DDP (H2D prefetch + gradient all_reduce). "
+            "fsdp: FSDP (per-layer all_gather + reduce_scatter). "
+            "Default: default"
+        ),
+    )
+
     # Iteration settings
     parser.add_argument(
         "--warmup", type=int, default=100,
@@ -70,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "--log-interval", type=int, default=100,
         help="Log progress every N iterations. Default: 100"
     )
-    
+
     # Tensor sizes
     parser.add_argument(
         "--h2d-size", type=int, default=1_000_000,
@@ -89,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         choices=["bfloat16", "float16", "float32"],
         help="Data type. Default: bfloat16"
     )
-    
+
     # Compute simulation (enabled by default, use --no-compute to disable)
     parser.add_argument(
         "--no-compute", action="store_true",
@@ -107,24 +123,52 @@ def parse_args() -> argparse.Namespace:
         "--no-backward", action="store_true",
         help="Skip backward pass simulation"
     )
-    
+
+    # FSDP-specific
+    parser.add_argument(
+        "--fsdp-shard-size", type=int, default=100_000,
+        help="FSDP shard size per rank (elements). Default: 100K"
+    )
+
+    # H2D buffering strategy
+    parser.add_argument(
+        "--prefetch", action="store_true",
+        help="Use double-buffered H2D prefetch (overlap next batch with backward)"
+    )
+
     # Stream configuration
     parser.add_argument(
         "--same-stream", action="store_true",
-        help="Put H2D and datadist on same stream (replicates experiment 4)"
+        help="Put H2D and datadist on same stream (definitive runtime bug test)"
     )
-    
+
+    # Optimizer (for modes that support it)
+    parser.add_argument(
+        "--optimizer", type=str, default="none",
+        choices=["none", "adamw", "sgd", "shampoo"],
+        help="Optimizer for weight updates (used by DDP mode). Default: none"
+    )
+
+    # DDP-specific
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help="Enable deterministic mode (required for DDP gradient verification)"
+    )
+    parser.add_argument(
+        "--bucketed", action="store_true",
+        help="Use bucketed per-layer gradient all_reduce overlapping with backward (DDP mode)"
+    )
+
     # Hardware settings (GPU_MAX_HW_QUEUES)
     parser.add_argument(
         "--hw-queues", type=int, default=None,
         help="Set GPU_MAX_HW_QUEUES (4 exposes bug, 2 masks it)"
     )
-    
+
     # ==========================================================================
     # Environment variable flags
-    # These can be set via CLI for convenience, or via env vars directly
     # ==========================================================================
-    
+
     parser.add_argument(
         "--signal-pool-size", type=int, default=None,
         help="Set ROC_SIGNAL_POOL_SIZE (default 64)"
@@ -149,7 +193,7 @@ def parse_args() -> argparse.Namespace:
         "--disable-clr-batch", action="store_true",
         help="Set DEBUG_CLR_BATCH_CPU_SYNC_SIZE=0 (disable CLR batching)"
     )
-    
+
     return parser.parse_args()
 
 
@@ -157,83 +201,99 @@ def init_distributed() -> tuple[int, int]:
     """Initialize distributed process group."""
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
-    
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    
+
     # Set device
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    
+
     return rank, world_size
 
 
 def apply_env_vars(args: argparse.Namespace) -> dict[str, str]:
     """Apply environment variables from CLI flags.
-    
+
     Returns dict of variables that were set for logging.
     """
     applied = {}
-    
+
     if args.hw_queues is not None:
         os.environ["GPU_MAX_HW_QUEUES"] = str(args.hw_queues)
         applied["GPU_MAX_HW_QUEUES"] = str(args.hw_queues)
-    
+
     if args.signal_pool_size is not None:
         os.environ["ROC_SIGNAL_POOL_SIZE"] = str(args.signal_pool_size)
         applied["ROC_SIGNAL_POOL_SIZE"] = str(args.signal_pool_size)
-    
+
     if args.disable_sdma:
         os.environ["HSA_ENABLE_SDMA"] = "0"
         applied["HSA_ENABLE_SDMA"] = "0"
-    
+
     if args.blit_copy_size is not None:
         os.environ["GPU_FORCE_BLIT_COPY_SIZE"] = str(args.blit_copy_size)
         applied["GPU_FORCE_BLIT_COPY_SIZE"] = str(args.blit_copy_size)
-    
+
     if args.nccl_implicit_order:
         os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
         applied["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
-    
+
     if args.disable_cheap_fence:
         os.environ["RCCL_GFX9_CHEAP_FENCE_OFF"] = "1"
         os.environ["RCCL_GFX942_CHEAP_FENCE_OFF"] = "1"
         applied["RCCL_GFX9_CHEAP_FENCE_OFF"] = "1"
         applied["RCCL_GFX942_CHEAP_FENCE_OFF"] = "1"
-    
+
     if args.disable_clr_batch:
         os.environ["DEBUG_CLR_BATCH_CPU_SYNC_SIZE"] = "0"
         applied["DEBUG_CLR_BATCH_CPU_SYNC_SIZE"] = "0"
-    
+
     return applied
+
+
+def run_with_mode(config: ReproducerConfig, rank: int, world_size: int) -> ReproducerResult:
+    """
+    Dispatch to the appropriate reproducer based on config.mode.
+
+    Uses the modular system (base.py + modes/) via create_reproducer().
+    """
+    from aorta.race.modes import create_reproducer
+
+    reproducer = create_reproducer(config, rank, world_size)
+    return reproducer.run()
 
 
 def main():
     """Main entry point."""
     args = parse_args()
-    
+
     # Apply environment variables from CLI flags (before any CUDA init)
     applied_env = apply_env_vars(args)
-    
+
     # Initialize distributed
     rank, world_size = init_distributed()
-    
+
     if rank == 0:
         log.info("=" * 70)
-        log.info("MINIMAL RCCL RACE CONDITION REPRODUCER")
+        log.info("RCCL RACE CONDITION REPRODUCER")
         log.info("=" * 70)
         log.info("")
         log.info("This reproducer uses PROPER SYNCHRONIZATION everywhere.")
         log.info("If corruption occurs, it indicates a RUNTIME BUG in RCCL/HIP,")
         log.info("not an application-level issue.")
         log.info("")
+        log.info(f"Mode: {args.mode}")
         log.info(f"World size: {world_size}")
         log.info(f"Warmup iterations: {args.warmup}")
         log.info(f"Verify iterations: {args.verify}")
         log.info(f"Simulate compute: {not args.no_compute}")
+        log.info(f"H2D prefetch: {args.prefetch}")
         log.info(f"Same stream mode: {args.same_stream}")
+        log.info(f"Optimizer: {args.optimizer}")
+        log.info(f"Deterministic: {args.deterministic}")
         log.info("")
-        
+
         # Log relevant env vars
         env_vars = [
             "GPU_MAX_HW_QUEUES",
@@ -252,9 +312,10 @@ def main():
             log.info(f"  {var}={value}{source}")
         log.info("")
         log.info("=" * 70)
-    
+
     # Build config
     config = ReproducerConfig(
+        mode=args.mode,
         warmup_iterations=args.warmup,
         verify_iterations=args.verify,
         stop_on_first_corruption=not args.no_stop_on_first,
@@ -262,36 +323,42 @@ def main():
         h2d_tensor_size=args.h2d_size,
         alltoall_tensor_size=args.a2a_size,
         allreduce_tensor_size=args.ar_size,
+        fsdp_shard_size=args.fsdp_shard_size,
         dtype=args.dtype,
         simulate_compute=not args.no_compute,
+        h2d_prefetch=args.prefetch,
         gemm_size=args.gemm_size,
         gemm_layers=args.gemm_layers,
         include_backward_compute=not args.no_backward,
         same_stream_mode=args.same_stream,
         gpu_max_hw_queues=args.hw_queues,
+        optimizer=args.optimizer,
+        deterministic=args.deterministic,
+        ddp_bucketed=args.bucketed,
     )
-    
-    # Run reproducer
-    result = run_reproducer(config, rank, world_size)
-    
+
+    # Run reproducer via mode dispatch
+    result = run_with_mode(config, rank, world_size)
+
     # Sync all ranks
     dist.barrier()
-    
+
     # Report results (rank 0 only)
     if rank == 0:
         log.info("")
         log.info("=" * 70)
         log.info("RESULTS")
         log.info("=" * 70)
+        log.info(f"Mode: {args.mode}")
         log.info(f"Passed: {result.passed}")
         log.info(f"Total iterations: {result.total_iterations}")
         log.info(f"Corruption count: {result.corruption_count}")
         log.info(f"Elapsed time: {result.elapsed_time_sec:.2f}s")
         log.info(f"Avg step time: {result.avg_step_time_ms:.2f}ms")
-        
+
         if result.first_corruption_iter is not None:
             log.info(f"First corruption at iteration: {result.first_corruption_iter}")
-        
+
         if result.passed:
             log.info("")
             log.info("VERDICT: No runtime bug detected with current settings.")
@@ -302,9 +369,9 @@ def main():
             log.info("VERDICT: RUNTIME BUG DETECTED!")
             log.info("Corruption occurred DESPITE proper synchronization.")
             log.info("This is a bug in RCCL/HIP runtime - report to AMD.")
-        
+
         log.info("=" * 70)
-    
+
     # Exit with appropriate code
     sys.exit(0 if result.passed else 1)
 

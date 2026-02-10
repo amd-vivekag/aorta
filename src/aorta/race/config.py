@@ -1,12 +1,271 @@
 """
-Race experiment configuration dataclass.
+Race experiment configuration dataclasses.
 
-This module defines the RaceConfig dataclass which contains all settings
-for race condition injection experiments.
+This module defines:
+- ReproducerConfig: Settings for the standalone RCCL race condition reproducer
+- ReproducerResult: Result from running the reproducer
+- RaceConfig: Settings for race condition injection experiments (broader aorta system)
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
+
+
+# =============================================================================
+# Standalone Reproducer Config
+# =============================================================================
+
+
+@dataclass
+class ReproducerConfig:
+    """
+    Configuration for the standalone RCCL race condition reproducer.
+
+    This reproducer tests for RUNTIME bugs (not application bugs) by:
+    - Using proper synchronization everywhere
+    - Using known-pattern data to detect any corruption
+    - Simulating training timing profile
+
+    If corruption occurs with proper syncs, it's a RUNTIME BUG in RCCL/HIP.
+    """
+
+    # =========================================================================
+    # Mode selection
+    # =========================================================================
+    mode: str = "default"
+    """
+    Reproducer mode. Determines the communication pattern tested.
+
+    Available modes:
+    - "default": TorchRec-like pattern (H2D + all_to_all + all_reduce)
+    - "ddp": DDP pattern (H2D with double-buffered prefetch + gradient all_reduce)
+    - "minimal": Legacy monolithic reproducer (backward compat)
+    """
+
+    # =========================================================================
+    # Iteration settings
+    # =========================================================================
+    warmup_iterations: int = 100
+    """
+    Number of iterations to run WITHOUT verification.
+
+    Builds up RCCL/runtime state before checking for corruption.
+    Runtime bugs may manifest after ~100+ steps due to internal state
+    accumulation. Warmup helps reach similar conditions.
+    """
+
+    verify_iterations: int = 10000
+    """
+    Number of iterations to run WITH verification.
+
+    After warmup, we check every iteration for corruption using
+    known-pattern data verification.
+    """
+
+    stop_on_first_corruption: bool = True
+    """Stop immediately when corruption is detected."""
+
+    log_interval: int = 100
+    """Log progress every N iterations."""
+
+    # =========================================================================
+    # Tensor sizes (stress factors)
+    # =========================================================================
+    h2d_tensor_size: int = 1_000_000
+    """
+    Size of H2D tensor (number of elements).
+
+    Larger = longer DMA = more overlap opportunity.
+    Recommended: 1M+ for stress testing.
+    """
+
+    alltoall_tensor_size: int = 100_000
+    """
+    Size of all_to_all tensor per rank (number of elements).
+
+    Total transfer size = alltoall_tensor_size * world_size.
+    Larger = longer collective = more overlap opportunity.
+    Used by default mode only.
+    """
+
+    allreduce_tensor_size: int = 100_000
+    """
+    Size of all_reduce tensor (number of elements).
+
+    Simulates gradient synchronization (e.g., FSDP-style).
+    Used by default mode only; DDP mode all-reduces actual gradients.
+    """
+
+    fsdp_shard_size: int = 100_000
+    """
+    Size of each FSDP parameter shard per rank (number of elements).
+
+    Used by FSDP mode for per-layer all_gather/reduce_scatter.
+    Full parameter size = fsdp_shard_size * world_size.
+    Larger = longer collectives = more overlap opportunity.
+    """
+
+    dtype: str = "bfloat16"
+    """Data type for tensors. Options: bfloat16, float16, float32."""
+
+    # =========================================================================
+    # Compute simulation (match training timing)
+    # =========================================================================
+    simulate_compute: bool = True
+    """
+    Add GEMM work between collectives to match training timing.
+
+    Without this, the reproducer runs ~100x faster than real training,
+    which may not trigger the same timing conditions.
+    """
+
+    compute_type: str = "gemm"
+    """Compute pattern type. Options: gemm (more can be registered)."""
+
+    gemm_size: int = 5120
+    """
+    Matrix size for GEMM operations.
+
+    5120x5120 GEMM takes ~14ms on MI300X.
+    Adjust based on GPU to achieve ~500ms/step target.
+    """
+
+    gemm_layers: int = 26
+    """
+    Number of GEMM layers to simulate forward/backward.
+
+    26 layers x 14ms = ~364ms per forward/backward pass.
+    """
+
+    include_backward_compute: bool = True
+    """Also simulate backward pass GEMMs (doubles compute time)."""
+
+    # =========================================================================
+    # Optimizer (used by modes that support it, e.g., DDP)
+    # =========================================================================
+    optimizer: str = "none"
+    """
+    Optimizer for weight updates. Options: none, adamw, sgd, shampoo.
+
+    When set to 'none', no optimizer step is performed.
+    DDP mode uses this to test gradient all_reduce + optimizer interaction.
+    """
+
+    optimizer_lr: float = 1e-4
+    """Learning rate."""
+
+    optimizer_weight_decay: float = 0.01
+    """Weight decay."""
+
+    optimizer_betas: Tuple[float, float] = (0.9, 0.999)
+    """Adam betas."""
+
+    optimizer_eps: float = 1e-8
+    """Adam epsilon."""
+
+    # =========================================================================
+    # Deterministic mode (used by DDP for cross-rank gradient verification)
+    # =========================================================================
+    deterministic: bool = False
+    """
+    Enable deterministic mode with fixed seeds.
+
+    Required for DDP gradient consistency verification across ranks.
+    """
+
+    deterministic_seed: int = 42
+    """Seed for deterministic mode."""
+
+    ddp_bucketed: bool = False
+    """
+    Use bucketed gradient all_reduce overlapping with backward.
+
+    When enabled, per-layer gradient all_reduce runs concurrently with
+    backward computation of earlier layers (real DDP behavior).
+    When disabled, one bulk all_reduce runs after all of backward finishes.
+
+    Only used by DDP mode.
+    """
+
+    # =========================================================================
+    # Buffer management
+    # =========================================================================
+    reuse_buffers: bool = True
+    """
+    Reuse tensor buffers across iterations.
+
+    Real training reuses buffers; fresh allocations each iteration
+    may change memory layout and timing.
+    """
+
+    pin_memory: bool = True
+    """Use pinned memory for H2D source tensors."""
+
+    h2d_prefetch: bool = False
+    """
+    Use double-buffered H2D with prefetch.
+
+    When enabled, the next batch is copied to GPU during the current iteration's
+    backward pass, overlapping H2D with compute. When disabled, H2D is a blocking
+    transfer at the start of each iteration.
+
+    Double-buffered is the standard pattern in real DDP/FSDP training pipelines.
+    Single-buffered is simpler and tests a different timing profile.
+    """
+
+    # =========================================================================
+    # Stream configuration
+    # =========================================================================
+    same_stream_mode: bool = False
+    """
+    Put H2D and datadist on the SAME new stream (not separate streams).
+
+    If corruption occurs in this mode, it's DEFINITIVE proof of a
+    runtime bug because operations on the same stream are guaranteed
+    to be ordered by CUDA/HIP specification.
+    """
+
+    # =========================================================================
+    # Environment variables
+    # =========================================================================
+    gpu_max_hw_queues: Optional[int] = 4
+    """
+    Set GPU_MAX_HW_QUEUES environment variable.
+
+    - 2: Reduced parallelism (may mask bugs)
+    - 4+: Full parallelism (exposes timing-sensitive bugs)
+    """
+
+
+@dataclass
+class ReproducerResult:
+    """Result from running the reproducer."""
+
+    passed: bool
+    """True if no corruption was detected."""
+
+    total_iterations: int
+    """Total iterations run (warmup + verify)."""
+
+    corruption_count: int
+    """Number of corruptions detected."""
+
+    first_corruption_iter: Optional[int]
+    """Iteration where first corruption was detected (None if passed)."""
+
+    corruption_details: List[Dict]
+    """Details of each corruption detected."""
+
+    elapsed_time_sec: float
+    """Total elapsed time in seconds."""
+
+    avg_step_time_ms: float
+    """Average time per step in milliseconds."""
+
+
+# =============================================================================
+# Race Injection Config (broader aorta system)
+# =============================================================================
 
 
 @dataclass

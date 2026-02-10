@@ -2,6 +2,132 @@
 
 This guide explains the modular architecture and how to extend the reproducer with new modes and compute types.
 
+## Validating Changes (Multi-Node)
+
+After modifying the reproducer code, run these tests on a multi-node cluster to verify correctness. All commands below are run from the **master node** (first node in `node_ip_list.txt`).
+
+### Prerequisites
+
+1. Two or more compute nodes listed in `scripts/multi_node/node_ip_list.txt` (master first)
+2. Docker containers running on all nodes (use `start_docker_all_nodes.sh`)
+3. All nodes on the same git branch
+
+```bash
+# Start containers on all nodes (one-time, persists across runs)
+./scripts/multi_node/start_docker_all_nodes.sh \
+    docker/docker-compose.rocm70_9-1-shampoo.yaml \
+    training-overlap-bugs-rocm70_9-1-shampoo
+```
+
+### Quick Smoke Tests
+
+Run these first -- they complete in ~1-2 minutes each and catch import errors, buffer allocation issues, and basic communication failures.
+
+```bash
+# 1. Default mode smoke test (TorchRec-like: H2D + all_to_all + all_reduce)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --hw-queues 4 --warmup 5 --verify 20 --no-compute
+
+# 2. DDP mode smoke test (gradient all_reduce + H2D prefetch)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --mode ddp --hw-queues 4 --warmup 5 --verify 20 --no-compute --deterministic
+
+# 3. DDP bucketed mode smoke test (per-layer backward + all_reduce overlap)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --mode ddp --bucketed --hw-queues 4 --warmup 5 --verify 20 --no-compute --deterministic
+
+# 4. FSDP mode smoke test (per-layer all_gather + reduce_scatter)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --mode fsdp --hw-queues 4 --warmup 5 --verify 20 --no-compute
+```
+
+**Expected output** (from `experiments/reproducer_*/logs/node_0.txt`):
+
+```
+PASSED: No corruption in 25 iterations with proper synchronization
+VERDICT: No runtime bug detected with current settings.
+```
+
+Both nodes should report PASSED on all ranks. Check for errors:
+
+```bash
+grep -i 'CORRUPTION\|RUNTIME BUG\|Error\|Traceback' experiments/reproducer_*/logs/node_*.txt
+```
+
+### Comprehensive Validation
+
+Run these for thorough testing (~80-90 min each with compute, ~15 min with `--no-compute`):
+
+```bash
+# 1. Default mode — baseline (HW_QUEUES=4, exposes timing-sensitive bugs)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --hw-queues 4 --warmup 100 --verify 10000
+
+# 2. Default mode — serialized comparison (HW_QUEUES=2, masks parallelism bugs)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --hw-queues 2 --warmup 100 --verify 10000
+
+# 3. Default mode — same-stream (definitive runtime bug test)
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --hw-queues 4 --same-stream --warmup 100 --verify 10000
+
+# 4. DDP mode — gradient all_reduce + H2D prefetch
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --mode ddp --deterministic --warmup 100 --verify 10000
+
+# 5. FSDP mode — per-layer all_gather + reduce_scatter
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --mode fsdp --hw-queues 4 --warmup 100 --verify 10000
+
+# 6. FSDP mode — with H2D prefetch
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --mode fsdp --prefetch --hw-queues 4 --warmup 100 --verify 10000
+
+# 7. Default mode — NCCL implicit order workaround
+./scripts/multi_node/launch_reproducer.sh \
+    --docker training-overlap-bugs-rocm70_9-1-shampoo \
+    --hw-queues 4 --nccl-implicit --warmup 100 --verify 10000
+```
+
+### Monitoring and Checking Results
+
+```bash
+# Follow live output (master node)
+tail -f experiments/reproducer_*/logs/node_0.txt
+
+# Follow all nodes
+tail -f experiments/reproducer_*/logs/node_*.txt
+
+# Check final verdict
+grep -i 'VERDICT\|PASSED\|FAILED' experiments/reproducer_*/logs/node_0.txt
+
+# Check for any corruption across all nodes
+grep -i 'CORRUPTION\|RUNTIME BUG' experiments/reproducer_*/logs/*.txt
+```
+
+### What to Verify After Code Changes
+
+| Change Type | Minimum Validation |
+|-------------|-------------------|
+| New mode added | Smoke test the new mode + smoke test existing modes (no regression) |
+| Modified `base.py` | Smoke test **all** modes (default + ddp + fsdp) |
+| Modified `compute.py` | Smoke test with compute enabled (remove `--no-compute`) |
+| Modified `config.py` | Smoke test both modes |
+| Modified a single mode | Smoke test that mode + one other mode |
+| Launch script changes | Smoke test any mode via the launch script |
+
+---
+
 ## Architecture
 
 ```
@@ -46,7 +172,7 @@ This guide explains the modular architecture and how to extend the reproducer wi
 
 | Component | Description | Status |
 |-----------|-------------|--------|
-| `modes/fsdp.py` | FSDP mode with sharded gradients | Planned |
+| `modes/fsdp.py` | FSDP mode with per-layer all_gather + reduce_scatter | **Implemented** |
 | `modes/pipeline.py` | Pipeline parallel mode | Planned |
 | `AttentionCompute` | Transformer attention compute | Planned |
 | `EmbeddingCompute` | Sparse embedding lookup | Planned |
@@ -57,14 +183,14 @@ This guide explains the modular architecture and how to extend the reproducer wi
 src/aorta/race/
 ├── __init__.py              # Public API exports
 ├── __main__.py              # CLI entry point
-├── config.py                # ReproducerConfig, ReproducerResult
-├── minimal_reproducer.py    # Legacy reproducer (backward compat)
+├── config.py                # ReproducerConfig, ReproducerResult, RaceConfig
 ├── base.py                  # BaseReproducer abstract class
 ├── compute.py               # Pluggable compute simulation
 ├── modes/                   # Mode implementations
 │   ├── __init__.py          # Factory function + MODE_REGISTRY
 │   ├── default.py           # TorchRec-like mode (all_to_all + all_reduce)
-│   └── ddp.py               # DDP mode (gradient all_reduce)
+│   ├── ddp.py               # DDP mode (gradient all_reduce)
+│   └── fsdp.py              # FSDP mode (per-layer all_gather + reduce_scatter)
 ├── README.md                # Usage documentation
 └── developer_guide.md       # This file
 ```
@@ -74,7 +200,8 @@ src/aorta/race/
 | Mode | Description | Data Flow |
 |------|-------------|-----------|
 | `default` | TorchRec-like pattern | H2D → Forward → Backward + all_to_all → all_reduce |
-| `ddp` | DDP gradient sync | H2D (double-buffered) → Forward → Backward → gradient all_reduce |
+| `ddp` | DDP gradient sync | H2D (single/double-buffered) → Forward → Backward → gradient all_reduce |
+| `fsdp` | FSDP sharded params | H2D → per-layer [all_gather → GEMM] → per-layer [GEMM bwd → reduce_scatter] |
 
 ---
 
@@ -250,7 +377,7 @@ register_compute("attention", AttentionCompute)
 
 ### Step 3: Use your compute type
 
-Update `config/race/minimal_reproducer.yaml`:
+Update config yaml:
 
 ```yaml
 compute_type: attention  # instead of "gemm"
@@ -371,3 +498,35 @@ Iteration N:
 **Verification checks:**
 - H2D: `batch_gpu == iteration % 1000`
 - Gradient consistency: All ranks have identical gradient checksums
+
+### DDP Mode (Bucketed, `--bucketed`)
+
+```
+memcpy_stream:   [H2D] ──────────────────────────────────────────────────────────────┐
+                                                                                      │ wait
+default_stream:  [Forward all layers]                                                 │
+                 [Bwd L2 + all_reduce L2] → [Bwd L1 + all_reduce L1] → [Bwd L0 + AR L0]
+                 [optimizer step]
+```
+
+Per-layer backward GEMM followed by immediate all_reduce. Each layer's all_reduce can overlap with the next layer's backward via NCCL internal pipelining.
+
+**Verification checks:**
+- H2D: `batch_gpu == iteration % 1000`
+- Gradient consistency: All ranks have identical gradient checksums
+
+### FSDP Mode
+
+```
+memcpy_stream:   [H2D] ─────────────────────────────────────────────────────┐
+                                                                             │ wait
+default_stream:  [all_gather L0 → GEMM L0 → all_gather L1 → GEMM L1 → ...]│
+                 [... → GEMM bwd L1 → reduce_scatter L1 →                   │
+                        GEMM bwd L0 → reduce_scatter L0]                    │
+                 [optimizer step]
+```
+
+**Verification checks:**
+- H2D: `batch_gpu == iteration % 1000`
+- all_gather: after gathering rank-filled shards, chunk j == `float(j)`
+- reduce_scatter: after scattering, output == `sum(1..world_size)`

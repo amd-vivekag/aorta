@@ -2,17 +2,24 @@
 Default mode reproducer (TorchRec-like pattern).
 
 This mode simulates a TorchRec-style workload with:
-- H2D transfer for batch data
+- H2D transfer for batch data (single- or double-buffered via --prefetch)
 - all_to_all for sparse embedding distribution
 - Forward/backward compute with GEMMs
 - all_reduce for gradient synchronization
 
-Data Flow:
+Data Flow (single-buffered, default):
     memcpy_stream:  [H2D] → batch_gpu
                               ↓ (Forward READS batch_gpu)
     default_stream:          [Forward] → [Backward] → [all_reduce]
     datadist_stream:         [all_to_all]
                               (overlaps with backward)
+
+Data Flow (double-buffered, --prefetch):
+    memcpy_stream:  [H2D batch_N+1 (prefetch)] ──────────────────────┐
+                                                                      │ overlap
+    default_stream: [Forward(batch_N)] → [Backward] → [all_reduce]   │
+    datadist_stream:                    [all_to_all]                  │
+                    ← swap buffers ───────────────────────────────────┘
 """
 
 import logging
@@ -36,6 +43,10 @@ class DefaultModeReproducer(BaseReproducer):
     - datadist_stream: all_to_all collectives (sparse embedding exchange)
     - default_stream: compute + all_reduce (gradient sync)
     
+    H2D strategy is controlled by config.h2d_prefetch:
+    - False (default): single-buffered, copy-then-use at start of iteration
+    - True (--prefetch): double-buffered, prefetch next batch during backward
+    
     Verification checks:
     - H2D: batch_gpu == iteration % 1000
     - all_to_all: recv_buf[j] == j (data from rank j)
@@ -48,9 +59,7 @@ class DefaultModeReproducer(BaseReproducer):
         # Mode-specific stream
         self.datadist_stream: Optional[torch.cuda.Stream] = None
         
-        # Mode-specific buffers
-        self.batch_cpu: Optional[torch.Tensor] = None
-        self.batch_gpu: Optional[torch.Tensor] = None
+        # Mode-specific buffers (H2D buffers are in base class)
         self.send_buf: Optional[torch.Tensor] = None
         self.recv_buf: Optional[torch.Tensor] = None
         self.reduce_buf: Optional[torch.Tensor] = None
@@ -68,20 +77,8 @@ class DefaultModeReproducer(BaseReproducer):
             log.info("Using separate datadist_stream")
     
     def setup_buffers(self) -> None:
-        """Allocate buffers for default mode."""
+        """Allocate mode-specific buffers (all_to_all + all_reduce)."""
         cfg = self.config
-        
-        # H2D buffers
-        if cfg.pin_memory:
-            self.batch_cpu = torch.empty(
-                cfg.h2d_tensor_size, dtype=self.dtype, pin_memory=True
-            )
-        else:
-            self.batch_cpu = torch.empty(cfg.h2d_tensor_size, dtype=self.dtype)
-        
-        self.batch_gpu = torch.empty(
-            cfg.h2d_tensor_size, dtype=self.dtype, device="cuda"
-        )
         
         # all_to_all buffers
         self.send_buf = torch.empty(
@@ -96,25 +93,17 @@ class DefaultModeReproducer(BaseReproducer):
         )
         
         log.info(
-            f"Allocated default mode buffers: h2d={cfg.h2d_tensor_size}, "
+            f"Allocated default mode buffers: "
             f"a2a={cfg.alltoall_tensor_size}, ar={cfg.allreduce_tensor_size}"
         )
     
-    def _fill_patterns(self, iteration: int) -> None:
-        """Fill buffers with known patterns for verification."""
-        # H2D: batch = iteration % 1000 (avoid overflow in bfloat16)
-        self.batch_cpu.fill_(float(iteration % 1000))
-        
+    def _fill_collective_patterns(self) -> None:
+        """Fill collective buffers with known patterns for verification."""
         # all_to_all: send_buf[i] = rank for all i
         self.send_buf.fill_(float(self.rank))
         
         # all_reduce: reduce_buf = rank + 1
         self.reduce_buf.fill_(float(self.rank + 1))
-    
-    def _run_h2d(self) -> None:
-        """Run H2D transfer on memcpy_stream."""
-        with torch.cuda.stream(self.memcpy_stream):
-            self.batch_gpu.copy_(self.batch_cpu, non_blocking=True)
     
     def _run_alltoall(self) -> dist.Work:
         """Run all_to_all on datadist_stream."""
@@ -132,71 +121,125 @@ class DefaultModeReproducer(BaseReproducer):
         """
         Run one iteration of the default (TorchRec-like) mode.
 
+        Supports both single-buffered and double-buffered (prefetch) H2D
+        via config.h2d_prefetch. The mode controls where H2D primitives are
+        called; the base class handles buffer allocation and mechanics.
+
+        Returns True if patterns verified correctly (or not in verification phase).
+        """
+        # Fill collective buffers with known patterns
+        self._fill_collective_patterns()
+
+        if self.config.h2d_prefetch:
+            return self._run_iteration_prefetch(iteration)
+        else:
+            return self._run_iteration_single(iteration)
+
+    def _run_iteration_single(self, iteration: int) -> bool:
+        """
+        Single-buffered iteration: transfer → wait → forward → ...
+
         Data Flow:
           memcpy_stream:  [H2D] → batch_gpu
           default_stream:          [Forward] → [Backward] → [all_reduce]
           datadist_stream:         [all_to_all] (overlaps with backward)
-
-        Returns True if patterns verified correctly (or not in verification phase).
         """
-        # Fill buffers with known patterns
-        self._fill_patterns(iteration)
+        # ─── Phase 1: H2D on memcpy_stream ───────────────────────────
+        self._h2d_transfer(iteration)
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 1: H2D on memcpy_stream
-        # ─────────────────────────────────────────────────────────────
-        self._run_h2d()
+        # ─── Phase 2: PROPER SYNC - wait for H2D ─────────────────────
+        self._h2d_wait()
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 2: PROPER SYNC - wait for H2D
-        # ─────────────────────────────────────────────────────────────
-        self.default_stream.wait_stream(self.memcpy_stream)
-
-        # ─────────────────────────────────────────────────────────────
-        # Phase 3: Forward pass (if enabled)
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 3: Forward pass (if enabled) ──────────────────────
         forward_output = None
         if self.compute:
             forward_output = self.compute.forward(self.batch_gpu)
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 4: all_to_all on datadist_stream (overlaps with backward)
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 4: all_to_all on datadist_stream ──────────────────
         work_a2a = self._run_alltoall()
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 5: Backward pass (if enabled)
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 5: Backward pass (if enabled) ─────────────────────
         if self.compute:
             self.compute.backward(
-                forward_output, 
+                forward_output,
                 use_autograd=(self.optimizer is not None)
             )
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 6: PROPER SYNC - wait for all_to_all
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 6: PROPER SYNC - wait for all_to_all ──────────────
         self.default_stream.wait_stream(self.datadist_stream)
         work_a2a.wait()
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 7: Optimizer step (if enabled)
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 7: Optimizer step (if enabled) ────────────────────
         self._run_optimizer_step()
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 8: all_reduce on default stream
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 8: all_reduce on default stream ───────────────────
         self._run_allreduce()
 
-        # ─────────────────────────────────────────────────────────────
-        # Phase 9: Verify patterns (only during verification phase)
-        # ─────────────────────────────────────────────────────────────
+        # ─── Phase 9: Verify patterns ────────────────────────────────
         if self.in_verification_phase:
             torch.cuda.synchronize()
             return self._verify(iteration)
 
         return True
+
+    def _run_iteration_prefetch(self, iteration: int) -> bool:
+        """
+        Double-buffered iteration: wait(prev) → forward → prefetch_next → ...
+
+        Data Flow:
+          memcpy_stream:  [H2D batch_N+1 (prefetch)] ─────────────────┐
+                                                                       │ overlap
+          default_stream: [Forward(batch_N)] → [Backward] → [all_reduce]
+          datadist_stream:                    [all_to_all]             │
+                          ← swap buffers ──────────────────────────────┘
+        """
+        # ─── Phase 1: Ensure current batch is ready ──────────────────
+        # First iteration: explicit transfer (no previous prefetch)
+        if self._h2d_is_first_iteration:
+            self._h2d_transfer(iteration)
+            self._h2d_is_first_iteration = False
+
+        # Wait for current batch H2D to complete
+        self._h2d_wait()
+
+        # ─── Phase 2: Forward pass (uses current batch) ──────────────
+        forward_output = None
+        if self.compute:
+            forward_output = self.compute.forward(self.batch_gpu)
+
+        # ─── Phase 3: Start prefetching NEXT batch ───────────────────
+        self._h2d_prefetch_next(iteration + 1)
+
+        # ─── Phase 4: all_to_all on datadist_stream ──────────────────
+        work_a2a = self._run_alltoall()
+
+        # ─── Phase 5: Backward pass (if enabled) ─────────────────────
+        if self.compute:
+            self.compute.backward(
+                forward_output,
+                use_autograd=(self.optimizer is not None)
+            )
+
+        # ─── Phase 6: PROPER SYNC - wait for all_to_all ──────────────
+        self.default_stream.wait_stream(self.datadist_stream)
+        work_a2a.wait()
+
+        # ─── Phase 7: Optimizer step (if enabled) ────────────────────
+        self._run_optimizer_step()
+
+        # ─── Phase 8: all_reduce on default stream ───────────────────
+        self._run_allreduce()
+
+        # ─── Phase 9: Verify patterns (before swapping buffers) ──────
+        result = True
+        if self.in_verification_phase:
+            torch.cuda.synchronize()
+            result = self._verify(iteration)
+
+        # ─── Phase 10: Swap buffers for next iteration ───────────────
+        self._h2d_swap_buffers()
+
+        return result
     
     def _verify(self, iteration: int) -> bool:
         """Verify all buffers contain expected patterns."""

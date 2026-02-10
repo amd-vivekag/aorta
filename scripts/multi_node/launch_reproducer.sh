@@ -18,11 +18,17 @@ usage() {
     echo ""
     echo "Basic Options:"
     echo "  -d, --docker CONTAINER    Docker container name (required)"
+    echo "  -m, --mode MODE           Reproducer mode: default, ddp, fsdp (default: default)"
+    echo "      --fsdp-shard-size N   FSDP shard size per rank (default: 100000)"
     echo "  -p, --nproc NPROC         Processes per node (default: 8)"
     echo "  -w, --warmup N            Warmup iterations (default: 100)"
     echo "  -v, --verify N            Verification iterations (default: 10000)"
+    echo "      --prefetch             Use double-buffered H2D prefetch"
     echo "  -s, --same-stream         Use same stream for H2D and datadist"
     echo "  -c, --no-compute          Disable compute simulation"
+    echo "      --deterministic       Enable deterministic mode (for DDP gradient verification)"
+    echo "      --bucketed            Use bucketed per-layer gradient all_reduce (DDP mode)"
+    echo "      --optimizer OPT       Optimizer: none, adamw, sgd, shampoo (default: none)"
     echo "  -l, --label LABEL         Experiment label"
     echo "      --master-port PORT    Master port (default: auto-select)"
     echo "  -h, --help                Show this help"
@@ -37,8 +43,14 @@ usage() {
     echo "      --disable-clr-batch   DEBUG_CLR_BATCH_CPU_SYNC_SIZE=0 (tried - still NaN)"
     echo ""
     echo "Examples:"
-    echo "  # Test with settings that EXPOSE the bug"
+    echo "  # Default mode (TorchRec-like) - most common test"
     echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --hw-queues 4"
+    echo ""
+    echo "  # DDP mode (gradient all_reduce + H2D prefetch)"
+    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --mode ddp --deterministic"
+    echo ""
+    echo "  # FSDP mode (per-layer all_gather + reduce_scatter)"
+    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --mode fsdp --hw-queues 4"
     echo ""
     echo "  # Test with settings that MASK the bug (comparison)"
     echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --hw-queues 2"
@@ -63,12 +75,18 @@ fi
 
 # Default values
 DOCKER_CONTAINER=""
+MODE="default"
 NPROC_PER_NODE=8
 HW_QUEUES=4
 WARMUP=100
 VERIFY=10000
 SAME_STREAM=""
 NO_COMPUTE=""
+PREFETCH=""
+DETERMINISTIC=""
+BUCKETED=""
+OPTIMIZER=""
+FSDP_SHARD_SIZE=""
 LABEL=""
 MASTER_PORT=""
 
@@ -87,6 +105,26 @@ while [[ $# -gt 0 ]]; do
             DOCKER_CONTAINER="$2"
             shift 2
             ;;
+        -m|--mode)
+            MODE="$2"
+            shift 2
+            ;;
+        --deterministic)
+            DETERMINISTIC="--deterministic"
+            shift
+            ;;
+        --bucketed)
+            BUCKETED="--bucketed"
+            shift
+            ;;
+        --optimizer)
+            OPTIMIZER="$2"
+            shift 2
+            ;;
+        --fsdp-shard-size)
+            FSDP_SHARD_SIZE="$2"
+            shift 2
+            ;;
         -p|--nproc)
             NPROC_PER_NODE="$2"
             shift 2
@@ -102,6 +140,10 @@ while [[ $# -gt 0 ]]; do
         -v|--verify)
             VERIFY="$2"
             shift 2
+            ;;
+        --prefetch)
+            PREFETCH="--prefetch"
+            shift
             ;;
         -s|--same-stream)
             SAME_STREAM="--same-stream"
@@ -181,7 +223,7 @@ WORLD_SIZE=$((NPROC_PER_NODE * NUM_NODES))
 
 # Create experiment directory
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_DIR="$AORTA_ROOT/experiments/reproducer_hw${HW_QUEUES}_${TIMESTAMP}${LABEL:+_$LABEL}"
+EXPERIMENT_DIR="$AORTA_ROOT/experiments/reproducer_${MODE}_hw${HW_QUEUES}_${TIMESTAMP}${LABEL:+_$LABEL}"
 mkdir -p "$EXPERIMENT_DIR/logs"
 
 # Build extra flags for Python CLI
@@ -198,12 +240,17 @@ cat > "$EXPERIMENT_DIR/experiment_info.txt" << EOF
 Experiment: Minimal RCCL Race Condition Reproducer
 Timestamp: $TIMESTAMP
 Label: ${LABEL:-unlabeled}
+Mode: $MODE
 Docker: $DOCKER_CONTAINER
 GPU_MAX_HW_QUEUES: $HW_QUEUES
 Warmup iterations: $WARMUP
 Verify iterations: $VERIFY
+H2D prefetch: ${PREFETCH:-no}
 Same stream mode: ${SAME_STREAM:-no}
 Compute simulation: ${NO_COMPUTE:-enabled}
+Deterministic: ${DETERMINISTIC:-no}
+Bucketed: ${BUCKETED:-no}
+Optimizer: ${OPTIMIZER:-none}
 Signal pool size: ${SIGNAL_POOL:-default}
 Disable SDMA: ${DISABLE_SDMA:-no}
 Blit copy size: ${BLIT_COPY:-default}
@@ -243,6 +290,9 @@ gemm_size: 5120
 gemm_layers: 26
 include_backward_compute: true
 
+# H2D buffering
+h2d_prefetch: $([ -z "$PREFETCH" ] && echo "false" || echo "true")
+
 # Stream configuration
 same_stream_mode: $([ -z "$SAME_STREAM" ] && echo "false" || echo "true")
 
@@ -281,10 +331,15 @@ echo "If corruption occurs, it indicates a RUNTIME BUG in RCCL/HIP."
 echo ""
 echo "Configuration:"
 echo "  Docker container: $DOCKER_CONTAINER"
+echo "  Mode: $MODE"
 echo "  Nodes: $NUM_NODES | World size: $WORLD_SIZE GPUs"
 echo "  Warmup: $WARMUP | Verify: $VERIFY iterations"
+echo "  H2D prefetch: ${PREFETCH:-no}"
 echo "  Same stream mode: ${SAME_STREAM:-no}"
 echo "  Compute simulation: ${NO_COMPUTE:-enabled}"
+echo "  Deterministic: ${DETERMINISTIC:-no}"
+echo "  Bucketed: ${BUCKETED:-no}"
+echo "  Optimizer: ${OPTIMIZER:-none}"
 echo ""
 echo "Customer-tested env vars:"
 echo "  GPU_MAX_HW_QUEUES: $HW_QUEUES"
@@ -327,10 +382,14 @@ while IFS= read -r HOST || [[ -n "$HOST" ]]; do
         --master_addr $MASTER_ADDR \
         --master_port $MASTER_PORT \
         -m aorta.race \
+        --mode $MODE \
         --warmup $WARMUP \
         --verify $VERIFY \
         --hw-queues $HW_QUEUES \
-        $SAME_STREAM $NO_COMPUTE $EXTRA_FLAGS"
+        $PREFETCH $SAME_STREAM $NO_COMPUTE $DETERMINISTIC $BUCKETED \
+        ${OPTIMIZER:+--optimizer $OPTIMIZER} \
+        ${FSDP_SHARD_SIZE:+--fsdp-shard-size $FSDP_SHARD_SIZE} \
+        $EXTRA_FLAGS"
 
     # Build docker exec command with environment variables from set_env_variables.sh
     DOCKER_ENV_FLAGS=$(build_docker_env_flags)

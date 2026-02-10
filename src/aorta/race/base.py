@@ -67,6 +67,13 @@ class BaseReproducer(ABC):
         # Optimizer
         self.optimizer: Optional[torch.optim.Optimizer] = None
         
+        # H2D buffers (managed by base class for all modes)
+        self.batch_cpu: Optional[torch.Tensor] = None
+        self.batch_gpu: Optional[torch.Tensor] = None
+        self._batch_cpu_next: Optional[torch.Tensor] = None   # double-buffer only
+        self._batch_gpu_next: Optional[torch.Tensor] = None   # double-buffer only
+        self._h2d_is_first_iteration: bool = True
+        
         # State
         self.in_verification_phase: bool = False
         self.corruption_details: List[Dict] = []
@@ -114,6 +121,43 @@ class BaseReproducer(ABC):
         self.memcpy_stream = torch.cuda.Stream()
         self.default_stream = torch.cuda.current_stream()
         log.info("Created memcpy_stream and default_stream")
+    
+    def _setup_h2d_buffers(self) -> None:
+        """
+        Allocate H2D buffers based on config.h2d_prefetch.
+        
+        Single-buffered: batch_cpu + batch_gpu (copy-then-use each iteration).
+        Double-buffered: + _batch_cpu_next + _batch_gpu_next (prefetch overlaps
+        with compute; buffers are swapped at end of each iteration).
+        
+        All modes use self.batch_gpu for the current batch.
+        """
+        cfg = self.config
+        pin = cfg.pin_memory
+        
+        # Always allocate current buffers
+        self.batch_cpu = torch.empty(
+            cfg.h2d_tensor_size, dtype=self.dtype,
+            pin_memory=pin,
+        )
+        self.batch_gpu = torch.empty(
+            cfg.h2d_tensor_size, dtype=self.dtype, device="cuda",
+        )
+        
+        if cfg.h2d_prefetch:
+            # Double-buffer: allocate next-batch buffers
+            self._batch_cpu_next = torch.empty(
+                cfg.h2d_tensor_size, dtype=self.dtype,
+                pin_memory=pin,
+            )
+            self._batch_gpu_next = torch.empty(
+                cfg.h2d_tensor_size, dtype=self.dtype, device="cuda",
+            )
+            log.info(
+                f"H2D: double-buffered (prefetch) mode, size={cfg.h2d_tensor_size}"
+            )
+        else:
+            log.info(f"H2D: single-buffered mode, size={cfg.h2d_tensor_size}")
     
     def _setup_compute(self) -> None:
         """Setup compute simulator if enabled."""
@@ -210,22 +254,26 @@ class BaseReproducer(ABC):
         self._setup_deterministic()
         self._setup_streams()
         self._setup_compute()
-        self.setup_buffers()  # Mode-specific
+        self._setup_h2d_buffers()  # H2D buffers (shared by all modes)
+        self.setup_buffers()       # Mode-specific (non-H2D buffers)
         self._setup_optimizer()
         
         log.info(
             f"Reproducer setup complete: mode={self.config.mode}, rank={self.rank}, "
             f"world_size={self.world_size}, h2d_size={self.config.h2d_tensor_size}, "
+            f"h2d_prefetch={self.config.h2d_prefetch}, "
             f"dtype={self.config.dtype}, optimizer={self.config.optimizer}"
         )
     
     @abstractmethod
     def setup_buffers(self) -> None:
         """
-        Allocate mode-specific buffers.
+        Allocate mode-specific buffers (NOT H2D buffers).
         
-        Implemented by subclasses to allocate tensors specific to their
-        communication pattern (e.g., all_to_all buffers, double buffers).
+        H2D buffers (batch_cpu, batch_gpu, and double-buffer variants) are
+        managed by the base class via _setup_h2d_buffers(). Subclasses only
+        need to allocate buffers specific to their communication pattern
+        (e.g., all_to_all send/recv buffers, all_reduce buffers).
         """
         pass
     
@@ -248,6 +296,67 @@ class BaseReproducer(ABC):
             False if corruption detected.
         """
         pass
+    
+    # =========================================================================
+    # H2D Primitives (used by all modes)
+    # =========================================================================
+    
+    def _h2d_transfer(self, iteration: int) -> None:
+        """
+        Fill current batch CPU buffer with known pattern and start async H2D.
+        
+        Used at the start of each iteration in single-buffered mode,
+        and only for the first iteration in double-buffered mode (subsequent
+        iterations rely on the prefetch from the previous iteration).
+        
+        Args:
+            iteration: Current iteration number (pattern = iteration % 1000).
+        """
+        self.batch_cpu.fill_(float(iteration % 1000))
+        with torch.cuda.stream(self.memcpy_stream):
+            self.batch_gpu.copy_(self.batch_cpu, non_blocking=True)
+    
+    def _h2d_prefetch_next(self, next_iteration: int) -> None:
+        """
+        Start prefetching the next batch on memcpy_stream.
+        
+        No-op when h2d_prefetch is disabled (single-buffered mode).
+        In double-buffered mode, fills _batch_cpu_next with the pattern for
+        next_iteration and starts async copy to _batch_gpu_next.
+        
+        Call this where you want the prefetch to overlap (e.g., after forward,
+        during backward).
+        
+        Args:
+            next_iteration: Iteration number for the next batch.
+        """
+        if not self.config.h2d_prefetch:
+            return
+        self._batch_cpu_next.fill_(float(next_iteration % 1000))
+        with torch.cuda.stream(self.memcpy_stream):
+            self._batch_gpu_next.copy_(self._batch_cpu_next, non_blocking=True)
+    
+    def _h2d_wait(self) -> None:
+        """Wait for the current H2D transfer to complete on the default stream."""
+        self.default_stream.wait_stream(self.memcpy_stream)
+    
+    def _h2d_swap_buffers(self) -> None:
+        """
+        Swap current and next buffers for the next iteration.
+        
+        No-op when h2d_prefetch is disabled (single-buffered mode).
+        In double-buffered mode, swaps batch_gpu <-> _batch_gpu_next and
+        batch_cpu <-> _batch_cpu_next so that the prefetched data becomes
+        the current batch for the next iteration.
+        """
+        if not self.config.h2d_prefetch:
+            return
+        self.batch_gpu, self._batch_gpu_next = (
+            self._batch_gpu_next, self.batch_gpu
+        )
+        self.batch_cpu, self._batch_cpu_next = (
+            self._batch_cpu_next, self.batch_cpu
+        )
     
     # =========================================================================
     # Shared Utilities
