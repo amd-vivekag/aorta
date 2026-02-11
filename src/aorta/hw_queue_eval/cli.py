@@ -105,9 +105,11 @@ def cli():
 @click.option("--quiet", "-q", is_flag=True, help="Minimal output")
 @click.option("--profile", "-p", is_flag=True, help="Enable PyTorch profiler (generates Chrome trace and TensorBoard logs)")
 @click.option("--profile-dir", default="profiles", help="Output directory for profiler traces")
+@click.option("--multi-gpu", is_flag=True, default=False,
+              help="Distribute streams across all available GPUs")
 def run(workload: str, streams: int, iterations: int, warmup: int,
         output: Optional[str], device: str, sync_mode: str, quiet: bool,
-        profile: bool, profile_dir: str):
+        profile: bool, profile_dir: str, multi_gpu: bool):
     """Run a single workload evaluation.
 
     WORKLOAD: Name of the workload to run (e.g., hetero_kernels, fsdp_tp)
@@ -118,7 +120,7 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
 
     try:
         # Get workload
-        wl = get_workload_instance(workload)
+        wl = get_workload_instance(workload, use_multi_gpu=multi_gpu)
         info = WorkloadRegistry.get_info(workload)
 
         # Check stream count compatibility
@@ -145,6 +147,11 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
         click.echo(f"  Measurement iterations: {iterations}")
         click.echo(f"  Warmup iterations:      {warmup}")
         click.echo(f"  Device:                 {device}")
+        click.echo(f"  Multi-GPU mode:         {'Enabled' if multi_gpu else 'Disabled'}")
+        if multi_gpu:
+            from aorta.utils import get_available_devices
+            available_gpus = len(get_available_devices() or [device])
+            click.echo(f"  Available GPUs:         {available_gpus}")
         click.echo(f"  Switch sensitivity:     {info.switch_latency_sensitivity}")
         click.echo()
         click.echo("-" * 70)
@@ -153,6 +160,13 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
             click.echo("  (Profiling enabled - will generate Chrome trace and TensorBoard logs)")
         click.echo()
 
+        # Validate multi-GPU configuration
+        if multi_gpu:
+            from aorta.utils import get_available_devices
+            available_devices = get_available_devices()
+            if available_devices and len(available_devices) < 2:
+                click.echo("Warning: --multi-gpu specified but only 1 GPU available", err=True)
+
         # Create harness
         config = HarnessConfig(
             stream_count=streams,
@@ -160,6 +174,7 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
             measurement_iterations=iterations,
             sync_mode=sync_mode,
             device=device,
+            use_multi_gpu=multi_gpu,
         )
         harness = StreamHarness(config)
 
@@ -401,8 +416,10 @@ def _print_interpretation(workload: str, info, result, streams: int) -> None:
 @click.option("--warmup", "-w", default=10, help="Warmup iterations")
 @click.option("--output", "-o", default=None, help="Output JSON file")
 @click.option("--device", "-d", default="cuda:0", help="Target device")
+@click.option("--multi-gpu", is_flag=True, default=False,
+              help="Distribute streams across all available GPUs")
 def sweep(workload: str, streams: str, iterations: int, warmup: int,
-          output: Optional[str], device: str):
+          output: Optional[str], device: str, multi_gpu: bool):
     """Run workload across multiple stream counts.
 
     WORKLOAD: Name of the workload to sweep
@@ -420,7 +437,7 @@ def sweep(workload: str, streams: str, iterations: int, warmup: int,
     click.echo()
 
     try:
-        wl = get_workload_instance(workload)
+        wl = get_workload_instance(workload, use_multi_gpu=multi_gpu)
 
         # Filter stream counts by workload limits
         valid_counts = [c for c in stream_counts if wl.supports_stream_count(c)]
@@ -442,6 +459,7 @@ def sweep(workload: str, streams: str, iterations: int, warmup: int,
                 warmup_iterations=warmup,
                 measurement_iterations=iterations,
                 device=device,
+                use_multi_gpu=multi_gpu,
             )
             harness = StreamHarness(config)
             result = harness.run_workload(wl)
@@ -484,8 +502,11 @@ def sweep(workload: str, streams: str, iterations: int, warmup: int,
 @click.option("--device", "-d", default="cuda:0", help="Target device")
 @click.option("--profile", "-p", is_flag=True, help="Enable PyTorch profiler for each workload")
 @click.option("--profile-dir", default="profiles", help="Output directory for profiler traces")
+@click.option("--multi-gpu", is_flag=True, default=False,
+              help="Distribute streams across all available GPUs")
 def run_priority(priority: str, streams: str, iterations: int,
-                 output_dir: str, device: str, profile: bool, profile_dir: str):
+                 output_dir: str, device: str, profile: bool, profile_dir: str,
+                 multi_gpu: bool):
     """Run all workloads of a given priority level.
 
     PRIORITY: Priority level (P0, P1, P2, P3, or 'all')
@@ -542,7 +563,7 @@ def run_priority(priority: str, streams: str, iterations: int,
         click.echo(f"[{workload_name}]")
 
         try:
-            wl = get_workload_instance(workload_name)
+            wl = get_workload_instance(workload_name, use_multi_gpu=multi_gpu)
             valid_counts = [c for c in stream_counts if wl.supports_stream_count(c)]
 
             if not valid_counts:
@@ -558,6 +579,7 @@ def run_priority(priority: str, streams: str, iterations: int,
                     warmup_iterations=10,
                     measurement_iterations=iterations,
                     device=device,
+                    use_multi_gpu=multi_gpu,
                 )
                 harness = StreamHarness(config)
 
