@@ -58,10 +58,12 @@ export TORCH_DIST_INIT_TIMEOUT=150           # Match collective timeout for cons
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_TRACE_BUFFER_SIZE=10000
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1          # Critical for hang debugging
-export AMD_LOG_LEVEL=5
-# AMD_LOG_LEVEL_FILE is set dynamically in local_launch.sh to point to experiment directory
-# Default fallback (will be overridden):
-export AMD_LOG_LEVEL_FILE=trace_amd.log
+
+#export AMD_LOG_LEVEL=5
+## AMD_LOG_LEVEL_FILE is set dynamically in local_launch.sh to point to experiment directory
+## Default fallback (will be overridden):
+#export AMD_LOG_LEVEL_FILE=trace_amd.log
+
 # -----------------------------------------------------------------------------
 # PyTorch ROCm Profiler
 # -----------------------------------------------------------------------------
@@ -100,8 +102,8 @@ DOCKER_ENV_VARS=(
     TORCH_NCCL_TRACE_BUFFER_SIZE
     TORCH_NCCL_DUMP_ON_TIMEOUT
     # AMD Logging
-    AMD_LOG_LEVEL
-    AMD_LOG_LEVEL_FILE
+    #AMD_LOG_LEVEL
+    #AMD_LOG_LEVEL_FILE
     # Profiler
     PYTORCH_ROCM_PROFILER_ENABLE_TRACING
 )
