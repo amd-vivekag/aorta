@@ -297,7 +297,7 @@ class HWQueueLoader:
     @staticmethod
     def load_auto(path: Path) -> Tuple[str, SingleRunData | SweepData]:
         """
-        Auto-detect format and load JSON file.
+        Auto-detect format and load JSON file. This is used to load a single run or a sweep.
 
         Args:
             path: Path to JSON file
