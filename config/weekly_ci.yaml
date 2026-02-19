@@ -1,0 +1,50 @@
+# Weekly CI Kickoff Configuration
+# ================================
+# This file contains default settings for the RCCL Warp Speed Performance Analysis.
+# All values can be overridden via command-line arguments.
+
+# RCCL Build Configuration
+rccl:
+  branch: "warp_speed_v1"
+  gpu_target: "gfx950"
+
+# Test Configuration
+test:
+  # Space-separated CU,threads pairs
+  config_pairs: "56,256 37,384 32,512"
+  # Baseline configuration for comparisons
+  baseline: "56,256"
+  # Training configuration YAML path
+  training_config: "config/single_node/gemm_overlap_comm.yaml"
+
+# Docker Configuration
+docker:
+  compose_file: "docker/rccl_test/docker-compose.rocm70_9-1.yaml"
+  container_name: "training-overlap-bugs-rocm70_9-1"
+
+# Stage Skip Configuration
+# Set to true to skip a stage, false to run it
+skip:
+  docker_setup: false
+  rccl_build: false
+  install_deps: false
+  performance_tests: false
+  pairwise_analysis: false
+  compare_all_analysis: true   # Skipped by default (expensive)
+  checkout_aorta_report: false
+  cross_timestamp_comparison: false
+  push_results: true           # Skipped by default (avoid accidental pushes)
+  cleanup: true                # Skipped by default (keep container running)
+
+# Cross-Timestamp Comparison Configuration
+cross_timestamp:
+  # Leave empty to auto-detect second-most-recent experiment
+  baseline_experiment: ""
+  # Path to aorta-report repository (relative to repo root or absolute)
+  aorta_report_path: "../aorta-report"
+
+# Output Configuration
+output:
+  log_dir: "logs"
+  log_level: "INFO"
+
