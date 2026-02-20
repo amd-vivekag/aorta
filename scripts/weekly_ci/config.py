@@ -44,6 +44,9 @@ class DockerConfig:
 
     compose_file: str = "docker/rccl_test/docker-compose.rocm70_9-1.yaml"
     container_name: str = "training-overlap-bugs-rocm70_9-1"
+    registry_user: str = ""  # Docker registry username (e.g., rocmshared)
+    registry_password: str = ""  # Docker registry password/token
+    skip_build: bool = True  # Skip docker build by default (use existing image)
 
 
 @dataclass
@@ -188,6 +191,32 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["docker", "container_name"],
         config.docker.container_name,
     )
+    config.docker.registry_user = _get_value(
+        args.docker_user,
+        yaml_data,
+        ["docker", "registry_user"],
+        config.docker.registry_user,
+    )
+    config.docker.registry_password = _get_value(
+        args.docker_password,
+        yaml_data,
+        ["docker", "registry_password"],
+        config.docker.registry_password,
+    )
+
+    # Docker build: --docker-build enables it, --no-docker-build disables it
+    # Default is to skip build (skip_build=True)
+    if args.docker_build:
+        config.docker.skip_build = False
+    elif args.no_docker_build:
+        config.docker.skip_build = True
+    else:
+        config.docker.skip_build = _get_value(
+            None,
+            yaml_data,
+            ["docker", "skip_build"],
+            config.docker.skip_build,
+        )
 
     # Skip config - CLI flags override YAML
     config.skip.docker_setup = _get_value(
@@ -359,6 +388,28 @@ Examples:
     )
     parser.add_argument(
         "--container-name", type=str, default=None, help="Docker container name"
+    )
+    parser.add_argument(
+        "--docker-user",
+        type=str,
+        default=None,
+        help="Docker registry username (e.g., rocmshared)",
+    )
+    parser.add_argument(
+        "--docker-password",
+        type=str,
+        default=None,
+        help="Docker registry password/token (can also use DOCKER_PASSWORD env var)",
+    )
+    parser.add_argument(
+        "--docker-build",
+        action="store_true",
+        help="Build Docker image before starting container (default: skip build)",
+    )
+    parser.add_argument(
+        "--no-docker-build",
+        action="store_true",
+        help="Skip Docker image build, use existing image (default behavior)",
     )
 
     # Skip stages
