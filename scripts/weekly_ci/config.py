@@ -36,6 +36,15 @@ class TestConfig:
     config_pairs: str = "56,256 37,384 32,512"
     baseline: str = "56,256"
     training_config: str = "config/single_node/gemm_overlap_comm.yaml"
+    experiment_dir: str = ""  # If empty, auto-detect most recent
+
+
+@dataclass
+class AnalysisConfig:
+    """Analysis configuration for aorta-report commands."""
+
+    baseline_label: str = ""  # Label for baseline in reports (e.g., "baseline", "v1.0")
+    test_label: str = ""  # Label for test in reports (e.g., "test", "v1.1")
 
 
 @dataclass
@@ -70,7 +79,17 @@ class CrossTimestampConfig:
     """Cross-timestamp comparison configuration."""
 
     baseline_experiment: str = ""  # If empty, auto-detect second-most-recent
+    baseline_date: str = ""  # Date directory in aorta-report (e.g., "2026-02-19")
     aorta_report_path: str = "../aorta-report"
+
+
+@dataclass
+class GitConfig:
+    """Git configuration for pushing results."""
+
+    user_name: str = "Weekly CI Bot"
+    user_email: str = "weekly-ci@aorta.local"
+    github_token: str = ""  # Can be set via AORTA_REPORT_GITHUB_TOKEN env var
 
 
 @dataclass
@@ -90,6 +109,8 @@ class Config:
     docker: DockerConfig = field(default_factory=DockerConfig)
     skip: SkipConfig = field(default_factory=SkipConfig)
     cross_timestamp: CrossTimestampConfig = field(default_factory=CrossTimestampConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
+    git: GitConfig = field(default_factory=GitConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
     # Runtime state (populated during execution)
@@ -176,6 +197,12 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         yaml_data,
         ["test", "training_config"],
         config.test.training_config,
+    )
+    config.test.experiment_dir = _get_value(
+        getattr(args, "experiment_dir", None),
+        yaml_data,
+        ["test", "experiment_dir"],
+        config.test.experiment_dir,
     )
 
     # Docker config
@@ -297,11 +324,51 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["cross_timestamp", "baseline_experiment"],
         config.cross_timestamp.baseline_experiment,
     )
+    config.cross_timestamp.baseline_date = _get_value(
+        getattr(args, "baseline_date", None),
+        yaml_data,
+        ["cross_timestamp", "baseline_date"],
+        config.cross_timestamp.baseline_date,
+    )
     config.cross_timestamp.aorta_report_path = _get_value(
         args.aorta_report_path,
         yaml_data,
         ["cross_timestamp", "aorta_report_path"],
         config.cross_timestamp.aorta_report_path,
+    )
+
+    # Analysis config (labels for aorta-report)
+    config.analysis.baseline_label = _get_value(
+        getattr(args, "baseline_label", None),
+        yaml_data,
+        ["analysis", "baseline_label"],
+        config.analysis.baseline_label,
+    )
+    config.analysis.test_label = _get_value(
+        getattr(args, "test_label", None),
+        yaml_data,
+        ["analysis", "test_label"],
+        config.analysis.test_label,
+    )
+
+    # Git config
+    config.git.user_name = _get_value(
+        getattr(args, "git_user_name", None),
+        yaml_data,
+        ["git", "user_name"],
+        config.git.user_name,
+    )
+    config.git.user_email = _get_value(
+        getattr(args, "git_user_email", None),
+        yaml_data,
+        ["git", "user_email"],
+        config.git.user_email,
+    )
+    config.git.github_token = _get_value(
+        getattr(args, "github_token", None),
+        yaml_data,
+        ["git", "github_token"],
+        config.git.github_token,
     )
 
     # Output config
@@ -369,6 +436,12 @@ Examples:
         type=str,
         default=None,
         help="Path to training config YAML",
+    )
+    parser.add_argument(
+        "--experiment-dir",
+        type=str,
+        default=None,
+        help="Explicit experiment directory to use (auto-detect if not specified)",
     )
 
     # RCCL configuration
@@ -461,6 +534,12 @@ Examples:
         help="Previous experiment directory for cross-timestamp comparison (auto-detect if not specified)",
     )
     parser.add_argument(
+        "--baseline-date",
+        type=str,
+        default=None,
+        help="Date directory in aorta-report for cross-timestamp baseline (e.g., '2026-02-19')",
+    )
+    parser.add_argument(
         "--aorta-report-path",
         type=str,
         default=None,
@@ -473,6 +552,40 @@ Examples:
     )
     parser.add_argument(
         "--cleanup", action="store_true", help="Cleanup container after completion"
+    )
+
+    # Analysis configuration (labels for aorta-report)
+    parser.add_argument(
+        "--baseline-label",
+        type=str,
+        default=None,
+        help="Label for baseline in aorta-report output (e.g., 'baseline', 'v1.0')",
+    )
+    parser.add_argument(
+        "--test-label",
+        type=str,
+        default=None,
+        help="Label for test in aorta-report output (e.g., 'test', 'v1.1')",
+    )
+
+    # Git configuration
+    parser.add_argument(
+        "--git-user-name",
+        type=str,
+        default=None,
+        help="Git user name for commits (default: Weekly CI Bot)",
+    )
+    parser.add_argument(
+        "--git-user-email",
+        type=str,
+        default=None,
+        help="Git user email for commits",
+    )
+    parser.add_argument(
+        "--github-token",
+        type=str,
+        default=None,
+        help="GitHub token for aorta-report (can also use AORTA_REPORT_GITHUB_TOKEN env var)",
     )
 
     # Output configuration

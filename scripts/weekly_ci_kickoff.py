@@ -48,14 +48,17 @@ from weekly_ci import (
 )
 from weekly_ci.stages import (
     stage_build_rccl,
+    stage_checkout_aorta_report,
     stage_cleanup,
     stage_compare_all_analysis,
     stage_cross_timestamp_comparison,
     stage_docker_setup,
     stage_find_baseline_experiment_dir,
     stage_find_experiment_dir,
+    stage_generate_summary,
     stage_install_dependencies,
     stage_pairwise_analysis,
+    stage_push_results,
     stage_run_performance_tests,
     stage_validate_environment,
 )
@@ -242,6 +245,7 @@ def main() -> int:
                 config.experiment_dir = stage_find_experiment_dir(
                     repo_root=repo_root,
                     logger=logger,
+                    explicit_experiment_dir=config.test.experiment_dir,
                 )
                 log_stage_complete(logger, "Find Experiment Directory")
             except Exception as e:
@@ -264,6 +268,8 @@ def main() -> int:
                     config_pairs=config.test.config_pairs,
                     baseline=config.test.baseline,
                     logger=logger,
+                    baseline_label=config.analysis.baseline_label,
+                    test_label=config.analysis.test_label,
                 )
                 log_stage_complete(logger, "Pairwise Analysis")
             except Exception as e:
@@ -297,9 +303,17 @@ def main() -> int:
             log_stage_skip(logger, "9. Checkout aorta-report")
         else:
             log_stage_start(logger, "9. Checkout aorta-report")
-            # TODO: Implement in Phase 4
-            logger.info("Stage implementation pending (Phase 4)")
-            log_stage_complete(logger, "Checkout aorta-report")
+            try:
+                config.aorta_report_dir = stage_checkout_aorta_report(
+                    aorta_report_path=config.cross_timestamp.aorta_report_path,
+                    repo_root=repo_root,
+                    logger=logger,
+                    git_token=config.git.github_token,
+                )
+                log_stage_complete(logger, "Checkout aorta-report")
+            except Exception as e:
+                log_stage_error(logger, "Checkout aorta-report", str(e))
+                raise
 
         # =====================================================================
         # Stage 10: Cross-Timestamp Comparison
@@ -314,6 +328,8 @@ def main() -> int:
                     repo_root=repo_root,
                     baseline_experiment=config.cross_timestamp.baseline_experiment,
                     logger=logger,
+                    baseline_date=config.cross_timestamp.baseline_date,
+                    aorta_report_dir=config.aorta_report_dir,
                 )
 
                 if config.baseline_experiment_dir:
@@ -323,6 +339,8 @@ def main() -> int:
                         baseline_experiment_dir=config.baseline_experiment_dir,
                         config_pairs=config.test.config_pairs,
                         logger=logger,
+                        baseline_label=config.analysis.baseline_label,
+                        test_label=config.analysis.test_label,
                     )
                     log_stage_complete(logger, "Cross-Timestamp Comparison")
                 else:
@@ -336,9 +354,25 @@ def main() -> int:
         # Stage 11: Generate Summary
         # =====================================================================
         log_stage_start(logger, "11. Generate Summary")
-        # TODO: Implement in Phase 4
-        logger.info("Stage implementation pending (Phase 4)")
-        log_stage_complete(logger, "Generate Summary")
+        try:
+            if config.experiment_dir:
+                stage_generate_summary(
+                    experiment_dir=config.experiment_dir,
+                    repo_root=repo_root,
+                    config_pairs=config.test.config_pairs,
+                    baseline=config.test.baseline,
+                    rccl_branch=config.rccl.branch,
+                    gpu_target=config.rccl.gpu_target,
+                    baseline_experiment_dir=config.baseline_experiment_dir,
+                    logger=logger,
+                )
+            else:
+                logger.warning("  Skipping summary generation (no experiment directory)")
+            log_stage_complete(logger, "Generate Summary")
+        except Exception as e:
+            log_stage_error(logger, "Generate Summary", str(e))
+            # Don't raise for summary failures
+            logger.warning("Summary generation failed but continuing...")
 
         # =====================================================================
         # Stage 12: Push Results
@@ -347,9 +381,25 @@ def main() -> int:
             log_stage_skip(logger, "12. Push Results")
         else:
             log_stage_start(logger, "12. Push Results")
-            # TODO: Implement in Phase 4
-            logger.info("Stage implementation pending (Phase 4)")
-            log_stage_complete(logger, "Push Results")
+            try:
+                if config.aorta_report_dir and config.experiment_dir:
+                    stage_push_results(
+                        aorta_report_dir=config.aorta_report_dir,
+                        experiment_dir=config.experiment_dir,
+                        repo_root=repo_root,
+                        logger=logger,
+                        git_user_name=config.git.user_name,
+                        git_user_email=config.git.user_email,
+                    )
+                else:
+                    if not config.aorta_report_dir:
+                        logger.warning("  Skipping push (aorta-report not checked out)")
+                    if not config.experiment_dir:
+                        logger.warning("  Skipping push (no experiment directory)")
+                log_stage_complete(logger, "Push Results")
+            except Exception as e:
+                log_stage_error(logger, "Push Results", str(e))
+                raise
 
         # =====================================================================
         # Stage 13: Cleanup

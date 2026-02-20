@@ -42,12 +42,32 @@ skip:
   push_results: true           # Skipped by default (avoid accidental pushes)
   cleanup: true                # Skipped by default (keep container running)
 
+# Test Configuration (additional options)
+# Uncomment to use explicit experiment directory instead of auto-detect
+# experiment_dir: "experiments/rccl_warp_speed_20260220_100000"
+
 # Cross-Timestamp Comparison Configuration
 cross_timestamp:
   # Leave empty to auto-detect second-most-recent experiment
   baseline_experiment: ""
+  # Date directory in aorta-report for baseline (e.g., "2026-02-19")
+  # If set, will look in aorta-report/{baseline_date}/rccl-warp-speed/
+  baseline_date: ""
   # Path to aorta-report repository (relative to repo root or absolute)
   aorta_report_path: "../aorta-report"
+
+# Analysis Configuration (labels for aorta-report commands)
+analysis:
+  # Labels for reports (leave empty to use defaults)
+  baseline_label: ""  # e.g., "baseline", "v1.0", "2026-02-19"
+  test_label: ""      # e.g., "test", "v1.1", "2026-02-20"
+
+# Git Configuration (for pushing results to aorta-report)
+git:
+  user_name: "Weekly CI Bot"
+  user_email: "weekly-ci@aorta.local"
+  # GitHub token for authentication (can also use AORTA_REPORT_GITHUB_TOKEN env var)
+  github_token: ""
 
 # Output Configuration
 output:

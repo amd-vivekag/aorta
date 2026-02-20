@@ -17,6 +17,15 @@ from .build import (
     verify_rccl_installation,
 )
 from .docker import stage_cleanup, stage_docker_setup
+from .reporting import (
+    generate_dashboard_entry,
+    stage_generate_summary,
+    update_dashboard_file,
+)
+from .repository import (
+    stage_checkout_aorta_report,
+    stage_push_results,
+)
 from .test import (
     stage_find_baseline_experiment_dir,
     stage_find_experiment_dir,
@@ -44,4 +53,11 @@ __all__ = [
     "stage_pairwise_analysis",
     "stage_compare_all_analysis",
     "stage_cross_timestamp_comparison",
+    # Repository
+    "stage_checkout_aorta_report",
+    "stage_push_results",
+    # Reporting
+    "stage_generate_summary",
+    "generate_dashboard_entry",
+    "update_dashboard_file",
 ]

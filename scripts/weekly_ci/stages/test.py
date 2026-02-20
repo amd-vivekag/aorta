@@ -89,32 +89,47 @@ def stage_run_performance_tests(
 def stage_find_experiment_dir(
     repo_root: Path,
     logger: logging.Logger,
+    explicit_experiment_dir: str = "",
 ) -> Optional[str]:
-    """Find the most recently created experiment directory.
+    """Find or validate the experiment directory.
 
-    Searches for experiment directories matching the pattern:
+    If explicit_experiment_dir is provided, validates it exists.
+    Otherwise, searches for the most recent experiment directory matching:
     experiments/rccl_warp_speed_<timestamp>/
 
     Args:
         repo_root: Path to the repository root.
         logger: Logger instance.
+        explicit_experiment_dir: Explicitly specified experiment directory (optional).
 
     Returns:
         Relative path to the experiment directory (e.g., "experiments/rccl_warp_speed_20260220_143000"),
         or None if no experiment directory found.
 
     Raises:
-        RuntimeError: If no experiment directory is found.
+        RuntimeError: If no experiment directory is found or explicit path doesn't exist.
     """
     logger.info("Finding experiment directory...")
 
+    if explicit_experiment_dir:
+        # Use explicitly provided experiment directory
+        exp_path = repo_root / explicit_experiment_dir
+        if exp_path.exists():
+            logger.info(f"  Using specified experiment directory: {explicit_experiment_dir}")
+            return explicit_experiment_dir
+        else:
+            raise RuntimeError(
+                f"Specified experiment directory not found: {explicit_experiment_dir}"
+            )
+
+    # Auto-detect most recent experiment
     experiments_dir = repo_root / "experiments"
     experiment_dir = find_latest_experiment_dir(experiments_dir)
 
     if experiment_dir is None:
         raise RuntimeError(
             f"No experiment directory found in {experiments_dir}. "
-            "Make sure performance tests have been run first."
+            "Make sure performance tests have been run first, or use --experiment-dir to specify one."
         )
 
     # Return relative path
@@ -128,42 +143,61 @@ def stage_find_baseline_experiment_dir(
     repo_root: Path,
     baseline_experiment: str,
     logger: logging.Logger,
+    baseline_date: str = "",
+    aorta_report_dir: Optional[Path] = None,
 ) -> Optional[str]:
     """Find baseline experiment directory for cross-timestamp comparison.
 
-    If baseline_experiment is provided, uses that directory.
-    Otherwise, auto-detects the second most recent experiment directory.
+    Priority order:
+    1. baseline_experiment - explicit local experiment path
+    2. baseline_date + aorta_report_dir - date directory in aorta-report
+    3. Auto-detect second most recent local experiment
 
     Args:
         repo_root: Path to the repository root.
         baseline_experiment: Explicit baseline experiment path (empty for auto-detect).
         logger: Logger instance.
+        baseline_date: Date directory in aorta-report (e.g., "2026-02-19").
+        aorta_report_dir: Path to aorta-report repository (for date-based lookup).
 
     Returns:
-        Relative path to the baseline experiment directory, or None if not found.
+        Path to the baseline experiment directory (absolute for aorta-report, relative for local),
+        or None if not found.
     """
     logger.info("Finding baseline experiment directory for cross-timestamp comparison...")
 
+    # Option 1: Explicit local experiment path
     if baseline_experiment:
-        # Use explicitly provided baseline
         baseline_path = repo_root / baseline_experiment
         if baseline_path.exists():
             logger.info(f"  Using provided baseline: {baseline_experiment}")
             return baseline_experiment
         else:
             logger.warning(f"  Provided baseline not found: {baseline_experiment}")
+            logger.info("  Attempting other options...")
+
+    # Option 2: Date directory in aorta-report
+    if baseline_date and aorta_report_dir:
+        aorta_baseline_path = aorta_report_dir / baseline_date / "rccl-warp-speed"
+        if aorta_baseline_path.exists():
+            logger.info(f"  Using aorta-report baseline from {baseline_date}")
+            logger.info(f"    Path: {aorta_baseline_path}")
+            return str(aorta_baseline_path)
+        else:
+            logger.warning(f"  Baseline date not found in aorta-report: {baseline_date}")
+            logger.info(f"    Expected path: {aorta_baseline_path}")
             logger.info("  Attempting auto-detection...")
 
-    # Auto-detect second most recent experiment
+    # Option 3: Auto-detect second most recent local experiment
     experiments_dir = repo_root / "experiments"
     baseline_dir = find_second_latest_experiment_dir(experiments_dir)
 
     if baseline_dir is None:
         logger.warning("  No baseline experiment directory found for cross-timestamp comparison")
-        logger.warning("  (Need at least 2 experiment runs for comparison)")
+        logger.warning("  (Need at least 2 experiment runs, or use --baseline-experiment or --baseline-date)")
         return None
 
-    # Return relative path
+    # Return relative path for local experiments
     relative_path = baseline_dir.relative_to(repo_root)
     logger.info(f"  Found baseline experiment directory: {relative_path}")
 

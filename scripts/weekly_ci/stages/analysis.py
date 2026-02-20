@@ -21,6 +21,8 @@ def stage_pairwise_analysis(
     config_pairs: str,
     baseline: str,
     logger: logging.Logger,
+    baseline_label: str = "",
+    test_label: str = "",
 ) -> None:
     """Run pairwise comparison analysis for each configuration.
 
@@ -36,6 +38,8 @@ def stage_pairwise_analysis(
         config_pairs: Space-separated CU,threads pairs.
         baseline: Baseline configuration (CU,threads format, e.g., "56,256").
         logger: Logger instance.
+        baseline_label: Optional label for baseline in reports.
+        test_label: Optional label for test in reports.
 
     Raises:
         RuntimeError: If analysis fails.
@@ -106,6 +110,13 @@ def stage_pairwise_analysis(
 
         logger.info(f"  Comparing: baseline ({baseline}) vs {cu},{threads}...")
 
+        # Build label arguments if provided
+        label_args = ""
+        if baseline_label:
+            label_args += f' --baseline-label "{baseline_label}"'
+        if test_label:
+            label_args += f' --test-label "{test_label}"'
+
         comparison_script = f"""
             set -e
             export LD_LIBRARY_PATH=/rccl/rccl/build/release:$LD_LIBRARY_PATH
@@ -130,7 +141,7 @@ def stage_pairwise_analysis(
                 --baseline "{baseline_path}" \\
                 --test "{test_dir}" \\
                 --skip-tracelens \\
-                --output "{comparison_output}"
+                --output "{comparison_output}"{label_args}
 
             echo "Comparison complete!"
         """
@@ -252,6 +263,8 @@ def stage_cross_timestamp_comparison(
     baseline_experiment_dir: str,
     config_pairs: str,
     logger: logging.Logger,
+    baseline_label: str = "",
+    test_label: str = "",
 ) -> None:
     """Run cross-timestamp comparison between two experiment runs.
 
@@ -264,6 +277,8 @@ def stage_cross_timestamp_comparison(
         baseline_experiment_dir: Path to baseline (older) experiment directory.
         config_pairs: Space-separated CU,threads pairs.
         logger: Logger instance.
+        baseline_label: Optional label for baseline in reports.
+        test_label: Optional label for test in reports.
 
     Raises:
         RuntimeError: If comparison fails.
@@ -271,11 +286,22 @@ def stage_cross_timestamp_comparison(
     logger.info("Running cross-timestamp comparison...")
     logger.info(f"  Current experiment: {current_experiment_dir}")
     logger.info(f"  Baseline experiment: {baseline_experiment_dir}")
+    if baseline_label:
+        logger.info(f"  Baseline label: {baseline_label}")
+    if test_label:
+        logger.info(f"  Test label: {test_label}")
 
     # Parse configurations
     pairs = parse_config_pairs(config_pairs)
 
     output_dir = f"{current_experiment_dir}/cross_timestamp_comparison"
+
+    # Build label arguments if provided
+    label_args = ""
+    if baseline_label:
+        label_args += f' --baseline-label "{baseline_label}"'
+    if test_label:
+        label_args += f' --test-label "{test_label}"'
 
     for cu, threads in pairs:
         config_dir_name = get_config_dir_name(cu, threads)
@@ -311,7 +337,7 @@ def stage_cross_timestamp_comparison(
                 --baseline "{baseline_test_dir}" \\
                 --test "{current_test_dir}" \\
                 --skip-tracelens \\
-                --output "{comparison_output}"
+                --output "{comparison_output}"{label_args}
 
             echo "Cross-timestamp comparison complete for {config_dir_name}!"
         """
