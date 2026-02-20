@@ -209,9 +209,13 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
                 warmup=warmup,
             )
 
+            # Clean up resources from profiling before starting the benchmark phase.
+            wl.cleanup()
+
         # PHASE 2: Benchmark (clean timing without profiler overhead)
-        # Note: workload.setup() is called again inside harness.run_workload(),
-        # which ensures clean state for timing measurements.
+        # Note: workload.cleanup() has been called after profiling, and
+        # workload.setup() is called again inside harness.run_workload(),
+        # ensuring a clean state for timing measurements.
         # The harness uses the same multi-GPU stream distribution as profiling above.
         result = harness.run_workload(wl)
 
