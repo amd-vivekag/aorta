@@ -48,7 +48,7 @@ scontrol show hostnames $SLURM_NODELIST > scripts/multi_node/node_ip_list.txt
 ./scripts/multi_node/start_docker_all_nodes.sh
 
 # Run training
-./scripts/multi_node/master_launch.sh --channels 28 --threads 256 --nproc 8
+./scripts/multi_node/master_launch.sh --channels 56 --threads 256 --nproc 8
 
 # With custom Docker container and experiment label
 ./scripts/multi_node/master_launch.sh --docker my-container --label experiment_v1
@@ -160,6 +160,29 @@ Select a config file from `config/` or `config/multi_node/`:
     --channels 28 --threads 256 \
     --config config/multi_node/distributed_multinode.yaml
 ```
+
+### Precision Configuration
+
+All precision settings live under a single `precision:` section in the YAML config:
+
+```yaml
+precision:
+  param_dtype: bf16      # fp32, fp16, bf16 — params during forward/backward
+  reduce_dtype: fp32     # fp32, fp16, bf16 — gradient all-reduce communication
+  buffer_dtype: fp32     # fp32, fp16, bf16 — module buffers (e.g. BatchNorm running stats)
+  tf32_mode: disabled    # disabled, native, x1, x3 — TF32 for fp32 matmuls
+```
+
+| Setting | What it controls |
+|---------|-----------------|
+| `param_dtype` | Dtype parameters are cast to during forward/backward. Master weights stay in fp32. |
+| `reduce_dtype` | Dtype used for gradient all-reduce across ranks. fp32 is safest for accuracy. |
+| `buffer_dtype` | Dtype for module buffers (e.g. BatchNorm running mean/variance). |
+| `tf32_mode` | TF32 precision for fp32 matmuls (e.g. Shampoo optimizer). Only affects ops outside mixed-precision regions. `x3` = most accurate (triple accumulation), `x1` = fastest. |
+
+**FSDP mode** uses PyTorch's native `FSDP MixedPrecision` policy — sharded parameters are stored in `param_dtype` (saving GPU memory), gradients reduced in `reduce_dtype`. No `torch.autocast` is used.
+
+**DDP mode** falls back to `torch.autocast` with `param_dtype` as the cast dtype, since DDP does not have a built-in mixed precision policy.
 
 ### Experiment Output
 

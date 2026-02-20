@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, Optional
 from functools import partial
@@ -18,7 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.profiler import ProfilerActivity, schedule, tensorboard_trace_handler, profile
-from torch.distributed.fsdp import BackwardPrefetch, FullyShardedDataParallel as FSDP, ShardingStrategy
+from torch.distributed.fsdp import BackwardPrefetch, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
@@ -27,7 +28,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from aorta.data import SyntheticDatasetConfig, create_dataloader
 from aorta.models import ModelConfig, RankingTransformerModel
 from aorta.profiling.stream_profiler import StreamProfiler
-from aorta.utils import detect_accelerator, get_device, get_distributed_backend, load_config, merge_cli_overrides, setup_logging
+from aorta.utils import (
+    detect_accelerator,
+    get_device,
+    get_distributed_backend,
+    load_config,
+    manual_sync_params,
+    merge_cli_overrides,
+    setup_logging,
+    warmup_rccl_communicators,
+    warmup_training_collectives,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,13 +59,20 @@ class SchedulerConfig:
 
 
 @dataclass
+class PrecisionConfig:
+    param_dtype: str = "bf16"     # dtype for parameters during forward/backward: fp32, fp16, bf16
+    reduce_dtype: str = "fp32"    # dtype for gradient all-reduce communication: fp32, fp16, bf16
+    buffer_dtype: str = "fp32"    # dtype for module buffers (e.g. BatchNorm stats): fp32, fp16, bf16
+    tf32_mode: str = "disabled"   # TF32 matmul mode: disabled, native, x1, x3
+
+
+@dataclass
 class TrainingConfig:
     epochs: int = 1
     batch_size: int = 8
     gradient_accumulation: int = 1
     max_steps: Optional[int] = None
     grad_clip_norm: float = 1.0
-    mixed_precision: str = "bf16"  # options: none, fp16, bf16
     log_interval: int = 10
     output_dir: Path = Path("artifacts")
     inject_allreduce_copies: bool = False  # Inject all_reduce + host-device copies to trigger hang
@@ -73,6 +91,17 @@ class FSDPConfig:
     # For HYBRID_SHARD: GPUs per node (None = auto-detect from LOCAL_WORLD_SIZE env var)
     # Only set this if auto-detection fails or you want to override
     hybrid_shard_gpus_per_node: Optional[int] = None
+    # Number of warmup operations to perform on RCCL communicators before FSDP init
+    # This helps avoid race conditions in inter-node RDMA setup
+    # Higher values provide more stability but increase startup time
+    rccl_warmup_iterations: int = 10
+    # Skip RCCL warmup entirely (for testing race conditions)
+    skip_rccl_warmup: bool = False
+    # Number of training warmup steps (forward/backward/optimizer) before main loop
+    # This exercises all collectives to ensure RCCL is fully established
+    training_warmup_steps: int = 1
+    # Skip training warmup entirely
+    skip_training_warmup: bool = False
 
 
 @dataclass
@@ -123,6 +152,38 @@ def _build_training_config(raw: Dict[str, Any]) -> TrainingConfig:
         if field.name in training:
             setattr(cfg, field.name, training[field.name])
     cfg.output_dir = Path(cfg.output_dir)
+    return cfg
+
+
+def _build_precision_config(raw: Dict[str, Any]) -> PrecisionConfig:
+    section = raw.get("precision", {})
+    cfg = PrecisionConfig()
+    for field in dataclass_fields(PrecisionConfig):
+        if field.name in section:
+            setattr(cfg, field.name, section[field.name])
+
+    # Backward compatibility: migrate training.mixed_precision -> precision.param_dtype
+    training_mp = raw.get("training", {}).get("mixed_precision")
+    if training_mp is not None and "param_dtype" not in section:
+        log.warning(
+            "DEPRECATED: training.mixed_precision is deprecated. "
+            "Move it to precision.param_dtype in your config file. "
+            "Using training.mixed_precision='%s' as param_dtype.",
+            training_mp,
+        )
+        cfg.param_dtype = training_mp
+
+    # Validate all dtype fields eagerly so typos surface at config load time.
+    for dtype_field in ("param_dtype", "reduce_dtype", "buffer_dtype"):
+        _resolve_dtype(getattr(cfg, dtype_field))
+
+    tf32 = cfg.tf32_mode.lower()
+    if tf32 not in _VALID_TF32_MODES:
+        raise ValueError(
+            f"Unknown tf32_mode '{cfg.tf32_mode}'. "
+            f"Expected one of: {', '.join(sorted(_VALID_TF32_MODES))}"
+        )
+
     return cfg
 
 
@@ -204,9 +265,71 @@ def dataclass_fields(cls) -> Iterable[Any]:
     return getattr(cls, "__dataclass_fields__").values()
 
 
+_DTYPE_MAP: Dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "none": torch.float32,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
+
+# Canonical names shown in error messages and validation output.
+_DTYPE_CANONICAL_NAMES = ("fp32", "fp16", "bf16")
+
+_VALID_TF32_MODES = frozenset({"disabled", "native", "x1", "x3"})
+
+
+def _resolve_dtype(name: str) -> torch.dtype:
+    """Resolve a user-facing dtype string to a ``torch.dtype``.
+
+    Accepts canonical short names (fp32, fp16, bf16), long names (float32,
+    float16, bfloat16), and the legacy value ``"none"`` (mapped to fp32).
+    """
+    key = name.strip().lower()
+    if key not in _DTYPE_MAP:
+        raise ValueError(
+            f"Unknown dtype '{name}'. Expected one of: {', '.join(_DTYPE_CANONICAL_NAMES)}"
+        )
+    return _DTYPE_MAP[key]
+
+
+def build_fsdp_mixed_precision(precision_cfg: PrecisionConfig) -> Optional[MixedPrecision]:
+    """Build an ``FSDP MixedPrecision`` policy from *precision_cfg*.
+
+    Returns ``None`` when all dtypes resolve to fp32, since no mixed
+    precision is needed in that case.
+    """
+    param_dtype = _resolve_dtype(precision_cfg.param_dtype)
+    reduce_dtype = _resolve_dtype(precision_cfg.reduce_dtype)
+    buffer_dtype = _resolve_dtype(precision_cfg.buffer_dtype)
+
+    all_fp32 = (
+        param_dtype == torch.float32
+        and reduce_dtype == torch.float32
+        and buffer_dtype == torch.float32
+    )
+    if all_fp32:
+        log.info("FSDP MixedPrecision disabled (all dtypes are fp32)")
+        return None
+
+    policy = MixedPrecision(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        buffer_dtype=buffer_dtype,
+    )
+    log.info(
+        "FSDP MixedPrecision | param_dtype=%s reduce_dtype=%s buffer_dtype=%s",
+        param_dtype, reduce_dtype, buffer_dtype,
+    )
+    return policy
+
+
 def init_distributed(training_cfg: TrainingConfig, log_level: str) -> Dict[str, Any]:
     backend = get_distributed_backend()
-    dist.init_process_group(backend=backend)
+    timeout_seconds = int(os.environ.get("TORCH_DIST_INIT_TIMEOUT", "600"))
+    dist.init_process_group(backend=backend, timeout=timedelta(seconds=timeout_seconds))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
@@ -238,6 +361,7 @@ def build_fsdp_model(
     fsdp_cfg: FSDPConfig,
     compile_cfg: CompileConfig,
     device: torch.device,
+    mixed_precision_policy: Optional[MixedPrecision] = None,
 ) -> FSDP:
     model = RankingTransformerModel(model_cfg)
 
@@ -250,13 +374,48 @@ def build_fsdp_model(
 
     # Create process groups for hybrid_shard strategy
     process_group = None
+    shard_group = None
+    replicate_group = None
+
     if sharding == ShardingStrategy.HYBRID_SHARD:
-        process_group = _create_hybrid_shard_process_groups(fsdp_cfg.hybrid_shard_gpus_per_node)
-        if process_group is not None:
+        result = _create_hybrid_shard_process_groups(fsdp_cfg.hybrid_shard_gpus_per_node)
+        if result is not None:
+            shard_group, replicate_group = result
+            process_group = (shard_group, replicate_group)
+
+            # Warmup RCCL communicators BEFORE FSDP initialization
+            # This ensures inter-node communicators are fully established before
+            # the _sync_params_and_buffers broadcasts that can cause hangs
+            if fsdp_cfg.skip_rccl_warmup:
+                log.warning("SKIPPING RCCL warmup (skip_rccl_warmup=True) - may cause hangs or race conditions")
+            else:
+                warmup_rccl_communicators(
+                    shard_group,
+                    replicate_group,
+                    device,
+                    num_warmup_ops=fsdp_cfg.rccl_warmup_iterations,
+                )
             log.info("Created custom process groups for HYBRID_SHARD strategy")
 
-    fsdp_model = FSDP(
-        model.to(device),
+    # Ensure GPU operations are complete before FSDP wrapping
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # For HYBRID_SHARD with sync_module_states, we disable automatic sync and do it
+    # manually with explicit barriers to avoid RCCL race conditions
+    use_sync_module_states = fsdp_cfg.sync_module_states
+    needs_manual_sync = False
+
+    if sharding == ShardingStrategy.HYBRID_SHARD and fsdp_cfg.sync_module_states:
+        use_sync_module_states = False
+        needs_manual_sync = True
+        log.info(
+            "Disabling sync_module_states for HYBRID_SHARD - will sync manually after wrapping"
+        )
+
+    log.info("Starting FSDP model wrapping with sync_module_states=%s", use_sync_module_states)
+
+    fsdp_kwargs: Dict[str, Any] = dict(
         sharding_strategy=sharding,
         process_group=process_group,
         auto_wrap_policy=auto_wrap_policy,
@@ -265,8 +424,17 @@ def build_fsdp_model(
         limit_all_gathers=fsdp_cfg.limit_all_gathers,
         forward_prefetch=fsdp_cfg.forward_prefetch,
         device_id=torch.cuda.current_device(),
-        sync_module_states=fsdp_cfg.sync_module_states,
+        sync_module_states=use_sync_module_states,
     )
+    if mixed_precision_policy is not None:
+        fsdp_kwargs["mixed_precision"] = mixed_precision_policy
+
+    fsdp_model = FSDP(model.to(device), **fsdp_kwargs)
+
+    # Manual parameter synchronization for HYBRID_SHARD
+    if needs_manual_sync and replicate_group is not None:
+        manual_sync_params(fsdp_model, replicate_group)
+
     if compile_cfg.enabled:
         fsdp_model = _maybe_compile(fsdp_model, compile_cfg)
     return fsdp_model
@@ -289,6 +457,9 @@ def _create_hybrid_shard_process_groups(gpus_per_node: Optional[int] = None):
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    timeout_seconds = int(os.environ.get("TORCH_DIST_INIT_TIMEOUT", "600"))
+    group_timeout = timedelta(seconds=timeout_seconds)
 
     # Auto-detect GPUs per node from environment if not provided
     if gpus_per_node is None:
@@ -320,21 +491,21 @@ def _create_hybrid_shard_process_groups(gpus_per_node: Optional[int] = None):
         return None
 
     log.info(
-        "Creating HYBRID_SHARD process groups | rank=%d world_size=%d num_nodes=%d gpus_per_node=%d node_id=%d",
-        rank, world_size, num_nodes, gpus_per_node, node_id
+        "Creating HYBRID_SHARD process groups | rank=%d world_size=%d num_nodes=%d gpus_per_node=%d node_id=%d timeout=%ds",
+        rank, world_size, num_nodes, gpus_per_node, node_id, timeout_seconds
     )
 
     # Intra-node groups: shard within each node
     for i in range(num_nodes):
         ranks_in_node = list(range(i * gpus_per_node, (i + 1) * gpus_per_node))
-        group = dist.new_group(ranks=ranks_in_node)
+        group = dist.new_group(ranks=ranks_in_node, timeout=group_timeout)
         if i == node_id:
             my_shard_group = group
 
     # Inter-node groups: replicate across nodes (same local_rank)
     for local_r in range(gpus_per_node):
         ranks_across_nodes = [node * gpus_per_node + local_r for node in range(num_nodes)]
-        group = dist.new_group(ranks=ranks_across_nodes)
+        group = dist.new_group(ranks=ranks_across_nodes, timeout=group_timeout)
         if local_r == local_rank:
             my_replicate_group = group
 
@@ -438,28 +609,26 @@ def training_loop(
     optimizer: torch.optim.Optimizer,
     dataloader,
     training_cfg: TrainingConfig,
+    precision_cfg: PrecisionConfig,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     environment: Dict[str, Any],
     profiler: StreamProfiler,
     enable_rocm_metrics: bool,
     profiler_cfg: ProfilerConfig,
+    *,
+    use_autocast: bool = False,
 ) -> None:
     rank = environment["rank"]
     world_size = environment["world_size"]
     device = environment["device"]
 
-    scaler: Optional[torch.cuda.amp.GradScaler]
-    autocast_dtype: Optional[torch.dtype]
-    mp_mode = training_cfg.mixed_precision.lower()
-    if mp_mode == "fp16":
-        autocast_dtype = torch.float16
-        scaler = torch.cuda.amp.GradScaler()
-    elif mp_mode == "bf16":
-        autocast_dtype = torch.bfloat16
-        scaler = None
-    else:
-        autocast_dtype = None
-        scaler = None
+    param_dtype = _resolve_dtype(precision_cfg.param_dtype)
+    scaler: Optional[torch.cuda.amp.GradScaler] = (
+        torch.cuda.amp.GradScaler() if param_dtype == torch.float16 else None
+    )
+    autocast_dtype: Optional[torch.dtype] = (
+        param_dtype if use_autocast and param_dtype != torch.float32 else None
+    )
 
     metrics_logger = MetricsLogger(training_cfg.output_dir, rank)
 
@@ -501,6 +670,10 @@ def training_loop(
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
+
+                    # Synchronize before gradient clipping to ensure backward is complete
+                    # This prevents race conditions between FSDP gradient reduction and clipping
+                    torch.cuda.synchronize()
 
                     grad_norm = None
                     if training_cfg.grad_clip_norm is not None and training_cfg.grad_clip_norm > 0:
@@ -779,6 +952,67 @@ def _torch_profiler_context(
                 log.warning("Chrome trace export failed: %s", exc, exc_info=True)
 
 
+def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
+    """Apply TF32 precision settings from *precision_cfg* to the process.
+
+    Configures ``torch.backends.cuda.matmul.allow_tf32`` and the
+    ``HIPBLASLT_ALLOW_TF32`` environment variable according to
+    ``precision_cfg.tf32_mode``.
+
+    Returns:
+        The active tf32_mode string (lower-cased, validated).
+    """
+    tf32_mode = precision_cfg.tf32_mode.lower()
+    if tf32_mode not in _VALID_TF32_MODES:
+        log.warning(
+            "Unknown tf32_mode '%s', falling back to 'disabled'. Valid: %s",
+            tf32_mode, sorted(_VALID_TF32_MODES),
+        )
+        tf32_mode = "disabled"
+
+    allow_tf32 = tf32_mode != "disabled"
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+    hipblaslt_values = {"x1": "1", "x3": "3"}
+    if tf32_mode in hipblaslt_values:
+        os.environ["HIPBLASLT_ALLOW_TF32"] = hipblaslt_values[tf32_mode]
+    else:
+        os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+
+    log.info(
+        "TF32 precision | tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s float32_matmul_precision=%s",
+        tf32_mode,
+        torch.backends.cuda.matmul.allow_tf32,
+        os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
+        torch.get_float32_matmul_precision(),
+    )
+
+    param_dtype = _resolve_dtype(precision_cfg.param_dtype)
+    if tf32_mode != "disabled" and param_dtype != torch.float32:
+        log.warning(
+            "param_dtype=%s with tf32_mode=%s: TF32 only affects fp32 matmuls outside "
+            "the mixed-precision forward/backward (e.g. Shampoo optimizer matmuls).",
+            precision_cfg.param_dtype, tf32_mode,
+        )
+
+    return tf32_mode
+
+
+def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
+    """Log TF32 state for verification.
+
+    Note: A matmul probe was previously used here but caused SIGSEGV on ROCm
+    when allow_tf32=True, so verification is now done via loss curve comparison.
+    """
+    log.info(
+        "[TF32 CHECK] tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s float32_matmul_precision=%s",
+        tf32_mode,
+        torch.backends.cuda.matmul.allow_tf32,
+        os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
+        torch.get_float32_matmul_precision(),
+    )
+
+
 def main_cli() -> None:  # pragma: no cover - CLI entry
     parser = argparse.ArgumentParser(description="FSDP2 training benchmark with multi-stream profiling")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML/JSON config file")
@@ -805,6 +1039,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
 
     config = _parse_config(parsed)
     training_cfg = _build_training_config(config)
+    precision_cfg = _build_precision_config(config)
     optimizer_cfg = _build_optimizer_config(config)
     scheduler_cfg = _build_scheduler_config(config)
     model_cfg = _build_model_config(config)
@@ -814,9 +1049,13 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     compile_cfg = _build_compile_config(config)
     profiler_cfg = _build_profiler_config(config)
 
+    tf32_mode = configure_tf32_precision(precision_cfg)
+
     log_level = config.get("logging", {}).get("level", "INFO")
     env = init_distributed(training_cfg, log_level)
     rank = env["rank"]
+
+    verify_tf32_active(env["device"], tf32_mode)
 
     dataloader = create_dataloader(
         dataset_cfg,
@@ -832,10 +1071,15 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         dist_mode = "fsdp"
     dist_mode = dist_mode.lower()
 
+    # For FSDP, FSDP MixedPrecision handles dtype casting (no autocast needed).
+    # For DDP, we fall back to torch.autocast in the training loop.
+    use_fsdp = dist_mode != "ddp"
+    mp_policy = build_fsdp_mixed_precision(precision_cfg) if use_fsdp else None
+
     if dist_mode == "ddp":
         model = build_ddp_model(model_cfg, ddp_cfg, compile_cfg, env["device"])
     else:
-        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"])
+        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"], mp_policy)
     optimizer = configure_optimizer(model, optimizer_cfg, dist_mode)
     scheduler = configure_scheduler(
         optimizer,
@@ -845,21 +1089,52 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
 
     profiler = StreamProfiler(env["device"])
 
+    # Training warmup: run a few forward/backward/optimizer steps to warm up collectives
+    if not fsdp_cfg.skip_training_warmup and fsdp_cfg.training_warmup_steps > 0:
+        log.info("Starting training warmup with %d steps...", fsdp_cfg.training_warmup_steps)
+        param_dtype = _resolve_dtype(precision_cfg.param_dtype)
+        warmup_scaler = torch.cuda.amp.GradScaler() if param_dtype == torch.float16 else None
+        # Only use autocast for DDP; FSDP MixedPrecision handles casting
+        warmup_autocast_dtype = (
+            param_dtype if not use_fsdp and param_dtype != torch.float32 else None
+        )
+
+        warmup_training_collectives(
+            model=model,
+            optimizer=optimizer,
+            dataloader=dataloader,
+            device=env["device"],
+            autocast_dtype=warmup_autocast_dtype,
+            scaler=warmup_scaler,
+            loss_fn=compute_loss,
+            num_warmup_steps=fsdp_cfg.training_warmup_steps,
+        )
+        log.info("Training warmup complete")
+
     try:
         training_loop(
             model,
             optimizer,
             dataloader,
             training_cfg,
+            precision_cfg,
             scheduler,
             env,
             profiler,
             enable_rocm_metrics,
             profiler_cfg,
+            use_autocast=not use_fsdp,
         )
     finally:
-        dist.barrier()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            try:
+                dist.barrier()
+            except Exception as e:
+                log.warning("Barrier failed during cleanup: %s", e)
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                log.warning("destroy_process_group failed: %s", e)
 
 
 __all__ = ["main", "main_cli"]

@@ -5,7 +5,6 @@ training:
   epochs: 1
   batch_size: 32
   gradient_accumulation: 4
-  mixed_precision: bf16
   grad_clip_norm: 1.0
   log_interval: 5
   max_steps: 20  # Short run for profiling
@@ -76,3 +75,8 @@ profiling:
   tensorboard: false
   chrome_trace: false
   trace_filename: trace_overlap_short.json
+
+precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  buffer_dtype: fp32

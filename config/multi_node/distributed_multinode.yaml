@@ -4,7 +4,6 @@ training:
   epochs: 1
   batch_size: 448
   gradient_accumulation: 4
-  mixed_precision: bf16
   max_steps: 10
   grad_clip_norm: 1.0
   output_dir: artifacts/optuna_tracelens_sweep_fixed/trial_0000
@@ -95,5 +94,10 @@ profiling:
   tensorboard: false
   chrome_trace: true
   trace_filename: customer_trace.json
+precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  buffer_dtype: fp32
+
 tracelens:
   enabled: true

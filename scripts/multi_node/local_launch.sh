@@ -106,7 +106,7 @@ log "Docker container '${DOCKER_CONTAINER}' is running"
 
 # Base command for torchrun with multi-node parameters
 BASE_CMD="torchrun --nnodes ${NNODES} --node_rank ${NODE_RANK} --nproc_per_node ${NPROC_PER_NODE} --master_addr ${MASTER_IP} --master_port ${MASTER_PORT} train.py --config ${CONFIG_FILE_DOCKER}"
-BASE_OVERRIDES="--override profiling.tensorboard=false"
+OVERRIDES="--override profiling.tensorboard=false training.output_dir=${OUTPUT_DIR_DOCKER}"
 
 # Build docker exec prefix with environment variables
 DOCKER_EXEC="docker exec \
@@ -114,6 +114,7 @@ DOCKER_EXEC="docker exec \
     -e NCCL_MAX_NCHANNELS=${CHANNELS} \
     -e HSA_ENABLE_SDMA=0 \
     -e PYTORCH_ROCM_PROFILER_ENABLE_TRACING=1 \
+    ${HIPBLASLT_ALLOW_TF32:+-e HIPBLASLT_ALLOW_TF32=${HIPBLASLT_ALLOW_TF32}} \
     ${DOCKER_CONTAINER}"
 
 # Run with or without rocprofv3
@@ -124,8 +125,7 @@ if [ "${ENABLE_ROCPROF}" = "true" ]; then
     if [ -n "${ROCPROF_INPUT}" ]; then
         log "Using rocprofv3 input file: ${ROCPROF_INPUT}"
         ${DOCKER_EXEC} bash -c "rocprofv3 -i ${ROCPROF_INPUT} -d ${ROCPROF_DIR} -- \
-            ${BASE_CMD} ${BASE_OVERRIDES} \
-            --override training.output_dir=${OUTPUT_DIR_DOCKER}" \
+            ${BASE_CMD} ${OVERRIDES}" \
             2>&1 | tee -a "${LOG_FILE}"
     else
         ROCPROF_ARGS="--kernel-trace"
@@ -135,15 +135,13 @@ if [ "${ENABLE_ROCPROF}" = "true" ]; then
 
         log "Running with rocprofv3 kernel tracing inside Docker"
         ${DOCKER_EXEC} bash -c "rocprofv3 ${ROCPROF_ARGS} -d ${ROCPROF_DIR} -- \
-            ${BASE_CMD} ${BASE_OVERRIDES} \
-            --override training.output_dir=${OUTPUT_DIR_DOCKER}" \
+            ${BASE_CMD} ${OVERRIDES}" \
             2>&1 | tee -a "${LOG_FILE}"
     fi
 else
     log "Running inside Docker container"
-    log "Command: ${BASE_CMD} ${BASE_OVERRIDES} --override training.output_dir=${OUTPUT_DIR_DOCKER}"
-    ${DOCKER_EXEC} bash -c "${BASE_CMD} ${BASE_OVERRIDES} \
-        --override training.output_dir=${OUTPUT_DIR_DOCKER}" \
+    log "Command: ${BASE_CMD} ${OVERRIDES}"
+    ${DOCKER_EXEC} bash -c "${BASE_CMD} ${OVERRIDES}" \
         2>&1 | tee -a "${LOG_FILE}"
 fi
 

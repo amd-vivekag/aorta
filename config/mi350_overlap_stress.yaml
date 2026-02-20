@@ -5,7 +5,6 @@ training:
   epochs: 2
   batch_size: 32
   gradient_accumulation: 4
-  mixed_precision: bf16
   grad_clip_norm: 1.0
   log_interval: 10
   max_steps: 600
@@ -74,3 +73,8 @@ profiling:
   tensorboard: true
   chrome_trace: true
   trace_filename: trace_overlap_stress.json
+
+precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  buffer_dtype: fp32

@@ -9,7 +9,6 @@ training:
   epochs: 1
   batch_size: 1024 # Very large batch size for maximum arithmetic intensity
   gradient_accumulation: 1  # Very high gradient accumulation
-  mixed_precision: fp16  # FP16 creates more comm traffic than TF32
   grad_clip_norm: 1.0
   log_interval: 5
   max_steps: 500  # More steps to increase chance of hang
@@ -106,3 +105,8 @@ profiling:
   chrome_trace: true
   # profile_ranks: [1, 2]
   trace_filename: trace.json
+
+precision:
+  param_dtype: fp16
+  reduce_dtype: fp32
+  buffer_dtype: fp32

@@ -122,8 +122,8 @@ def generate_trial_config(trial: optuna.Trial, base_config: Dict[str, Any],
         config["training"]["gradient_accumulation"] = trial.suggest_categorical(
             "training.gradient_accumulation", [1, 2, 4, 8]
         )
-        config["training"]["mixed_precision"] = trial.suggest_categorical(
-            "training.mixed_precision", ["bf16", "fp16", "none"]
+        config.setdefault("precision", {})["param_dtype"] = trial.suggest_categorical(
+            "precision.param_dtype", ["bf16", "fp16", "fp32"]
         )
 
     # Environment variables for RCCL (stored as trial params, applied at runtime)

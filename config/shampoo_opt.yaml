@@ -9,7 +9,6 @@ training:
   epochs: 10
   batch_size: 512
   gradient_accumulation: 2
-  mixed_precision: bf16
   max_steps: 2200
   grad_clip_norm: 1.0
   output_dir: artifacts/user_shampoo
@@ -108,6 +107,11 @@ profiling:
   tensorboard: false
   chrome_trace: false
   trace_filename: user_shampoo.json
+
+precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  buffer_dtype: fp32
 
 tracelens:
   enabled: false
