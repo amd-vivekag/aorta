@@ -46,6 +46,13 @@ from weekly_ci import (
     parse_args,
     setup_logging,
 )
+from weekly_ci.stages import (
+    stage_build_rccl,
+    stage_cleanup,
+    stage_docker_setup,
+    stage_install_dependencies,
+    stage_validate_environment,
+)
 
 
 def main() -> int:
@@ -79,70 +86,124 @@ def main() -> int:
     logger.info(f"  Baseline: {config.test.baseline}")
     logger.info(f"  Docker compose: {config.docker.compose_file}")
     logger.info(f"  Container: {config.docker.container_name}")
+    logger.info(f"  Docker build: {'skip' if config.docker.skip_build else 'enabled'}")
     logger.info("")
 
     # Log skip configuration
     logger.info("Stages to skip:")
+    skip_any = False
     if config.skip.docker_setup:
         logger.info("  - docker_setup")
+        skip_any = True
     if config.skip.rccl_build:
         logger.info("  - rccl_build")
+        skip_any = True
     if config.skip.install_deps:
         logger.info("  - install_deps")
+        skip_any = True
     if config.skip.performance_tests:
         logger.info("  - performance_tests")
+        skip_any = True
     if config.skip.pairwise_analysis:
         logger.info("  - pairwise_analysis")
+        skip_any = True
     if config.skip.compare_all_analysis:
         logger.info("  - compare_all_analysis")
+        skip_any = True
     if config.skip.checkout_aorta_report:
         logger.info("  - checkout_aorta_report")
+        skip_any = True
     if config.skip.cross_timestamp_comparison:
         logger.info("  - cross_timestamp_comparison")
+        skip_any = True
     if config.skip.push_results:
         logger.info("  - push_results")
+        skip_any = True
     if config.skip.cleanup:
         logger.info("  - cleanup")
+        skip_any = True
+    if not skip_any:
+        logger.info("  (none)")
     logger.info("")
 
-    # Track overall success
+    # Track overall success and repo root
     success = True
+    repo_root = None
 
     try:
+        # =====================================================================
         # Stage 1: Validate Environment
+        # =====================================================================
         log_stage_start(logger, "1. Validate Environment")
-        # TODO: Implement in Phase 2
-        logger.info("Stage implementation pending (Phase 2)")
-        log_stage_complete(logger, "Validate Environment")
+        try:
+            repo_root = stage_validate_environment(args.config, logger)
+            log_stage_complete(logger, "Validate Environment")
+        except Exception as e:
+            log_stage_error(logger, "Validate Environment", str(e))
+            raise
 
+        # =====================================================================
         # Stage 2: Docker Setup
+        # =====================================================================
         if config.skip.docker_setup:
             log_stage_skip(logger, "2. Docker Setup")
         else:
             log_stage_start(logger, "2. Docker Setup")
-            # TODO: Implement in Phase 2
-            logger.info("Stage implementation pending (Phase 2)")
-            log_stage_complete(logger, "Docker Setup")
+            try:
+                stage_docker_setup(
+                    compose_file=config.docker.compose_file,
+                    container_name=config.docker.container_name,
+                    repo_root=repo_root,
+                    logger=logger,
+                    registry_user=config.docker.registry_user,
+                    registry_password=config.docker.registry_password,
+                    skip_build=config.docker.skip_build,
+                )
+                log_stage_complete(logger, "Docker Setup")
+            except Exception as e:
+                log_stage_error(logger, "Docker Setup", str(e))
+                raise
 
+        # =====================================================================
         # Stage 3: Build RCCL
+        # =====================================================================
         if config.skip.rccl_build:
             log_stage_skip(logger, "3. Build RCCL")
         else:
             log_stage_start(logger, "3. Build RCCL")
-            # TODO: Implement in Phase 2
-            logger.info("Stage implementation pending (Phase 2)")
-            log_stage_complete(logger, "Build RCCL")
+            try:
+                stage_build_rccl(
+                    container_name=config.docker.container_name,
+                    rccl_branch=config.rccl.branch,
+                    gpu_target=config.rccl.gpu_target,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Build RCCL")
+            except Exception as e:
+                log_stage_error(logger, "Build RCCL", str(e))
+                raise
 
+        # =====================================================================
         # Stage 4: Install Dependencies
+        # =====================================================================
         if config.skip.install_deps:
             log_stage_skip(logger, "4. Install Dependencies")
         else:
             log_stage_start(logger, "4. Install Dependencies")
-            # TODO: Implement in Phase 2
-            logger.info("Stage implementation pending (Phase 2)")
-            log_stage_complete(logger, "Install Dependencies")
+            try:
+                stage_install_dependencies(
+                    container_name=config.docker.container_name,
+                    repo_root=repo_root,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Install Dependencies")
+            except Exception as e:
+                log_stage_error(logger, "Install Dependencies", str(e))
+                raise
 
+        # =====================================================================
         # Stage 5: Run Performance Tests
+        # =====================================================================
         if config.skip.performance_tests:
             log_stage_skip(logger, "5. Run Performance Tests")
         else:
@@ -151,13 +212,17 @@ def main() -> int:
             logger.info("Stage implementation pending (Phase 3)")
             log_stage_complete(logger, "Run Performance Tests")
 
+        # =====================================================================
         # Stage 6: Find Experiment Directory
+        # =====================================================================
         log_stage_start(logger, "6. Find Experiment Directory")
         # TODO: Implement in Phase 3
         logger.info("Stage implementation pending (Phase 3)")
         log_stage_complete(logger, "Find Experiment Directory")
 
+        # =====================================================================
         # Stage 7: Pairwise Analysis
+        # =====================================================================
         if config.skip.pairwise_analysis:
             log_stage_skip(logger, "7. Pairwise Analysis")
         else:
@@ -166,7 +231,9 @@ def main() -> int:
             logger.info("Stage implementation pending (Phase 3)")
             log_stage_complete(logger, "Pairwise Analysis")
 
+        # =====================================================================
         # Stage 8: Compare All Analysis
+        # =====================================================================
         if config.skip.compare_all_analysis:
             log_stage_skip(logger, "8. Compare All Analysis")
         else:
@@ -175,7 +242,9 @@ def main() -> int:
             logger.info("Stage implementation pending (Phase 3)")
             log_stage_complete(logger, "Compare All Analysis")
 
+        # =====================================================================
         # Stage 9: Checkout aorta-report
+        # =====================================================================
         if config.skip.checkout_aorta_report:
             log_stage_skip(logger, "9. Checkout aorta-report")
         else:
@@ -184,7 +253,9 @@ def main() -> int:
             logger.info("Stage implementation pending (Phase 4)")
             log_stage_complete(logger, "Checkout aorta-report")
 
+        # =====================================================================
         # Stage 10: Cross-Timestamp Comparison
+        # =====================================================================
         if config.skip.cross_timestamp_comparison:
             log_stage_skip(logger, "10. Cross-Timestamp Comparison")
         else:
@@ -193,13 +264,17 @@ def main() -> int:
             logger.info("Stage implementation pending (Phase 4)")
             log_stage_complete(logger, "Cross-Timestamp Comparison")
 
+        # =====================================================================
         # Stage 11: Generate Summary
+        # =====================================================================
         log_stage_start(logger, "11. Generate Summary")
         # TODO: Implement in Phase 4
         logger.info("Stage implementation pending (Phase 4)")
         log_stage_complete(logger, "Generate Summary")
 
+        # =====================================================================
         # Stage 12: Push Results
+        # =====================================================================
         if config.skip.push_results:
             log_stage_skip(logger, "12. Push Results")
         else:
@@ -208,20 +283,32 @@ def main() -> int:
             logger.info("Stage implementation pending (Phase 4)")
             log_stage_complete(logger, "Push Results")
 
+        # =====================================================================
         # Stage 13: Cleanup
+        # =====================================================================
         if config.skip.cleanup:
             log_stage_skip(logger, "13. Cleanup")
         else:
             log_stage_start(logger, "13. Cleanup")
-            # TODO: Implement in Phase 2
-            logger.info("Stage implementation pending (Phase 2)")
-            log_stage_complete(logger, "Cleanup")
+            try:
+                stage_cleanup(
+                    compose_file=config.docker.compose_file,
+                    container_name=config.docker.container_name,
+                    repo_root=repo_root,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Cleanup")
+            except Exception as e:
+                log_stage_error(logger, "Cleanup", str(e))
+                # Don't raise for cleanup failures
+                logger.warning("Cleanup failed but continuing...")
 
     except KeyboardInterrupt:
         logger.warning("\nInterrupted by user")
         success = False
     except Exception as e:
         logger.error(f"Pipeline failed with error: {e}")
+        logger.debug("Full traceback:", exc_info=True)
         success = False
 
     # Final summary
@@ -238,4 +325,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
