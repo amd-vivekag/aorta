@@ -49,8 +49,14 @@ from weekly_ci import (
 from weekly_ci.stages import (
     stage_build_rccl,
     stage_cleanup,
+    stage_compare_all_analysis,
+    stage_cross_timestamp_comparison,
     stage_docker_setup,
+    stage_find_baseline_experiment_dir,
+    stage_find_experiment_dir,
     stage_install_dependencies,
+    stage_pairwise_analysis,
+    stage_run_performance_tests,
     stage_validate_environment,
 )
 
@@ -208,17 +214,41 @@ def main() -> int:
             log_stage_skip(logger, "5. Run Performance Tests")
         else:
             log_stage_start(logger, "5. Run Performance Tests")
-            # TODO: Implement in Phase 3
-            logger.info("Stage implementation pending (Phase 3)")
-            log_stage_complete(logger, "Run Performance Tests")
+            try:
+                stage_run_performance_tests(
+                    container_name=config.docker.container_name,
+                    config_pairs=config.test.config_pairs,
+                    training_config=config.test.training_config,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Run Performance Tests")
+            except Exception as e:
+                log_stage_error(logger, "Run Performance Tests", str(e))
+                raise
 
         # =====================================================================
         # Stage 6: Find Experiment Directory
         # =====================================================================
-        log_stage_start(logger, "6. Find Experiment Directory")
-        # TODO: Implement in Phase 3
-        logger.info("Stage implementation pending (Phase 3)")
-        log_stage_complete(logger, "Find Experiment Directory")
+        # Only need to find experiment dir if we're running analysis stages
+        need_experiment_dir = (
+            not config.skip.pairwise_analysis
+            or not config.skip.compare_all_analysis
+            or not config.skip.cross_timestamp_comparison
+        )
+
+        if need_experiment_dir:
+            log_stage_start(logger, "6. Find Experiment Directory")
+            try:
+                config.experiment_dir = stage_find_experiment_dir(
+                    repo_root=repo_root,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Find Experiment Directory")
+            except Exception as e:
+                log_stage_error(logger, "Find Experiment Directory", str(e))
+                raise
+        else:
+            log_stage_skip(logger, "6. Find Experiment Directory (no analysis stages enabled)")
 
         # =====================================================================
         # Stage 7: Pairwise Analysis
@@ -227,9 +257,18 @@ def main() -> int:
             log_stage_skip(logger, "7. Pairwise Analysis")
         else:
             log_stage_start(logger, "7. Pairwise Analysis")
-            # TODO: Implement in Phase 3
-            logger.info("Stage implementation pending (Phase 3)")
-            log_stage_complete(logger, "Pairwise Analysis")
+            try:
+                stage_pairwise_analysis(
+                    container_name=config.docker.container_name,
+                    experiment_dir=config.experiment_dir,
+                    config_pairs=config.test.config_pairs,
+                    baseline=config.test.baseline,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Pairwise Analysis")
+            except Exception as e:
+                log_stage_error(logger, "Pairwise Analysis", str(e))
+                raise
 
         # =====================================================================
         # Stage 8: Compare All Analysis
@@ -238,9 +277,18 @@ def main() -> int:
             log_stage_skip(logger, "8. Compare All Analysis")
         else:
             log_stage_start(logger, "8. Compare All Analysis")
-            # TODO: Implement in Phase 3
-            logger.info("Stage implementation pending (Phase 3)")
-            log_stage_complete(logger, "Compare All Analysis")
+            try:
+                stage_compare_all_analysis(
+                    container_name=config.docker.container_name,
+                    experiment_dir=config.experiment_dir,
+                    config_pairs=config.test.config_pairs,
+                    baseline=config.test.baseline,
+                    logger=logger,
+                )
+                log_stage_complete(logger, "Compare All Analysis")
+            except Exception as e:
+                log_stage_error(logger, "Compare All Analysis", str(e))
+                raise
 
         # =====================================================================
         # Stage 9: Checkout aorta-report
@@ -260,9 +308,29 @@ def main() -> int:
             log_stage_skip(logger, "10. Cross-Timestamp Comparison")
         else:
             log_stage_start(logger, "10. Cross-Timestamp Comparison")
-            # TODO: Implement in Phase 4
-            logger.info("Stage implementation pending (Phase 4)")
-            log_stage_complete(logger, "Cross-Timestamp Comparison")
+            try:
+                # Find baseline experiment directory for comparison
+                config.baseline_experiment_dir = stage_find_baseline_experiment_dir(
+                    repo_root=repo_root,
+                    baseline_experiment=config.cross_timestamp.baseline_experiment,
+                    logger=logger,
+                )
+
+                if config.baseline_experiment_dir:
+                    stage_cross_timestamp_comparison(
+                        container_name=config.docker.container_name,
+                        current_experiment_dir=config.experiment_dir,
+                        baseline_experiment_dir=config.baseline_experiment_dir,
+                        config_pairs=config.test.config_pairs,
+                        logger=logger,
+                    )
+                    log_stage_complete(logger, "Cross-Timestamp Comparison")
+                else:
+                    logger.warning("  Skipping cross-timestamp comparison (no baseline found)")
+                    log_stage_complete(logger, "Cross-Timestamp Comparison (partial)")
+            except Exception as e:
+                log_stage_error(logger, "Cross-Timestamp Comparison", str(e))
+                raise
 
         # =====================================================================
         # Stage 11: Generate Summary
