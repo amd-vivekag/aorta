@@ -32,7 +32,7 @@ docker:
 # Set to true to skip a stage, false to run it
 skip:
   docker_setup: false
-  rccl_build: false
+  rccl_build: true
   install_deps: false
   performance_tests: false
   pairwise_analysis: false
@@ -53,8 +53,9 @@ cross_timestamp:
   # Date directory in aorta-report for baseline (e.g., "2026-02-19")
   # If set, will look in aorta-report/{baseline_date}/rccl-warp-speed/
   baseline_date: ""
-  # Path to aorta-report repository (relative to repo root or absolute)
-  aorta_report_path: "../aorta-report"
+  # Path to aorta-report repository (relative to repo root)
+  # Using .aorta-report inside the repo makes it accessible inside Docker container
+  aorta_report_path: ".aorta-report"
 
 # Analysis Configuration (labels for aorta-report commands)
 analysis:

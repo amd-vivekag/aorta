@@ -77,7 +77,7 @@ def stage_pairwise_analysis(
             fi
 
             echo "Generating summary for {config_dir_name}..."
-            aorta-report pipeline summary --test-dir "{test_dir}"
+            aorta-report pipeline summary --test "{test_dir}"
         """
 
         try:
@@ -257,6 +257,35 @@ def stage_compare_all_analysis(
         raise RuntimeError(f"Compare-all-runs analysis failed: {e}") from e
 
 
+def _extract_date_label(experiment_dir: str) -> str:
+    """Extract a date label from an experiment directory path.
+
+    Handles two formats:
+    - experiments/rccl_warp_speed_20260223_065820 -> "2026-02-23"
+    - .aorta-report/2026-02-22/rccl-warp-speed -> "2026-02-22"
+
+    Args:
+        experiment_dir: Path to experiment directory.
+
+    Returns:
+        Date string in YYYY-MM-DD format, or directory name if extraction fails.
+    """
+    import re
+
+    # Try to extract from rccl_warp_speed_YYYYMMDD_HHMMSS format
+    match = re.search(r"rccl_warp_speed_(\d{4})(\d{2})(\d{2})_\d{6}", experiment_dir)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+
+    # Try to extract YYYY-MM-DD from path (aorta-report format)
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", experiment_dir)
+    if match:
+        return match.group(1)
+
+    # Fallback: use the last directory component
+    return Path(experiment_dir).name
+
+
 def stage_cross_timestamp_comparison(
     container_name: str,
     current_experiment_dir: str,
@@ -277,8 +306,8 @@ def stage_cross_timestamp_comparison(
         baseline_experiment_dir: Path to baseline (older) experiment directory.
         config_pairs: Space-separated CU,threads pairs.
         logger: Logger instance.
-        baseline_label: Optional label for baseline in reports.
-        test_label: Optional label for test in reports.
+        baseline_label: Optional label for baseline in reports (auto-generated if empty).
+        test_label: Optional label for test in reports (auto-generated if empty).
 
     Raises:
         RuntimeError: If comparison fails.
@@ -286,9 +315,18 @@ def stage_cross_timestamp_comparison(
     logger.info("Running cross-timestamp comparison...")
     logger.info(f"  Current experiment: {current_experiment_dir}")
     logger.info(f"  Baseline experiment: {baseline_experiment_dir}")
-    if baseline_label:
+
+    # Auto-generate labels from directory names if not provided
+    if not baseline_label:
+        baseline_label = _extract_date_label(baseline_experiment_dir)
+        logger.info(f"  Baseline label (auto): {baseline_label}")
+    else:
         logger.info(f"  Baseline label: {baseline_label}")
-    if test_label:
+
+    if not test_label:
+        test_label = _extract_date_label(current_experiment_dir)
+        logger.info(f"  Test label (auto): {test_label}")
+    else:
         logger.info(f"  Test label: {test_label}")
 
     # Parse configurations
@@ -296,12 +334,8 @@ def stage_cross_timestamp_comparison(
 
     output_dir = f"{current_experiment_dir}/cross_timestamp_comparison"
 
-    # Build label arguments if provided
-    label_args = ""
-    if baseline_label:
-        label_args += f' --baseline-label "{baseline_label}"'
-    if test_label:
-        label_args += f' --test-label "{test_label}"'
+    # Build label arguments (always provided now, either explicit or auto-generated)
+    label_args = f' --baseline-label "{baseline_label}" --test-label "{test_label}"'
 
     for cu, threads in pairs:
         config_dir_name = get_config_dir_name(cu, threads)
