@@ -61,9 +61,12 @@ def stage_pairwise_analysis(
     # Step 1: Generate summary for each configuration individually
     logger.info("Step 1: Generating individual summaries for each configuration...")
 
+    single_config_output_dir = f"{experiment_dir}/single_config_results"
+
     for cu, threads in pairs:
         config_dir_name = get_config_dir_name(cu, threads)
         test_dir = f"{experiment_dir}/{config_dir_name}"
+        single_output = f"{single_config_output_dir}/single_config_{config_dir_name}"
 
         logger.info(f"  Processing {config_dir_name}...")
 
@@ -76,8 +79,10 @@ def stage_pairwise_analysis(
                 exit 0
             fi
 
+            mkdir -p "{single_output}"
+
             echo "Generating summary for {config_dir_name}..."
-            aorta-report pipeline summary --test "{test_dir}"
+            aorta-report pipeline summary --test "{test_dir}" --output "{single_output}"
         """
 
         try:
@@ -106,9 +111,9 @@ def stage_pairwise_analysis(
 
         config_dir_name = get_config_dir_name(cu, threads)
         test_dir = f"{experiment_dir}/{config_dir_name}"
-        comparison_output = f"{comparison_output_dir}/baseline_vs_{config_dir_name}"
+        comparison_output = f"{comparison_output_dir}/{baseline_dir_name}_vs_{config_dir_name}"
 
-        logger.info(f"  Comparing: baseline ({baseline}) vs {cu},{threads}...")
+        logger.info(f"  Comparing: {baseline_dir_name} vs {config_dir_name}...")
 
         # Build label arguments if provided
         label_args = ""
@@ -154,9 +159,9 @@ def stage_pairwise_analysis(
                 workdir="/workspace/aorta",
                 check=True,
             )
-            logger.info(f"    ✓ Comparison complete: baseline vs {config_dir_name}")
+            logger.info(f"    ✓ Comparison complete: {baseline_dir_name} vs {config_dir_name}")
         except Exception as e:
-            logger.warning(f"    ⚠ Comparison failed for {config_dir_name}: {e}")
+            logger.warning(f"    ⚠ Comparison failed for {baseline_dir_name} vs {config_dir_name}: {e}")
 
     logger.info("  ✓ Pairwise analysis completed")
 
