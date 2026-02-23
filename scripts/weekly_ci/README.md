@@ -449,7 +449,7 @@ scripts/
 └── weekly_ci/
     ├── __init__.py           # Package exports
     ├── config.py             # Configuration management
-    ├── logging_config.py     # Logging setup
+    ├── logging_setup.py      # Logging setup
     ├── utils.py              # Utility functions
     └── stages/
         ├── __init__.py       # Stage exports

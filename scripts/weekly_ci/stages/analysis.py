@@ -85,7 +85,7 @@ def stage_pairwise_analysis(
                 container_name,
                 summary_script,
                 logger,
-                workdir="/workspace",
+                workdir="/workspace/aorta",
                 check=True,
             )
             logger.info(f"    ✓ Summary generated for {config_dir_name}")
@@ -151,7 +151,7 @@ def stage_pairwise_analysis(
                 container_name,
                 comparison_script,
                 logger,
-                workdir="/workspace",
+                workdir="/workspace/aorta",
                 check=True,
             )
             logger.info(f"    ✓ Comparison complete: baseline vs {config_dir_name}")
@@ -249,7 +249,7 @@ def stage_compare_all_analysis(
             container_name,
             compare_all_script,
             logger,
-            workdir="/workspace",
+            workdir="/workspace/aorta",
             check=True,
         )
         logger.info("  ✓ Compare-all-runs analysis completed")
@@ -347,7 +347,7 @@ def stage_cross_timestamp_comparison(
                 container_name,
                 comparison_script,
                 logger,
-                workdir="/workspace",
+                workdir="/workspace/aorta",
                 check=True,
             )
             logger.info(f"    ✓ Cross-timestamp comparison complete: {config_dir_name}")

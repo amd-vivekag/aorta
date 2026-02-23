@@ -78,7 +78,7 @@ def stage_run_performance_tests(
             container_name,
             test_script,
             logger,
-            workdir="/workspace",
+            workdir="/workspace/aorta",
             check=True,
         )
         logger.info("  ✓ Performance tests completed successfully")

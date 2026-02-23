@@ -19,7 +19,7 @@ test:
 
 # Docker Configuration
 docker:
-  compose_file: "docker/rccl_test/docker-compose.rocm70_9-1.yaml"
+  compose_file: "docker/docker-compose.rocm70_9-1.yaml"
   container_name: "training-overlap-bugs-rocm70_9-1"
   # Registry credentials (for pulling private base images)
   # Password can also be set via DOCKER_PASSWORD environment variable
