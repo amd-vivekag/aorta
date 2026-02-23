@@ -36,10 +36,10 @@ WHEEL_OUT="${WHEEL_OUT_DIR:-/workspace/aorta/docker/wheels}"
 # =============================================================================
 # Expected versions & pins
 # =============================================================================
-EXPECTED_PYTORCH_VERSION="2.11.0"
+EXPECTED_PYTORCH_VERSION="2.12.0"
 EXPECTED_ROCM_VERSION="7.0.2.1"
 EXPECTED_GCN_ARCH="gfx950:sramecc+:xnack-"
-CK_COMMIT="${CK_COMMIT:-b4207c01c7af6f385d016e5bb9d2a9113edc6116}"
+CK_COMMIT="${CK_COMMIT:-fcc9372c009c8e0a23fece77b582da83b04a654f}"
 
 # =============================================================================
 # [1/7] Pre-flight checks
@@ -361,6 +361,29 @@ fi
 # Work around CMake 4.x incompatibility with old cmake_minimum_required()
 # in vendored third-party CMakeLists.txt files (e.g., the 'six' package).
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+# Clean stale CK SDPA generated .hip files from a previous build.
+# CMake's generate.py writes kernel instantiations directly into the source
+# tree but doesn't remove old ones when CK is updated. Stale files reference
+# the old CK API and break compilation.
+CK_SDPA_DIR="aten/src/ATen/native/transformers/hip/flash_attn/ck"
+CK_SDPA_V3_DIR="aten/src/ATen/native/transformers/hip/flash_attn/ck/fav_v3"
+STALE_COUNT=0
+for dir in "$CK_SDPA_DIR" "$CK_SDPA_V3_DIR"; do
+    if [ -d "$dir" ]; then
+        cnt=$(find "$dir" -maxdepth 1 -name 'fmha_*.hip' -o -name 'mha_*.hip' 2>/dev/null | wc -l)
+        if [ "$cnt" -gt 0 ]; then
+            echo "  Removing $cnt stale generated .hip files from $dir ..."
+            find "$dir" -maxdepth 1 \( -name 'fmha_*.hip' -o -name 'mha_*.hip' \) -delete
+            STALE_COUNT=$((STALE_COUNT + cnt))
+        fi
+    fi
+done
+if [ "$STALE_COUNT" -gt 0 ]; then
+    echo "  [OK] Removed $STALE_COUNT stale CK SDPA .hip files (cmake will regenerate)"
+else
+    echo "  [OK] No stale CK SDPA .hip files found"
+fi
 
 # Build the wheel
 echo ""

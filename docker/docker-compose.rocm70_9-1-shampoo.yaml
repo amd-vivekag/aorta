@@ -38,6 +38,7 @@ services:
       - /home/manrao:/manrao
       - /apps/oyazdanb/rccl:/rccl
       - /apps/oyazdanb/aorta:/workspace/aorta
+      - /apps/oyazdanb/pytorch:/workspace/pytorch
     devices:
       - /dev/kfd
       - /dev/dri

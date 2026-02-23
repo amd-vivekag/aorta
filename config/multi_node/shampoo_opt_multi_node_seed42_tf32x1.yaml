@@ -28,26 +28,26 @@ scheduler:
 
 dataset:
   num_samples: 200000
-  sequence_length: 160
-  dense_dim: 256
-  sparse_features: 64
-  vocab_size: 350000
-  num_dense_features: 32
+  sequence_length: 128
+  dense_dim: 128
+  sparse_features: 32
+  vocab_size: 100000
+  num_dense_features: 16
   seed: 42
 
 model:
-  vocab_size: 350000
-  embedding_dim: 256
-  num_dense_features: 32
-  dense_dim: 256
-  model_dim: 1024
-  num_heads: 16
-  num_layers: 18
+  vocab_size: 100000
+  embedding_dim: 128
+  num_dense_features: 16
+  dense_dim: 128
+  model_dim: 512
+  num_heads: 8
+  num_layers: 8
   dropout: 0.1
-  mlp_hidden_dim: 4096
+  mlp_hidden_dim: 2048
 
 fsdp:
-  sharding_strategy: hybrid_shard
+  sharding_strategy: full_shard
   backward_prefetch: BACKWARD_PRE
   use_orig_params: true
   limit_all_gathers: true
@@ -56,8 +56,8 @@ fsdp:
   param_init_device: meta
   rccl_warmup_iterations: 10
   skip_rccl_warmup: false
-  training_warmup_steps: 1
-  skip_training_warmup: false
+  training_warmup_steps: 0
+  skip_training_warmup: true
 
 distributed:
   backend: nccl

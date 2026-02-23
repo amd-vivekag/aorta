@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import signal
 import subprocess
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, Optional
 from functools import partial
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -952,6 +955,62 @@ def _torch_profiler_context(
                 log.warning("Chrome trace export failed: %s", exc, exc_info=True)
 
 
+def seed_everything(seed: int) -> None:
+    """Set all random seeds and enable deterministic mode for reproducibility.
+
+    Covers: Python stdlib, NumPy global RNG, PyTorch CPU & all CUDA/ROCm
+    devices, cuDNN/MIOpen algorithm selection, and PyTorch op determinism.
+
+    Must be called before model construction, dataloader creation, and any
+    operation that consumes the global RNG (weight init, dropout, etc.).
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    # torch.manual_seed also seeds all CUDA/ROCm devices (since PyTorch 1.x).
+    torch.manual_seed(seed)
+
+    # Disable autotuning so the same algorithms are chosen across runs.
+    # On NVIDIA this controls cuDNN; on ROCm PyTorch keeps these attributes
+    # and routes them to MIOpen where applicable.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # CUBLAS_WORKSPACE_CONFIG is NVIDIA-only; on ROCm deterministic dispatch
+    # is handled via torch.use_deterministic_algorithms.
+    is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+    if not is_rocm:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    # warn_only=True lets training continue when an op has no deterministic
+    # implementation (common on ROCm) while still logging a warning.
+    # NOTE: Disabled on ROCm — Flash Attention backward has no deterministic
+    # implementation and can produce NaN when this flag interacts with hipBLAS.
+    if not is_rocm:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+    hash_seed = os.environ.get("PYTHONHASHSEED")
+    if hash_seed is None or hash_seed == "random":
+        log.warning(
+            "PYTHONHASHSEED is not fixed (%s). Set PYTHONHASHSEED=%d before "
+            "launching Python for fully reproducible dict/set iteration order.",
+            hash_seed, seed,
+        )
+
+    log.info(
+        "Seeded all RNGs with seed=%d | deterministic_algorithms=True "
+        "(warn_only) | cudnn.deterministic=True | cudnn.benchmark=False | "
+        "platform=%s",
+        seed, "ROCm" if is_rocm else "CUDA",
+    )
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """Seed each DataLoader worker for reproducibility when num_workers > 0."""
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     """Apply TF32 precision settings from *precision_cfg* to the process.
 
@@ -1049,6 +1108,8 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     compile_cfg = _build_compile_config(config)
     profiler_cfg = _build_profiler_config(config)
 
+    seed_everything(dataset_cfg.seed)
+
     tf32_mode = configure_tf32_precision(precision_cfg)
 
     log_level = config.get("logging", {}).get("level", "INFO")
@@ -1064,6 +1125,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         rank=rank,
         num_workers=config.get("dataloader", {}).get("num_workers", 4),
         pin_memory=config.get("dataloader", {}).get("pin_memory", True),
+        worker_init_fn=_worker_init_fn,
     )
 
     dist_mode = config.get("distributed", {}).get("mode")

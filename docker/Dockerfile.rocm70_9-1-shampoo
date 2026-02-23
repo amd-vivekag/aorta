@@ -12,8 +12,10 @@ RUN wget https://artifactory-cdn.amd.com/artifactory/list/amdgpu-rpm/rhel/amdgpu
     yum install -y ./amdgpu-install-internal-7.0_9-1.noarch.rpm || rpm -ivh ./amdgpu-install-internal-7.0_9-1.noarch.rpm && \
     rm amdgpu-install-internal-7.0_9-1.noarch.rpm
 
-# Update amdgpu-repo with specific builds (ROCm 7.0 Build #19, Jan 20, 2026)
-RUN amdgpu-repo --amdgpu-build=2281818 --rocm-build=compute-rocm-rel-7.0-meta/19
+# Update amdgpu-repo with ROCm 7.0.2.1 release (Build #6 = last successful)
+# amdgpu-build: 2281818, rocm-build: compute-rocm-rel-7.0.2.1/6
+# Packages: http://compute-artifactory.amd.com/artifactory/list/rocm-osdb-rhel-9.x/compute-rocm-rel-7.0.2.1-6
+RUN amdgpu-repo --amdgpu-build=2281818 --rocm-build=compute-rocm-rel-7.0.2.1/6
 
 # Since base image already has ROCm, just update the key runtime components
 # instead of doing a full reinstall which causes dependency conflicts
@@ -26,6 +28,11 @@ RUN yum update -y --skip-broken \
     hip-dev \
     hip-runtime-amd \
     rocm-core || echo "Updated available ROCm packages"
+
+# Install custom-built PyTorch wheel (built from source for gfx950 + ROCm 7.0)
+COPY wheels/torch-*.whl /tmp/
+RUN pip install /tmp/torch-*.whl --force-reinstall --no-deps && \
+    rm -f /tmp/torch-*.whl
 
 # Install TraceLens and additional Python packages
 RUN python3.10 -m pip install git+https://github.com/AMD-AGI/TraceLens.git || echo "TraceLens install failed, continuing..."

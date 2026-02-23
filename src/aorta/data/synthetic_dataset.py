@@ -76,11 +76,14 @@ def create_dataloader(
     rank: int,
     num_workers: int = 2,
     pin_memory: bool = True,
+    worker_init_fn=None,
 ) -> DataLoader:
     dataset = SyntheticRankingDataset(cfg)
     sampler: Optional[DistributedSampler] = None
     if world_size > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=cfg.seed,
+        )
 
     return DataLoader(
         dataset,
@@ -92,6 +95,7 @@ def create_dataloader(
         pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=num_workers > 0,
+        worker_init_fn=worker_init_fn,
     )
 
 
