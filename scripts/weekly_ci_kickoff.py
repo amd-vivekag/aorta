@@ -60,6 +60,7 @@ from weekly_ci.stages import (
     stage_pairwise_analysis,
     stage_push_results,
     stage_run_performance_tests,
+    stage_update_dashboard,
     stage_validate_environment,
 )
 
@@ -391,6 +392,16 @@ def main() -> int:
                         logger=logger,
                         git_user_name=config.git.user_name,
                         git_user_email=config.git.user_email,
+                    )
+                    
+                    # Update README dashboard with cross-timestamp results
+                    logger.info("Updating README dashboard...")
+                    stage_update_dashboard(
+                        experiment_dir=config.experiment_dir,
+                        repo_root=repo_root,
+                        config_pairs=config.test.config_pairs,
+                        aorta_report_dir=config.aorta_report_dir,
+                        logger=logger,
                     )
                 else:
                     if not config.aorta_report_dir:

@@ -20,6 +20,7 @@ from .docker import stage_cleanup, stage_docker_setup
 from .reporting import (
     generate_dashboard_entry,
     stage_generate_summary,
+    stage_update_dashboard,
     update_dashboard_file,
 )
 from .repository import (
@@ -58,6 +59,7 @@ __all__ = [
     "stage_push_results",
     # Reporting
     "stage_generate_summary",
+    "stage_update_dashboard",
     "generate_dashboard_entry",
     "update_dashboard_file",
 ]
