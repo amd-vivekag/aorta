@@ -56,6 +56,7 @@ class DockerConfig:
     registry_user: str = ""  # Docker registry username (e.g., rocmshared)
     registry_password: str = ""  # Docker registry password/token
     skip_build: bool = True  # Skip docker build by default (use existing image)
+    force_restart: bool = False  # If False, reuse running container; if True, always restart
 
 
 @dataclass
@@ -243,6 +244,17 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
             yaml_data,
             ["docker", "skip_build"],
             config.docker.skip_build,
+        )
+
+    # Force restart: --force-restart forces container restart even if running
+    if args.force_restart:
+        config.docker.force_restart = True
+    else:
+        config.docker.force_restart = _get_value(
+            None,
+            yaml_data,
+            ["docker", "force_restart"],
+            config.docker.force_restart,
         )
 
     # Skip config - CLI flags override YAML
@@ -483,6 +495,11 @@ Examples:
         "--no-docker-build",
         action="store_true",
         help="Skip Docker image build, use existing image (default behavior)",
+    )
+    parser.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="Force restart container even if already running (default: reuse running container)",
     )
 
     # Skip stages

@@ -27,6 +27,8 @@ docker:
   registry_password: ""  # Set via env var DOCKER_PASSWORD or --docker-password CLI arg
   # Skip docker compose build by default (use --docker-build to enable)
   skip_build: true
+  # If false, reuse running container; if true, always stop and restart (use --force-restart)
+  force_restart: false
 
 # Stage Skip Configuration
 # Set to true to skip a stage, false to run it

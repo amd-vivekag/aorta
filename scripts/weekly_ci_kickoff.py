@@ -167,6 +167,7 @@ def main() -> int:
                     registry_user=config.docker.registry_user,
                     registry_password=config.docker.registry_password,
                     skip_build=config.docker.skip_build,
+                    force_restart=config.docker.force_restart,
                 )
                 log_stage_complete(logger, "Docker Setup")
             except Exception as e:
