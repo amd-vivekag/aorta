@@ -353,9 +353,9 @@ def main() -> int:
                 raise
 
         # =====================================================================
-        # Stage 11: Generate Summary
+        # Stage 11: Generate Summary & Dashboard
         # =====================================================================
-        log_stage_start(logger, "11. Generate Summary")
+        log_stage_start(logger, "11. Generate Summary & Dashboard")
         try:
             if config.experiment_dir:
                 stage_generate_summary(
@@ -368,13 +368,25 @@ def main() -> int:
                     baseline_experiment_dir=config.baseline_experiment_dir,
                     logger=logger,
                 )
+
+                # Update aorta-report README dashboard with cross-timestamp results
+                if config.aorta_report_dir:
+                    stage_update_dashboard(
+                        experiment_dir=config.experiment_dir,
+                        repo_root=repo_root,
+                        config_pairs=config.test.config_pairs,
+                        aorta_report_dir=config.aorta_report_dir,
+                        logger=logger,
+                    )
+                else:
+                    logger.info("  Skipping dashboard update (aorta-report not checked out)")
             else:
                 logger.warning("  Skipping summary generation (no experiment directory)")
-            log_stage_complete(logger, "Generate Summary")
+            log_stage_complete(logger, "Generate Summary & Dashboard")
         except Exception as e:
-            log_stage_error(logger, "Generate Summary", str(e))
+            log_stage_error(logger, "Generate Summary & Dashboard", str(e))
             # Don't raise for summary failures
-            logger.warning("Summary generation failed but continuing...")
+            logger.warning("Summary/dashboard generation failed but continuing...")
 
         # =====================================================================
         # Stage 12: Push Results
@@ -392,16 +404,6 @@ def main() -> int:
                         logger=logger,
                         git_user_name=config.git.user_name,
                         git_user_email=config.git.user_email,
-                    )
-                    
-                    # Update README dashboard with cross-timestamp results
-                    logger.info("Updating README dashboard...")
-                    stage_update_dashboard(
-                        experiment_dir=config.experiment_dir,
-                        repo_root=repo_root,
-                        config_pairs=config.test.config_pairs,
-                        aorta_report_dir=config.aorta_report_dir,
-                        logger=logger,
                     )
                 else:
                     if not config.aorta_report_dir:

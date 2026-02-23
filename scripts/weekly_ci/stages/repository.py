@@ -179,10 +179,10 @@ def stage_push_results(
             check=False,  # May fail if no upstream
         )
 
-        # Add and commit
+        # Add and commit (include README.md for dashboard updates)
         logger.info("  Committing changes...")
         run_command(
-            f"git add {today}",
+            f"git add {today} README.md",
             logger,
             cwd=aorta_report_dir,
             capture_output=True,
@@ -200,7 +200,7 @@ def stage_push_results(
 
         if result.stdout.strip():
             run_command(
-                f'git commit -m "Add RCCL warp speed results for {today}"',
+                f'git commit -m "Add RCCL warp speed results for {today} and update dashboard"',
                 logger,
                 cwd=aorta_report_dir,
                 capture_output=True,
