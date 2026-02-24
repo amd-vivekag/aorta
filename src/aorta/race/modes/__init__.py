@@ -5,6 +5,7 @@ This package contains different distributed training simulation modes:
 - default: TorchRec-like pattern with all_to_all + all_reduce
 - ddp: DDP pattern with gradient all_reduce and H2D prefetch
 - fsdp: FSDP pattern with per-layer all_gather + reduce_scatter
+- stress: All patterns combined with many streams + embedding simulation
 
 Use create_reproducer() factory function to instantiate the appropriate mode.
 """
@@ -41,16 +42,19 @@ def create_reproducer(
         - "default": TorchRec-like (H2D + all_to_all + all_reduce)
         - "ddp": DDP (H2D prefetch + gradient all_reduce)
         - "fsdp": FSDP (per-layer all_gather + reduce_scatter)
+        - "stress": All patterns combined with many streams + embeddings
     """
     # Import here to avoid circular imports
     from .ddp import DDPModeReproducer
     from .default import DefaultModeReproducer
     from .fsdp import FSDPModeReproducer
+    from .stress import StressModeReproducer
 
     MODE_REGISTRY = {
         "default": DefaultModeReproducer,
         "ddp": DDPModeReproducer,
         "fsdp": FSDPModeReproducer,
+        "stress": StressModeReproducer,
     }
 
     mode = config.mode.lower()
@@ -75,6 +79,9 @@ def __getattr__(name: str):
     elif name == "FSDPModeReproducer":
         from .fsdp import FSDPModeReproducer
         return FSDPModeReproducer
+    elif name == "StressModeReproducer":
+        from .stress import StressModeReproducer
+        return StressModeReproducer
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -83,4 +90,5 @@ __all__ = [
     "DefaultModeReproducer",
     "DDPModeReproducer",
     "FSDPModeReproducer",
+    "StressModeReproducer",
 ]

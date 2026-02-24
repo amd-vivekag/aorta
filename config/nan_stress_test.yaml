@@ -1,0 +1,70 @@
+# NaN Stress Test Configuration
+#
+# Aggressive settings designed to reproduce the customer's NaN issue
+# with Distributed Shampoo.  Maximizes stream contention by combining:
+#   - Large embedding tables with all_to_all on datadist_stream
+#   - Real model training with DDP gradient all_reduce
+#   - Shampoo's DDPDistributor AllGather during optimizer.step()
+#   - Multiple extra CUDA streams for embedding lookups
+#   - GPU_MAX_HW_QUEUES=4 for full HW queue parallelism
+#
+# Usage:
+#   GPU_MAX_HW_QUEUES=4 torchrun --nproc_per_node=8 \
+#       scripts/nan_stress_test.py --config config/nan_stress_test.yaml
+
+# Training
+max_steps: 50000
+duration_hours: 0
+batch_size: 64
+mixed_precision: bf16
+grad_clip_norm: 1.0
+gradient_accumulation: 2
+compile: false
+
+# Model (matches customer's config from shampoo_opt.yaml)
+vocab_size: 350000
+embedding_dim: 256
+num_dense_features: 32
+dense_dim: 256
+model_dim: 1024
+num_heads: 16
+num_layers: 18
+dropout: 0.1
+mlp_hidden_dim: 4096
+
+# Dataset
+sequence_length: 64
+sparse_features: 64
+num_samples: 200000
+
+# Optimizer: Shampoo with aggressive preconditioning
+optimizer: shampoo
+lr: 0.0002
+weight_decay: 0.01
+betas: [0.9, 0.985]
+eps: 1.0e-8
+
+# Shampoo-specific: frequent preconditioning for timing variation
+precondition_frequency: 50
+max_preconditioner_dim: 8192
+start_preconditioning_step: 50
+
+# Embedding stress simulation (TorchRec-like)
+num_embedding_tables: 8
+emb_table_rows: 2000000
+emb_table_dim: 128
+emb_lookups_per_iter: 8192
+num_extra_streams: 4
+
+# Extra NCCL stress (concurrent AllGather ops during optimizer.step)
+extra_nccl_streams: 0
+extra_nccl_allgather_size: 2000000
+
+# Hardware
+gpu_max_hw_queues: 4
+
+# Monitoring
+log_interval: 20
+nan_check_interval: 1
+shampoo_state_check_interval: 100
+stop_on_nan: true
