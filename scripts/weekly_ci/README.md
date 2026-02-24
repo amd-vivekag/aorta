@@ -8,7 +8,7 @@ This script automates the entire performance testing and analysis pipeline:
 1. Docker container setup
 2. RCCL library build
 3. Performance test execution
-4. Pairwise and cross-timestamp analysis
+4. Single-config analysis, pairwise comparison, and cross-timestamp comparison
 5. Summary report generation
 6. Results publishing to aorta-report repository
 
@@ -93,6 +93,14 @@ python scripts/weekly_ci_kickoff.py \
     --skip-performance-tests
 ```
 
+#### Skip TraceLens in single-config (when already run)
+```bash
+# Use when TraceLens analysis was done in a prior run
+python scripts/weekly_ci_kickoff.py \
+    --skip-tracelens \
+    --skip-performance-tests
+```
+
 #### Custom configuration pairs
 ```bash
 python scripts/weekly_ci_kickoff.py \
@@ -133,7 +141,8 @@ skip:
   rccl_build: false
   install_deps: false
   performance_tests: false
-  pairwise_analysis: false
+  single_config_analysis: false
+  pairwise_comparison: false
   compare_all_analysis: true    # Expensive, skip by default
   checkout_aorta_report: false
   cross_timestamp_comparison: false
@@ -193,7 +202,8 @@ Skip Stages:
   --skip-rccl-build     Skip RCCL build
   --skip-install-deps   Skip dependency installation
   --skip-performance-tests  Skip performance tests
-  --skip-pairwise-analysis  Skip pairwise analysis
+  --skip-single-config-analysis  Skip single-config analysis
+  --skip-pairwise-comparison  Skip pairwise comparison
   --skip-compare-all    Skip compare-all analysis (default: skipped)
   --no-skip-compare-all Enable compare-all analysis
   --skip-checkout-aorta-report  Skip aorta-report checkout
@@ -205,9 +215,10 @@ Cross-Timestamp Options:
   --baseline-date       Date directory in aorta-report (e.g., "2026-02-19")
   --aorta-report-path   Path to aorta-report repository
 
-Analysis Labels:
+Analysis Options:
   --baseline-label      Label for baseline in reports (e.g., "v1.0")
   --test-label          Label for test in reports (e.g., "v1.1")
+  --skip-tracelens      Pass --skip-tracelens to single-config only (when TraceLens already run)
 
 Other Options:
   --cleanup             Cleanup container after completion
@@ -230,13 +241,14 @@ The script executes these stages in order:
 | 4. Install Dependencies | Install Python packages | Yes |
 | 5. Run Performance Tests | Execute RCCL warp speed tests | Yes |
 | 6. Find Experiment Dir | Locate test results | Auto |
-| 7. Pairwise Analysis | Compare baseline vs each config | Yes |
-| 8. Compare All Analysis | Multi-config comparison | Yes (default: skip) |
-| 9. Checkout aorta-report | Clone/update report repo | Yes |
-| 10. Cross-Timestamp | Compare with previous run | Yes |
-| 11. Generate Summary | Create summary report | No |
-| 12. Push Results | Push to aorta-report | Yes (default: skip) |
-| 13. Cleanup | Stop container | Yes (default: skip) |
+| 7. Single Config Analysis | aorta-report summary per config | Yes |
+| 8. Pairwise Comparison | Baseline vs each config | Yes |
+| 9. Compare All Analysis | Multi-config comparison | Yes (default: skip) |
+| 10. Checkout aorta-report | Clone/update report repo | Yes |
+| 11. Cross-Timestamp | Compare with previous run | Yes |
+| 12. Generate Summary | Create summary report | No |
+| 13. Push Results | Push to aorta-report | Yes (default: skip) |
+| 14. Cleanup | Stop container | Yes (default: skip) |
 
 ### Data Flow Between Stages
 
@@ -245,8 +257,8 @@ Stages discover their inputs from the filesystem or previous stages:
 | Stage | Input Source | Override Option |
 |-------|-------------|-----------------|
 | 6. Find Experiment Dir | Scans `experiments/rccl_warp_speed_*` | `--experiment-dir` |
-| 7-8. Analysis | Uses experiment dir from Stage 6 | (automatic) |
-| 10. Cross-Timestamp | Local experiments or aorta-report | `--baseline-experiment` or `--baseline-date` |
+| 7-9. Analysis | Uses experiment dir from Stage 6 | (automatic) |
+| 11. Cross-Timestamp | Local experiments or aorta-report | `--baseline-experiment` or `--baseline-date` |
 
 #### Explicit Experiment Directory
 
@@ -300,7 +312,11 @@ experiments/rccl_warp_speed_YYYYMMDD_HHMMSS/
 │   └── summary/
 ├── 32cu_512threads/              # Test configuration 2
 │   └── summary/
-├── comparison_results/           # Pairwise comparisons
+├── single_config_results/        # Single-config summaries (Stage 7)
+│   ├── single_config_56cu_256threads/
+│   ├── single_config_37cu_384threads/
+│   └── single_config_32cu_512threads/
+├── comparison_results/           # Pairwise comparisons (Stage 8)
 │   ├── baseline_vs_37cu_384threads/
 │   │   ├── summary.json
 │   │   ├── comparison.xlsx
@@ -364,10 +380,10 @@ Tested Configurations
 ----------------------------------------------------------------------
 Generated Artifacts
 ----------------------------------------------------------------------
-  Summary Reports:
-    - 56cu_256threads/summary/
-    - 37cu_384threads/summary/
-    - 32cu_512threads/summary/
+  Single Config Results:
+    - single_config_results/single_config_56cu_256threads/
+    - single_config_results/single_config_37cu_384threads/
+    - single_config_results/single_config_32cu_512threads/
   Comparison Results:
     - comparison_results/baseline_vs_37cu_384threads/
     - comparison_results/baseline_vs_32cu_512threads/

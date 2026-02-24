@@ -45,6 +45,7 @@ class AnalysisConfig:
 
     baseline_label: str = ""  # Label for baseline in reports (e.g., "baseline", "v1.0")
     test_label: str = ""  # Label for test in reports (e.g., "test", "v1.1")
+    skip_tracelens_single_config: bool = False  # CLI --skip-tracelens: add to single-config only
 
 
 @dataclass
@@ -67,7 +68,8 @@ class SkipConfig:
     rccl_build: bool = False
     install_deps: bool = False
     performance_tests: bool = False
-    pairwise_analysis: bool = False
+    single_config_analysis: bool = False
+    pairwise_comparison: bool = False
     compare_all_analysis: bool = True  # Skip by default for initial setup
     checkout_aorta_report: bool = False  # Needed for cross-timestamp comparison
     cross_timestamp_comparison: bool = False
@@ -282,11 +284,17 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["skip", "performance_tests"],
         config.skip.performance_tests,
     )
-    config.skip.pairwise_analysis = _get_value(
-        args.skip_pairwise_analysis if args.skip_pairwise_analysis else None,
+    config.skip.single_config_analysis = _get_value(
+        args.skip_single_config_analysis if args.skip_single_config_analysis else None,
         yaml_data,
-        ["skip", "pairwise_analysis"],
-        config.skip.pairwise_analysis,
+        ["skip", "single_config_analysis"],
+        config.skip.single_config_analysis,
+    )
+    config.skip.pairwise_comparison = _get_value(
+        args.skip_pairwise_comparison if args.skip_pairwise_comparison else None,
+        yaml_data,
+        ["skip", "pairwise_comparison"],
+        config.skip.pairwise_comparison,
     )
 
     # Handle compare_all_analysis: --no-skip-compare-all enables it
@@ -362,6 +370,10 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["analysis", "test_label"],
         config.analysis.test_label,
     )
+
+    # skip_tracelens_single_config: CLI only (not in YAML). Only add when --skip-tracelens passed.
+    if getattr(args, "skip_tracelens", False):
+        config.analysis.skip_tracelens_single_config = True
 
     # Git config
     config.git.user_name = _get_value(
@@ -520,9 +532,19 @@ Examples:
         help="Skip performance tests stage",
     )
     parser.add_argument(
-        "--skip-pairwise-analysis",
+        "--skip-single-config-analysis",
         action="store_true",
-        help="Skip pairwise analysis stage",
+        help="Skip single-config analysis stage",
+    )
+    parser.add_argument(
+        "--skip-pairwise-comparison",
+        action="store_true",
+        help="Skip pairwise comparison stage",
+    )
+    parser.add_argument(
+        "--skip-tracelens",
+        action="store_true",
+        help="Pass --skip-tracelens to single-config aorta-report (when TraceLens already run)",
     )
     parser.add_argument(
         "--skip-compare-all",

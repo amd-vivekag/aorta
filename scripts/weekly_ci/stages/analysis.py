@@ -2,8 +2,10 @@
 Analysis stages for Weekly CI Kickoff.
 
 This module provides:
-- Pairwise comparison analysis (baseline vs each config)
+- Single-config analysis (aorta-report summary per config)
+- Pairwise comparison (baseline vs each config)
 - Compare-all-runs analysis (all configs compared together)
+- Cross-timestamp comparison
 """
 
 from __future__ import annotations
@@ -15,52 +17,30 @@ from typing import Optional
 from ..utils import docker_exec, get_config_dir_name, parse_config_pairs
 
 
-def stage_pairwise_analysis(
+def stage_single_config_analysis(
     container_name: str,
     experiment_dir: str,
     config_pairs: str,
-    baseline: str,
     logger: logging.Logger,
-    baseline_label: str = "",
-    test_label: str = "",
+    skip_tracelens: bool = False,
 ) -> None:
-    """Run pairwise comparison analysis for each configuration.
+    """Run single-config summary analysis for each configuration.
 
-    This stage performs two-step analysis:
-    1. First, run `aorta-report pipeline summary --test-dir` for each configuration
-       to generate individual summary reports
-    2. Then, run pairwise comparisons between baseline and each non-baseline config
-       using `aorta-report pipeline summary --baseline --test --skip-tracelens`
+    Generates individual summary reports using
+    `aorta-report pipeline summary --test <config_dir>`.
 
     Args:
         container_name: Name of the Docker container.
         experiment_dir: Path to the experiment directory (relative to workspace).
         config_pairs: Space-separated CU,threads pairs.
-        baseline: Baseline configuration (CU,threads format, e.g., "56,256").
         logger: Logger instance.
-        baseline_label: Optional label for baseline in reports.
-        test_label: Optional label for test in reports.
-
-    Raises:
-        RuntimeError: If analysis fails.
+        skip_tracelens: If True, pass --skip-tracelens (when TraceLens already run).
     """
-    logger.info("Running pairwise comparison analysis...")
+    logger.info("Running single-config analysis...")
     logger.info(f"  Experiment directory: {experiment_dir}")
-    logger.info(f"  Baseline configuration: {baseline}")
 
-    # Parse configurations
     pairs = parse_config_pairs(config_pairs)
-    baseline_parts = baseline.split(",")
-    if len(baseline_parts) != 2:
-        raise RuntimeError(f"Invalid baseline format: {baseline}. Expected 'CU,threads'")
-
-    baseline_cu, baseline_threads = baseline_parts
-    baseline_dir_name = get_config_dir_name(baseline_cu, baseline_threads)
-    baseline_path = f"{experiment_dir}/{baseline_dir_name}"
-
-    # Step 1: Generate summary for each configuration individually
-    logger.info("Step 1: Generating individual summaries for each configuration...")
-
+    skip_tracelens_flag = " --skip-tracelens" if skip_tracelens else ""
     single_config_output_dir = f"{experiment_dir}/single_config_results"
 
     for cu, threads in pairs:
@@ -82,7 +62,7 @@ def stage_pairwise_analysis(
             mkdir -p "{single_output}"
 
             echo "Generating summary for {config_dir_name}..."
-            aorta-report pipeline summary --test "{test_dir}" --output "{single_output}"
+            aorta-report pipeline summary --test "{test_dir}" --output "{single_output}"{skip_tracelens_flag}
         """
 
         try:
@@ -97,14 +77,47 @@ def stage_pairwise_analysis(
         except Exception as e:
             logger.warning(f"    ⚠ Summary generation failed for {config_dir_name}: {e}")
 
-    # Step 2: Run pairwise comparisons (baseline vs each non-baseline config)
-    logger.info("")
-    logger.info("Step 2: Running pairwise comparisons (baseline vs each configuration)...")
+    logger.info("  ✓ Single-config analysis completed")
 
+
+def stage_pairwise_comparison(
+    container_name: str,
+    experiment_dir: str,
+    config_pairs: str,
+    baseline: str,
+    logger: logging.Logger,
+    baseline_label: str = "",
+    test_label: str = "",
+) -> None:
+    """Run pairwise comparison analysis (baseline vs each config).
+
+    Uses `aorta-report pipeline summary --baseline --test --skip-tracelens`.
+    Always passes --skip-tracelens (expects tracelens from single-config stage).
+
+    Args:
+        container_name: Name of the Docker container.
+        experiment_dir: Path to the experiment directory (relative to workspace).
+        config_pairs: Space-separated CU,threads pairs.
+        baseline: Baseline configuration (CU,threads format, e.g., "56,256").
+        logger: Logger instance.
+        baseline_label: Optional label for baseline in reports.
+        test_label: Optional label for test in reports.
+    """
+    logger.info("Running pairwise comparison analysis...")
+    logger.info(f"  Experiment directory: {experiment_dir}")
+    logger.info(f"  Baseline configuration: {baseline}")
+
+    pairs = parse_config_pairs(config_pairs)
+    baseline_parts = baseline.split(",")
+    if len(baseline_parts) != 2:
+        raise RuntimeError(f"Invalid baseline format: {baseline}. Expected 'CU,threads'")
+
+    baseline_cu, baseline_threads = baseline_parts
+    baseline_dir_name = get_config_dir_name(baseline_cu, baseline_threads)
+    baseline_path = f"{experiment_dir}/{baseline_dir_name}"
     comparison_output_dir = f"{experiment_dir}/comparison_results"
 
     for cu, threads in pairs:
-        # Skip if this is the baseline
         if cu == baseline_cu and threads == baseline_threads:
             logger.debug(f"  Skipping baseline: {baseline_cu},{baseline_threads}")
             continue
@@ -115,7 +128,6 @@ def stage_pairwise_analysis(
 
         logger.info(f"  Comparing: {baseline_dir_name} vs {config_dir_name}...")
 
-        # Build label arguments if provided
         label_args = ""
         if baseline_label:
             label_args += f' --baseline-label "{baseline_label}"'
@@ -163,7 +175,7 @@ def stage_pairwise_analysis(
         except Exception as e:
             logger.warning(f"    ⚠ Comparison failed for {baseline_dir_name} vs {config_dir_name}: {e}")
 
-    logger.info("  ✓ Pairwise analysis completed")
+    logger.info("  ✓ Pairwise comparison completed")
 
 
 def stage_compare_all_analysis(

@@ -6,7 +6,7 @@ This script replicates the CI workflow locally for:
 - Building Docker containers
 - Cloning and building RCCL
 - Running performance tests
-- Performing pairwise and cross-timestamp analysis
+- Single-config analysis, pairwise comparison, and cross-timestamp comparison
 - Pushing results to aorta-report repository
 
 Usage:
@@ -57,9 +57,10 @@ from weekly_ci.stages import (
     stage_find_experiment_dir,
     stage_generate_summary,
     stage_install_dependencies,
-    stage_pairwise_analysis,
+    stage_pairwise_comparison,
     stage_push_results,
     stage_run_performance_tests,
+    stage_single_config_analysis,
     stage_update_dashboard,
     stage_validate_environment,
 )
@@ -114,8 +115,11 @@ def main() -> int:
     if config.skip.performance_tests:
         logger.info("  - performance_tests")
         skip_any = True
-    if config.skip.pairwise_analysis:
-        logger.info("  - pairwise_analysis")
+    if config.skip.single_config_analysis:
+        logger.info("  - single_config_analysis")
+        skip_any = True
+    if config.skip.pairwise_comparison:
+        logger.info("  - pairwise_comparison")
         skip_any = True
     if config.skip.compare_all_analysis:
         logger.info("  - compare_all_analysis")
@@ -236,7 +240,8 @@ def main() -> int:
         # =====================================================================
         # Only need to find experiment dir if we're running analysis stages
         need_experiment_dir = (
-            not config.skip.pairwise_analysis
+            not config.skip.single_config_analysis
+            or not config.skip.pairwise_comparison
             or not config.skip.compare_all_analysis
             or not config.skip.cross_timestamp_comparison
         )
@@ -257,14 +262,34 @@ def main() -> int:
             log_stage_skip(logger, "6. Find Experiment Directory (no analysis stages enabled)")
 
         # =====================================================================
-        # Stage 7: Pairwise Analysis
+        # Stage 7: Single Config Analysis
         # =====================================================================
-        if config.skip.pairwise_analysis:
-            log_stage_skip(logger, "7. Pairwise Analysis")
+        if config.skip.single_config_analysis:
+            log_stage_skip(logger, "7. Single Config Analysis")
         else:
-            log_stage_start(logger, "7. Pairwise Analysis")
+            log_stage_start(logger, "7. Single Config Analysis")
             try:
-                stage_pairwise_analysis(
+                stage_single_config_analysis(
+                    container_name=config.docker.container_name,
+                    experiment_dir=config.experiment_dir,
+                    config_pairs=config.test.config_pairs,
+                    logger=logger,
+                    skip_tracelens=config.analysis.skip_tracelens_single_config,
+                )
+                log_stage_complete(logger, "Single Config Analysis")
+            except Exception as e:
+                log_stage_error(logger, "Single Config Analysis", str(e))
+                raise
+
+        # =====================================================================
+        # Stage 8: Pairwise Comparison
+        # =====================================================================
+        if config.skip.pairwise_comparison:
+            log_stage_skip(logger, "8. Pairwise Comparison")
+        else:
+            log_stage_start(logger, "8. Pairwise Comparison")
+            try:
+                stage_pairwise_comparison(
                     container_name=config.docker.container_name,
                     experiment_dir=config.experiment_dir,
                     config_pairs=config.test.config_pairs,
@@ -273,18 +298,18 @@ def main() -> int:
                     baseline_label=config.analysis.baseline_label,
                     test_label=config.analysis.test_label,
                 )
-                log_stage_complete(logger, "Pairwise Analysis")
+                log_stage_complete(logger, "Pairwise Comparison")
             except Exception as e:
-                log_stage_error(logger, "Pairwise Analysis", str(e))
+                log_stage_error(logger, "Pairwise Comparison", str(e))
                 raise
 
         # =====================================================================
-        # Stage 8: Compare All Analysis
+        # Stage 9: Compare All Analysis
         # =====================================================================
         if config.skip.compare_all_analysis:
-            log_stage_skip(logger, "8. Compare All Analysis")
+            log_stage_skip(logger, "9. Compare All Analysis")
         else:
-            log_stage_start(logger, "8. Compare All Analysis")
+            log_stage_start(logger, "9. Compare All Analysis")
             try:
                 stage_compare_all_analysis(
                     container_name=config.docker.container_name,
@@ -299,12 +324,12 @@ def main() -> int:
                 raise
 
         # =====================================================================
-        # Stage 9: Checkout aorta-report
+        # Stage 10: Checkout aorta-report
         # =====================================================================
         if config.skip.checkout_aorta_report:
-            log_stage_skip(logger, "9. Checkout aorta-report")
+            log_stage_skip(logger, "10. Checkout aorta-report")
         else:
-            log_stage_start(logger, "9. Checkout aorta-report")
+            log_stage_start(logger, "10. Checkout aorta-report")
             try:
                 config.aorta_report_dir = stage_checkout_aorta_report(
                     aorta_report_path=config.cross_timestamp.aorta_report_path,
@@ -318,12 +343,12 @@ def main() -> int:
                 raise
 
         # =====================================================================
-        # Stage 10: Cross-Timestamp Comparison
+        # Stage 11: Cross-Timestamp Comparison
         # =====================================================================
         if config.skip.cross_timestamp_comparison:
-            log_stage_skip(logger, "10. Cross-Timestamp Comparison")
+            log_stage_skip(logger, "11. Cross-Timestamp Comparison")
         else:
-            log_stage_start(logger, "10. Cross-Timestamp Comparison")
+            log_stage_start(logger, "11. Cross-Timestamp Comparison")
             try:
                 # Find baseline experiment directory for comparison
                 config.baseline_experiment_dir = stage_find_baseline_experiment_dir(
@@ -353,9 +378,9 @@ def main() -> int:
                 raise
 
         # =====================================================================
-        # Stage 11: Generate Summary & Dashboard
+        # Stage 12: Generate Summary & Dashboard
         # =====================================================================
-        log_stage_start(logger, "11. Generate Summary & Dashboard")
+        log_stage_start(logger, "12. Generate Summary & Dashboard")
         try:
             if config.experiment_dir:
                 stage_generate_summary(
@@ -389,12 +414,12 @@ def main() -> int:
             logger.warning("Summary/dashboard generation failed but continuing...")
 
         # =====================================================================
-        # Stage 12: Push Results
+        # Stage 13: Push Results
         # =====================================================================
         if config.skip.push_results:
-            log_stage_skip(logger, "12. Push Results")
+            log_stage_skip(logger, "13. Push Results")
         else:
-            log_stage_start(logger, "12. Push Results")
+            log_stage_start(logger, "13. Push Results")
             try:
                 if config.aorta_report_dir and config.experiment_dir:
                     stage_push_results(
@@ -416,12 +441,12 @@ def main() -> int:
                 raise
 
         # =====================================================================
-        # Stage 13: Cleanup
+        # Stage 14: Cleanup
         # =====================================================================
         if config.skip.cleanup:
-            log_stage_skip(logger, "13. Cleanup")
+            log_stage_skip(logger, "14. Cleanup")
         else:
-            log_stage_start(logger, "13. Cleanup")
+            log_stage_start(logger, "14. Cleanup")
             try:
                 stage_cleanup(
                     compose_file=config.docker.compose_file,

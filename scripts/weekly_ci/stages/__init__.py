@@ -9,7 +9,8 @@ from __future__ import annotations
 from .analysis import (
     stage_compare_all_analysis,
     stage_cross_timestamp_comparison,
-    stage_pairwise_analysis,
+    stage_pairwise_comparison,
+    stage_single_config_analysis,
 )
 from .build import (
     stage_build_rccl,
@@ -51,7 +52,8 @@ __all__ = [
     "stage_find_baseline_experiment_dir",
     "validate_experiment_configs",
     # Analysis
-    "stage_pairwise_analysis",
+    "stage_single_config_analysis",
+    "stage_pairwise_comparison",
     "stage_compare_all_analysis",
     "stage_cross_timestamp_comparison",
     # Repository

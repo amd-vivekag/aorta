@@ -131,37 +131,39 @@ output:
 │     • Execute run_rccl_warp_speed_comparison.sh             │
 │     • Find generated experiment directory                   │
 ├─────────────────────────────────────────────────────────────┤
-│  6. Run Pairwise Analysis                       [SKIPPABLE] │
-│     • Step 1: Generate summary for ALL configs              │
-│       └─ aorta-report pipeline summary --test-dir <dir>     │
-│     • Step 2: Pairwise comparison (baseline vs each)        │
-│       └─ aorta-report pipeline summary --baseline --test    │
-│          --skip-tracelens                                   │
+│  6. Single Config Analysis                       [SKIPPABLE] │
+│     • aorta-report pipeline summary --test <dir> per config  │
+│     • Default: run TraceLens; use --skip-tracelens to skip  │
 ├─────────────────────────────────────────────────────────────┤
-│  7. Run Compare-All Analysis          [SKIPPABLE, OFF*]     │
+│  7. Pairwise Comparison                         [SKIPPABLE] │
+│     • aorta-report pipeline summary --baseline --test       │
+│       --skip-tracelens (always)                              │
+├─────────────────────────────────────────────────────────────┤
+│  8. Run Compare-All Analysis          [SKIPPABLE, OFF*]     │
 │     • Merged report of all configurations                   │
 │     * Skipped by default for initial setup                  │
 ├─────────────────────────────────────────────────────────────┤
-│  8. Checkout aorta-report                       [SKIPPABLE] │
+│  9. Checkout aorta-report                       [SKIPPABLE] │
 │     • Clone or update aorta-report repository               │
 │     • Required for cross-timestamp comparison               │
 ├─────────────────────────────────────────────────────────────┤
-│  9. Cross-Timestamp Comparison                  [SKIPPABLE] │
+│ 10. Cross-Timestamp Comparison                  [SKIPPABLE] │
 │     • Find previous experiment (from config or auto-detect) │
 │     • Compare each config: older timestamp = baseline,      │
 │       newer timestamp = test                                │
 │     • aorta-report pipeline summary --baseline <old>        │
 │       --test <new> --skip-tracelens                         │
 ├─────────────────────────────────────────────────────────────┤
-│ 10. Generate Summary Report                                 │
+│ 11. Generate Summary Report                                 │
 │     • Print summary to terminal                             │
 │     • Save summary to file                                  │
 ├─────────────────────────────────────────────────────────────┤
-│ 11. Push to aorta-report (Optional)             [SKIPPABLE] │
+│ 12. Push to aorta-report (Optional)             [SKIPPABLE] │
 │     • Copy results to dated directory                       │
 │     • Commit and push                                       │
+│     • Update README dashboard                               │
 ├─────────────────────────────────────────────────────────────┤
-│ 12. Cleanup                                     [SKIPPABLE] │
+│ 13. Cleanup                                     [SKIPPABLE] │
 │     • docker compose down                                   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -181,7 +183,11 @@ experiments/rccl_warp_speed_YYYYMMDD_HHMMSS/
 │   └── summary/
 ├── 32cu_512threads/              # Test configuration 2
 │   └── summary/
-├── comparison_results/           # Pairwise comparisons (--skip-tracelens)
+├── single_config_results/        # Single-config summaries (Stage 6)
+│   ├── single_config_56cu_256threads/
+│   ├── single_config_37cu_384threads/
+│   └── single_config_32cu_512threads/
+├── comparison_results/           # Pairwise comparisons (Stage 7)
 │   ├── baseline_vs_37cu_384threads/
 │   └── baseline_vs_32cu_512threads/
 ├── cross_timestamp_comparison/   # Comparison with previous run (older=baseline, newer=test)
@@ -2376,26 +2382,38 @@ python scripts/weekly_ci_kickoff.py --skip-rccl-build --skip-install-deps --skip
 
 ### Phase 3: Analysis Stages (Days 6-8)
 
-#### Task 3.1: Stage 6 - Pairwise Analysis
+#### Task 3.1a: Stage 6 - Single Config Analysis
 **File:** `scripts/weekly_ci/stages/analysis.py`
 
 ```python
 # Implementation checklist:
-- [x] Check skip flag
-- [x] Ensure experiment_dir is set (call stage_find_experiment_dir)
+- [x] Check skip flag (skip.single_config_analysis)
+- [x] Loop through config_pairs
+- [x] Run: aorta-report pipeline summary --test <dir> --output <dir>
+- [x] --skip-tracelens: only when --skip-tracelens CLI passed (default: run full TraceLens)
+```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/analysis.py` (`stage_single_config_analysis`)
+
+**Dependencies:** Stage 5
+
+---
+
+#### Task 3.1b: Stage 7 - Pairwise Comparison
+**File:** `scripts/weekly_ci/stages/analysis.py`
+
+```python
+# Implementation checklist:
+- [x] Check skip flag (skip.pairwise_comparison)
 - [x] Parse baseline configuration
-- [x] Step 1: Generate summary for ALL configs
-      - Loop through config_pairs
-      - Run: aorta-report pipeline summary --test-dir <dir>
-- [x] Step 2: Pairwise comparisons
-      - Loop through non-baseline configs
-      - Run: aorta-report pipeline summary --baseline <base> --test <test> --skip-tracelens
+- [x] Loop through non-baseline configs
+- [x] Run: aorta-report pipeline summary --baseline <base> --test <test> --skip-tracelens (always)
 - [x] Support --baseline-label and --test-label arguments
 ```
 
-**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/analysis.py` (`stage_pairwise_analysis`)
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/analysis.py` (`stage_pairwise_comparison`)
 
-**Dependencies:** Stage 5
+**Dependencies:** Stage 5, 6 (single-config populates tracelens_analysis for pairwise --skip-tracelens)
 
 **Testing:**
 ```bash

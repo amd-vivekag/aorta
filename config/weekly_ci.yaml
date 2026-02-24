@@ -36,8 +36,9 @@ skip:
   docker_setup: false
   rccl_build: true
   install_deps: false
-  performance_tests: false
-  pairwise_analysis: false
+  performance_tests: true
+  single_config_analysis: false
+  pairwise_comparison: false
   compare_all_analysis: true   # Skipped by default (expensive)
   checkout_aorta_report: false
   cross_timestamp_comparison: false
