@@ -21,11 +21,14 @@ When ``simulate_collectives=False`` the workload uses real
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
+
+logger = logging.getLogger(__name__)
 
 from aorta.hw_queue_eval.workloads.base import DistributedWorkload, MultiGPUMixin
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
@@ -79,7 +82,7 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
     name = "comms_compute_overlap"
     description = "Comm-compute overlap with configurable GEMM and collectives"
     category = "distributed"
-    min_streams = 2
+    min_streams = 1
     max_streams = 32
     recommended_streams = 4
     switch_latency_sensitivity = "high"
@@ -197,43 +200,38 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
 
             self._setup_multi_gpu(stream_count, device, use_multi_gpu=False)
 
-            # Process groups
+            # Process groups -- overlapping groups are allowed (e.g.
+            # the same ranks can appear in multiple groups).  The workload
+            # uses the first group that contains this rank as the active
+            # group for collectives.
             if self._pg_spec is not None:
                 pg_ranks = parse_process_groups(self._pg_spec)
 
-                # Validate that every rank belongs to exactly one group
-                rank_to_pgs: Dict[int, List[int]] = {
-                    r: [] for r in range(self._world_size)
-                }
+                # Validate that all ranks are within [0, world_size)
                 for pg_id, ranks in pg_ranks.items():
                     for r in ranks:
-                        if 0 <= r < self._world_size:
-                            rank_to_pgs[r].append(pg_id)
-
-                unassigned = [r for r, pgs in rank_to_pgs.items() if not pgs]
-                multi = {r: pgs for r, pgs in rank_to_pgs.items() if len(pgs) > 1}
-                if unassigned or multi:
-                    parts = [
-                        "Invalid process group spec: each rank must belong "
-                        "to exactly one group."
-                    ]
-                    if unassigned:
-                        parts.append(f" Unassigned ranks: {sorted(unassigned)}.")
-                    if multi:
-                        parts.append(
-                            " Ranks in multiple groups: "
-                            + ", ".join(
-                                f"{r}: {pg_ids}"
-                                for r, pg_ids in sorted(multi.items())
+                        if not (0 <= r < self._world_size):
+                            raise RuntimeError(
+                                f"Invalid process group spec: rank {r} is out of "
+                                f"range for world size {self._world_size} "
+                                f"(valid ranks: 0..{self._world_size - 1})."
                             )
-                            + "."
-                        )
-                    raise RuntimeError("".join(parts))
 
                 self._process_groups = create_process_groups(
                     pg_ranks, backend=self._backend
                 )
-                self._active_group = self._process_groups[rank_to_pgs[self._rank][0]]
+
+                # Pick the first group this rank belongs to
+                for pg_id, ranks in pg_ranks.items():
+                    if self._rank in ranks:
+                        self._active_group = self._process_groups[pg_id]
+                        break
+
+                if self._active_group is None:
+                    raise RuntimeError(
+                        f"Rank {self._rank} does not belong to any of the "
+                        f"specified process groups: {self._pg_spec}"
+                    )
             else:
                 self._active_group = dist.group.WORLD
         else:
@@ -243,8 +241,17 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
         self._comm_stream_idx = 0
 
         if self._requested_compute_streams is not None:
-            # Explicit compute stream count (independent of total streams)
+
             self._num_compute_streams = self._requested_compute_streams
+            # Warn if compute streams exceed available harness streams
+            avail = stream_count if self.mode == "compute_only" else max(0, stream_count - 1)
+            if avail > 0 and self._num_compute_streams > avail:
+                logger.warning(
+                    "compute_streams=%d exceeds available streams=%d; "
+                    "multiple GEMM sets will serialize on shared streams.",
+                    self._num_compute_streams,
+                    avail,
+                )
         elif self.mode == "comms_only":
             self._num_compute_streams = 0
         elif self.mode == "compute_only":
@@ -337,6 +344,11 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
     ) -> None:
         """Dispatch GEMM compute across compute streams."""
         num_available = len(streams) - compute_stream_offset
+        if num_available <= 0:
+            raise ValueError(
+                f"No compute streams available: {len(streams)} total streams "
+                f"with compute_stream_offset={compute_stream_offset}."
+            )
         for i in range(self._num_compute_streams):
             stream = streams[compute_stream_offset + (i % num_available)]
             a = self._A[i]
@@ -361,6 +373,14 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
         return "TFLOPS"
 
     def compute_throughput(self, iterations: int, total_time_sec: float) -> float:
+        """Compute throughput from iteration count and elapsed time.
+
+        In ``comms_only`` mode the metric is raw data throughput (GB/s).
+        In simulation mode this reflects local memory bandwidth of the
+        copy+add mock; with real collectives it reflects the end-to-end
+        collective data rate (which depends on the algorithm, topology,
+        and world size -- not just point-to-point link bandwidth).
+        """
         if total_time_sec <= 0:
             return 0.0
 

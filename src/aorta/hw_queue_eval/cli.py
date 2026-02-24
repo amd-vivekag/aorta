@@ -71,12 +71,19 @@ PRIORITY_WORKLOADS = {
 
 def _parse_size(value: str) -> int:
     """Parse a size string with optional K/M/G suffix into bytes."""
+    original = value
     value = value.strip().upper()
     multipliers = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
-    for suffix, mult in multipliers.items():
-        if value.endswith(suffix):
-            return int(float(value[:-1]) * mult)
-    return int(value)
+    try:
+        for suffix, mult in multipliers.items():
+            if value.endswith(suffix):
+                return int(float(value[:-1]) * mult)
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid size value '{original}'. "
+            "Expected an integer or a number with K/M/G suffix, e.g. '128M' or '1024'."
+        ) from None
 
 
 def get_workload_instance(name: str, **kwargs):

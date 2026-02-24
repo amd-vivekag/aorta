@@ -410,6 +410,108 @@ class TestCommsComputeOverlapWorkload:
         workload.cleanup()
 
 
+class TestParseProcessGroups:
+    """Tests for the process-group spec parser."""
+
+    def test_single_group(self):
+        from aorta.utils.distributed import parse_process_groups
+        assert parse_process_groups("[0,1,2,3]") == {0: [0, 1, 2, 3]}
+
+    def test_two_groups(self):
+        from aorta.utils.distributed import parse_process_groups
+        assert parse_process_groups("[0,1],[2,3]") == {0: [0, 1], 1: [2, 3]}
+
+    def test_four_groups(self):
+        from aorta.utils.distributed import parse_process_groups
+        result = parse_process_groups("[0,1],[2,3],[4,5],[6,7]")
+        assert result == {0: [0, 1], 1: [2, 3], 2: [4, 5], 3: [6, 7]}
+
+    def test_single_rank_groups(self):
+        from aorta.utils.distributed import parse_process_groups
+        assert parse_process_groups("[0],[1],[2]") == {0: [0], 1: [1], 2: [2]}
+
+    def test_whitespace_handling(self):
+        from aorta.utils.distributed import parse_process_groups
+        assert parse_process_groups(" [ 0 , 1 ] , [ 2 , 3 ] ") == {0: [0, 1], 1: [2, 3]}
+
+    def test_empty_string_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="non-empty"):
+            parse_process_groups("")
+
+    def test_whitespace_only_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="non-empty"):
+            parse_process_groups("   ")
+
+    def test_empty_brackets_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="does not contain any ranks"):
+            parse_process_groups("[]")
+
+    def test_empty_group_in_list_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="Empty process group"):
+            parse_process_groups("[0,1],[],[2,3]")
+
+    def test_non_integer_rank_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="Non-integer"):
+            parse_process_groups("[0,abc,2]")
+
+    def test_float_rank_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="Non-integer"):
+            parse_process_groups("[0,1.5,2]")
+
+    def test_large_ranks(self):
+        from aorta.utils.distributed import parse_process_groups
+        assert parse_process_groups("[100,200,300]") == {0: [100, 200, 300]}
+
+    def test_preserves_order(self):
+        from aorta.utils.distributed import parse_process_groups
+        assert parse_process_groups("[3,1,2,0]") == {0: [3, 1, 2, 0]}
+
+
+class TestParseSize:
+    """Tests for the CLI _parse_size helper."""
+
+    def test_plain_integer(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        assert _parse_size("1024") == 1024
+
+    def test_megabytes(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        assert _parse_size("128M") == 128 * 1024 * 1024
+
+    def test_gigabytes(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        assert _parse_size("1G") == 1024 ** 3
+
+    def test_lowercase_suffix(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        assert _parse_size("64m") == 64 * 1024 * 1024
+
+    def test_fractional_with_suffix(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        assert _parse_size("1.5G") == int(1.5 * 1024 ** 3)
+
+    def test_invalid_string_raises(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        with pytest.raises(ValueError, match="Invalid size"):
+            _parse_size("abc")
+
+    def test_empty_string_raises(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        with pytest.raises(ValueError, match="Invalid size"):
+            _parse_size("")
+
+    def test_suffix_only_raises(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        with pytest.raises(ValueError, match="Invalid size"):
+            _parse_size("M")
+
+
 class TestWorkloadRegistry:
     """Tests for workload registry."""
 

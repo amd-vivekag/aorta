@@ -47,7 +47,7 @@ python -m aorta.hw_queue_eval profile hetero_kernels --streams 8
 
 | Workload | Description |
 | --- | --- |
-| `comms_compute_overlap` | Configurable comm-compute overlap with GEMM and collectives |
+| `comms_compute_overlap` | Configurable comms-compute overlap with GEMM and collectives |
 | `fsdp_tp` | FSDP + Tensor Parallelism (3D parallelism) with actual collectives |
 | `moe` | Mixture of Experts with 8-16 parallel expert streams |
 | `activation_ckpt` | Activation checkpointing with recomputation patterns |
@@ -105,7 +105,7 @@ Each run collects:
 --profile --profile-dir traces/
 ```
 
-### Comm-Compute Overlap Options
+### Comms-Compute Overlap Options
 
 These options apply to the `comms_compute_overlap` workload:
 
