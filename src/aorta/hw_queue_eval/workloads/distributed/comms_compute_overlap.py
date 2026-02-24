@@ -200,14 +200,41 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
             # Process groups
             if self._pg_spec is not None:
                 pg_ranks = parse_process_groups(self._pg_spec)
+
+                # Validate that every rank belongs to exactly one group
+                rank_to_pgs: Dict[int, List[int]] = {
+                    r: [] for r in range(self._world_size)
+                }
+                for pg_id, ranks in pg_ranks.items():
+                    for r in ranks:
+                        if 0 <= r < self._world_size:
+                            rank_to_pgs[r].append(pg_id)
+
+                unassigned = [r for r, pgs in rank_to_pgs.items() if not pgs]
+                multi = {r: pgs for r, pgs in rank_to_pgs.items() if len(pgs) > 1}
+                if unassigned or multi:
+                    parts = [
+                        "Invalid process group spec: each rank must belong "
+                        "to exactly one group."
+                    ]
+                    if unassigned:
+                        parts.append(f" Unassigned ranks: {sorted(unassigned)}.")
+                    if multi:
+                        parts.append(
+                            " Ranks in multiple groups: "
+                            + ", ".join(
+                                f"{r}: {pg_ids}"
+                                for r, pg_ids in sorted(multi.items())
+                            )
+                            + "."
+                        )
+                    raise RuntimeError("".join(parts))
+
                 self._process_groups = create_process_groups(
                     pg_ranks, backend=self._backend
                 )
-                for pg_id, ranks in pg_ranks.items():
-                    if self._rank in ranks:
-                        self._active_group = self._process_groups[pg_id]
-                        break
-            if self._active_group is None:
+                self._active_group = self._process_groups[rank_to_pgs[self._rank][0]]
+            else:
                 self._active_group = dist.group.WORLD
         else:
             self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)

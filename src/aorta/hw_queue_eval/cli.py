@@ -194,30 +194,45 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
                 process_groups=process_groups,
             )
 
-        # Workload-specific parameters (only set when explicitly provided)
-        if wl_mode is not None:
-            kwargs["mode"] = wl_mode
-        if mm_dim is not None:
-            parts = [int(x.strip()) for x in mm_dim.split(",")]
-            if len(parts) == 1:
-                kwargs["mm_dim"] = (parts[0], parts[0], parts[0])
-            elif len(parts) == 3:
-                kwargs["mm_dim"] = tuple(parts)
-            else:
-                click.echo("Error: --mm-dim must be M,N,K or a single value", err=True)
+        # Workload-specific parameters (comms_compute_overlap only)
+        _overlap_opts = (
+            wl_mode, mm_dim, num_compute, num_coll,
+            comm_size, compute_streams, comp_dtype, comm_dtype,
+        )
+        if any(v is not None for v in _overlap_opts):
+            if workload != "comms_compute_overlap":
+                click.echo(
+                    f"Error: Options --mode, --mm-dim, --num-compute, --num-coll, "
+                    f"--comm-size, --compute-streams, --comp-dtype, --comm-dtype "
+                    f"are only valid for the comms_compute_overlap workload, "
+                    f"not '{workload}'.",
+                    err=True,
+                )
                 sys.exit(1)
-        if num_compute is not None:
-            kwargs["num_compute_per_iter"] = num_compute
-        if num_coll is not None:
-            kwargs["num_coll_per_iter"] = num_coll
-        if comm_size is not None:
-            kwargs["comm_size_bytes"] = _parse_size(comm_size)
-        if compute_streams is not None:
-            kwargs["compute_streams"] = compute_streams
-        if comp_dtype is not None:
-            kwargs["comp_data_type"] = comp_dtype
-        if comm_dtype is not None:
-            kwargs["comm_data_type"] = comm_dtype
+
+            if wl_mode is not None:
+                kwargs["mode"] = wl_mode
+            if mm_dim is not None:
+                parts = [int(x.strip()) for x in mm_dim.split(",")]
+                if len(parts) == 1:
+                    kwargs["mm_dim"] = (parts[0], parts[0], parts[0])
+                elif len(parts) == 3:
+                    kwargs["mm_dim"] = tuple(parts)
+                else:
+                    click.echo("Error: --mm-dim must be M,N,K or a single value", err=True)
+                    sys.exit(1)
+            if num_compute is not None:
+                kwargs["num_compute_per_iter"] = num_compute
+            if num_coll is not None:
+                kwargs["num_coll_per_iter"] = num_coll
+            if comm_size is not None:
+                kwargs["comm_size_bytes"] = _parse_size(comm_size)
+            if compute_streams is not None:
+                kwargs["compute_streams"] = compute_streams
+            if comp_dtype is not None:
+                kwargs["comp_data_type"] = comp_dtype
+            if comm_dtype is not None:
+                kwargs["comm_data_type"] = comm_dtype
 
         wl = get_workload_instance(workload, **kwargs)
         info = WorkloadRegistry.get_info(workload)

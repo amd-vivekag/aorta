@@ -180,7 +180,4 @@ src/aorta/
     │   ├── pipeline/         # Async dataload, ZeRO, etc.
     │   └── latency_sensitive/ # Hetero kernels, tiny kernels
     └── cli.py                # Command-line interface
-
-scripts/
-└── run_comms_compute_coverage.sh  # Exhaustive parameter coverage test
 ```
