@@ -66,7 +66,7 @@ class PrecisionConfig:
     param_dtype: str = "bf16"     # dtype for parameters during forward/backward: fp32, fp16, bf16
     reduce_dtype: str = "fp32"    # dtype for gradient all-reduce communication: fp32, fp16, bf16
     buffer_dtype: str = "fp32"    # dtype for module buffers (e.g. BatchNorm stats): fp32, fp16, bf16
-    tf32_mode: str = "disabled"   # TF32 matmul mode: disabled, native, x1, x3
+    tf32_mode: str = "disabled"   # TF32 matmul mode: disabled, x1, x3
 
 
 @dataclass
@@ -165,18 +165,6 @@ def _build_precision_config(raw: Dict[str, Any]) -> PrecisionConfig:
         if field.name in section:
             setattr(cfg, field.name, section[field.name])
 
-    # Backward compatibility: migrate training.mixed_precision -> precision.param_dtype
-    training_mp = raw.get("training", {}).get("mixed_precision")
-    if training_mp is not None and "param_dtype" not in section:
-        log.warning(
-            "DEPRECATED: training.mixed_precision is deprecated. "
-            "Move it to precision.param_dtype in your config file. "
-            "Using training.mixed_precision='%s' as param_dtype.",
-            training_mp,
-        )
-        cfg.param_dtype = training_mp
-
-    # Validate all dtype fields eagerly so typos surface at config load time.
     for dtype_field in ("param_dtype", "reduce_dtype", "buffer_dtype"):
         _resolve_dtype(getattr(cfg, dtype_field))
 
@@ -281,7 +269,7 @@ _DTYPE_MAP: Dict[str, torch.dtype] = {
 # Canonical names shown in error messages and validation output.
 _DTYPE_CANONICAL_NAMES = ("fp32", "fp16", "bf16")
 
-_VALID_TF32_MODES = frozenset({"disabled", "native", "x1", "x3"})
+_VALID_TF32_MODES = frozenset({"disabled", "x1", "x3"})
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -1014,9 +1002,29 @@ def _worker_init_fn(worker_id: int) -> None:
 def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     """Apply TF32 precision settings from *precision_cfg* to the process.
 
-    Configures ``torch.backends.cuda.matmul.allow_tf32`` and the
-    ``HIPBLASLT_ALLOW_TF32`` environment variable according to
-    ``precision_cfg.tf32_mode``.
+    Configures three levels of TF32 control:
+
+    1. ``torch.set_float32_matmul_precision`` — the documented PyTorch API.
+    2. ``torch.backends.cuda.matmul.allow_tf32`` — low-level flag (set
+       implicitly by the API above, but also set explicitly for clarity).
+    3. ``HIPBLASLT_ALLOW_TF32`` env var — **required on AMD/ROCm** to make
+       hipBLASLt select ``HIPBLAS_COMPUTE_32F_FAST_TF32`` kernels.  On NVIDIA
+       this env var is irrelevant; cuBLAS honours the PyTorch flag directly.
+
+    Hardware notes (AMD):
+
+    * **gfx942 (MI300X/MI308)** — native TF32 (truncates fp32 mantissa to
+      10 bits).  ``x1`` uses a single TF32 accumulation pass.
+    * **gfx950 (MI355)** — no native TF32; ``x1`` uses a single BF16 matmul,
+      ``x3`` uses three BF16 matmuls (BF16x3) for higher accuracy.
+
+    ========  ====================  ==========================  ==============
+    tf32_mode HIPBLASLT_ALLOW_TF32  float32_matmul_precision    hipBLASLt
+    ========  ====================  ==========================  ==============
+    disabled  (unset)               highest                     FP32 GEMM
+    x1        1                     high                        FAST_TF32 x1
+    x3        3                     high                        FAST_TF32 x3
+    ========  ====================  ==========================  ==============
 
     Returns:
         The active tf32_mode string (lower-cased, validated).
@@ -1029,21 +1037,27 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
         )
         tf32_mode = "disabled"
 
-    allow_tf32 = tf32_mode != "disabled"
-    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
 
-    hipblaslt_values = {"x1": "1", "x3": "3"}
-    if tf32_mode in hipblaslt_values:
-        os.environ["HIPBLASLT_ALLOW_TF32"] = hipblaslt_values[tf32_mode]
-    else:
+    if tf32_mode == "disabled":
+        torch.set_float32_matmul_precision("highest")
         os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+    else:
+        torch.set_float32_matmul_precision("high")
+        if is_rocm:
+            hipblaslt_values = {"x1": "1", "x3": "3"}
+            os.environ["HIPBLASLT_ALLOW_TF32"] = hipblaslt_values[tf32_mode]
+        else:
+            os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
 
     log.info(
-        "TF32 precision | tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s float32_matmul_precision=%s",
+        "TF32 precision | tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s "
+        "float32_matmul_precision=%s platform=%s",
         tf32_mode,
         torch.backends.cuda.matmul.allow_tf32,
         os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
         torch.get_float32_matmul_precision(),
+        "ROCm" if is_rocm else "CUDA",
     )
 
     param_dtype = _resolve_dtype(precision_cfg.param_dtype)
@@ -1057,19 +1071,159 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     return tf32_mode
 
 
-def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
-    """Log TF32 state for verification.
+def _run_matmul_with_tf32(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    hipblaslt_value: Optional[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Run a single matmul with specific TF32 settings."""
+    allow = hipblaslt_value is not None
+    torch.backends.cuda.matmul.allow_tf32 = allow
+    if allow:
+        torch.set_float32_matmul_precision("high")
+    else:
+        torch.set_float32_matmul_precision("highest")
+    if hipblaslt_value is not None:
+        os.environ["HIPBLASLT_ALLOW_TF32"] = hipblaslt_value
+    else:
+        os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+    torch.cuda.synchronize(device)
+    result = torch.mm(A, B)
+    torch.cuda.synchronize(device)
+    return result
 
-    Note: A matmul probe was previously used here but caused SIGSEGV on ROCm
-    when allow_tf32=True, so verification is now done via loss curve comparison.
+
+def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
+    """Verify TF32 precision with a matmul probe.
+
+    Runs fp32 matmuls under four settings — fp32 (disabled), fp64 (ground
+    truth), x1 (``HIPBLASLT_ALLOW_TF32=1``), and x3
+    (``HIPBLASLT_ALLOW_TF32=3``) — then reports:
+
+    1. Whether the *configured* mode is active (differs from fp32).
+    2. Accuracy of each mode vs fp64 ground truth.
+    3. **x1 vs x3 delta** — the comparison that matters for the client's
+       error tolerance (TF32x3 vs TF32x1).
+
+    All ranks execute the probe independently (local matmul, no collectives).
+    Only rank 0 emits detailed log messages.
     """
-    log.info(
-        "[TF32 CHECK] tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s float32_matmul_precision=%s",
-        tf32_mode,
-        torch.backends.cuda.matmul.allow_tf32,
-        os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
-        torch.get_float32_matmul_precision(),
-    )
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    is_primary = rank == 0
+
+    if is_primary:
+        log.info(
+            "[PRECISION PROBE] tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s "
+            "float32_matmul_precision=%s — running matmul verification...",
+            tf32_mode,
+            torch.backends.cuda.matmul.allow_tf32,
+            os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
+            torch.get_float32_matmul_precision(),
+        )
+
+    saved_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    saved_hipblaslt = os.environ.get("HIPBLASLT_ALLOW_TF32")
+    saved_precision = torch.get_float32_matmul_precision()
+    rng_state = torch.cuda.get_rng_state(device)
+
+    try:
+        torch.cuda.manual_seed(98765)
+
+        M, K, N = 4096, 4096, 4096
+        A = torch.randn(M, K, device=device, dtype=torch.float32)
+        B = torch.randn(K, N, device=device, dtype=torch.float32)
+
+        # fp64 ground truth
+        ref_f64 = torch.mm(A.double(), B.double())
+
+        # fp32 baseline (TF32 disabled)
+        out_fp32 = _run_matmul_with_tf32(A, B, None, device)
+
+        # x1: HIPBLASLT_ALLOW_TF32=1 (HIPBLAS_COMPUTE_32F_FAST_16BF on gfx950)
+        out_x1 = _run_matmul_with_tf32(A, B, "1", device)
+
+        # x3: HIPBLASLT_ALLOW_TF32=3 (HIPBLAS_COMPUTE_32F_FAST_TF32 / BF16x3 on gfx950)
+        out_x3 = _run_matmul_with_tf32(A, B, "3", device)
+
+        # --- Errors vs fp64 ground truth ---
+        fp32_err = (out_fp32.double() - ref_f64).abs()
+        x1_err = (out_x1.double() - ref_f64).abs()
+        x3_err = (out_x3.double() - ref_f64).abs()
+
+        # --- x1 vs x3 delta (the client-relevant comparison) ---
+        x1_x3_diff = (out_x1 - out_x3).abs()
+
+        # --- Configured mode vs fp32 (activation check) ---
+        configured_map = {"disabled": out_fp32, "x1": out_x1, "x3": out_x3}
+        out_configured = configured_map[tf32_mode]
+        vs_fp32_diff = (out_fp32 - out_configured).abs().max().item()
+        results_identical = vs_fp32_diff == 0.0
+
+        if tf32_mode == "disabled":
+            if results_identical:
+                if is_primary:
+                    log.info(
+                        "[PRECISION PROBE] PASS  tf32_mode=disabled — matmul output is "
+                        "bit-identical to fp32 reference. TF32 is correctly OFF."
+                    )
+            else:
+                log.error(
+                    "[PRECISION PROBE] FAIL  tf32_mode=disabled but matmul output DIFFERS "
+                    "from fp32 reference (max_diff=%.4e). TF32 may be unexpectedly active!",
+                    vs_fp32_diff,
+                )
+        else:
+            if not results_identical:
+                if is_primary:
+                    log.info(
+                        "[PRECISION PROBE] PASS  tf32_mode=%s — matmul output differs from "
+                        "fp32 reference (max_diff=%.4e). TF32 is confirmed ACTIVE.",
+                        tf32_mode, vs_fp32_diff,
+                    )
+            else:
+                log.warning(
+                    "[PRECISION PROBE] WARN  tf32_mode=%s but matmul output is bit-identical "
+                    "to fp32 reference. The runtime may not support TF32.",
+                    tf32_mode,
+                )
+
+        if is_primary:
+            log.info(
+                "[PRECISION PROBE] Accuracy vs fp64 (max_err) — "
+                "fp32=%.4e, x1=%.4e (%.2fx), x3=%.4e (%.2fx)",
+                fp32_err.max().item(),
+                x1_err.max().item(),
+                x1_err.max().item() / fp32_err.max().item() if fp32_err.max().item() > 0 else float("inf"),
+                x3_err.max().item(),
+                x3_err.max().item() / fp32_err.max().item() if fp32_err.max().item() > 0 else float("inf"),
+            )
+            log.info(
+                "[PRECISION PROBE] x1 vs x3 delta — max=%.4e, mean=%.4e, "
+                "identical=%s",
+                x1_x3_diff.max().item(),
+                x1_x3_diff.mean().item(),
+                x1_x3_diff.max().item() == 0.0,
+            )
+
+        del A, B, ref_f64, out_fp32, out_x1, out_x3
+        del fp32_err, x1_err, x3_err, x1_x3_diff
+        torch.cuda.synchronize(device)
+
+    except Exception as exc:
+        log.warning(
+            "[PRECISION PROBE] Probe failed (%s); precision flags were set but "
+            "could not be verified at runtime.",
+            exc, exc_info=True,
+        )
+    finally:
+        torch.cuda.set_rng_state(rng_state, device)
+        torch.backends.cuda.matmul.allow_tf32 = saved_allow_tf32
+        torch.set_float32_matmul_precision(saved_precision)
+        if saved_hipblaslt is not None:
+            os.environ["HIPBLASLT_ALLOW_TF32"] = saved_hipblaslt
+        else:
+            os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
 
 
 def main_cli() -> None:  # pragma: no cover - CLI entry

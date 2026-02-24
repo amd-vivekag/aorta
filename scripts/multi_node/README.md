@@ -170,7 +170,7 @@ precision:
   param_dtype: bf16      # fp32, fp16, bf16 — params during forward/backward
   reduce_dtype: fp32     # fp32, fp16, bf16 — gradient all-reduce communication
   buffer_dtype: fp32     # fp32, fp16, bf16 — module buffers (e.g. BatchNorm running stats)
-  tf32_mode: disabled    # disabled, native, x1, x3 — TF32 for fp32 matmuls
+  tf32_mode: disabled    # disabled, x1, x3 — TF32 for fp32 matmuls
 ```
 
 | Setting | What it controls |
@@ -178,7 +178,17 @@ precision:
 | `param_dtype` | Dtype parameters are cast to during forward/backward. Master weights stay in fp32. |
 | `reduce_dtype` | Dtype used for gradient all-reduce across ranks. fp32 is safest for accuracy. |
 | `buffer_dtype` | Dtype for module buffers (e.g. BatchNorm running mean/variance). |
-| `tf32_mode` | TF32 precision for fp32 matmuls (e.g. Shampoo optimizer). Only affects ops outside mixed-precision regions. `x3` = most accurate (triple accumulation), `x1` = fastest. |
+| `tf32_mode` | TF32 precision for fp32 matmuls (e.g. Shampoo optimizer). Only affects ops outside mixed-precision regions. See table below. |
+
+**`tf32_mode` values** (AMD/ROCm — controlled via `HIPBLASLT_ALLOW_TF32` → `HIPBLAS_COMPUTE_32F_FAST_TF32`):
+
+| Mode | HIPBLASLT_ALLOW_TF32 | float32_matmul_precision | Behaviour |
+|------|---------------------|-------------------------|-----------|
+| `disabled` | unset | highest | Full fp32 GEMMs |
+| `x1` | 1 | high | Single accumulation (TF32 on gfx942, BF16x1 on gfx950) — fastest |
+| `x3` | 3 | high | Triple accumulation (BF16x3) — most accurate TF32 mode |
+
+A matmul probe runs at startup to verify the configured precision mode is actually active on the hardware.
 
 **FSDP mode** uses PyTorch's native `FSDP MixedPrecision` policy — sharded parameters are stored in `param_dtype` (saving GPU memory), gradients reduced in `reduce_dtype`. No `torch.autocast` is used.
 
