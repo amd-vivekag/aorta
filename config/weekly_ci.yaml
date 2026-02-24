@@ -42,7 +42,7 @@ skip:
   compare_all_analysis: true   # Skipped by default (expensive)
   checkout_aorta_report: false
   cross_timestamp_comparison: false
-  push_results: true           # Skipped by default (avoid accidental pushes)
+  push_results: false           # Skipped by default (avoid accidental pushes)
   cleanup: true                # Skipped by default (keep container running)
 
 # Test Configuration (additional options)

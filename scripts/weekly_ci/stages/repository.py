@@ -22,7 +22,7 @@ from ..utils import run_command
 TRACE_GZIP_THRESHOLD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # File extensions treated as trace files (case-insensitive)
-TRACE_EXTENSIONS = (".pt.trace.json", ".trace.json")
+TRACE_EXTENSIONS = (".pt.trace.json", ".trace.json", ".traces.json", ".pt.traces.json", "trace.json", "pt.trace.json")
 
 
 def stage_checkout_aorta_report(
