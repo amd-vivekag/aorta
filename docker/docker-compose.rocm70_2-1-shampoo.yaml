@@ -1,9 +1,9 @@
 services:
-  torchenv-rocm70-shampoo:
-    container_name: training-overlap-bugs-rocm70_9-1-shampoo
+  torchenv-rocm70-2-1-shampoo:
+    container_name: training-overlap-bugs-rocm70_2-1-shampoo
     build:
       context: .
-      dockerfile: Dockerfile.rocm70_9-1-shampoo
+      dockerfile: Dockerfile.rocm70_2-1-shampoo
       network: host
     user: root
     privileged: true
