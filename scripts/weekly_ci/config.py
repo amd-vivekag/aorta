@@ -36,6 +36,17 @@ class TestConfig:
     config_pairs: str = "56,256 37,384 32,512"
     baseline: str = "56,256"
     training_config: str = "config/single_node/gemm_overlap_comm.yaml"
+    experiment_dir: str = ""  # If empty, auto-detect most recent
+
+
+@dataclass
+class AnalysisConfig:
+    """Analysis configuration for aorta-report commands."""
+
+    baseline_label: str = ""  # Label for baseline in reports (e.g., "baseline", "v1.0")
+    test_label: str = ""  # Label for test in reports (e.g., "test", "v1.1")
+    report_label: str = ""  # Override for aorta-report dir & dashboard (default: date from experiment)
+    skip_tracelens_single_config: bool = False  # CLI --skip-tracelens: add to single-config only
 
 
 @dataclass
@@ -44,6 +55,10 @@ class DockerConfig:
 
     compose_file: str = "docker/rccl_test/docker-compose.rocm70_9-1.yaml"
     container_name: str = "training-overlap-bugs-rocm70_9-1"
+    registry_user: str = ""  # Docker registry username (e.g., rocmshared)
+    registry_password: str = ""  # Docker registry password/token
+    skip_build: bool = True  # Skip docker build by default (use existing image)
+    force_restart: bool = False  # If False, reuse running container; if True, always restart
 
 
 @dataclass
@@ -54,10 +69,12 @@ class SkipConfig:
     rccl_build: bool = False
     install_deps: bool = False
     performance_tests: bool = False
-    pairwise_analysis: bool = False
+    single_config_analysis: bool = False
+    pairwise_comparison: bool = False
     compare_all_analysis: bool = True  # Skip by default for initial setup
     checkout_aorta_report: bool = False  # Needed for cross-timestamp comparison
     cross_timestamp_comparison: bool = False
+    convert_html_to_md: bool = False  # Convert HTML to Markdown before push (skip to disable)
     push_results: bool = True  # Skip by default
     cleanup: bool = True  # Skip by default (leave container running)
 
@@ -67,7 +84,17 @@ class CrossTimestampConfig:
     """Cross-timestamp comparison configuration."""
 
     baseline_experiment: str = ""  # If empty, auto-detect second-most-recent
+    baseline_date: str = ""  # Date directory in aorta-report (e.g., "2026-02-19")
     aorta_report_path: str = "../aorta-report"
+
+
+@dataclass
+class GitConfig:
+    """Git configuration for pushing results."""
+
+    user_name: str = "Weekly CI Bot"
+    user_email: str = "weekly-ci@aorta.local"
+    github_token: str = ""  # Can be set via AORTA_REPORT_GITHUB_TOKEN env var
 
 
 @dataclass
@@ -87,6 +114,8 @@ class Config:
     docker: DockerConfig = field(default_factory=DockerConfig)
     skip: SkipConfig = field(default_factory=SkipConfig)
     cross_timestamp: CrossTimestampConfig = field(default_factory=CrossTimestampConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
+    git: GitConfig = field(default_factory=GitConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
     # Runtime state (populated during execution)
@@ -174,6 +203,12 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["test", "training_config"],
         config.test.training_config,
     )
+    config.test.experiment_dir = _get_value(
+        getattr(args, "experiment_dir", None),
+        yaml_data,
+        ["test", "experiment_dir"],
+        config.test.experiment_dir,
+    )
 
     # Docker config
     config.docker.compose_file = _get_value(
@@ -188,6 +223,43 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["docker", "container_name"],
         config.docker.container_name,
     )
+    config.docker.registry_user = _get_value(
+        args.docker_user,
+        yaml_data,
+        ["docker", "registry_user"],
+        config.docker.registry_user,
+    )
+    config.docker.registry_password = _get_value(
+        args.docker_password,
+        yaml_data,
+        ["docker", "registry_password"],
+        config.docker.registry_password,
+    )
+
+    # Docker build: --docker-build enables it, --no-docker-build disables it
+    # Default is to skip build (skip_build=True)
+    if args.docker_build:
+        config.docker.skip_build = False
+    elif args.no_docker_build:
+        config.docker.skip_build = True
+    else:
+        config.docker.skip_build = _get_value(
+            None,
+            yaml_data,
+            ["docker", "skip_build"],
+            config.docker.skip_build,
+        )
+
+    # Force restart: --force-restart forces container restart even if running
+    if args.force_restart:
+        config.docker.force_restart = True
+    else:
+        config.docker.force_restart = _get_value(
+            None,
+            yaml_data,
+            ["docker", "force_restart"],
+            config.docker.force_restart,
+        )
 
     # Skip config - CLI flags override YAML
     config.skip.docker_setup = _get_value(
@@ -214,11 +286,17 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["skip", "performance_tests"],
         config.skip.performance_tests,
     )
-    config.skip.pairwise_analysis = _get_value(
-        args.skip_pairwise_analysis if args.skip_pairwise_analysis else None,
+    config.skip.single_config_analysis = _get_value(
+        args.skip_single_config_analysis if args.skip_single_config_analysis else None,
         yaml_data,
-        ["skip", "pairwise_analysis"],
-        config.skip.pairwise_analysis,
+        ["skip", "single_config_analysis"],
+        config.skip.single_config_analysis,
+    )
+    config.skip.pairwise_comparison = _get_value(
+        args.skip_pairwise_comparison if args.skip_pairwise_comparison else None,
+        yaml_data,
+        ["skip", "pairwise_comparison"],
+        config.skip.pairwise_comparison,
     )
 
     # Handle compare_all_analysis: --no-skip-compare-all enables it
@@ -246,6 +324,12 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["skip", "cross_timestamp_comparison"],
         config.skip.cross_timestamp_comparison,
     )
+    config.skip.convert_html_to_md = _get_value(
+        args.skip_convert_html_to_md if args.skip_convert_html_to_md else None,
+        yaml_data,
+        ["skip", "convert_html_to_md"],
+        config.skip.convert_html_to_md,
+    )
     config.skip.push_results = _get_value(
         args.skip_push if args.skip_push else None,
         yaml_data,
@@ -268,11 +352,61 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["cross_timestamp", "baseline_experiment"],
         config.cross_timestamp.baseline_experiment,
     )
+    config.cross_timestamp.baseline_date = _get_value(
+        getattr(args, "baseline_date", None),
+        yaml_data,
+        ["cross_timestamp", "baseline_date"],
+        config.cross_timestamp.baseline_date,
+    )
     config.cross_timestamp.aorta_report_path = _get_value(
         args.aorta_report_path,
         yaml_data,
         ["cross_timestamp", "aorta_report_path"],
         config.cross_timestamp.aorta_report_path,
+    )
+
+    # Analysis config (labels for aorta-report)
+    config.analysis.baseline_label = _get_value(
+        getattr(args, "baseline_label", None),
+        yaml_data,
+        ["analysis", "baseline_label"],
+        config.analysis.baseline_label,
+    )
+    config.analysis.test_label = _get_value(
+        getattr(args, "test_label", None),
+        yaml_data,
+        ["analysis", "test_label"],
+        config.analysis.test_label,
+    )
+    config.analysis.report_label = _get_value(
+        getattr(args, "report_label", None),
+        yaml_data,
+        ["analysis", "report_label"],
+        config.analysis.report_label,
+    )
+
+    # skip_tracelens_single_config: CLI only (not in YAML). Only add when --skip-tracelens passed.
+    if getattr(args, "skip_tracelens", False):
+        config.analysis.skip_tracelens_single_config = True
+
+    # Git config
+    config.git.user_name = _get_value(
+        getattr(args, "git_user_name", None),
+        yaml_data,
+        ["git", "user_name"],
+        config.git.user_name,
+    )
+    config.git.user_email = _get_value(
+        getattr(args, "git_user_email", None),
+        yaml_data,
+        ["git", "user_email"],
+        config.git.user_email,
+    )
+    config.git.github_token = _get_value(
+        getattr(args, "github_token", None),
+        yaml_data,
+        ["git", "github_token"],
+        config.git.github_token,
     )
 
     # Output config
@@ -341,6 +475,12 @@ Examples:
         default=None,
         help="Path to training config YAML",
     )
+    parser.add_argument(
+        "--experiment-dir",
+        type=str,
+        default=None,
+        help="Explicit experiment directory to use (auto-detect if not specified)",
+    )
 
     # RCCL configuration
     parser.add_argument(
@@ -359,6 +499,33 @@ Examples:
     )
     parser.add_argument(
         "--container-name", type=str, default=None, help="Docker container name"
+    )
+    parser.add_argument(
+        "--docker-user",
+        type=str,
+        default=None,
+        help="Docker registry username (e.g., rocmshared)",
+    )
+    parser.add_argument(
+        "--docker-password",
+        type=str,
+        default=None,
+        help="Docker registry password/token (can also use DOCKER_PASSWORD env var)",
+    )
+    parser.add_argument(
+        "--docker-build",
+        action="store_true",
+        help="Build Docker image before starting container (default: skip build)",
+    )
+    parser.add_argument(
+        "--no-docker-build",
+        action="store_true",
+        help="Skip Docker image build, use existing image (default behavior)",
+    )
+    parser.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="Force restart container even if already running (default: reuse running container)",
     )
 
     # Skip stages
@@ -379,9 +546,19 @@ Examples:
         help="Skip performance tests stage",
     )
     parser.add_argument(
-        "--skip-pairwise-analysis",
+        "--skip-single-config-analysis",
         action="store_true",
-        help="Skip pairwise analysis stage",
+        help="Skip single-config analysis stage",
+    )
+    parser.add_argument(
+        "--skip-pairwise-comparison",
+        action="store_true",
+        help="Skip pairwise comparison stage",
+    )
+    parser.add_argument(
+        "--skip-tracelens",
+        action="store_true",
+        help="Pass --skip-tracelens to single-config aorta-report (when TraceLens already run)",
     )
     parser.add_argument(
         "--skip-compare-all",
@@ -404,10 +581,21 @@ Examples:
         help="Skip cross-timestamp comparison stage",
     )
     parser.add_argument(
+        "--skip-convert-html-to-md",
+        action="store_true",
+        help="Skip HTML-to-Markdown conversion stage (before push)",
+    )
+    parser.add_argument(
         "--baseline-experiment",
         type=str,
         default=None,
         help="Previous experiment directory for cross-timestamp comparison (auto-detect if not specified)",
+    )
+    parser.add_argument(
+        "--baseline-date",
+        type=str,
+        default=None,
+        help="Date directory in aorta-report for cross-timestamp baseline (e.g., '2026-02-19')",
     )
     parser.add_argument(
         "--aorta-report-path",
@@ -422,6 +610,46 @@ Examples:
     )
     parser.add_argument(
         "--cleanup", action="store_true", help="Cleanup container after completion"
+    )
+
+    # Analysis configuration (labels for aorta-report)
+    parser.add_argument(
+        "--baseline-label",
+        type=str,
+        default=None,
+        help="Label for baseline in aorta-report output (e.g., 'baseline', 'v1.0')",
+    )
+    parser.add_argument(
+        "--test-label",
+        type=str,
+        default=None,
+        help="Label for test in aorta-report output (e.g., 'test', 'v1.1')",
+    )
+    parser.add_argument(
+        "--report-label",
+        type=str,
+        default=None,
+        help="Override label for aorta-report directory and dashboard entry (default: date from experiment dir)",
+    )
+
+    # Git configuration
+    parser.add_argument(
+        "--git-user-name",
+        type=str,
+        default=None,
+        help="Git user name for commits (default: Weekly CI Bot)",
+    )
+    parser.add_argument(
+        "--git-user-email",
+        type=str,
+        default=None,
+        help="Git user email for commits",
+    )
+    parser.add_argument(
+        "--github-token",
+        type=str,
+        default=None,
+        help="GitHub token for aorta-report (can also use AORTA_REPORT_GITHUB_TOKEN env var)",
     )
 
     # Output configuration
