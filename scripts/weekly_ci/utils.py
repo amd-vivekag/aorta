@@ -12,8 +12,33 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+
+def extract_date_from_experiment_dir(experiment_dir: str, logger: logging.Logger) -> str:
+    """Extract YYYY-MM-DD from experiment directory name.
+
+    Format: rccl_warp_speed_YYYYMMDD_HHMMSS (e.g. experiments/rccl_warp_speed_20260224_065602)
+    Fallback: today's date if parsing fails.
+
+    Args:
+        experiment_dir: Path to experiment directory (relative or absolute).
+        logger: Logger instance for warnings.
+
+    Returns:
+        Date string in YYYY-MM-DD format.
+    """
+    exp_name = Path(experiment_dir).name
+    try:
+        timestamp_str = exp_name.replace("rccl_warp_speed_", "")
+        date_obj = datetime.strptime(timestamp_str[:8], "%Y%m%d")
+        return date_obj.strftime("%Y-%m-%d")
+    except (ValueError, IndexError):
+        result = datetime.now().strftime("%Y-%m-%d")
+        logger.warning(f"Could not parse date from {exp_name}, using today: {result}")
+        return result
 
 
 def get_repo_root() -> Path:
