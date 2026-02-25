@@ -29,6 +29,7 @@ from torch.optim import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from aorta.data import SyntheticDatasetConfig, create_dataloader
+from aorta.losses import NormalizedEntropyLoss
 from aorta.models import ModelConfig, RankingTransformerModel
 from aorta.profiling.stream_profiler import StreamProfiler
 from aorta.utils import (
@@ -67,6 +68,13 @@ class PrecisionConfig:
     reduce_dtype: str = "fp32"    # dtype for gradient all-reduce communication: fp32, fp16, bf16
     buffer_dtype: str = "fp32"    # dtype for module buffers (e.g. BatchNorm stats): fp32, fp16, bf16
     tf32_mode: str = "disabled"   # TF32 matmul mode: disabled, x1, x3
+
+
+@dataclass
+class LossConfig:
+    name: str = "bce"  # "bce" or "normalized_entropy"
+    ne_window_size: int = 100
+    ne_initial_ctr: float = 0.1
 
 
 @dataclass
@@ -175,6 +183,15 @@ def _build_precision_config(raw: Dict[str, Any]) -> PrecisionConfig:
             f"Expected one of: {', '.join(sorted(_VALID_TF32_MODES))}"
         )
 
+    return cfg
+
+
+def _build_loss_config(raw: Dict[str, Any]) -> LossConfig:
+    section = raw.get("loss", {})
+    cfg = LossConfig()
+    for field in dataclass_fields(LossConfig):
+        if field.name in section:
+            setattr(cfg, field.name, section[field.name])
     return cfg
 
 
@@ -558,9 +575,47 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
     return {key: tensor.to(device, non_blocking=True) for key, tensor in batch.items()}
 
 
-def compute_loss(scores: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+_VALID_LOSS_NAMES = frozenset({"bce", "normalized_entropy"})
+
+
+def build_loss_criterion(loss_cfg: LossConfig) -> Optional[nn.Module]:
+    """Build the loss function from config.
+
+    Returns ``None`` for BCE (handled inline by :func:`compute_loss`),
+    or a :class:`NormalizedEntropyLoss` module for NE.
+
+    Raises:
+        ValueError: If ``loss_cfg.name`` is not a recognised loss function.
+    """
+    name = loss_cfg.name.lower().strip()
+    if name not in _VALID_LOSS_NAMES:
+        raise ValueError(
+            f"Unknown loss function '{loss_cfg.name}'. "
+            f"Expected one of: {', '.join(sorted(_VALID_LOSS_NAMES))}"
+        )
+    if name == "normalized_entropy":
+        log.info(
+            "Using NormalizedEntropyLoss | window_size=%d initial_ctr=%.3f",
+            loss_cfg.ne_window_size,
+            loss_cfg.ne_initial_ctr,
+        )
+        return NormalizedEntropyLoss(
+            window_size=loss_cfg.ne_window_size,
+            initial_ctr=loss_cfg.ne_initial_ctr,
+        )
+    log.info("Using BCE loss (default)")
+    return None
+
+
+def compute_loss(
+    scores: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    criterion: Optional[nn.Module] = None,
+) -> torch.Tensor:
     target = batch["target"].to(scores.dtype)
     importance = batch["importance"].to(scores.dtype)
+    if criterion is not None:
+        return criterion(scores, target, weight=importance)
     loss = torch.nn.functional.binary_cross_entropy_with_logits(scores, target, weight=importance)
     return loss.mean()
 
@@ -608,6 +663,7 @@ def training_loop(
     profiler_cfg: ProfilerConfig,
     *,
     use_autocast: bool = False,
+    criterion: Optional[nn.Module] = None,
 ) -> None:
     rank = environment["rank"]
     world_size = environment["world_size"]
@@ -651,10 +707,10 @@ def training_loop(
                         if autocast_dtype:
                             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                                 scores = model(batch)
-                                loss = compute_loss(scores, batch)
+                                loss = compute_loss(scores, batch, criterion)
                         else:
                             scores = model(batch)
-                            loss = compute_loss(scores, batch)
+                            loss = compute_loss(scores, batch, criterion)
 
                     with profiler.range("compute", f"epoch{epoch}_step{step}_backward"):
                         if scaler is not None:
@@ -754,17 +810,24 @@ def training_loop(
                         "lr": optimizer.param_groups[0]["lr"],
                         "profile": iteration_profile,
                     }
+                    if isinstance(criterion, NormalizedEntropyLoss):
+                        iteration_payload["ne"] = criterion.normalized_entropy
+                        iteration_payload["background_ctr"] = criterion.background_ctr
 
                     iteration_payload.update(collect_rocm_metrics(enable_rocm_metrics))
                     metrics_logger.log(iteration_payload)
 
                     if global_step % training_cfg.log_interval == 0 and rank == 0:
+                        ne_str = ""
+                        if "ne" in iteration_payload:
+                            ne_str = f" NE={iteration_payload['ne']:.4f} bg_ctr={iteration_payload['background_ctr']:.4f}"
                         log.info(
-                            "epoch=%s step=%s loss=%.5f lr=%.6f overlap=%.3fms compute=%.3fms",
+                            "epoch=%s step=%s loss=%.5f lr=%.6f%s overlap=%.3fms compute=%.3fms",
                             epoch,
                             step,
                             iteration_payload["loss"],
                             iteration_payload["lr"],
+                            ne_str,
                             iteration_profile["overlap"]["overlap_ms"].get("compute_comm", 0.0),
                             iteration_profile["overlap"]["per_stream_ms"].get("compute", 0.0),
                         )
@@ -1008,8 +1071,8 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     2. ``torch.backends.cuda.matmul.allow_tf32`` — low-level flag (set
        implicitly by the API above, but also set explicitly for clarity).
     3. ``HIPBLASLT_ALLOW_TF32`` env var — **required on AMD/ROCm** to make
-       hipBLASLt select ``HIPBLAS_COMPUTE_32F_FAST_TF32`` kernels.  On NVIDIA
-       this env var is irrelevant; cuBLAS honours the PyTorch flag directly.
+       hipBLASLt select reduced-precision compute kernels.  On NVIDIA this
+       env var is irrelevant; cuBLAS honours the PyTorch flag directly.
 
     Hardware notes (AMD):
 
@@ -1018,13 +1081,13 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     * **gfx950 (MI355)** — no native TF32; ``x1`` uses a single BF16 matmul,
       ``x3`` uses three BF16 matmuls (BF16x3) for higher accuracy.
 
-    ========  ====================  ==========================  ==============
-    tf32_mode HIPBLASLT_ALLOW_TF32  float32_matmul_precision    hipBLASLt
-    ========  ====================  ==========================  ==============
+    ========  ====================  ==========================  ================================
+    tf32_mode HIPBLASLT_ALLOW_TF32  float32_matmul_precision    hipBLAS compute type
+    ========  ====================  ==========================  ================================
     disabled  (unset)               highest                     FP32 GEMM
-    x1        1                     high                        FAST_TF32 x1
-    x3        3                     high                        FAST_TF32 x3
-    ========  ====================  ==========================  ==============
+    x1        1                     high                        HIPBLAS_COMPUTE_32F_FAST_16BF
+    x3        3                     high                        HIPBLAS_COMPUTE_32F_FAST_TF32
+    ========  ====================  ==========================  ================================
 
     Returns:
         The active tf32_mode string (lower-cased, validated).
@@ -1257,6 +1320,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     scheduler_cfg = _build_scheduler_config(config)
     model_cfg = _build_model_config(config)
     dataset_cfg = _build_dataset_config(config)
+    loss_cfg = _build_loss_config(config)
     fsdp_cfg = _build_fsdp_config(config)
     ddp_cfg = _build_ddp_config(config)
     compile_cfg = _build_compile_config(config)
@@ -1302,6 +1366,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
         scheduler_cfg,
         training_cfg.max_steps or training_cfg.epochs * len(dataloader),
     )
+    criterion = build_loss_criterion(loss_cfg)
 
     profiler = StreamProfiler(env["device"])
 
@@ -1340,6 +1405,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
             enable_rocm_metrics,
             profiler_cfg,
             use_autocast=not use_fsdp,
+            criterion=criterion,
         )
     finally:
         if dist.is_initialized():

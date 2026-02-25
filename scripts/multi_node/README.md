@@ -7,6 +7,8 @@ Scripts for multi-node distributed training with custom NCCL channel and thread 
 - [Quick Start](#quick-start)
 - [Slurm Setup](#slurm-setup)
 - [Usage](#usage)
+  - [Precision Configuration](#precision-configuration)
+  - [Loss Configuration](#loss-configuration)
 - [Stopping Training](#stopping-training)
 - [Troubleshooting](#troubleshooting)
 - [NCCL Configuration](#nccl-configuration)
@@ -180,19 +182,47 @@ precision:
 | `buffer_dtype` | Dtype for module buffers (e.g. BatchNorm running mean/variance). |
 | `tf32_mode` | TF32 precision for fp32 matmuls (e.g. Shampoo optimizer). Only affects ops outside mixed-precision regions. See table below. |
 
-**`tf32_mode` values** (AMD/ROCm — controlled via `HIPBLASLT_ALLOW_TF32` → `HIPBLAS_COMPUTE_32F_FAST_TF32`):
+**`tf32_mode` values** (AMD/ROCm — controlled via `HIPBLASLT_ALLOW_TF32`):
 
-| Mode | HIPBLASLT_ALLOW_TF32 | float32_matmul_precision | Behaviour |
-|------|---------------------|-------------------------|-----------|
-| `disabled` | unset | highest | Full fp32 GEMMs |
-| `x1` | 1 | high | Single accumulation (TF32 on gfx942, BF16x1 on gfx950) — fastest |
-| `x3` | 3 | high | Triple accumulation (BF16x3) — most accurate TF32 mode |
+| Mode | HIPBLASLT_ALLOW_TF32 | hipBLAS compute type | Behaviour |
+|------|---------------------|----------------------|-----------|
+| `disabled` | unset | Full FP32 | Standard fp32 GEMMs |
+| `x1` | 1 | `HIPBLAS_COMPUTE_32F_FAST_16BF` | Single BF16 accumulation (TF32 on gfx942, BF16x1 on gfx950) — fastest |
+| `x3` | 3 | `HIPBLAS_COMPUTE_32F_FAST_TF32` | Triple BF16 accumulation (BF16x3 on gfx950) — most accurate TF32 mode |
 
 A matmul probe runs at startup to verify the configured precision mode is actually active on the hardware.
 
 **FSDP mode** uses PyTorch's native `FSDP MixedPrecision` policy — sharded parameters are stored in `param_dtype` (saving GPU memory), gradients reduced in `reduce_dtype`. No `torch.autocast` is used.
 
 **DDP mode** falls back to `torch.autocast` with `param_dtype` as the cast dtype, since DDP does not have a built-in mixed precision policy.
+
+### Loss Configuration
+
+Two loss functions are available, configured under the `loss:` section in the YAML config.
+
+**BCE** (default) — standard binary cross-entropy, no extra config needed:
+
+```yaml
+loss:
+  name: bce
+```
+
+**Normalized Entropy (NE)** — BCE normalized by the background click-through rate. Useful for recommendation workloads where the metric is click/acceptance rate:
+
+```yaml
+loss:
+  name: normalized_entropy
+  ne_window_size: 100    # mini-batches to estimate background CTR
+  ne_initial_ctr: 0.10   # assumed CTR before window fills (set to your expected acceptance rate)
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `name` | `bce` | Loss function: `bce` or `normalized_entropy` |
+| `ne_window_size` | `100` | Sliding window size (in mini-batches) for background CTR estimation |
+| `ne_initial_ctr` | `0.1` | Initial CTR assumed before the window is populated |
+
+When using `normalized_entropy`, the training log includes two extra fields: `NE` (the normalized entropy value) and `bg_ctr` (the current background CTR estimate). NE < 1.0 means the model outperforms the naive base-rate predictor.
 
 ### Experiment Output
 
