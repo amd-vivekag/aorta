@@ -45,6 +45,8 @@ class AnalysisConfig:
 
     baseline_label: str = ""  # Label for baseline in reports (e.g., "baseline", "v1.0")
     test_label: str = ""  # Label for test in reports (e.g., "test", "v1.1")
+    report_label: str = ""  # Override for aorta-report dir & dashboard (default: date from experiment)
+    skip_tracelens_single_config: bool = False  # CLI --skip-tracelens: add to single-config only
 
 
 @dataclass
@@ -56,6 +58,7 @@ class DockerConfig:
     registry_user: str = ""  # Docker registry username (e.g., rocmshared)
     registry_password: str = ""  # Docker registry password/token
     skip_build: bool = True  # Skip docker build by default (use existing image)
+    force_restart: bool = False  # If False, reuse running container; if True, always restart
 
 
 @dataclass
@@ -66,10 +69,12 @@ class SkipConfig:
     rccl_build: bool = False
     install_deps: bool = False
     performance_tests: bool = False
-    pairwise_analysis: bool = False
+    single_config_analysis: bool = False
+    pairwise_comparison: bool = False
     compare_all_analysis: bool = True  # Skip by default for initial setup
     checkout_aorta_report: bool = False  # Needed for cross-timestamp comparison
     cross_timestamp_comparison: bool = False
+    convert_html_to_md: bool = False  # Convert HTML to Markdown before push (skip to disable)
     push_results: bool = True  # Skip by default
     cleanup: bool = True  # Skip by default (leave container running)
 
@@ -245,6 +250,17 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
             config.docker.skip_build,
         )
 
+    # Force restart: --force-restart forces container restart even if running
+    if args.force_restart:
+        config.docker.force_restart = True
+    else:
+        config.docker.force_restart = _get_value(
+            None,
+            yaml_data,
+            ["docker", "force_restart"],
+            config.docker.force_restart,
+        )
+
     # Skip config - CLI flags override YAML
     config.skip.docker_setup = _get_value(
         args.skip_docker_setup if args.skip_docker_setup else None,
@@ -270,11 +286,17 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["skip", "performance_tests"],
         config.skip.performance_tests,
     )
-    config.skip.pairwise_analysis = _get_value(
-        args.skip_pairwise_analysis if args.skip_pairwise_analysis else None,
+    config.skip.single_config_analysis = _get_value(
+        args.skip_single_config_analysis if args.skip_single_config_analysis else None,
         yaml_data,
-        ["skip", "pairwise_analysis"],
-        config.skip.pairwise_analysis,
+        ["skip", "single_config_analysis"],
+        config.skip.single_config_analysis,
+    )
+    config.skip.pairwise_comparison = _get_value(
+        args.skip_pairwise_comparison if args.skip_pairwise_comparison else None,
+        yaml_data,
+        ["skip", "pairwise_comparison"],
+        config.skip.pairwise_comparison,
     )
 
     # Handle compare_all_analysis: --no-skip-compare-all enables it
@@ -301,6 +323,12 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         yaml_data,
         ["skip", "cross_timestamp_comparison"],
         config.skip.cross_timestamp_comparison,
+    )
+    config.skip.convert_html_to_md = _get_value(
+        args.skip_convert_html_to_md if args.skip_convert_html_to_md else None,
+        yaml_data,
+        ["skip", "convert_html_to_md"],
+        config.skip.convert_html_to_md,
     )
     config.skip.push_results = _get_value(
         args.skip_push if args.skip_push else None,
@@ -350,6 +378,16 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["analysis", "test_label"],
         config.analysis.test_label,
     )
+    config.analysis.report_label = _get_value(
+        getattr(args, "report_label", None),
+        yaml_data,
+        ["analysis", "report_label"],
+        config.analysis.report_label,
+    )
+
+    # skip_tracelens_single_config: CLI only (not in YAML). Only add when --skip-tracelens passed.
+    if getattr(args, "skip_tracelens", False):
+        config.analysis.skip_tracelens_single_config = True
 
     # Git config
     config.git.user_name = _get_value(
@@ -484,6 +522,11 @@ Examples:
         action="store_true",
         help="Skip Docker image build, use existing image (default behavior)",
     )
+    parser.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="Force restart container even if already running (default: reuse running container)",
+    )
 
     # Skip stages
     parser.add_argument(
@@ -503,9 +546,19 @@ Examples:
         help="Skip performance tests stage",
     )
     parser.add_argument(
-        "--skip-pairwise-analysis",
+        "--skip-single-config-analysis",
         action="store_true",
-        help="Skip pairwise analysis stage",
+        help="Skip single-config analysis stage",
+    )
+    parser.add_argument(
+        "--skip-pairwise-comparison",
+        action="store_true",
+        help="Skip pairwise comparison stage",
+    )
+    parser.add_argument(
+        "--skip-tracelens",
+        action="store_true",
+        help="Pass --skip-tracelens to single-config aorta-report (when TraceLens already run)",
     )
     parser.add_argument(
         "--skip-compare-all",
@@ -526,6 +579,11 @@ Examples:
         "--skip-cross-timestamp",
         action="store_true",
         help="Skip cross-timestamp comparison stage",
+    )
+    parser.add_argument(
+        "--skip-convert-html-to-md",
+        action="store_true",
+        help="Skip HTML-to-Markdown conversion stage (before push)",
     )
     parser.add_argument(
         "--baseline-experiment",
@@ -566,6 +624,12 @@ Examples:
         type=str,
         default=None,
         help="Label for test in aorta-report output (e.g., 'test', 'v1.1')",
+    )
+    parser.add_argument(
+        "--report-label",
+        type=str,
+        default=None,
+        help="Override label for aorta-report directory and dashboard entry (default: date from experiment dir)",
     )
 
     # Git configuration

@@ -131,7 +131,7 @@ def stage_install_dependencies(
             container_name,
             install_script,
             logger,
-            workdir="/workspace",
+            workdir="/workspace/aorta",
             check=True,
         )
         logger.info("  ✓ Dependencies installed successfully")

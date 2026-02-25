@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from ..utils import get_config_dir_name, parse_config_pairs
+from ..utils import extract_date_from_experiment_dir, get_config_dir_name, parse_config_pairs
 
 
 def stage_generate_summary(
@@ -406,4 +406,335 @@ def update_dashboard_file(
     logger.info(f"  ✓ Dashboard updated: {dashboard_path}")
 
     return dashboard_path
+
+
+# =============================================================================
+# Dashboard Integration Functions
+# =============================================================================
+#
+# How we calculate a single improvement number from all the data:
+# ----------------------------------------------------------------
+# 1. For each configuration (e.g., 32cu_512threads), we read the
+#    `final_analysis_report.xlsx` from the cross_timestamp_comparison folder.
+#
+# 2. The "Summary_Dashboard" sheet contains pre-calculated improvements for
+#    multiple metrics like GPU_total_time, GPU_computation_time, NCCL_latency, etc.
+#
+# 3. We select KEY METRICS that represent overall performance:
+#    - GPU_total_time: Total GPU execution time (lower is better)
+#    - GPU_computation_time: Pure compute time (lower is better)
+#    - GPU_exposed_comm_time: Communication not overlapped with compute (lower is better)
+#
+# 4. We AVERAGE the improvement percentages across these key metrics to get
+#    a single "overall improvement" number for each configuration.
+#
+# 5. The dashboard shows per-configuration improvements and an overall average
+#    across all configurations.
+#
+# Note: The improvement percentages are normalized so that:
+#    - POSITIVE = improvement (things got faster/better)
+#    - NEGATIVE = regression (things got slower/worse)
+#
+# TODO: Enhance aorta-report to output a JSON summary file alongside Excel
+#       to make metric extraction more robust and future-proof.
+# =============================================================================
+
+# Key metrics to use for overall improvement calculation
+# These represent the most important performance indicators
+KEY_METRICS = [
+    "GPU_total_time",
+    "GPU_computation_time", 
+    "GPU_exposed_comm_time",
+]
+
+
+def extract_metrics_from_excel(
+    excel_path: Path,
+    logger: logging.Logger,
+) -> dict[str, float]:
+    """Extract improvement metrics from final_analysis_report.xlsx.
+
+    Reads the Summary_Dashboard sheet which contains pre-calculated
+    improvement percentages for various metrics.
+
+    Args:
+        excel_path: Path to final_analysis_report.xlsx.
+        logger: Logger instance.
+
+    Returns:
+        Dict mapping metric names to improvement percentages.
+        Empty dict if extraction fails.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        logger.warning("pandas not available, cannot extract metrics from Excel")
+        return {}
+
+    if not excel_path.exists():
+        logger.debug(f"Excel file not found: {excel_path}")
+        return {}
+
+    try:
+        df = pd.read_excel(excel_path, sheet_name="Summary_Dashboard")
+        
+        metrics = {}
+        for _, row in df.iterrows():
+            metric_name = row.get("Metric", "")
+            improvement = row.get("Improvement (%)", 0)
+            if metric_name and pd.notna(improvement):
+                metrics[metric_name] = float(improvement)
+        
+        logger.debug(f"Extracted {len(metrics)} metrics from {excel_path.name}")
+        return metrics
+    
+    except Exception as e:
+        logger.warning(f"Failed to extract metrics from {excel_path}: {e}")
+        return {}
+
+
+def calculate_overall_improvement(
+    metrics: dict[str, float],
+    key_metrics: list[str] = None,
+) -> float:
+    """Calculate overall improvement from multiple metrics.
+
+    Takes the average of key metric improvements to produce a single
+    representative number.
+
+    Args:
+        metrics: Dict mapping metric names to improvement percentages.
+        key_metrics: List of metric names to use (defaults to KEY_METRICS).
+
+    Returns:
+        Average improvement percentage across key metrics.
+        Returns 0.0 if no key metrics found.
+    """
+    if key_metrics is None:
+        key_metrics = KEY_METRICS
+
+    improvements = []
+    for metric in key_metrics:
+        if metric in metrics:
+            improvements.append(metrics[metric])
+
+    if not improvements:
+        # Fall back to average of all available metrics
+        if metrics:
+            return sum(metrics.values()) / len(metrics)
+        return 0.0
+
+    return sum(improvements) / len(improvements)
+
+
+def get_status_emoji(improvement_pct: float) -> str:
+    """Get status emoji based on improvement percentage.
+
+    Args:
+        improvement_pct: Improvement percentage (positive = better).
+
+    Returns:
+        Emoji string: 🟢 (>+2%), 🟡 (±2%), 🔴 (<-2%), ⚪ (no data)
+    """
+    if improvement_pct > 2:
+        return "🟢"  # Significant improvement
+    elif improvement_pct < -2:
+        return "🔴"  # Significant regression
+    else:
+        return "🟡"  # Neutral / within noise
+
+
+def generate_dashboard_row(
+    experiment_dir: Path,
+    config_pairs: str,
+    date_str: str,
+    logger: logging.Logger,
+) -> Optional[str]:
+    """Generate a markdown dashboard row for the current experiment.
+
+    Reads cross_timestamp_comparison results for each configuration and
+    calculates overall improvement percentages.
+
+    Args:
+        experiment_dir: Path to the experiment directory.
+        config_pairs: Space-separated CU,threads pairs.
+        date_str: Date string for the row (e.g., "2026-02-23").
+        logger: Logger instance.
+
+    Returns:
+        Markdown table row string, or None if no data available.
+        Format: | 2026-02-23 | 🟢 +3.2% | 🟡 +0.8% | 🟢 +2.5% | 🟢 +2.2% | [View](...) |
+    """
+    cross_ts_dir = experiment_dir / "cross_timestamp_comparison"
+    
+    if not cross_ts_dir.exists():
+        logger.warning(f"Cross-timestamp comparison directory not found: {cross_ts_dir}")
+        return None
+
+    # Parse configurations
+    pairs = parse_config_pairs(config_pairs)
+    config_results = {}
+
+    for cu, threads in pairs:
+        config_name = get_config_dir_name(cu, threads)
+        config_dir = cross_ts_dir / config_name
+        excel_path = config_dir / "final_analysis_report.xlsx"
+
+        if excel_path.exists():
+            metrics = extract_metrics_from_excel(excel_path, logger)
+            if metrics:
+                overall_imp = calculate_overall_improvement(metrics)
+                config_results[config_name] = overall_imp
+                logger.debug(f"  {config_name}: {overall_imp:+.1f}%")
+            else:
+                config_results[config_name] = None
+        else:
+            logger.debug(f"  {config_name}: no Excel file found")
+            config_results[config_name] = None
+
+    if not any(v is not None for v in config_results.values()):
+        logger.warning("No metrics extracted from any configuration")
+        return None
+
+    # Build table cells for each configuration
+    cells = []
+    valid_improvements = []
+    
+    for cu, threads in pairs:
+        config_name = get_config_dir_name(cu, threads)
+        # Shorten config name for table (56cu_256threads -> 56cu_256t)
+        short_name = f"{cu}cu_{threads}t"
+        
+        imp = config_results.get(config_name)
+        if imp is not None:
+            emoji = get_status_emoji(imp)
+            cells.append(f"{emoji} {imp:+.1f}%")
+            valid_improvements.append(imp)
+        else:
+            cells.append("⚪ —")
+
+    # Calculate overall improvement (average across configs)
+    if valid_improvements:
+        overall_imp = sum(valid_improvements) / len(valid_improvements)
+        overall_emoji = get_status_emoji(overall_imp)
+        overall_cell = f"{overall_emoji} {overall_imp:+.1f}%"
+    else:
+        overall_cell = "⚪ —"
+
+    # Build the row
+    row = f"| {date_str} | {' | '.join(cells)} | {overall_cell} | [View]({date_str}/rccl-warp-speed/) |"
+
+    logger.info(f"Generated dashboard row: {row}")
+    return row
+
+
+def update_readme_dashboard(
+    aorta_report_dir: Path,
+    new_row: str,
+    logger: logging.Logger,
+) -> bool:
+    """Insert new dashboard row into aorta-report README.
+
+    Finds the dashboard table in README.md and inserts the new row
+    after the table header separator.
+
+    Args:
+        aorta_report_dir: Path to the aorta-report repository.
+        new_row: Markdown table row to insert.
+        logger: Logger instance.
+
+    Returns:
+        True if update successful, False otherwise.
+    """
+    readme_path = aorta_report_dir / "README.md"
+
+    if not readme_path.exists():
+        logger.error(f"README not found: {readme_path}")
+        return False
+
+    content = readme_path.read_text()
+
+    # Find the dashboard table header separator
+    # Table format: | Date | 56cu_256t | 37cu_384t | 32cu_512t | Overall | Details |
+    # We look for the separator line after the header
+    marker = "|------|"
+
+    if marker not in content:
+        logger.warning("Could not find dashboard table marker in README")
+        logger.warning("  Expected table with '|------|' separator")
+        return False
+
+    # Find the full separator line and insert after it
+    lines = content.split("\n")
+    new_lines = []
+    inserted = False
+
+    for line in lines:
+        new_lines.append(line)
+        if not inserted and marker in line and line.strip().startswith("|"):
+            # Insert new row after separator
+            new_lines.append(new_row)
+            inserted = True
+
+    if not inserted:
+        logger.warning("Failed to insert dashboard row")
+        return False
+
+    # Write updated content
+    readme_path.write_text("\n".join(new_lines))
+    logger.info(f"  ✓ Dashboard updated in {readme_path}")
+
+    return True
+
+
+def stage_update_dashboard(
+    experiment_dir: str,
+    repo_root: Path,
+    config_pairs: str,
+    aorta_report_dir: Path,
+    logger: logging.Logger,
+    report_label: Optional[str] = None,
+) -> bool:
+    """Update aorta-report README dashboard with current experiment results.
+
+    This is the main entry point for dashboard integration, to be called
+    from the push results stage.
+
+    Args:
+        experiment_dir: Path to experiment directory (relative to repo_root).
+        repo_root: Path to the aorta repository root.
+        config_pairs: Space-separated CU,threads pairs.
+        aorta_report_dir: Path to the aorta-report repository.
+        logger: Logger instance.
+        report_label: Optional override for dashboard entry (default: date from experiment dir).
+
+    Returns:
+        True if dashboard updated successfully, False otherwise.
+    """
+    logger.info("Updating aorta-report dashboard...")
+
+    exp_path = repo_root / experiment_dir
+
+    # Use report_label override or extract date from experiment directory
+    if report_label and report_label.strip():
+        date_str = report_label.strip()
+    else:
+        date_str = extract_date_from_experiment_dir(experiment_dir, logger)
+
+    # Generate dashboard row
+    row = generate_dashboard_row(exp_path, config_pairs, date_str, logger)
+
+    if not row:
+        logger.warning("  Could not generate dashboard row (no cross-timestamp data)")
+        return False
+
+    # Update README
+    success = update_readme_dashboard(aorta_report_dir, row, logger)
+
+    if success:
+        logger.info("  ✓ Dashboard integration complete")
+    else:
+        logger.warning("  Dashboard update failed")
+
+    return success
 

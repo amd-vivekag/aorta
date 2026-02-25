@@ -78,7 +78,7 @@ def stage_run_performance_tests(
             container_name,
             test_script,
             logger,
-            workdir="/workspace",
+            workdir="/workspace/aorta",
             check=True,
         )
         logger.info("  ✓ Performance tests completed successfully")
@@ -139,6 +139,38 @@ def stage_find_experiment_dir(
     return str(relative_path)
 
 
+def _find_latest_aorta_report_date(aorta_report_dir: Path, logger: logging.Logger) -> Optional[Path]:
+    """Find the most recent date directory in aorta-report containing rccl-warp-speed results.
+
+    Args:
+        aorta_report_dir: Path to aorta-report repository.
+        logger: Logger instance.
+
+    Returns:
+        Path to the most recent rccl-warp-speed directory, or None if not found.
+    """
+    if not aorta_report_dir or not aorta_report_dir.exists():
+        return None
+
+    # Look for date directories (format: YYYY-MM-DD) containing rccl-warp-speed
+    date_dirs = []
+    for item in aorta_report_dir.iterdir():
+        if item.is_dir() and len(item.name) == 10 and item.name[4] == '-' and item.name[7] == '-':
+            rccl_path = item / "rccl-warp-speed"
+            if rccl_path.exists() and rccl_path.is_dir():
+                date_dirs.append((item.name, rccl_path))
+
+    if not date_dirs:
+        return None
+
+    # Sort by date (descending) and return the most recent
+    date_dirs.sort(key=lambda x: x[0], reverse=True)
+    latest_date, latest_path = date_dirs[0]
+    logger.debug(f"  Found {len(date_dirs)} date directories in aorta-report, latest: {latest_date}")
+
+    return latest_path
+
+
 def stage_find_baseline_experiment_dir(
     repo_root: Path,
     baseline_experiment: str,
@@ -150,8 +182,9 @@ def stage_find_baseline_experiment_dir(
 
     Priority order:
     1. baseline_experiment - explicit local experiment path
-    2. baseline_date + aorta_report_dir - date directory in aorta-report
-    3. Auto-detect second most recent local experiment
+    2. baseline_date + aorta_report_dir - explicit date directory in aorta-report
+    3. Auto-detect most recent date in aorta-report (if checked out)
+    4. Auto-detect second most recent local experiment
 
     Args:
         repo_root: Path to the repository root.
@@ -176,25 +209,51 @@ def stage_find_baseline_experiment_dir(
             logger.warning(f"  Provided baseline not found: {baseline_experiment}")
             logger.info("  Attempting other options...")
 
-    # Option 2: Date directory in aorta-report
+    # Option 2: Explicit date directory in aorta-report
     if baseline_date and aorta_report_dir:
         aorta_baseline_path = aorta_report_dir / baseline_date / "rccl-warp-speed"
         if aorta_baseline_path.exists():
             logger.info(f"  Using aorta-report baseline from {baseline_date}")
-            logger.info(f"    Path: {aorta_baseline_path}")
-            return str(aorta_baseline_path)
+            # Return relative path if aorta-report is inside repo (for Docker compatibility)
+            try:
+                relative_path = aorta_baseline_path.relative_to(repo_root)
+                logger.info(f"    Path (relative): {relative_path}")
+                return str(relative_path)
+            except ValueError:
+                # aorta-report is outside repo, return absolute path
+                logger.info(f"    Path (absolute): {aorta_baseline_path}")
+                return str(aorta_baseline_path)
         else:
             logger.warning(f"  Baseline date not found in aorta-report: {baseline_date}")
             logger.info(f"    Expected path: {aorta_baseline_path}")
             logger.info("  Attempting auto-detection...")
 
-    # Option 3: Auto-detect second most recent local experiment
+    # Option 3: Auto-detect most recent date in aorta-report
+    if aorta_report_dir and aorta_report_dir.exists():
+        logger.info("  Searching aorta-report for most recent baseline...")
+        aorta_baseline_path = _find_latest_aorta_report_date(aorta_report_dir, logger)
+        if aorta_baseline_path:
+            logger.info(f"  Found baseline in aorta-report: {aorta_baseline_path.parent.name}")
+            # Return relative path if aorta-report is inside repo (for Docker compatibility)
+            try:
+                relative_path = aorta_baseline_path.relative_to(repo_root)
+                logger.info(f"    Path (relative): {relative_path}")
+                return str(relative_path)
+            except ValueError:
+                # aorta-report is outside repo, return absolute path
+                logger.info(f"    Path (absolute): {aorta_baseline_path}")
+                return str(aorta_baseline_path)
+        else:
+            logger.info("  No rccl-warp-speed results found in aorta-report")
+            logger.info("  Attempting local auto-detection...")
+
+    # Option 4: Auto-detect second most recent local experiment
     experiments_dir = repo_root / "experiments"
     baseline_dir = find_second_latest_experiment_dir(experiments_dir)
 
     if baseline_dir is None:
         logger.warning("  No baseline experiment directory found for cross-timestamp comparison")
-        logger.warning("  (Need at least 2 experiment runs, or use --baseline-experiment or --baseline-date)")
+        logger.warning("  (Need at least 2 experiment runs, aorta-report with results, or use --baseline-experiment)")
         return None
 
     # Return relative path for local experiments
