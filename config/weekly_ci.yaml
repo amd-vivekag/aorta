@@ -42,6 +42,7 @@ skip:
   compare_all_analysis: true   # Skipped by default (expensive)
   checkout_aorta_report: false
   cross_timestamp_comparison: false
+  convert_html_to_md: false     # Skip HTML-to-MD conversion (set true to skip this stage)
   push_results: false           # Skipped by default (avoid accidental pushes)
   cleanup: true                # Skipped by default (keep container running)
 

@@ -24,6 +24,7 @@ from .reporting import (
     stage_update_dashboard,
     update_dashboard_file,
 )
+from .convert import stage_convert_html_to_md
 from .repository import (
     stage_checkout_aorta_report,
     stage_push_results,
@@ -56,6 +57,8 @@ __all__ = [
     "stage_pairwise_comparison",
     "stage_compare_all_analysis",
     "stage_cross_timestamp_comparison",
+    # Convert
+    "stage_convert_html_to_md",
     # Repository
     "stage_checkout_aorta_report",
     "stage_push_results",

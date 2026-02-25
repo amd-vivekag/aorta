@@ -146,6 +146,7 @@ skip:
   compare_all_analysis: true    # Expensive, skip by default
   checkout_aorta_report: false
   cross_timestamp_comparison: false
+  convert_html_to_md: false     # Convert HTML to Markdown before push (set true to skip)
   push_results: true            # Avoid accidental pushes
   cleanup: true                 # Keep container running
 
@@ -209,6 +210,7 @@ Skip Stages:
   --no-skip-compare-all Enable compare-all analysis
   --skip-checkout-aorta-report  Skip aorta-report checkout
   --skip-cross-timestamp  Skip cross-timestamp comparison
+  --skip-convert-html-to-md  Skip HTML-to-Markdown conversion (before push)
   --skip-push           Skip pushing results
 
 Cross-Timestamp Options:
@@ -249,8 +251,9 @@ The script executes these stages in order:
 | 10. Checkout aorta-report | Clone/update report repo | Yes |
 | 11. Cross-Timestamp | Compare with previous run | Yes |
 | 12. Generate Summary | Create summary report and dashboard row | No |
-| 13. Push Results | Push to aorta-report | Yes (default: skip) |
-| 14. Cleanup | Stop container | Yes (default: skip) |
+| 13. Convert HTML to MD | Convert HTML reports to Markdown | Yes |
+| 14. Push Results | Push to aorta-report | Yes (default: skip) |
+| 15. Cleanup | Stop container | Yes (default: skip) |
 
 ### Data Flow Between Stages
 
@@ -261,7 +264,7 @@ Stages discover their inputs from the filesystem or previous stages:
 | 6. Find Experiment Dir | Scans `experiments/rccl_warp_speed_*` | `--experiment-dir` |
 | 7-9. Analysis | Uses experiment dir from Stage 6 | (automatic) |
 | 11. Cross-Timestamp | Local experiments or aorta-report | `--baseline-experiment` or `--baseline-date` |
-| 12-13. Summary & Push | Experiment dir for data; date from dir for aorta-report path | `--report-label` |
+| 12-14. Summary, Convert, Push | Experiment dir for data; date from dir for aorta-report path | `--report-label`, `--skip-convert-html-to-md` |
 
 #### Explicit Experiment Directory
 
@@ -311,6 +314,16 @@ python scripts/weekly_ci_kickoff.py --report-label "2026-02-24" ...
 ```
 
 This affects only the aorta-report directory name (`aorta-report/{label}/rccl-warp-speed/`) and the first column of the dashboard table. The **experiment directory** (source of data) is unchanged.
+
+#### Convert HTML to Markdown (Stage 13)
+
+By default, Stage 13 converts all HTML files in the experiment directory to Markdown before pushing to aorta-report. Original HTML files are kept. Requires `beautifulsoup4` (`pip install beautifulsoup4`). Skip with `--skip-convert-html-to-md` or set `skip.convert_html_to_md: true` in config.
+
+**Standalone usage:**
+```bash
+python scripts/weekly_ci/stages/convert.py experiments/rccl_warp_speed_20260224_065602
+python scripts/weekly_ci/stages/convert.py experiments/rccl_warp_speed_20260224_065602 -v
+```
 
 ## Expected Output
 
@@ -491,6 +504,7 @@ scripts/
         ├── build.py          # RCCL build
         ├── test.py           # Performance tests
         ├── analysis.py       # Analysis stages
+        ├── convert.py        # HTML-to-Markdown conversion (runnable standalone)
         ├── repository.py     # Git operations
         └── reporting.py      # Summary generation
 ```

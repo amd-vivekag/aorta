@@ -74,6 +74,7 @@ class SkipConfig:
     compare_all_analysis: bool = True  # Skip by default for initial setup
     checkout_aorta_report: bool = False  # Needed for cross-timestamp comparison
     cross_timestamp_comparison: bool = False
+    convert_html_to_md: bool = False  # Convert HTML to Markdown before push (skip to disable)
     push_results: bool = True  # Skip by default
     cleanup: bool = True  # Skip by default (leave container running)
 
@@ -322,6 +323,12 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         yaml_data,
         ["skip", "cross_timestamp_comparison"],
         config.skip.cross_timestamp_comparison,
+    )
+    config.skip.convert_html_to_md = _get_value(
+        args.skip_convert_html_to_md if args.skip_convert_html_to_md else None,
+        yaml_data,
+        ["skip", "convert_html_to_md"],
+        config.skip.convert_html_to_md,
     )
     config.skip.push_results = _get_value(
         args.skip_push if args.skip_push else None,
@@ -572,6 +579,11 @@ Examples:
         "--skip-cross-timestamp",
         action="store_true",
         help="Skip cross-timestamp comparison stage",
+    )
+    parser.add_argument(
+        "--skip-convert-html-to-md",
+        action="store_true",
+        help="Skip HTML-to-Markdown conversion stage (before push)",
     )
     parser.add_argument(
         "--baseline-experiment",

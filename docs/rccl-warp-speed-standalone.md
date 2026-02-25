@@ -93,6 +93,7 @@ output:
 | `--baseline-label` | Label for baseline in aorta-report output | From config |
 | `--test-label` | Label for test in aorta-report output | From config |
 | `--report-label` | Override for aorta-report dir and dashboard entry | Date from experiment |
+| `--skip-convert-html-to-md` | Skip HTML-to-Markdown conversion stage | From config |
 | `--skip-push` | Skip pushing to aorta-report | From config |
 | `--cleanup` | Cleanup container after run | From config |
 | `--log-level` | Logging level (DEBUG/INFO/WARNING/ERROR) | INFO |
@@ -1456,6 +1457,7 @@ skip:
   compare_all_analysis: true       # Skip by default for initial setup
   checkout_aorta_report: false     # Needed for cross-timestamp comparison
   cross_timestamp_comparison: false
+  convert_html_to_md: false         # Convert HTML to Markdown before push (set true to skip)
   push_results: true               # Skip by default (requires SSH access)
   cleanup: true                    # Skip by default (leave container running)
 

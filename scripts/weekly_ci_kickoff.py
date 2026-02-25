@@ -52,6 +52,7 @@ from weekly_ci.stages import (
     stage_cleanup,
     stage_compare_all_analysis,
     stage_cross_timestamp_comparison,
+    stage_convert_html_to_md,
     stage_docker_setup,
     stage_find_baseline_experiment_dir,
     stage_find_experiment_dir,
@@ -415,10 +416,32 @@ def main() -> int:
             logger.warning("Summary/dashboard generation failed but continuing...")
 
         # =====================================================================
-        # Stage 13: Push Results
+        # Stage 13: Convert HTML to Markdown
+        # =====================================================================
+        if config.skip.convert_html_to_md:
+            log_stage_skip(logger, "13. Convert HTML to Markdown")
+        else:
+            log_stage_start(logger, "13. Convert HTML to Markdown")
+            try:
+                if config.experiment_dir:
+                    stage_convert_html_to_md(
+                        experiment_dir=config.experiment_dir,
+                        repo_root=repo_root,
+                        logger=logger,
+                    )
+                    log_stage_complete(logger, "Convert HTML to Markdown")
+                else:
+                    logger.warning("  Skipping (no experiment directory)")
+                    log_stage_complete(logger, "Convert HTML to Markdown")
+            except Exception as e:
+                log_stage_error(logger, "Convert HTML to Markdown", str(e))
+                logger.warning("HTML conversion failed but continuing...")
+
+        # =====================================================================
+        # Stage 14: Push Results
         # =====================================================================
         if config.skip.push_results:
-            log_stage_skip(logger, "13. Push Results")
+            log_stage_skip(logger, "14. Push Results")
         else:
             log_stage_start(logger, "13. Push Results")
             try:
@@ -443,12 +466,12 @@ def main() -> int:
                 raise
 
         # =====================================================================
-        # Stage 14: Cleanup
+        # Stage 15: Cleanup
         # =====================================================================
         if config.skip.cleanup:
-            log_stage_skip(logger, "14. Cleanup")
+            log_stage_skip(logger, "15. Cleanup")
         else:
-            log_stage_start(logger, "14. Cleanup")
+            log_stage_start(logger, "15. Cleanup")
             try:
                 stage_cleanup(
                     compose_file=config.docker.compose_file,
