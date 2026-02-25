@@ -89,6 +89,11 @@ output:
 | `--skip-cross-timestamp` | Skip cross-timestamp comparison | From config |
 | `--baseline-experiment` | Previous experiment dir for cross-timestamp comparison | Auto-detect |
 | `--aorta-report-path` | Path to aorta-report repository | `../aorta-report` |
+| `--baseline-date` | Date dir in aorta-report for cross-timestamp baseline | Auto-detect |
+| `--baseline-label` | Label for baseline in aorta-report output | From config |
+| `--test-label` | Label for test in aorta-report output | From config |
+| `--report-label` | Override for aorta-report dir and dashboard entry | Date from experiment |
+| `--skip-convert-html-to-md` | Skip HTML-to-Markdown conversion stage | From config |
 | `--skip-push` | Skip pushing to aorta-report | From config |
 | `--cleanup` | Cleanup container after run | From config |
 | `--log-level` | Logging level (DEBUG/INFO/WARNING/ERROR) | INFO |
@@ -131,37 +136,39 @@ output:
 │     • Execute run_rccl_warp_speed_comparison.sh             │
 │     • Find generated experiment directory                   │
 ├─────────────────────────────────────────────────────────────┤
-│  6. Run Pairwise Analysis                       [SKIPPABLE] │
-│     • Step 1: Generate summary for ALL configs              │
-│       └─ aorta-report pipeline summary --test-dir <dir>     │
-│     • Step 2: Pairwise comparison (baseline vs each)        │
-│       └─ aorta-report pipeline summary --baseline --test    │
-│          --skip-tracelens                                   │
+│  6. Single Config Analysis                       [SKIPPABLE] │
+│     • aorta-report pipeline summary --test <dir> per config  │
+│     • Default: run TraceLens; use --skip-tracelens to skip  │
 ├─────────────────────────────────────────────────────────────┤
-│  7. Run Compare-All Analysis          [SKIPPABLE, OFF*]     │
+│  7. Pairwise Comparison                         [SKIPPABLE] │
+│     • aorta-report pipeline summary --baseline --test       │
+│       --skip-tracelens (always)                              │
+├─────────────────────────────────────────────────────────────┤
+│  8. Run Compare-All Analysis          [SKIPPABLE, OFF*]     │
 │     • Merged report of all configurations                   │
 │     * Skipped by default for initial setup                  │
 ├─────────────────────────────────────────────────────────────┤
-│  8. Checkout aorta-report                       [SKIPPABLE] │
+│  9. Checkout aorta-report                       [SKIPPABLE] │
 │     • Clone or update aorta-report repository               │
 │     • Required for cross-timestamp comparison               │
 ├─────────────────────────────────────────────────────────────┤
-│  9. Cross-Timestamp Comparison                  [SKIPPABLE] │
+│ 10. Cross-Timestamp Comparison                  [SKIPPABLE] │
 │     • Find previous experiment (from config or auto-detect) │
 │     • Compare each config: older timestamp = baseline,      │
 │       newer timestamp = test                                │
 │     • aorta-report pipeline summary --baseline <old>        │
 │       --test <new> --skip-tracelens                         │
 ├─────────────────────────────────────────────────────────────┤
-│ 10. Generate Summary Report                                 │
+│ 11. Generate Summary Report                                 │
 │     • Print summary to terminal                             │
 │     • Save summary to file                                  │
 ├─────────────────────────────────────────────────────────────┤
-│ 11. Push to aorta-report (Optional)             [SKIPPABLE] │
+│ 12. Push to aorta-report (Optional)             [SKIPPABLE] │
 │     • Copy results to dated directory                       │
 │     • Commit and push                                       │
+│     • Update README dashboard                               │
 ├─────────────────────────────────────────────────────────────┤
-│ 12. Cleanup                                     [SKIPPABLE] │
+│ 13. Cleanup                                     [SKIPPABLE] │
 │     • docker compose down                                   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -181,7 +188,11 @@ experiments/rccl_warp_speed_YYYYMMDD_HHMMSS/
 │   └── summary/
 ├── 32cu_512threads/              # Test configuration 2
 │   └── summary/
-├── comparison_results/           # Pairwise comparisons (--skip-tracelens)
+├── single_config_results/        # Single-config summaries (Stage 6)
+│   ├── single_config_56cu_256threads/
+│   ├── single_config_37cu_384threads/
+│   └── single_config_32cu_512threads/
+├── comparison_results/           # Pairwise comparisons (Stage 7)
 │   ├── baseline_vs_37cu_384threads/
 │   └── baseline_vs_32cu_512threads/
 ├── cross_timestamp_comparison/   # Comparison with previous run (older=baseline, newer=test)
@@ -1446,6 +1457,7 @@ skip:
   compare_all_analysis: true       # Skip by default for initial setup
   checkout_aorta_report: false     # Needed for cross-timestamp comparison
   cross_timestamp_comparison: false
+  convert_html_to_md: false         # Convert HTML to Markdown before push (set true to skip)
   push_results: true               # Skip by default (requires SSH access)
   cleanup: true                    # Skip by default (leave container running)
 
@@ -1454,8 +1466,16 @@ cross_timestamp:
   # Previous experiment directory to compare against (optional)
   # If not specified, auto-detects the second-most-recent experiment
   baseline_experiment: ""
+  # Date directory in aorta-report for baseline (e.g., "2026-02-19")
+  baseline_date: ""
   # Path to aorta-report repository (for finding previous runs)
   aorta_report_path: "../aorta-report"
+
+# Analysis labels (for aorta-report commands)
+analysis:
+  baseline_label: ""    # e.g., "baseline", "v1.0"
+  test_label: ""        # e.g., "test", "v1.1"
+  report_label: ""      # Override aorta-report dir & dashboard (default: date from experiment)
 
 # Output settings
 output:
@@ -1531,6 +1551,10 @@ python scripts/weekly_ci_kickoff.py \
 # Use custom aorta-report path
 python scripts/weekly_ci_kickoff.py \
     --aorta-report-path /path/to/aorta-report
+
+# Override label for aorta-report directory and dashboard (default: date from experiment dir)
+python scripts/weekly_ci_kickoff.py --report-label "v1.2.3" ...
+python scripts/weekly_ci_kickoff.py --report-label "2026-02-24" ...
 
 # Skip cross-timestamp comparison entirely
 python scripts/weekly_ci_kickoff.py --skip-cross-timestamp
@@ -2218,11 +2242,19 @@ config/
 ```
 
 **Deliverables:**
-- [ ] Create directory structure
-- [ ] Create `config.py` with all dataclasses
-- [ ] Create `logging_setup.py` with ColoredFormatter
-- [ ] Create `utils.py` with run_command and docker_exec
-- [ ] Create default `config/weekly_ci.yaml`
+- [x] Create directory structure
+- [x] Create `config.py` with all dataclasses
+- [x] Create `logging_setup.py` with ColoredFormatter
+- [x] Create `utils.py` with run_command and docker_exec
+- [x] Create default `config/weekly_ci.yaml`
+
+**Note:** Actual file structure differs slightly from plan:
+- `rccl.py` + `dependencies.py` → combined into `build.py`
+- `performance.py` → renamed to `test.py`
+- `cross_timestamp.py` → merged into `analysis.py` and `repository.py`
+- `summary.py` → renamed to `reporting.py`
+- `push.py` → merged into `repository.py`
+- `cleanup.py` → merged into `docker.py`
 
 ---
 
@@ -2231,16 +2263,18 @@ config/
 
 ```python
 # Implementation checklist:
-- [ ] RCCLConfig dataclass
-- [ ] TestConfig dataclass  
-- [ ] DockerConfig dataclass
-- [ ] SkipConfig dataclass
-- [ ] CrossTimestampConfig dataclass
-- [ ] OutputConfig dataclass
-- [ ] Config main dataclass
-- [ ] load_config_file() function
-- [ ] merge_config() function
-- [ ] parse_args() function
+- [x] RCCLConfig dataclass
+- [x] TestConfig dataclass  
+- [x] DockerConfig dataclass
+- [x] SkipConfig dataclass
+- [x] CrossTimestampConfig dataclass
+- [x] OutputConfig dataclass
+- [x] Config main dataclass
+- [x] load_config_file() function
+- [x] merge_config() function
+- [x] parse_args() function
+- [x] AnalysisConfig dataclass (additional)
+- [x] GitConfig dataclass (additional)
 ```
 
 **Testing:**
@@ -2258,13 +2292,15 @@ python -c "from weekly_ci.config import Config, load_config_file; print(load_con
 
 ```python
 # Implementation checklist:
-- [ ] Check Docker installed
-- [ ] Check Docker daemon running
-- [ ] Check docker compose available
-- [ ] Check in aorta repo root (pyproject.toml, src/aorta)
-- [ ] Check docker-compose file exists
-- [ ] Check training config exists
+- [x] Check Docker installed
+- [x] Check Docker daemon running
+- [x] Check docker compose available
+- [x] Check in aorta repo root (pyproject.toml, src/aorta)
+- [x] Check docker-compose file exists
+- [x] Check training config exists
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/validate.py`
 
 **Testing:**
 ```bash
@@ -2282,15 +2318,17 @@ cd /tmp && python -c "..."  # Should error
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] Stop existing container (ignore errors)
-- [ ] Remove existing container (ignore errors)
-- [ ] docker compose down (ignore errors)
-- [ ] docker compose build
-- [ ] docker compose up -d
-- [ ] Wait for container ready (5s sleep)
-- [ ] Verify container is running
+- [x] Check skip flag
+- [x] Stop existing container (ignore errors)
+- [x] Remove existing container (ignore errors)
+- [x] docker compose down (ignore errors)
+- [x] docker compose build (conditional on --docker-build flag)
+- [x] docker compose up -d
+- [x] Wait for container ready (5s sleep)
+- [x] Verify container is running
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/docker.py`
 
 **Testing:**
 ```bash
@@ -2301,17 +2339,19 @@ python scripts/weekly_ci_kickoff.py --skip-rccl-build --skip-install-deps --skip
 ---
 
 #### Task 2.3: Stage 3 - Build RCCL
-**File:** `scripts/weekly_ci/stages/rccl.py`
+**File:** `scripts/weekly_ci/stages/build.py` (was planned as `rccl.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] Create /rccl directory in container
-- [ ] Clone or update rccl repo
-- [ ] Checkout specified branch
-- [ ] Run install.sh with GPU target
-- [ ] Verify build output exists
+- [x] Check skip flag
+- [x] Create /rccl directory in container
+- [x] Clone or update rccl repo
+- [x] Checkout specified branch
+- [x] Run install.sh with GPU target
+- [x] Verify build output exists
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/build.py` (`stage_build_rccl`)
 
 **Dependencies:** Stage 2 (Docker must be running)
 
@@ -2324,31 +2364,35 @@ python scripts/weekly_ci_kickoff.py --skip-rccl-build --skip-install-deps --skip
 ---
 
 #### Task 2.4: Stage 4 - Install Dependencies  
-**File:** `scripts/weekly_ci/stages/dependencies.py`
+**File:** `scripts/weekly_ci/stages/build.py` (was planned as `dependencies.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] pip install -e . (current package)
-- [ ] pip install -r requirements.txt
-- [ ] pip install pandas openpyxl matplotlib seaborn numpy
+- [x] Check skip flag
+- [x] pip install -e . (current package)
+- [x] pip install -r requirements.txt
+- [x] pip install pandas openpyxl matplotlib seaborn numpy
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/build.py` (`stage_install_dependencies`)
 
 **Dependencies:** Stage 2
 
 ---
 
 #### Task 2.5: Stage 5 - Run Performance Tests
-**File:** `scripts/weekly_ci/stages/performance.py`
+**File:** `scripts/weekly_ci/stages/test.py` (was planned as `performance.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] Set LD_LIBRARY_PATH for RCCL
-- [ ] Run run_rccl_warp_speed_comparison.sh
-- [ ] Find experiment directory (most recent rccl_warp_speed_*)
-- [ ] Store in config.experiment_dir
+- [x] Check skip flag
+- [x] Set LD_LIBRARY_PATH for RCCL
+- [x] Run run_rccl_warp_speed_comparison.sh
+- [x] Find experiment directory (most recent rccl_warp_speed_*)
+- [x] Store in config.experiment_dir
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/test.py` (`stage_run_performance_tests`, `stage_find_experiment_dir`)
 
 **Dependencies:** Stages 3, 4
 
@@ -2356,23 +2400,38 @@ python scripts/weekly_ci_kickoff.py --skip-rccl-build --skip-install-deps --skip
 
 ### Phase 3: Analysis Stages (Days 6-8)
 
-#### Task 3.1: Stage 6 - Pairwise Analysis
+#### Task 3.1a: Stage 6 - Single Config Analysis
 **File:** `scripts/weekly_ci/stages/analysis.py`
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] Ensure experiment_dir is set (call stage_find_experiment_dir)
-- [ ] Parse baseline configuration
-- [ ] Step 1: Generate summary for ALL configs
-      - Loop through config_pairs
-      - Run: aorta-report pipeline summary --test-dir <dir>
-- [ ] Step 2: Pairwise comparisons
-      - Loop through non-baseline configs
-      - Run: aorta-report pipeline summary --baseline <base> --test <test> --skip-tracelens
+- [x] Check skip flag (skip.single_config_analysis)
+- [x] Loop through config_pairs
+- [x] Run: aorta-report pipeline summary --test <dir> --output <dir>
+- [x] --skip-tracelens: only when --skip-tracelens CLI passed (default: run full TraceLens)
 ```
 
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/analysis.py` (`stage_single_config_analysis`)
+
 **Dependencies:** Stage 5
+
+---
+
+#### Task 3.1b: Stage 7 - Pairwise Comparison
+**File:** `scripts/weekly_ci/stages/analysis.py`
+
+```python
+# Implementation checklist:
+- [x] Check skip flag (skip.pairwise_comparison)
+- [x] Parse baseline configuration
+- [x] Loop through non-baseline configs
+- [x] Run: aorta-report pipeline summary --baseline <base> --test <test> --skip-tracelens (always)
+- [x] Support --baseline-label and --test-label arguments
+```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/analysis.py` (`stage_pairwise_comparison`)
+
+**Dependencies:** Stage 5, 6 (single-config populates tracelens_analysis for pairwise --skip-tracelens)
 
 **Testing:**
 ```bash
@@ -2388,11 +2447,13 @@ python scripts/weekly_ci_kickoff.py \
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag (default: skipped)
-- [ ] Ensure experiment_dir is set
-- [ ] Build list of test directories
-- [ ] Run: aorta-report pipeline summary --baseline --test <multiple> --skip-tracelens --compare-all-runs
+- [x] Check skip flag (default: skipped)
+- [x] Ensure experiment_dir is set
+- [x] Build list of test directories
+- [x] Run: python run_full_analysis.py --baseline --test <multiple> --skip-tracelens --compare-all-runs
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/analysis.py` (`stage_compare_all_analysis`)
 
 **Note:** This stage is skipped by default for initial setup.
 
@@ -2401,17 +2462,22 @@ python scripts/weekly_ci_kickoff.py \
 ### Phase 4: Cross-Timestamp Comparison (Days 9-10)
 
 #### Task 4.1: Stage 8 - Checkout aorta-report
-**File:** `scripts/weekly_ci/stages/cross_timestamp.py`
+**File:** `scripts/weekly_ci/stages/repository.py` (was planned as `cross_timestamp.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] Check if aorta_report_path exists
-- [ ] If exists: git fetch && git pull --rebase
-- [ ] If not exists: git clone
-- [ ] Store resolved path in config.aorta_report_dir
-- [ ] Handle clone failures gracefully
+- [x] Check skip flag
+- [x] Check if aorta_report_path exists
+- [x] If exists: git fetch && git pull --rebase
+- [x] If not exists: git clone
+- [x] Store resolved path in config.aorta_report_dir
+- [x] Handle clone failures gracefully
+- [x] Support SSH and HTTPS authentication
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/repository.py` (`stage_checkout_aorta_report`)
+
+**Note:** Default aorta_report_path changed to `.aorta-report` (inside repo) for Docker accessibility.
 
 **Testing:**
 ```bash
@@ -2425,23 +2491,30 @@ python scripts/weekly_ci_kickoff.py ... --aorta-report-path /tmp/aorta-report-te
 ---
 
 #### Task 4.2: Stage 9 - Cross-Timestamp Comparison
-**File:** `scripts/weekly_ci/stages/cross_timestamp.py` (same file)
+**File:** `scripts/weekly_ci/stages/analysis.py` + `test.py` (was planned as `cross_timestamp.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag
-- [ ] Ensure experiment_dir is set
-- [ ] Find baseline experiment:
+- [x] Check skip flag
+- [x] Ensure experiment_dir is set
+- [x] Find baseline experiment:
       - If config.cross_timestamp.baseline_experiment set → use it
-      - Else → auto-detect (second-most-recent experiment)
-- [ ] Handle case: < 2 experiments (skip gracefully)
-- [ ] Create cross_timestamp_comparison/ output directory
-- [ ] For each config_pair:
+      - If config.cross_timestamp.baseline_date set → use aorta-report/{date}/rccl-warp-speed
+      - Else → auto-detect from aorta-report (most recent date directory)
+      - Else → auto-detect (second-most-recent local experiment)
+- [x] Handle case: < 2 experiments (skip gracefully)
+- [x] Create cross_timestamp_comparison/ output directory
+- [x] For each config_pair:
       - Build baseline and test paths
       - Check baseline exists (skip if not)
       - Run: aorta-report pipeline summary --baseline <old> --test <new> --skip-tracelens
-- [ ] Store baseline_experiment_dir in config
+- [x] Store baseline_experiment_dir in config
+- [x] Auto-generate --baseline-label and --test-label from directory dates
 ```
+
+**Status:** ✅ Complete - Implemented in:
+- `scripts/weekly_ci/stages/analysis.py` (`stage_cross_timestamp_comparison`)
+- `scripts/weekly_ci/stages/test.py` (`stage_find_baseline_experiment_dir`)
 
 **Testing:**
 ```bash
@@ -2460,53 +2533,62 @@ python scripts/weekly_ci_kickoff.py ... --baseline-experiment experiments/rccl_w
 ### Phase 5: Summary & Push (Days 11-12)
 
 #### Task 5.1: Stage 10 - Generate Summary
-**File:** `scripts/weekly_ci/stages/summary.py`
+**File:** `scripts/weekly_ci/stages/reporting.py` (was planned as `summary.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Ensure experiment_dir is set
-- [ ] Generate summary content with:
+- [x] Ensure experiment_dir is set
+- [x] Generate summary content with:
       - Run date
       - Configuration details
       - Tested configurations list
       - Cross-timestamp baseline info
       - Generated artifacts list
-      - Directory structure
-      - Skipped stages list
-- [ ] Write to {experiment_dir}/summary.txt
-- [ ] Print to console via logger
+      - Directory structure (partial)
+      - Skipped stages list (not included)
+- [x] Write to {experiment_dir}/summary.txt
+- [x] Print to console via logger
+- [x] Extract key metrics from comparison results
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/reporting.py` (`stage_generate_summary`)
 
 ---
 
 #### Task 5.2: Stage 11 - Push to aorta-report
-**File:** `scripts/weekly_ci/stages/push.py`
+**File:** `scripts/weekly_ci/stages/repository.py` (was planned as `push.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag (default: skipped)
-- [ ] Use existing aorta_report_dir or fallback to config path
-- [ ] Clone/update if needed
-- [ ] Create date directory: {date}/rccl-warp-speed/
-- [ ] Copy experiment results
-- [ ] Git config user.name and user.email
-- [ ] Git add, commit, push
-- [ ] (Optional) Generate and insert dashboard entry
+- [x] Check skip flag (default: skipped)
+- [x] Use existing aorta_report_dir or fallback to config path
+- [x] Clone/update if needed (handled by stage 8)
+- [x] Create date directory: {date}/rccl-warp-speed/
+- [x] Copy experiment results (excluding large files like .rpd, .sqlite)
+- [x] Git config user.name and user.email
+- [x] Git add, commit, push
+- [ ] ❌ Generate and insert dashboard entry (functions exist but NOT called)
+- [ ] ❌ update_readme_dashboard() NOT IMPLEMENTED
 ```
 
-**Additional:** Integrate `generate_dashboard_entry()` and `update_readme_dashboard()`
+**Status:** ⚠️ Partial - Core push implemented, dashboard integration missing
+
+**Additional:** `generate_dashboard_entry()` and `update_dashboard_file()` exist in `reporting.py` but are NOT called.
+The planned `update_readme_dashboard()` function is NOT implemented.
 
 ---
 
 #### Task 5.3: Stage 12 - Cleanup
-**File:** `scripts/weekly_ci/stages/cleanup.py`
+**File:** `scripts/weekly_ci/stages/docker.py` (was planned as `cleanup.py`)
 
 ```python
 # Implementation checklist:
-- [ ] Check skip flag (default: skipped, container left running)
-- [ ] Run: docker compose -f {compose_file} down
-- [ ] Log manual cleanup command if skipped
+- [x] Check skip flag (default: skipped, container left running)
+- [x] Run: docker compose -f {compose_file} down
+- [x] Log manual cleanup command if skipped
 ```
+
+**Status:** ✅ Complete - Implemented in `scripts/weekly_ci/stages/docker.py` (`stage_cleanup`)
 
 ---
 
@@ -2517,19 +2599,21 @@ python scripts/weekly_ci_kickoff.py ... --baseline-experiment experiments/rccl_w
 
 ```python
 # Implementation checklist:
-- [ ] Import all modules
-- [ ] main() function:
+- [x] Import all modules
+- [x] main() function:
       - Parse args
       - Load config file
       - Merge config
       - Setup logging
       - Log configuration
-      - Define stages list
+      - Define stages list (13 stages)
       - Execute stages in order
       - Handle failures
       - Return exit code
-- [ ] if __name__ == "__main__" block
+- [x] if __name__ == "__main__" block
 ```
+
+**Status:** ✅ Complete - Fully implemented with 13 stages
 
 ---
 
@@ -2576,6 +2660,8 @@ python scripts/weekly_ci_kickoff.py --config config/my_test.yaml
 - [ ] test_generate_dashboard_entry
 ```
 
+**Status:** ❌ NOT IMPLEMENTED - No unit tests created yet
+
 ---
 
 ### Phase 7: Documentation & Polish (Days 16-17)
@@ -2587,11 +2673,15 @@ python scripts/weekly_ci_kickoff.py --config config/my_test.yaml
 - [ ] Include sample dashboard
 - [ ] Include setup instructions
 
+**Status:** ❌ NOT IMPLEMENTED
+
 #### Task 7.2: Update Main README
 **File:** `README.md`
 
 - [ ] Add section for Weekly CI Kickoff
 - [ ] Link to detailed documentation
+
+**Status:** ❌ NOT IMPLEMENTED
 
 #### Task 7.3: Add to pyproject.toml
 **File:** `pyproject.toml`
@@ -2601,21 +2691,29 @@ python scripts/weekly_ci_kickoff.py --config config/my_test.yaml
 weekly-ci = "weekly_ci:main"
 ```
 
+**Status:** ❌ NOT IMPLEMENTED
+
 ---
 
 ### Implementation Summary
 
-| Phase | Tasks | Days | Dependencies |
-|-------|-------|------|--------------|
-| 1. Foundation | Config, Logging, Utils | 1-2 | None |
-| 2. Core Stages | Stages 1-5 | 3-5 | Phase 1 |
-| 3. Analysis | Stages 6-7 | 6-8 | Phase 2 |
-| 4. Cross-Timestamp | Stages 8-9 | 9-10 | Phase 3 |
-| 5. Summary & Push | Stages 10-12 | 11-12 | Phase 4 |
-| 6. Integration | Main script, Tests | 13-15 | All phases |
-| 7. Documentation | README, polish | 16-17 | Phase 6 |
+| Phase | Tasks | Days | Dependencies | Status |
+|-------|-------|------|--------------|--------|
+| 1. Foundation | Config, Logging, Utils | 1-2 | None | ✅ Complete |
+| 2. Core Stages | Stages 1-5 | 3-5 | Phase 1 | ✅ Complete |
+| 3. Analysis | Stages 6-7 | 6-8 | Phase 2 | ✅ Complete |
+| 4. Cross-Timestamp | Stages 8-9 | 9-10 | Phase 3 | ✅ Complete |
+| 5. Summary & Push | Stages 10-12 | 11-12 | Phase 4 | ✅ Complete |
+| 6. Integration | Main script, Tests | 13-15 | All phases | ⚠️ Partial (no unit tests) |
+| 7. Documentation | README, polish | 16-17 | Phase 6 | ❌ Not Started |
 
 **Total Estimated Time:** 17 days (can be parallelized)
+
+**Current Status (as of 2026-02-23):**
+- Core pipeline (13 stages): ✅ Fully functional
+- Dashboard integration: ✅ Implemented (reads Excel files)
+- Unit tests: ❌ Not created
+- Documentation updates: ❌ Pending
 
 ---
 
@@ -2658,13 +2756,24 @@ EOF
 
 ## TODO / Future Enhancements
 
+### High Priority (Dashboard Integration) - ✅ COMPLETE
+- [x] Wire up `stage_update_dashboard()` call in push stage
+- [x] Implement `update_readme_dashboard()` to update aorta-report README markdown table
+- [x] Extract metrics from cross-timestamp comparison results for dashboard (via Excel parsing)
+
+### Medium Priority (Testing & Documentation)
+- [ ] Create unit tests (`tests/test_weekly_ci.py`)
+- [ ] Create aorta-report README template (`templates/aorta-report-readme-template.md`)
+- [ ] Update main aorta README with Weekly CI section
+- [ ] Add `weekly-ci` entry point to pyproject.toml
+
+### Future Enhancements
+- [ ] **Enhance aorta-report to output JSON summary** alongside Excel for easier metric extraction
 - [ ] Add `--dry-run` mode to preview commands without execution
 - [ ] Add `--resume` to continue from last failed stage
 - [ ] Add progress bar for long-running operations
 - [ ] Support parallel execution of independent analyses
-- [ ] Add result comparison with previous runs
 - [ ] Email/Slack notification on completion
 - [ ] Web dashboard for viewing results
 - [ ] Integration with pytest for result validation
-- [ ] Auto-generate dashboard entries in aorta-report README
 - [ ] Add trend charts (sparklines) in dashboard

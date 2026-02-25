@@ -38,6 +38,9 @@ def pipeline(ctx):
 @click.option("--test-label", default=None, help="Label for test/config (default: directory name)")
 @click.option("--skip-tracelens", is_flag=True, help="Skip TraceLens analysis (if already done)")
 @click.option(
+    "-v", "--verbose", is_flag=True, help="Enable verbose output (e.g. collective comparison diagnostics)"
+)
+@click.option(
     "--gpu-timeline/--no-gpu-timeline", default=True, help="Enable/disable GPU timeline comparison"
 )
 @click.option(
@@ -57,6 +60,7 @@ def pipeline_summary(
     baseline_label,
     test_label,
     skip_tracelens,
+    verbose,
     gpu_timeline,
     collective,
     final_report,
@@ -94,7 +98,7 @@ def pipeline_summary(
     """
     from . import run_summary_pipeline, SummaryPipelineConfig
 
-    verbose = ctx.obj.get("verbose", False)
+    verbose = verbose or ctx.obj.get("verbose", False)
     quiet = ctx.obj.get("quiet", False)
 
     # Resolve paths to absolute to ensure all outputs go to correct location

@@ -24,14 +24,16 @@ def stage_docker_setup(
     registry_user: Optional[str] = None,
     registry_password: Optional[str] = None,
     skip_build: bool = True,
+    force_restart: bool = False,
 ) -> None:
     """Set up Docker container for the pipeline.
 
     Steps:
-    1. Login to Docker registry (if credentials provided)
-    2. Stop and remove any existing container with the same name
-    3. Build the Docker image using docker compose (if skip_build=False)
-    4. Start the container in detached mode
+    1. Check if container is already running (skip setup if so, unless force_restart)
+    2. Login to Docker registry (if credentials provided)
+    3. Stop and remove any existing container with the same name
+    4. Build the Docker image using docker compose (if skip_build=False)
+    5. Start the container in detached mode
 
     Args:
         compose_file: Path to docker-compose file (relative to repo root).
@@ -41,6 +43,7 @@ def stage_docker_setup(
         registry_user: Docker registry username (optional).
         registry_password: Docker registry password (optional, can use DOCKER_PASSWORD env).
         skip_build: If True, skip docker compose build (default: True).
+        force_restart: If True, restart container even if already running (default: False).
 
     Raises:
         RuntimeError: If Docker setup fails.
@@ -52,6 +55,16 @@ def stage_docker_setup(
         raise RuntimeError(f"Docker compose file not found: {compose_path}")
 
     logger.info(f"Using compose file: {compose_path}")
+
+    # Check if container is already running - reuse if so (unless force_restart)
+    if check_docker_running(container_name, logger) and not force_restart:
+        logger.info(f"Container '{container_name}' is already running")
+        logger.info("  Reusing existing container (use --force-restart to restart)")
+        logger.info(f"  ✓ Container {container_name} is ready")
+        return
+
+    if force_restart:
+        logger.info("Force restart requested, will restart container...")
 
     # Docker login (if credentials provided)
     password = registry_password or os.environ.get("DOCKER_PASSWORD", "")
