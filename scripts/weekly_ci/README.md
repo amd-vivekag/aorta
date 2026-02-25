@@ -159,6 +159,7 @@ cross_timestamp:
 analysis:
   baseline_label: ""            # e.g., "baseline", "v1.0"
   test_label: ""                # e.g., "test", "v1.1"
+  report_label: ""              # Override for aorta-report dir & dashboard (default: date from experiment)
 
 # Git Configuration
 git:
@@ -218,6 +219,7 @@ Cross-Timestamp Options:
 Analysis Options:
   --baseline-label      Label for baseline in reports (e.g., "v1.0")
   --test-label          Label for test in reports (e.g., "v1.1")
+  --report-label        Override for aorta-report directory and dashboard entry (default: date from experiment dir)
   --skip-tracelens      Pass --skip-tracelens to single-config only (when TraceLens already run)
 
 Other Options:
@@ -246,7 +248,7 @@ The script executes these stages in order:
 | 9. Compare All Analysis | Multi-config comparison | Yes (default: skip) |
 | 10. Checkout aorta-report | Clone/update report repo | Yes |
 | 11. Cross-Timestamp | Compare with previous run | Yes |
-| 12. Generate Summary | Create summary report | No |
+| 12. Generate Summary | Create summary report and dashboard row | No |
 | 13. Push Results | Push to aorta-report | Yes (default: skip) |
 | 14. Cleanup | Stop container | Yes (default: skip) |
 
@@ -259,6 +261,7 @@ Stages discover their inputs from the filesystem or previous stages:
 | 6. Find Experiment Dir | Scans `experiments/rccl_warp_speed_*` | `--experiment-dir` |
 | 7-9. Analysis | Uses experiment dir from Stage 6 | (automatic) |
 | 11. Cross-Timestamp | Local experiments or aorta-report | `--baseline-experiment` or `--baseline-date` |
+| 12-13. Summary & Push | Experiment dir for data; date from dir for aorta-report path | `--report-label` |
 
 #### Explicit Experiment Directory
 
@@ -294,6 +297,20 @@ python scripts/weekly_ci_kickoff.py \
     --baseline-label "v1.0-stable" \
     --test-label "v1.1-experimental"
 ```
+
+#### Report Label (aorta-report directory and dashboard)
+
+By default, the aorta-report directory name and dashboard entry use the **date extracted from the experiment directory** (e.g., `experiments/rccl_warp_speed_20260224_065602` → `2026-02-24`). You can override this with `--report-label`:
+
+```bash
+# Use custom label (e.g., for releases or manual runs)
+python scripts/weekly_ci_kickoff.py --report-label "v1.2.3" ...
+
+# Or explicit date
+python scripts/weekly_ci_kickoff.py --report-label "2026-02-24" ...
+```
+
+This affects only the aorta-report directory name (`aorta-report/{label}/rccl-warp-speed/`) and the first column of the dashboard table. The **experiment directory** (source of data) is unchanged.
 
 ## Expected Output
 

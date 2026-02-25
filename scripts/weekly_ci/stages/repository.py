@@ -12,11 +12,10 @@ import gzip
 import logging
 import os
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from ..utils import run_command
+from ..utils import extract_date_from_experiment_dir, run_command
 
 # Trace files larger than this (bytes) are gzipped before upload
 TRACE_GZIP_THRESHOLD_BYTES = 100 * 1024 * 1024  # 100 MB
@@ -119,6 +118,7 @@ def stage_push_results(
     experiment_dir: str,
     repo_root: Path,
     logger: logging.Logger,
+    report_label: Optional[str] = None,
     git_user_name: str = "Weekly CI Bot",
     git_user_email: str = "weekly-ci@aorta.local",
 ) -> None:
@@ -132,6 +132,7 @@ def stage_push_results(
         experiment_dir: Path to the experiment directory (relative to repo_root).
         repo_root: Path to the aorta repository root.
         logger: Logger instance.
+        report_label: Optional override for directory name (default: date from experiment dir).
         git_user_name: Git user name for commit.
         git_user_email: Git user email for commit.
 
@@ -140,11 +141,14 @@ def stage_push_results(
     """
     logger.info("Pushing results to aorta-report...")
 
-    # Get today's date for directory name
-    today = datetime.now().strftime("%Y-%m-%d")
-    target_dir = aorta_report_dir / today / "rccl-warp-speed"
+    # Use report_label override or extract date from experiment directory
+    if report_label and report_label.strip():
+        date_str = report_label.strip()
+    else:
+        date_str = extract_date_from_experiment_dir(experiment_dir, logger)
+    target_dir = aorta_report_dir / date_str / "rccl-warp-speed"
 
-    logger.info(f"  Date directory: {today}")
+    logger.info(f"  Date directory: {date_str}")
     logger.info(f"  Target path: {target_dir}")
 
     # Source experiment directory
@@ -189,7 +193,7 @@ def stage_push_results(
         # Add and commit (include README.md for dashboard updates)
         logger.info("  Committing changes...")
         run_command(
-            f"git add {today} README.md",
+            f"git add {date_str} README.md",
             logger,
             cwd=aorta_report_dir,
             capture_output=True,
@@ -207,7 +211,7 @@ def stage_push_results(
 
         if result.stdout.strip():
             run_command(
-                f'git commit -m "Add RCCL warp speed results for {today} and update dashboard"',
+                f'git commit -m "Add RCCL warp speed results for {date_str} and update dashboard"',
                 logger,
                 cwd=aorta_report_dir,
                 capture_output=True,

@@ -45,6 +45,7 @@ class AnalysisConfig:
 
     baseline_label: str = ""  # Label for baseline in reports (e.g., "baseline", "v1.0")
     test_label: str = ""  # Label for test in reports (e.g., "test", "v1.1")
+    report_label: str = ""  # Override for aorta-report dir & dashboard (default: date from experiment)
     skip_tracelens_single_config: bool = False  # CLI --skip-tracelens: add to single-config only
 
 
@@ -370,6 +371,12 @@ def merge_config(config: Config, yaml_data: dict, args: argparse.Namespace) -> C
         ["analysis", "test_label"],
         config.analysis.test_label,
     )
+    config.analysis.report_label = _get_value(
+        getattr(args, "report_label", None),
+        yaml_data,
+        ["analysis", "report_label"],
+        config.analysis.report_label,
+    )
 
     # skip_tracelens_single_config: CLI only (not in YAML). Only add when --skip-tracelens passed.
     if getattr(args, "skip_tracelens", False):
@@ -605,6 +612,12 @@ Examples:
         type=str,
         default=None,
         help="Label for test in aorta-report output (e.g., 'test', 'v1.1')",
+    )
+    parser.add_argument(
+        "--report-label",
+        type=str,
+        default=None,
+        help="Override label for aorta-report directory and dashboard entry (default: date from experiment dir)",
     )
 
     # Git configuration

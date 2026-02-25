@@ -89,6 +89,10 @@ output:
 | `--skip-cross-timestamp` | Skip cross-timestamp comparison | From config |
 | `--baseline-experiment` | Previous experiment dir for cross-timestamp comparison | Auto-detect |
 | `--aorta-report-path` | Path to aorta-report repository | `../aorta-report` |
+| `--baseline-date` | Date dir in aorta-report for cross-timestamp baseline | Auto-detect |
+| `--baseline-label` | Label for baseline in aorta-report output | From config |
+| `--test-label` | Label for test in aorta-report output | From config |
+| `--report-label` | Override for aorta-report dir and dashboard entry | Date from experiment |
 | `--skip-push` | Skip pushing to aorta-report | From config |
 | `--cleanup` | Cleanup container after run | From config |
 | `--log-level` | Logging level (DEBUG/INFO/WARNING/ERROR) | INFO |
@@ -1460,8 +1464,16 @@ cross_timestamp:
   # Previous experiment directory to compare against (optional)
   # If not specified, auto-detects the second-most-recent experiment
   baseline_experiment: ""
+  # Date directory in aorta-report for baseline (e.g., "2026-02-19")
+  baseline_date: ""
   # Path to aorta-report repository (for finding previous runs)
   aorta_report_path: "../aorta-report"
+
+# Analysis labels (for aorta-report commands)
+analysis:
+  baseline_label: ""    # e.g., "baseline", "v1.0"
+  test_label: ""        # e.g., "test", "v1.1"
+  report_label: ""      # Override aorta-report dir & dashboard (default: date from experiment)
 
 # Output settings
 output:
@@ -1537,6 +1549,10 @@ python scripts/weekly_ci_kickoff.py \
 # Use custom aorta-report path
 python scripts/weekly_ci_kickoff.py \
     --aorta-report-path /path/to/aorta-report
+
+# Override label for aorta-report directory and dashboard (default: date from experiment dir)
+python scripts/weekly_ci_kickoff.py --report-label "v1.2.3" ...
+python scripts/weekly_ci_kickoff.py --report-label "2026-02-24" ...
 
 # Skip cross-timestamp comparison entirely
 python scripts/weekly_ci_kickoff.py --skip-cross-timestamp

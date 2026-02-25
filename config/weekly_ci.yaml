@@ -65,6 +65,8 @@ analysis:
   # Labels for reports (leave empty to use defaults)
   baseline_label: ""  # e.g., "baseline", "v1.0", "2026-02-19"
   test_label: ""      # e.g., "test", "v1.1", "2026-02-20"
+  # Override for aorta-report directory and dashboard entry (default: date from experiment dir)
+  report_label: ""    # e.g., "2026-02-24", "v1.2.3", "release-candidate"
 
 # Git Configuration (for pushing results to aorta-report)
 git:

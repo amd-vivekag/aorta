@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from ..utils import get_config_dir_name, parse_config_pairs
+from ..utils import extract_date_from_experiment_dir, get_config_dir_name, parse_config_pairs
 
 
 def stage_generate_summary(
@@ -693,6 +693,7 @@ def stage_update_dashboard(
     config_pairs: str,
     aorta_report_dir: Path,
     logger: logging.Logger,
+    report_label: Optional[str] = None,
 ) -> bool:
     """Update aorta-report README dashboard with current experiment results.
 
@@ -705,6 +706,7 @@ def stage_update_dashboard(
         config_pairs: Space-separated CU,threads pairs.
         aorta_report_dir: Path to the aorta-report repository.
         logger: Logger instance.
+        report_label: Optional override for dashboard entry (default: date from experiment dir).
 
     Returns:
         True if dashboard updated successfully, False otherwise.
@@ -713,16 +715,11 @@ def stage_update_dashboard(
 
     exp_path = repo_root / experiment_dir
 
-    # Extract date from experiment directory name
-    # Format: experiments/rccl_warp_speed_YYYYMMDD_HHMMSS
-    exp_name = Path(experiment_dir).name
-    try:
-        timestamp_str = exp_name.replace("rccl_warp_speed_", "")
-        date_obj = datetime.strptime(timestamp_str[:8], "%Y%m%d")
-        date_str = date_obj.strftime("%Y-%m-%d")
-    except ValueError:
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        logger.warning(f"Could not parse date from {exp_name}, using today: {date_str}")
+    # Use report_label override or extract date from experiment directory
+    if report_label and report_label.strip():
+        date_str = report_label.strip()
+    else:
+        date_str = extract_date_from_experiment_dir(experiment_dir, logger)
 
     # Generate dashboard row
     row = generate_dashboard_row(exp_path, config_pairs, date_str, logger)

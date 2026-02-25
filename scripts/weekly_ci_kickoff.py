@@ -402,6 +402,7 @@ def main() -> int:
                         config_pairs=config.test.config_pairs,
                         aorta_report_dir=config.aorta_report_dir,
                         logger=logger,
+                        report_label=config.analysis.report_label or None,
                     )
                 else:
                     logger.info("  Skipping dashboard update (aorta-report not checked out)")
@@ -427,6 +428,7 @@ def main() -> int:
                         experiment_dir=config.experiment_dir,
                         repo_root=repo_root,
                         logger=logger,
+                        report_label=config.analysis.report_label or None,
                         git_user_name=config.git.user_name,
                         git_user_email=config.git.user_email,
                     )
