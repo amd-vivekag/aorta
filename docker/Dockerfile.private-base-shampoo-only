@@ -1,0 +1,27 @@
+FROM rocm/pytorch-private:20251030_rocm_e2e_phantom_mi350_genai_nightly
+
+USER root
+
+RUN yum install -y git 2>/dev/null || apt-get update && apt-get install -y git || true
+
+RUN python3.10 -m pip install openpyxl seaborn pandas matplotlib pyyaml tqdm tensorboard
+
+RUN cd /tmp && \
+    git clone https://github.com/facebookresearch/optimizers.git && \
+    cd optimizers && \
+    git checkout 840de49b1ab732ec3834aaf614324f222efed7d6 && \
+    sed -i 's/requires-python = ">=3.12"/requires-python = ">=3.10"/' pyproject.toml && \
+    sed -i 's/requires-python = ">=.*"/requires-python = ">=3.10"/' pyproject.toml && \
+    python3.10 -m pip install . && \
+    cd / && \
+    rm -rf /tmp/optimizers
+
+RUN python3.10 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
+    python3.10 -c "import torch; print(f'ROCm: {torch.cuda.is_available()}')" && \
+    python3.10 -c "import distributed_shampoo; print('[OK] Shampoo installed')" && \
+    ls /opt/rocm/lib/libhipblaslt* && \
+    strings /opt/rocm/lib/libhipblaslt.so | grep -q HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32 && \
+    echo "[OK] hipblaslt supports HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32"
+
+WORKDIR /workspace/aorta
+CMD ["/bin/bash"]

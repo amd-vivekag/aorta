@@ -182,15 +182,17 @@ precision:
 | `buffer_dtype` | Dtype for module buffers (e.g. BatchNorm running mean/variance). |
 | `tf32_mode` | TF32 precision for fp32 matmuls (e.g. Shampoo optimizer). Only affects ops outside mixed-precision regions. See table below. |
 
-**`tf32_mode` values** (AMD/ROCm — controlled via `HIPBLASLT_ALLOW_TF32`):
+**`tf32_mode` values** (AMD/ROCm — controlled via `HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32`):
 
-| Mode | HIPBLASLT_ALLOW_TF32 | hipBLAS compute type | Behaviour |
-|------|---------------------|----------------------|-----------|
-| `disabled` | unset | Full FP32 | Standard fp32 GEMMs |
-| `x1` | 1 | `HIPBLAS_COMPUTE_32F_FAST_16BF` | Single BF16 accumulation (TF32 on gfx942, BF16x1 on gfx950) — fastest |
-| `x3` | 3 | `HIPBLAS_COMPUTE_32F_FAST_TF32` | Triple BF16 accumulation (BF16x3 on gfx950) — most accurate TF32 mode |
+PyTorch sends `HIPBLAS_COMPUTE_32F_FAST_TF32` (xf32) to hipBLASLt when `allow_tf32=True`. The override env var selects the actual accumulation strategy inside hipBLASLt:
 
-A matmul probe runs at startup to verify the configured precision mode is actually active on the hardware.
+| Mode | HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32 | hipBLAS compute type | Behaviour |
+|------|-------------------------------------|----------------------|-----------|
+| `disabled` | unset | `HIPBLAS_COMPUTE_32F` (Full FP32) | Standard fp32 GEMMs |
+| `x1` | 2 | `HIPBLAS_COMPUTE_32F_FAST_16BF` | Single BF16 accumulation (TF32 on gfx942, BF16x1 on gfx950) — fastest |
+| `x3` | 1 | `HIPBLAS_COMPUTE_32F_FAST_TF32` | Triple BF16 accumulation (BF16x3 on gfx950) — most accurate TF32 mode |
+
+A matmul probe runs at startup to verify the configured precision mode is actually active on the hardware. See [Precision Testing](../../docs/precision_testing.md) for standalone verification.
 
 **FSDP mode** uses PyTorch's native `FSDP MixedPrecision` policy — sharded parameters are stored in `param_dtype` (saving GPU memory), gradients reduced in `reduce_dtype`. No `torch.autocast` is used.
 

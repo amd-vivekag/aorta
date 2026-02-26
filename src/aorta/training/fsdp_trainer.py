@@ -1070,9 +1070,11 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     1. ``torch.set_float32_matmul_precision`` — the documented PyTorch API.
     2. ``torch.backends.cuda.matmul.allow_tf32`` — low-level flag (set
        implicitly by the API above, but also set explicitly for clarity).
-    3. ``HIPBLASLT_ALLOW_TF32`` env var — **required on AMD/ROCm** to make
-       hipBLASLt select reduced-precision compute kernels.  On NVIDIA this
-       env var is irrelevant; cuBLAS honours the PyTorch flag directly.
+    3. ``HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32`` env var — on AMD/ROCm,
+       PyTorch always passes ``HIPBLAS_COMPUTE_32F_FAST_TF32`` (xf32) to
+       hipBLASLt when ``allow_tf32=True``.  This env var overrides the
+       compute type *inside* hipBLASLt to select the actual accumulation
+       strategy.
 
     Hardware notes (AMD):
 
@@ -1081,13 +1083,13 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
     * **gfx950 (MI355)** — no native TF32; ``x1`` uses a single BF16 matmul,
       ``x3`` uses three BF16 matmuls (BF16x3) for higher accuracy.
 
-    ========  ====================  ==========================  ================================
-    tf32_mode HIPBLASLT_ALLOW_TF32  float32_matmul_precision    hipBLAS compute type
-    ========  ====================  ==========================  ================================
-    disabled  (unset)               highest                     FP32 GEMM
-    x1        1                     high                        HIPBLAS_COMPUTE_32F_FAST_16BF
-    x3        3                     high                        HIPBLAS_COMPUTE_32F_FAST_TF32
-    ========  ====================  ==========================  ================================
+    ========  ======================================  ==========================  ================================
+    tf32_mode HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32    float32_matmul_precision    hipBLAS compute type
+    ========  ======================================  ==========================  ================================
+    disabled  (unset)                                 highest                     FP32 GEMM
+    x1        2                                       high                        HIPBLAS_COMPUTE_32F_FAST_16BF
+    x3        1 (default / unset)                     high                        HIPBLAS_COMPUTE_32F_FAST_TF32
+    ========  ======================================  ==========================  ================================
 
     Returns:
         The active tf32_mode string (lower-cased, validated).
@@ -1104,21 +1106,25 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
 
     if tf32_mode == "disabled":
         torch.set_float32_matmul_precision("highest")
-        os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+        os.environ.pop("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32", None)
     else:
         torch.set_float32_matmul_precision("high")
         if is_rocm:
-            hipblaslt_values = {"x1": "1", "x3": "3"}
-            os.environ["HIPBLASLT_ALLOW_TF32"] = hipblaslt_values[tf32_mode]
+            # PyTorch sends COMPUTE_32XF (FAST_TF32) to hipBLASLt when allow_tf32=True.
+            # Override=2 downgrades to FAST_16BF (single BF16 acc, x1).
+            # Override=1 keeps FAST_TF32 (triple BF16 acc, x3).
+            override_values = {"x1": "2", "x3": "1"}
+            os.environ["HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32"] = override_values[tf32_mode]
         else:
-            os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+            os.environ.pop("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32", None)
 
     log.info(
-        "TF32 precision | tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s "
+        "TF32 precision | tf32_mode=%s allow_tf32=%s "
+        "HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32=%s "
         "float32_matmul_precision=%s platform=%s",
         tf32_mode,
         torch.backends.cuda.matmul.allow_tf32,
-        os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
+        os.environ.get("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32", "unset"),
         torch.get_float32_matmul_precision(),
         "ROCm" if is_rocm else "CUDA",
     )
@@ -1137,20 +1143,23 @@ def configure_tf32_precision(precision_cfg: PrecisionConfig) -> str:
 def _run_matmul_with_tf32(
     A: torch.Tensor,
     B: torch.Tensor,
-    hipblaslt_value: Optional[str],
+    override_xf32: Optional[str],
     device: torch.device,
 ) -> torch.Tensor:
-    """Run a single matmul with specific TF32 settings."""
-    allow = hipblaslt_value is not None
+    """Run a single matmul with specific TF32 settings.
+
+    *override_xf32* maps to ``HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32``:
+    ``None`` → TF32 disabled (pure fp32), ``"1"`` → keep FAST_TF32 (x3),
+    ``"2"`` → downgrade to FAST_16BF (x1).
+    """
+    allow = override_xf32 is not None
     torch.backends.cuda.matmul.allow_tf32 = allow
     if allow:
         torch.set_float32_matmul_precision("high")
+        os.environ["HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32"] = override_xf32
     else:
         torch.set_float32_matmul_precision("highest")
-    if hipblaslt_value is not None:
-        os.environ["HIPBLASLT_ALLOW_TF32"] = hipblaslt_value
-    else:
-        os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+        os.environ.pop("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32", None)
     torch.cuda.synchronize(device)
     result = torch.mm(A, B)
     torch.cuda.synchronize(device)
@@ -1160,14 +1169,14 @@ def _run_matmul_with_tf32(
 def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
     """Verify TF32 precision with a matmul probe.
 
-    Runs fp32 matmuls under four settings — fp32 (disabled), fp64 (ground
-    truth), x1 (``HIPBLASLT_ALLOW_TF32=1``), and x3
-    (``HIPBLASLT_ALLOW_TF32=3``) — then reports:
+    Runs fp32 matmuls under three settings — fp32 (disabled), x1
+    (``HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32=2``, FAST_16BF), and x3
+    (``HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32=1``, FAST_TF32) — then
+    reports:
 
     1. Whether the *configured* mode is active (differs from fp32).
     2. Accuracy of each mode vs fp64 ground truth.
-    3. **x1 vs x3 delta** — the comparison that matters for the client's
-       error tolerance (TF32x3 vs TF32x1).
+    3. **x1 vs x3 delta** — confirms different hipBLASLt compute passes.
 
     All ranks execute the probe independently (local matmul, no collectives).
     Only rank 0 emits detailed log messages.
@@ -1177,16 +1186,17 @@ def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
 
     if is_primary:
         log.info(
-            "[PRECISION PROBE] tf32_mode=%s allow_tf32=%s HIPBLASLT_ALLOW_TF32=%s "
+            "[PRECISION PROBE] tf32_mode=%s allow_tf32=%s "
+            "HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32=%s "
             "float32_matmul_precision=%s — running matmul verification...",
             tf32_mode,
             torch.backends.cuda.matmul.allow_tf32,
-            os.environ.get("HIPBLASLT_ALLOW_TF32", "unset"),
+            os.environ.get("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32", "unset"),
             torch.get_float32_matmul_precision(),
         )
 
     saved_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-    saved_hipblaslt = os.environ.get("HIPBLASLT_ALLOW_TF32")
+    saved_override = os.environ.get("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32")
     saved_precision = torch.get_float32_matmul_precision()
     rng_state = torch.cuda.get_rng_state(device)
 
@@ -1203,11 +1213,11 @@ def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
         # fp32 baseline (TF32 disabled)
         out_fp32 = _run_matmul_with_tf32(A, B, None, device)
 
-        # x1: HIPBLASLT_ALLOW_TF32=1 (HIPBLAS_COMPUTE_32F_FAST_16BF on gfx950)
-        out_x1 = _run_matmul_with_tf32(A, B, "1", device)
+        # x1: Override=2 → HIPBLAS_COMPUTE_32F_FAST_16BF (single BF16 acc)
+        out_x1 = _run_matmul_with_tf32(A, B, "2", device)
 
-        # x3: HIPBLASLT_ALLOW_TF32=3 (HIPBLAS_COMPUTE_32F_FAST_TF32 / BF16x3 on gfx950)
-        out_x3 = _run_matmul_with_tf32(A, B, "3", device)
+        # x3: Override=1 → HIPBLAS_COMPUTE_32F_FAST_TF32 (triple BF16 acc)
+        out_x3 = _run_matmul_with_tf32(A, B, "1", device)
 
         # --- Errors vs fp64 ground truth ---
         fp32_err = (out_fp32.double() - ref_f64).abs()
@@ -1283,10 +1293,10 @@ def verify_tf32_active(device: torch.device, tf32_mode: str) -> None:
         torch.cuda.set_rng_state(rng_state, device)
         torch.backends.cuda.matmul.allow_tf32 = saved_allow_tf32
         torch.set_float32_matmul_precision(saved_precision)
-        if saved_hipblaslt is not None:
-            os.environ["HIPBLASLT_ALLOW_TF32"] = saved_hipblaslt
+        if saved_override is not None:
+            os.environ["HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32"] = saved_override
         else:
-            os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+            os.environ.pop("HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32", None)
 
 
 def main_cli() -> None:  # pragma: no cover - CLI entry
