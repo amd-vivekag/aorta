@@ -38,6 +38,11 @@ def pipeline(ctx):
 @click.option("--test-label", default=None, help="Label for test/config (default: directory name)")
 @click.option("--skip-tracelens", is_flag=True, help="Skip TraceLens analysis (if already done)")
 @click.option(
+    "--skip-baseline-gpu-processing",
+    is_flag=True,
+    help="Skip GPU timeline processing for baseline (use existing gpu_timeline_summary_mean.xlsx; avoids overwriting baseline dir)",
+)
+@click.option(
     "-v", "--verbose", is_flag=True, help="Enable verbose output (e.g. collective comparison diagnostics)"
 )
 @click.option(
@@ -60,6 +65,7 @@ def pipeline_summary(
     baseline_label,
     test_label,
     skip_tracelens,
+    skip_baseline_gpu_processing,
     verbose,
     gpu_timeline,
     collective,
@@ -113,6 +119,7 @@ def pipeline_summary(
         baseline_label=baseline_label,
         test_label=test_label,
         skip_tracelens=skip_tracelens,
+        skip_baseline_gpu_processing=skip_baseline_gpu_processing,
         gpu_timeline=gpu_timeline,
         collective=collective,
         final_report=final_report,
@@ -138,7 +145,7 @@ def pipeline_summary(
             click.echo(f"Config: {test}")
             click.echo(f"Label: {test_label or '(auto)'}")
         click.echo(f"Output: {output}")
-        click.echo(f"Options: skip_tracelens={skip_tracelens}, gpu_timeline={gpu_timeline}")
+        click.echo(f"Options: skip_tracelens={skip_tracelens}, skip_baseline_gpu_processing={skip_baseline_gpu_processing}, gpu_timeline={gpu_timeline}")
         click.echo(f"         collective={collective}, final_report={final_report}")
         click.echo(f"         plots={plots}, html={html}")
 
