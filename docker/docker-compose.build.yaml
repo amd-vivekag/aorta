@@ -1,6 +1,6 @@
 # Unified Docker Compose Configuration
 #
-# This file replaces docker-compose.rocm70_9-1.yaml and docker-compose.rocm70_9-1-shampoo.yaml
+# This file replaces docker-compose.public-rocm72-base.yaml and docker-compose.private-meta19-torch2.12-shampoo.yaml
 #
 # Usage:
 #   1. Copy .env.example to .env
@@ -16,7 +16,7 @@ services:
     container_name: ${CONTAINER_NAME:-training-overlap-bugs-default}
     build:
       context: .
-      dockerfile: ${DOCKERFILE:-Dockerfile.rocm70_9-1}
+      dockerfile: ${DOCKERFILE:-Dockerfile.public-rocm72-base}
       # Required for build: apt/npm access during docker compose build
       network: host
     # Security Configuration (Elevated Privileges Required)

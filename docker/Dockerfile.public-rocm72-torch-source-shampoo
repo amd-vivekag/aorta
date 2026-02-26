@@ -1,0 +1,30 @@
+FROM rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+
+USER root
+
+RUN apt-get update && apt-get install -y wget git && rm -rf /var/lib/apt/lists/*
+
+# Install pre-built PyTorch wheel (built from source commit 580a6e2 against ROCm 7.2)
+COPY wheels/torch-2.12.0a0+git580a6e2-cp310-cp310-linux_x86_64.whl /tmp/
+RUN pip install /tmp/torch-2.12.0a0+git580a6e2-cp310-cp310-linux_x86_64.whl --force-reinstall --no-deps && \
+    rm /tmp/torch-2.12.0a0+git580a6e2-cp310-cp310-linux_x86_64.whl
+
+RUN python3.10 -m pip install openpyxl seaborn pandas matplotlib pyyaml tqdm tensorboard
+
+# Shampoo - latest from main (compatible with torch 2.12)
+RUN cd /tmp && \
+    git clone https://github.com/facebookresearch/optimizers.git && \
+    cd optimizers && \
+    sed -i 's/requires-python = ">=3.12"/requires-python = ">=3.10"/' pyproject.toml && \
+    sed -i 's/requires-python = ">=.*"/requires-python = ">=3.10"/' pyproject.toml && \
+    python3.10 -m pip install . && \
+    cd / && \
+    rm -rf /tmp/optimizers
+
+RUN python3.10 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
+    python3.10 -c "import torch; print(f'HIP: {torch.version.hip}')" && \
+    python3.10 -c "import torch; print(f'ROCm: {torch.version.rocm}')" && \
+    python3.10 -c "import distributed_shampoo; print('[OK] Shampoo installed')"
+
+WORKDIR /workspace/aorta
+CMD ["/bin/bash"]

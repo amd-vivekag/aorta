@@ -3,7 +3,7 @@
 #
 # Please use the unified docker-compose.build.yaml with .env configuration:
 #   1. Copy .env.example to .env
-#   2. Set DOCKERFILE=Dockerfile.rocm70_9-1 in your .env file
+#   2. Set DOCKERFILE=Dockerfile.public-rocm72-base in your .env file
 #   3. Run: docker compose -f docker-compose.build.yaml up
 #
 # Or use the interactive setup script:
@@ -17,7 +17,7 @@ services:
     container_name: training-overlap-bugs-rocm70_9-1
     build:
       context: .
-      dockerfile: Dockerfile.rocm70_9-1
+      dockerfile: Dockerfile.public-rocm72-base
     user: root
     privileged: true
     network_mode: host

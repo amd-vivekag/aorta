@@ -1,0 +1,30 @@
+FROM rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+
+USER root
+
+RUN apt-get update && apt-get install -y wget git && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch wheel from ROCm 7.2.1 build index
+# Available versions (cp310): 2.7.1, 2.8.0, 2.9.1, 2.10.0.dev
+# Change the URL below to test different versions
+ARG TORCH_WHEEL_URL=http://compute-artifactory.amd.com/artifactory/compute-pytorch-rocm/compute-rocm-rel-7.2/64/torch-2.10.0.dev20260216+rocm7.2.1.lw.git2e4bfe8a-cp310-cp310-linux_x86_64.whl
+RUN pip install $TORCH_WHEEL_URL --force-reinstall --no-deps
+
+RUN python3.10 -m pip install openpyxl seaborn pandas matplotlib pyyaml tqdm tensorboard
+
+# Latest Shampoo from main (compatible with torch >= 2.10)
+RUN cd /tmp && \
+    git clone https://github.com/facebookresearch/optimizers.git && \
+    cd optimizers && \
+    sed -i 's/requires-python = ">=3.12"/requires-python = ">=3.10"/' pyproject.toml && \
+    sed -i 's/requires-python = ">=.*"/requires-python = ">=3.10"/' pyproject.toml && \
+    python3.10 -m pip install . && \
+    cd / && \
+    rm -rf /tmp/optimizers
+
+RUN python3.10 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
+    python3.10 -c "import torch; print(f'ROCm: {torch.cuda.is_available()}')" && \
+    python3.10 -c "import distributed_shampoo; print('[OK] Shampoo installed')"
+
+WORKDIR /workspace/aorta
+CMD ["/bin/bash"]

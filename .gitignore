@@ -88,3 +88,11 @@ node_ip_list.txt
 
 # Experiment results
 results/
+
+
+.cursor/
+sdpa/
+shampoo_cifar/
+docker/wheels/
+docker/hipblaslt_install/
+docker/.env.example
