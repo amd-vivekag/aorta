@@ -56,7 +56,12 @@ class FSDPModeReproducer(BaseReproducer):
     def __init__(self, config: ReproducerConfig, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
 
-        self.num_layers: int = config.gemm_layers
+        if config.compute_type == "transformer":
+            self.num_layers: int = config.num_layers
+            self._dim: int = config.model_dim
+        else:
+            self.num_layers: int = config.gemm_layers
+            self._dim: int = config.gemm_size
         self.shard_size: int = config.fsdp_shard_size
 
         # Per-layer parameter shards (each rank holds 1/world_size)
@@ -85,11 +90,12 @@ class FSDPModeReproducer(BaseReproducer):
         if not self.config.simulate_compute:
             return
 
-        # Validate buffer sizes (same check as base class)
-        min_h2d_size = self.config.gemm_size * self.config.gemm_size
+        # Validate buffer sizes based on compute type
+        dim = self._dim
+        min_h2d_size = dim * dim
         if self.config.h2d_tensor_size < min_h2d_size:
             log.warning(
-                f"h2d_tensor_size ({self.config.h2d_tensor_size}) < gemm_size² "
+                f"h2d_tensor_size ({self.config.h2d_tensor_size}) < {dim}² "
                 f"({min_h2d_size}). Increasing to {min_h2d_size} for compute."
             )
             self.config.h2d_tensor_size = min_h2d_size
@@ -127,19 +133,20 @@ class FSDPModeReproducer(BaseReproducer):
         # FSDP mode manages its own compute because collectives are interleaved
         # per-layer, unlike the base compute simulator which runs all layers at once.
         if cfg.simulate_compute:
+            dim = self._dim
             self.weight_matrices = [
                 torch.randn(
-                    cfg.gemm_size, cfg.gemm_size,
+                    dim, dim,
                     dtype=self.dtype, device="cuda",
                 )
                 for _ in range(self.num_layers)
             ]
             self.activation = torch.randn(
-                cfg.gemm_size, cfg.gemm_size,
+                dim, dim,
                 dtype=self.dtype, device="cuda",
             )
             self.grad_buffer = torch.randn(
-                cfg.gemm_size, cfg.gemm_size,
+                dim, dim,
                 dtype=self.dtype, device="cuda",
             )
 
@@ -175,12 +182,9 @@ class FSDPModeReproducer(BaseReproducer):
         if self.config.simulate_compute and self.weight_matrices:
             # Use batch_gpu for data dependency on first layer (H2D race opportunity)
             if layer_idx == 0:
-                batch_slice = self.batch_gpu[
-                    :self.config.gemm_size * self.config.gemm_size
-                ]
-                self.activation = batch_slice.view(
-                    self.config.gemm_size, self.config.gemm_size
-                )
+                dim = self._dim
+                batch_slice = self.batch_gpu[:dim * dim]
+                self.activation = batch_slice.view(dim, dim)
 
             self.activation = torch.mm(
                 self.weight_matrices[layer_idx], self.activation

@@ -43,12 +43,17 @@ aorta/
 ├── src/aorta/
 │   ├── training/
 │   │   └── fsdp_trainer.py             # Main FSDP trainer
-│   └── race/                           # Race condition experiments module
+│   └── race/                           # Standalone race condition reproducer
 │       ├── __init__.py                 # Public API exports
-│       ├── config.py                   # RaceConfig dataclass
-│       ├── h2d_racing.py               # H2D memcpy racing
-│       ├── datadist_racing.py          # Datadist/all_to_all racing
-│       └── injectors.py                # High-level injection API
+│       ├── __main__.py                 # CLI entry point
+│       ├── config.py                   # ReproducerConfig, RaceConfig
+│       ├── base.py                     # BaseReproducer abstract class
+│       ├── compute.py                  # Pluggable compute simulation
+│       └── modes/                      # Mode implementations
+│           ├── __init__.py             # Factory + registry
+│           ├── default.py              # TorchRec-like (all_to_all + all_reduce)
+│           ├── ddp.py                  # DDP (gradient all_reduce)
+│           └── fsdp.py                 # FSDP (all_gather + reduce_scatter)
 ```
 
 ## Quick Start
@@ -174,7 +179,7 @@ This is useful when running multiple experiments to track different configuratio
 
 Environment variables: `CHANNELS=42 THREADS=512 ./scripts/multi_node/master_launch.sh`
 
-GPU subset: Use `-p 4` or `export CUDA_VISIBLE_DEVICES=0,2,4,6`
+GPU subset: Use `-p 4` or `export ROCR_VISIBLE_DEVICES=0,2,4,6`
 
 ### Monitoring
 

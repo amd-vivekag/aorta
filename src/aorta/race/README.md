@@ -8,7 +8,7 @@ The key idea: the test uses **correct synchronization everywhere**. If data corr
 
 ### The Problem It Detects
 
-In multi-GPU training, different operations run on different CUDA streams in parallel:
+In multi-GPU training, different operations run on different GPU streams in parallel:
 
 1. **H2D** ("Host-to-Device"): Copies a batch of data from CPU memory to GPU memory on a dedicated `memcpy_stream`.
 2. **datadist** ("data distribution"): Runs `all_to_all` collective communication (exchanging sparse embeddings across GPUs, TorchRec-style) on a dedicated `datadist_stream`.
@@ -229,7 +229,7 @@ torchrun --nproc_per_node=8 -m aorta.race --same-stream
 | `--warmup N` | 100 | Warmup iterations (runs pipeline, skips corruption checks) |
 | `--verify N` | 10000 | Verification iterations (runs pipeline and checks for corruption) |
 | `--no-compute` | - | Skip GEMM compute simulation (faster but less realistic timing) |
-| `--same-stream` | - | Put H2D and datadist on same CUDA stream |
+| `--same-stream` | - | Put H2D and datadist on same GPU stream |
 | `--no-stop-on-first` | - | Continue running after first corruption (count total) |
 | `--gemm-size N` | 5120 | GEMM matrix size (controls compute duration) |
 | `--gemm-layers N` | 26 | Number of GEMM layers (controls compute duration) |
@@ -287,6 +287,6 @@ See `developer_guide.md` for the full walkthrough.
 
 - **Background & Concepts:** `src/aorta/race/background.md` -- Detailed explanation of distributed training patterns, collectives, streams, and the race condition bug
 - **Config Reference:** `config/race/`
-- **Environment Variables:** `config/race/customer_env_vars.yaml`
+- **Environment Variables:** `config/race/env_vars_reference.yaml`
 - **Multi-node Scripts:** `scripts/multi_node/launch_reproducer.sh`
 - **Developer Guide:** `src/aorta/race/developer_guide.md`

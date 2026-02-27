@@ -120,11 +120,12 @@ class ReproducerConfig:
     """
 
     compute_type: str = "gemm"
-    """Compute pattern type. Options: gemm (more can be registered)."""
+    """Compute pattern type. Options: gemm, transformer."""
 
+    # ----- GEMM compute settings -----
     gemm_size: int = 5120
     """
-    Matrix size for GEMM operations.
+    Matrix size NxN for GEMM compute type.
 
     5120x5120 GEMM takes ~14ms on MI300X.
     Adjust based on GPU to achieve ~500ms/step target.
@@ -132,13 +133,31 @@ class ReproducerConfig:
 
     gemm_layers: int = 26
     """
-    Number of GEMM layers to simulate forward/backward.
+    Number of GEMM layers for GEMM compute type.
 
     26 layers x 14ms = ~364ms per forward/backward pass.
     """
 
+    # ----- Transformer compute settings -----
+    model_dim: int = 2048
+    """
+    Hidden dimension (d_model) for transformer compute type.
+
+    Controls the size of the self-attention and FFN layers.
+    Number of attention heads = model_dim // 128.
+    FFN intermediate size = model_dim * 4.
+    """
+
+    num_layers: int = 4
+    """
+    Number of transformer encoder layers for transformer compute type.
+
+    Each layer contains multi-head self-attention + FFN + layer norm.
+    4 layers at model_dim=2048 gives ~300ms/step on MI350X.
+    """
+
     include_backward_compute: bool = True
-    """Also simulate backward pass GEMMs (doubles compute time)."""
+    """Also simulate backward pass (doubles compute time)."""
 
     # =========================================================================
     # Optimizer (used by modes that support it, e.g., DDP)
@@ -352,28 +371,28 @@ class RaceConfig:
     gpu_max_hw_queues: Optional[int] = None
     """
     Set GPU_MAX_HW_QUEUES environment variable.
-    
+
     CRITICAL for race exposure:
     - 1-2: Streams share HW queues → implicit serialization → RACE MASKED
     - 4+: Each stream gets own HW queue → true parallelism → RACE EXPOSED
-    
-    Recommended: 4 for race testing, or 3 with client_stream_layout.
+
+    Recommended: 4 for race testing, or 3 with torchrec_stream_layout.
     """
 
-    client_stream_layout: bool = False
+    torchrec_stream_layout: bool = False
     """
-    Use client's stream layout for accurate reproduction of their NaN issue.
-    
+    Use TorchRec-style stream layout for accurate reproduction of the NaN issue.
+
     When enabled:
     - 3 streams only: default_stream, memcpy_stream, datadist_stream
     - Forward/backward/clip/optimizer/FSDP collectives run on default stream
     - Only H2D and datadist operations on separate racing streams
     - DistributedOpsInterceptor is bypassed (no stream redirection for collectives)
-    
-    This matches the client's actual TorchRec-style architecture where:
+
+    This matches a typical TorchRec-style architecture where:
     - memcpy_stream races with default stream (H2D not synced before forward)
     - datadist_stream races with default stream (all_to_all not synced before collective)
-    
+
     Recommended: Use with gpu_max_hw_queues: 3 for 1:1 stream-to-queue mapping.
     """
 
@@ -407,13 +426,13 @@ class RaceConfig:
     timing_debug_logs: bool = False
     """
     Enable detailed timing logs around H2D, datadist, and forward operations.
-    
+
     When enabled, logs wall-clock timestamps for:
     - H2D copy (memcpy_stream operations)
     - Datadist racing (all_to_all operations)
     - Timing skew delay
     - Forward pass
-    
+
     Also logs gap/overlap between operations to verify if race windows exist.
     Negative gap = overlap = potential race.
     """
@@ -421,19 +440,19 @@ class RaceConfig:
     gpu_event_timing: bool = False
     """
     Enable GPU event-based timing to measure actual stream overlap.
-    
+
     Unlike timing_debug_logs which measures CPU-side timestamps, this uses
     CUDA/HIP events to measure actual GPU execution times and overlap.
-    
+
     Event recording is non-blocking and doesn't interfere with race conditions.
     Timing calculations happen AFTER the iteration completes (when we sync anyway).
-    
+
     Logs GPU-side durations and overlap between streams:
     - GPU_H2D_DUR: Actual GPU time for H2D copy
     - GPU_DD_DUR: Actual GPU time for datadist all_to_all
     - GPU_FWD_DUR: Actual GPU time for forward pass
     - GPU_OVERLAP: Time between stream operations (negative = overlap = race!)
-    
+
     WARNING: Cross-stream timing (e.g., DD->FWD) is INACCURATE because events
     are on different streams. Use nccl_async_diagnostic for accurate overlap detection.
     """
@@ -441,15 +460,15 @@ class RaceConfig:
     nccl_async_diagnostic: bool = False
     """
     Enable NCCL async behavior diagnostic.
-    
+
     When enabled, checks if the datadist all_to_all work is still in-flight
     when forward pass starts. This uses work.is_completed() which is non-blocking
     and does NOT affect the race condition.
-    
+
     Logs:
-    - NCCL_DIAG: Whether all_to_all is PENDING (async, race possible) or 
+    - NCCL_DIAG: Whether all_to_all is PENDING (async, race possible) or
       COMPLETED (sync, race may be masked by NCCL internal sync)
-    
+
     This is the authoritative way to verify if a race window exists, because
     it directly queries the NCCL work handle status rather than relying on
     GPU event timing which is inaccurate for cross-stream measurements.
@@ -458,12 +477,12 @@ class RaceConfig:
     datadist_use_real_dependency: bool = True
     """
     Make datadist output actually used by forward pass.
-    
+
     When enabled, the all_to_all output tensor is added as noise to batch["dense"],
     creating a real data dependency that forward must read. This more accurately
-    reproduces the client's TorchRec pattern where distributed embeddings race
+    reproduces a TorchRec pattern where distributed embeddings race
     with the forward pass.
-    
+
     Without this, datadist creates synthetic tensors that are discarded,
     so there's no actual data race with forward (just stream contention).
     """
@@ -550,10 +569,10 @@ class RaceConfig:
     datadist_tensor_size: Optional[int] = 1_000_000
     """
     Fixed tensor size for datadist all_to_all operation.
-    
+
     If set, uses this fixed size instead of basing it on dense.numel().
     This allows controlling the all_to_all duration independently of dense_dim.
-    
+
     Recommended: 1M-10M elements for ~100-500ms all_to_all duration.
     Set to None to use dense.numel() (original behavior, but can be very slow
     with large dense_dim).

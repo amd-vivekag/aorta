@@ -18,7 +18,7 @@ This document explains the distributed training concepts behind each reproducer 
 
 ## 1. GPU Programming Model
 
-### CUDA Streams
+### GPU Streams
 
 A **stream** is a sequence of GPU operations that execute in order. Operations on the *same* stream are sequential; operations on *different* streams can run concurrently:
 
@@ -56,11 +56,11 @@ default_stream:                        [Forward ........]
 
 ### Hardware Queues (`GPU_MAX_HW_QUEUES`)
 
-The GPU has a limited number of **hardware dispatch queues**. Multiple CUDA streams are multiplexed onto these queues:
+The GPU has a limited number of **hardware dispatch queues**. Multiple GPU streams are multiplexed onto these queues:
 
 ```
                          ┌─── HW Queue 0 ──→ GPU compute units
-CUDA Streams ───────────►├─── HW Queue 1 ──→ GPU compute units
+GPU Streams  ───────────►├─── HW Queue 1 ──→ GPU compute units
 (software)               ├─── HW Queue 2 ──→ GPU compute units
                          └─── HW Queue 3 ──→ GPU compute units
 ```
@@ -502,4 +502,4 @@ If any value doesn't match, it's proof of a runtime bug -- the application's syn
 - [PyTorch FSDP](https://pytorch.org/docs/stable/fsdp.html) -- Fully Sharded Data Parallel
 - [TorchRec](https://pytorch.org/torchrec/) -- Recommendation model training framework
 - [NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/) -- Collective communication library (RCCL is AMD's fork)
-- [CUDA Streams](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#streams) -- Asynchronous GPU execution model
+- [GPU Streams (HIP)](https://rocm.docs.amd.com/projects/HIP/en/latest/how-to/hip_runtime_api/asynchronous.html) -- Asynchronous GPU execution model

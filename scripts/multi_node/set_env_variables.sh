@@ -53,7 +53,7 @@ export NCCL_SOCKET_IFNAME=enp49s0f0np0,fenic0
 # Timeout and Error Handling
 # -----------------------------------------------------------------------------
 export NCCL_TIMEOUT_MS=12000                 # 12 second timeout (legacy, not used by PyTorch)
-export NCCL_TIMEOUT=150                      # 300 second (5 min) timeout - first backward can be slow due to JIT/init
+export NCCL_TIMEOUT=150                      # 150 second (2.5 min) timeout - first backward can be slow due to JIT/init
 export TORCH_DIST_INIT_TIMEOUT=150           # Match collective timeout for consistency
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_TRACE_BUFFER_SIZE=10000

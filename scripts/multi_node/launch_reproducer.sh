@@ -33,7 +33,7 @@ usage() {
     echo "      --master-port PORT    Master port (default: auto-select)"
     echo "  -h, --help                Show this help"
     echo ""
-    echo "Customer-Tested Environment Variables:"
+    echo "Tested Environment Variables:"
     echo "  -q, --hw-queues N         GPU_MAX_HW_QUEUES (4=expose bug, 2=mask)"
     echo "      --signal-pool N       ROC_SIGNAL_POOL_SIZE (tried 16384 - still NaN)"
     echo "      --disable-sdma        HSA_ENABLE_SDMA=0 (tried - still NaN)"
@@ -90,7 +90,7 @@ FSDP_SHARD_SIZE=""
 LABEL=""
 MASTER_PORT=""
 
-# Customer-tested env var flags
+# Tested env var flags
 SIGNAL_POOL=""
 DISABLE_SDMA=""
 BLIT_COPY=""
@@ -161,7 +161,7 @@ while [[ $# -gt 0 ]]; do
             MASTER_PORT="$2"
             shift 2
             ;;
-        # Customer-tested env var flags
+        # Tested env var flags
         --signal-pool)
             SIGNAL_POOL="$2"
             shift 2
@@ -341,7 +341,7 @@ echo "  Deterministic: ${DETERMINISTIC:-no}"
 echo "  Bucketed: ${BUCKETED:-no}"
 echo "  Optimizer: ${OPTIMIZER:-none}"
 echo ""
-echo "Customer-tested env vars:"
+echo "Tested env vars:"
 echo "  GPU_MAX_HW_QUEUES: $HW_QUEUES"
 [[ -n "$SIGNAL_POOL" ]] && echo "  ROC_SIGNAL_POOL_SIZE: $SIGNAL_POOL"
 [[ -n "$DISABLE_SDMA" ]] && echo "  HSA_ENABLE_SDMA: 0"

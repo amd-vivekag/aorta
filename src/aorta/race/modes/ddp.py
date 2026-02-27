@@ -75,7 +75,12 @@ class DDPModeReproducer(BaseReproducer):
         super().__init__(config, rank, world_size)
 
         self.bucketed: bool = config.ddp_bucketed
-        self.num_layers: int = config.gemm_layers
+        if config.compute_type == "transformer":
+            self.num_layers: int = config.num_layers
+            self._dim: int = config.model_dim
+        else:
+            self.num_layers: int = config.gemm_layers
+            self._dim: int = config.gemm_size
 
         # Per-layer weight matrices (bucketed mode only, allocated in setup_buffers)
         self.weight_matrices: List[torch.Tensor] = []
@@ -99,11 +104,12 @@ class DDPModeReproducer(BaseReproducer):
         if not self.config.simulate_compute:
             return
 
-        # Validate buffer sizes
-        min_h2d_size = self.config.gemm_size * self.config.gemm_size
+        # Validate buffer sizes based on compute type
+        dim = self._dim
+        min_h2d_size = dim * dim
         if self.config.h2d_tensor_size < min_h2d_size:
             log.warning(
-                f"h2d_tensor_size ({self.config.h2d_tensor_size}) < gemm_size² "
+                f"h2d_tensor_size ({self.config.h2d_tensor_size}) < {dim}² "
                 f"({min_h2d_size}). Increasing to {min_h2d_size} for compute."
             )
             self.config.h2d_tensor_size = min_h2d_size
@@ -115,28 +121,28 @@ class DDPModeReproducer(BaseReproducer):
         if not self.bucketed or not self.config.simulate_compute:
             return
 
-        cfg = self.config
+        dim = self._dim
 
         self.weight_matrices = [
             torch.randn(
-                cfg.gemm_size, cfg.gemm_size,
+                dim, dim,
                 dtype=self.dtype, device="cuda", requires_grad=True,
             )
             for _ in range(self.num_layers)
         ]
 
         self.activation = torch.randn(
-            cfg.gemm_size, cfg.gemm_size,
+            dim, dim,
             dtype=self.dtype, device="cuda",
         )
         self.grad_buffer = torch.randn(
-            cfg.gemm_size, cfg.gemm_size,
+            dim, dim,
             dtype=self.dtype, device="cuda",
         )
 
         log.info(
             f"Allocated DDP bucketed buffers: layers={self.num_layers}, "
-            f"gemm_size={cfg.gemm_size}"
+            f"dim={dim}"
         )
 
     def _setup_optimizer(self) -> None:
@@ -204,9 +210,9 @@ class DDPModeReproducer(BaseReproducer):
         if not self.config.simulate_compute or not self.weight_matrices:
             return
 
-        cfg = self.config
-        batch_slice = self.batch_gpu[:cfg.gemm_size * cfg.gemm_size]
-        self.activation = batch_slice.view(cfg.gemm_size, cfg.gemm_size)
+        dim = self._dim
+        batch_slice = self.batch_gpu[:dim * dim]
+        self.activation = batch_slice.view(dim, dim)
 
         for weight in self.weight_matrices:
             self.activation = torch.mm(weight, self.activation)

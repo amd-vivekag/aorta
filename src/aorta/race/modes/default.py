@@ -37,37 +37,37 @@ log = logging.getLogger(__name__)
 class DefaultModeReproducer(BaseReproducer):
     """
     TorchRec-like reproducer with all_to_all + all_reduce.
-    
+
     This mode tests the 3-stream pattern common in recommendation models:
     - memcpy_stream: H2D data transfers
     - datadist_stream: all_to_all collectives (sparse embedding exchange)
     - default_stream: compute + all_reduce (gradient sync)
-    
+
     H2D strategy is controlled by config.h2d_prefetch:
     - False (default): single-buffered, copy-then-use at start of iteration
     - True (--prefetch): double-buffered, prefetch next batch during backward
-    
+
     Verification checks:
     - H2D: batch_gpu == iteration % 1000
     - all_to_all: recv_buf[j] == j (data from rank j)
     - all_reduce: reduce_buf == sum(1..world_size)
     """
-    
+
     def __init__(self, config: ReproducerConfig, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
-        
+
         # Mode-specific stream
         self.datadist_stream: Optional[torch.cuda.Stream] = None
-        
+
         # Mode-specific buffers (H2D buffers are in base class)
         self.send_buf: Optional[torch.Tensor] = None
         self.recv_buf: Optional[torch.Tensor] = None
         self.reduce_buf: Optional[torch.Tensor] = None
-    
+
     def _setup_streams(self) -> None:
         """Create CUDA streams including datadist_stream."""
         super()._setup_streams()
-        
+
         if self.config.same_stream_mode:
             # Same stream for H2D and datadist (definitive runtime bug test)
             self.datadist_stream = self.memcpy_stream
@@ -75,36 +75,36 @@ class DefaultModeReproducer(BaseReproducer):
         else:
             self.datadist_stream = torch.cuda.Stream()
             log.info("Using separate datadist_stream")
-    
+
     def setup_buffers(self) -> None:
         """Allocate mode-specific buffers (all_to_all + all_reduce)."""
         cfg = self.config
-        
+
         # all_to_all buffers
         self.send_buf = torch.empty(
             self.world_size, cfg.alltoall_tensor_size,
             dtype=self.dtype, device="cuda"
         )
         self.recv_buf = torch.empty_like(self.send_buf)
-        
+
         # all_reduce buffer
         self.reduce_buf = torch.empty(
             cfg.allreduce_tensor_size, dtype=self.dtype, device="cuda"
         )
-        
+
         log.info(
             f"Allocated default mode buffers: "
             f"a2a={cfg.alltoall_tensor_size}, ar={cfg.allreduce_tensor_size}"
         )
-    
+
     def _fill_collective_patterns(self) -> None:
         """Fill collective buffers with known patterns for verification."""
         # all_to_all: send_buf[i] = rank for all i
         self.send_buf.fill_(float(self.rank))
-        
+
         # all_reduce: reduce_buf = rank + 1
         self.reduce_buf.fill_(float(self.rank + 1))
-    
+
     def _run_alltoall(self) -> dist.Work:
         """Run all_to_all on datadist_stream."""
         with torch.cuda.stream(self.datadist_stream):
@@ -112,11 +112,11 @@ class DefaultModeReproducer(BaseReproducer):
                 self.recv_buf, self.send_buf, async_op=True
             )
         return work
-    
+
     def _run_allreduce(self) -> None:
         """Run all_reduce on default stream."""
         dist.all_reduce(self.reduce_buf)
-    
+
     def run_iteration(self, iteration: int) -> bool:
         """
         Run one iteration of the default (TorchRec-like) mode.
@@ -240,33 +240,33 @@ class DefaultModeReproducer(BaseReproducer):
         self._h2d_swap_buffers()
 
         return result
-    
+
     def _verify(self, iteration: int) -> bool:
         """Verify all buffers contain expected patterns."""
         all_correct = True
-        
+
         # Check H2D result
         if not self._verify_h2d(self.batch_gpu, iteration):
             all_correct = False
-        
+
         # Check all_to_all result
         if not self._verify_alltoall():
             all_correct = False
-        
+
         # Check all_reduce result
         if not self._verify_allreduce():
             all_correct = False
-        
+
         return all_correct
-    
+
     def _verify_alltoall(self) -> bool:
         """Verify all_to_all result: recv_buf[j] should be all j's."""
         all_correct = True
-        
+
         for src_rank in range(self.world_size):
             expected = float(src_rank)
             expected_tensor = torch.full_like(self.recv_buf[src_rank], expected)
-            
+
             if not torch.allclose(
                 self.recv_buf[src_rank], expected_tensor, rtol=1e-3, atol=1e-3
             ):
@@ -284,14 +284,14 @@ class DefaultModeReproducer(BaseReproducer):
                     "actual": actual,
                 })
                 all_correct = False
-        
+
         return all_correct
-    
+
     def _verify_allreduce(self) -> bool:
         """Verify all_reduce result: should be sum(1..world_size)."""
         expected = float(sum(range(1, self.world_size + 1)))
         expected_tensor = torch.full_like(self.reduce_buf, expected)
-        
+
         if not torch.allclose(
             self.reduce_buf, expected_tensor, rtol=1e-3, atol=1e-3
         ):
@@ -307,7 +307,7 @@ class DefaultModeReproducer(BaseReproducer):
                 "actual": actual,
             })
             return False
-        
+
         return True
 
 

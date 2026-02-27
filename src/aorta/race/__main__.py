@@ -123,6 +123,22 @@ def parse_args() -> argparse.Namespace:
         "--no-backward", action="store_true",
         help="Skip backward pass simulation"
     )
+    parser.add_argument(
+        "--compute-type", type=str, default="gemm",
+        choices=["gemm", "transformer"],
+        help="Compute pattern type. gemm: stacked matrix multiplications. "
+             "transformer: self-attention + FFN layers. Default: gemm"
+    )
+
+    # Transformer compute settings
+    parser.add_argument(
+        "--model-dim", type=int, default=2048,
+        help="Transformer hidden dim (d_model). Default: 2048"
+    )
+    parser.add_argument(
+        "--num-layers", type=int, default=4,
+        help="Number of transformer layers. Default: 4"
+    )
 
     # FSDP-specific
     parser.add_argument(
@@ -288,6 +304,11 @@ def main():
         log.info(f"Warmup iterations: {args.warmup}")
         log.info(f"Verify iterations: {args.verify}")
         log.info(f"Simulate compute: {not args.no_compute}")
+        log.info(f"Compute type: {args.compute_type}")
+        if args.compute_type == "transformer":
+            log.info(f"  model_dim: {args.model_dim}, num_layers: {args.num_layers}")
+        else:
+            log.info(f"  gemm_size: {args.gemm_size}, gemm_layers: {args.gemm_layers}")
         log.info(f"H2D prefetch: {args.prefetch}")
         log.info(f"Same stream mode: {args.same_stream}")
         log.info(f"Optimizer: {args.optimizer}")
@@ -326,9 +347,12 @@ def main():
         fsdp_shard_size=args.fsdp_shard_size,
         dtype=args.dtype,
         simulate_compute=not args.no_compute,
+        compute_type=args.compute_type,
         h2d_prefetch=args.prefetch,
         gemm_size=args.gemm_size,
         gemm_layers=args.gemm_layers,
+        model_dim=args.model_dim,
+        num_layers=args.num_layers,
         include_backward_compute=not args.no_backward,
         same_stream_mode=args.same_stream,
         gpu_max_hw_queues=args.hw_queues,

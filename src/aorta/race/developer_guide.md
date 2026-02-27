@@ -231,41 +231,41 @@ class YourModeReproducer(BaseReproducer):
         self.my_buffer = torch.zeros(
             self.config.tensor_size,
             dtype=self.dtype,
-            device=self.device,
+            device="cuda",
         )
         # ... more buffers as needed
 
     def run_iteration(self, iteration: int) -> bool:
         """
         Run one iteration of the mode-specific data flow.
-        
+
         Args:
             iteration: Current iteration number
-            
+
         Returns:
             True if verification passed, False if corruption detected
         """
         # 1. Prepare data with known pattern
         expected_value = float(iteration % 1000)
         self.batch_cpu.fill_(expected_value)
-        
+
         # 2. H2D transfer on memcpy_stream
         with torch.cuda.stream(self.memcpy_stream):
             self.batch_gpu.copy_(self.batch_cpu, non_blocking=True)
-        
+
         # 3. Record event for synchronization
         self.h2d_complete.record(self.memcpy_stream)
-        
+
         # 4. Wait for H2D before compute
         self.default_stream.wait_event(self.h2d_complete)
-        
+
         # 5. Run your compute/communication pattern
         # ... your mode-specific logic here
-        
+
         # 6. Verify data integrity (during verification phase)
         if iteration >= self.config.warmup_iterations:
             return self._verify_my_data(expected_value)
-        
+
         return True
 
     def _verify_my_data(self, expected: float) -> bool:
@@ -318,14 +318,14 @@ class AttentionCompute(BaseCompute):
         """Initialize attention layers."""
         self.query = torch.nn.Linear(
             self.config.gemm_size, self.config.gemm_size
-        ).to(self.device, dtype=self.dtype)
+        ).to("cuda", dtype=self.dtype)
         self.key = torch.nn.Linear(
             self.config.gemm_size, self.config.gemm_size
-        ).to(self.device, dtype=self.dtype)
+        ).to("cuda", dtype=self.dtype)
         self.value = torch.nn.Linear(
             self.config.gemm_size, self.config.gemm_size
-        ).to(self.device, dtype=self.dtype)
-        
+        ).to("cuda", dtype=self.dtype)
+
         if requires_grad:
             for p in self.parameters():
                 p.requires_grad_(True)
@@ -334,16 +334,16 @@ class AttentionCompute(BaseCompute):
         """Run attention forward pass."""
         # Reshape input for attention
         x = batch_gpu.view(-1, self.config.gemm_size)
-        
+
         q = self.query(x)
         k = self.key(x)
         v = self.value(x)
-        
+
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / (self.config.gemm_size ** 0.5)
         attn = torch.softmax(scores, dim=-1)
         output = torch.matmul(attn, v)
-        
+
         return output.sum()
 
     def backward(self, output: torch.Tensor, use_autograd: bool = False) -> None:
@@ -354,10 +354,10 @@ class AttentionCompute(BaseCompute):
             # Manual backward simulation
             for _ in range(self.config.gemm_layers):
                 dummy = torch.matmul(
-                    torch.randn(self.config.gemm_size, self.config.gemm_size, 
-                               device=self.device, dtype=self.dtype),
                     torch.randn(self.config.gemm_size, self.config.gemm_size,
-                               device=self.device, dtype=self.dtype)
+                               device="cuda", dtype=self.dtype),
+                    torch.randn(self.config.gemm_size, self.config.gemm_size,
+                               device="cuda", dtype=self.dtype)
                 )
 
     def parameters(self):
@@ -446,16 +446,14 @@ The `BaseReproducer` class provides these utilities for subclasses:
 | `self.config` | `ReproducerConfig` | Configuration object |
 | `self.rank` | `int` | Current process rank |
 | `self.world_size` | `int` | Total number of processes |
-| `self.device` | `torch.device` | CUDA device for this rank |
 | `self.dtype` | `torch.dtype` | Data type (e.g., bfloat16) |
-| `self.memcpy_stream` | `torch.cuda.Stream` | Stream for H2D transfers |
-| `self.default_stream` | `torch.cuda.Stream` | Default stream for compute |
-| `self.h2d_complete` | `torch.cuda.Event` | Event for H2D sync |
+| `self.memcpy_stream` | `torch.cuda.Stream` | GPU stream for H2D transfers |
+| `self.default_stream` | `torch.cuda.Stream` | Default GPU stream for compute |
 | `self.batch_cpu` | `torch.Tensor` | Pinned CPU tensor (H2D source) |
 | `self.batch_gpu` | `torch.Tensor` | GPU tensor (H2D destination) |
 | `self.compute` | `BaseCompute` | Compute simulator instance |
 | `self.optimizer` | `torch.optim.Optimizer` | Optimizer (if configured) |
-| `self.corruption_count` | `int` | Counter for detected corruptions |
+| `self.in_verification_phase` | `bool` | Whether currently in verification phase |
 | `self.corruption_details` | `list` | Details of each corruption |
 
 | Method | Description |
