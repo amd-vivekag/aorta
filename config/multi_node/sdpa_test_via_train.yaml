@@ -1,0 +1,142 @@
+# SDPA Testing via train.py Integration
+# This config enables SDPA testing through the existing train.py infrastructure
+# by using the SDPATestModel wrapper
+
+logging:
+  level: INFO
+
+# SDPA test configuration (activates SDPATestModel)
+sdpa_test:
+  # Path to SDPA input files
+  input_dir: data/sdpa_inputs
+  
+  # Maximum iterations (note: training loop controls this via max_steps)
+  max_iterations: 1000
+  
+  # Device to use
+  device: cuda
+  
+  # Enable verbose logging
+  verbose: false
+  
+  # Enable NaN checking
+  check_nan: true
+
+# Model configuration (used for SDPATestModel compatibility)
+model:
+  vocab_size: 100
+  embedding_dim: 64
+  num_dense_features: 1
+  dense_dim: 64
+  model_dim: 64
+  num_heads: 1
+  num_layers: 1
+  dropout: 0.0
+  mlp_hidden_dim: 64
+
+# Dataset configuration (minimal - not used for SDPA test)
+dataset:
+  num_samples: 1000
+  sequence_length: 10
+  dense_dim: 64
+  sparse_features: 1
+  vocab_size: 100
+  num_dense_features: 1
+  seed: 42
+
+# Training configuration
+training:
+  epochs: 1
+  batch_size: 1           # Dummy batch size (SDPA model ignores this)
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  max_steps: 1000         # Controls number of SDPA iterations
+  grad_clip_norm: 1.0
+  log_interval: 10
+  output_dir: artifacts/sdpa_test_via_train
+
+# Optimizer configuration (minimal)
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.98]
+  eps: 1.0e-8
+
+scheduler:
+  warmup_steps: 0
+  total_steps: 1000
+
+# Distributed configuration
+distributed:
+  mode: fsdp
+  backend: nccl
+  bucket_cap_mb: 128
+  gradient_as_bucket_view: true
+  static_graph: true
+  find_unused_parameters: false
+
+# FSDP configuration
+fsdp:
+  # Use hybrid_shard for multi-node
+  sharding_strategy: hybrid_shard
+  
+  # Don't sync module states (minimal model)
+  sync_module_states: false
+  
+  # Standard FSDP settings
+  backward_prefetch: BACKWARD_PRE
+  use_orig_params: true
+  limit_all_gathers: false
+  forward_prefetch: false
+
+# Race experiment configuration (optional)
+race_experiment:
+  # Hardware queue settings
+  gpu_max_hw_queues: 4
+  
+  # Skip warmup phases
+  skip_rccl_warmup: false
+  rccl_warmup_iterations: 5
+  skip_training_warmup: true
+  
+  # Debug instrumentation
+  timing_debug_logs: false
+  gpu_event_timing: false
+  nccl_async_diagnostic: false
+  
+  # Disable race injection features
+  client_stream_layout: false
+  h2d_memcpy_racing: false
+  datadist_racing: false
+  timing_skew_enabled: false
+  nan_check_collectives: false
+
+# Compilation (disabled)
+compile:
+  enabled: false
+  backend: inductor
+  mode: default
+  fullgraph: false
+  dynamic: false
+  options: {}
+
+# Dataloader configuration
+dataloader:
+  num_workers: 0
+  pin_memory: true
+
+# Profiling configuration
+profiling:
+  enabled: false
+  wait: 0
+  warmup: 0
+  active: 5
+  repeat: 1
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_flops: false
+  tensorboard: false
+  chrome_trace: false
+  trace_filename: sdpa_test.json

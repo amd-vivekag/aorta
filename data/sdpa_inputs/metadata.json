@@ -1,0 +1,40 @@
+{
+  "func_name": "_scaled_dot_product_flash_attention_backward.default",
+  "arg_names": [
+    "grad_out",
+    "query",
+    "key",
+    "value",
+    "out",
+    "logsumexp",
+    "cum_seq_q",
+    "cum_seq_k",
+    "max_q",
+    "max_k",
+    "dropout_p",
+    "is_causal",
+    "philox_seed",
+    "philox_offset"
+  ],
+  "saved_inputs": {
+    "grad_out": "input_grad_out.pt",
+    "query": "input_query.pt",
+    "key": "input_key.pt",
+    "value": "input_value.pt",
+    "out": "input_out.pt",
+    "logsumexp": "input_logsumexp.pt",
+    "cum_seq_q": "None",
+    "cum_seq_k": "None",
+    "max_q": "32",
+    "max_k": "150",
+    "dropout_p": "0.0",
+    "is_causal": "False",
+    "philox_seed": "input_philox_seed.pt",
+    "philox_offset": "input_philox_offset.pt",
+    "scale": "0.10206207261596577"
+  },
+  "rank": 0,
+  "timestamp": 1769623558,
+  "platform": "amd",
+  "log_number": 1
+}
