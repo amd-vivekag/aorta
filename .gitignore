@@ -73,7 +73,6 @@ Thumbs.db
 
 # Data files
 *.dat
-data/sdpa_inputs/
 
 tmp_prof.*
 rocprof_traces
