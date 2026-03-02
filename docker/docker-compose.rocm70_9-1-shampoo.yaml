@@ -1,6 +1,6 @@
 services:
-  torchenv-rocm70-shampoo:
-    container_name: training-overlap-bugs-rocm70_9-1-shampoo
+  torchenv-rocm70-shampoo-vivekag:
+    container_name: training-overlap-bugs-rocm70_9-1-shampoo-vivekag
     build:
       context: .
       dockerfile: Dockerfile.rocm70_9-1-shampoo
@@ -22,8 +22,10 @@ services:
 
     volumes:
       - /home/manrao:/manrao
-      - /apps/oyazdanb/rccl:/rccl
-      - /apps/oyazdanb/aorta:/workspace/aorta
+      # - /apps/prosenj/rccl/:/rccl
+      - /apps/vivekag/aorta_work/rocm-systems/projects/rccl/:/rccl
+      - /apps/vivekag/aorta_work/aorta/:/workspace/aorta
+      - /apps/vivekag/aorta_work/nan_issue/sdpa/:/workspace/sdpa
     devices:
       - /dev/kfd
       - /dev/dri

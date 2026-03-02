@@ -73,13 +73,13 @@ Thumbs.db
 
 # Data files
 *.dat
+data/sdpa_inputs/
 
 tmp_prof.*
 rocprof_traces
 overlap.*
 .*repro.*
 # Multi-node IP configuration (should be customized per deployment)
-node_ip_list.txt
 
 # Profiler traces
 *.json

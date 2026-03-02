@@ -28,7 +28,7 @@ from torch.optim import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import timedelta
 from aorta.data import SyntheticDatasetConfig, create_dataloader
-from aorta.models import ModelConfig, RankingTransformerModel
+from aorta.models import ModelConfig, RankingTransformerModel, SDPATestConfig, SDPATestModel
 from aorta.profiling.stream_profiler import StreamProfiler
 from aorta.race import RaceConfig
 from aorta.race.injectors import (
@@ -305,8 +305,14 @@ def build_fsdp_model(
     compile_cfg: CompileConfig,
     device: torch.device,
     race_cfg: Optional[RaceConfig] = None,
+    sdpa_cfg: Optional[SDPATestConfig] = None,
 ) -> FSDP:
-    model = RankingTransformerModel(model_cfg)
+    # Select model based on configuration
+    if sdpa_cfg is not None:
+        log.info("Building SDPA test model for distributed testing")
+        model = SDPATestModel(sdpa_cfg)
+    else:
+        model = RankingTransformerModel(model_cfg)
 
     sharding = getattr(ShardingStrategy, fsdp_cfg.sharding_strategy.upper())
     backward_prefetch = getattr(BackwardPrefetch, fsdp_cfg.backward_prefetch.upper())
@@ -1575,6 +1581,18 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
             race_cfg.warmup_batch_size, training_cfg.batch_size
         )
 
+    # Check if SDPA test mode is enabled
+    sdpa_cfg = None
+    if "sdpa_test" in config:
+        sdpa_cfg = SDPATestConfig()
+        for key, value in config["sdpa_test"].items():
+            if hasattr(sdpa_cfg, key):
+                if key == "output_dir":
+                    setattr(sdpa_cfg, key, Path(value))
+                else:
+                    setattr(sdpa_cfg, key, value)
+        log.info("SDPA test mode enabled with input_dir=%s", sdpa_cfg.input_dir)
+
     dist_mode = config.get("distributed", {}).get("mode")
     if dist_mode is None:
         dist_mode = "fsdp"
@@ -1583,7 +1601,7 @@ def main(args: Optional[argparse.Namespace] = None, *, enable_rocm_metrics: bool
     if dist_mode == "ddp":
         model = build_ddp_model(model_cfg, ddp_cfg, compile_cfg, env["device"])
     else:
-        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"], race_cfg)
+        model = build_fsdp_model(model_cfg, fsdp_cfg, compile_cfg, env["device"], race_cfg, sdpa_cfg)
     optimizer = configure_optimizer(model, optimizer_cfg, dist_mode)
     scheduler = configure_scheduler(
         optimizer,
