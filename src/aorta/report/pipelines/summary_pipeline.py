@@ -200,6 +200,16 @@ def _step_process_gpu_timelines(config: SummaryPipelineConfig, result: PipelineR
             print("\nSkipping baseline GPU processing (--skip-baseline-gpu-processing)")
         result.steps_skipped.append("process_baseline_gpu_timelines")
 
+        baseline_gpu_timeline = config.baseline_path / "gpu_timeline_summary_mean.xlsx"
+        if not baseline_gpu_timeline.is_file():
+            msg = (
+                "Baseline GPU timeline file not found. Cannot use "
+                "--skip-baseline-gpu-processing without existing "
+                "gpu_timeline_summary_mean.xlsx."
+            )
+            if config.verbose:
+                print(msg)
+            raise FileNotFoundError(msg)
     # Process test/single config
     test_reports = config.test_path / "tracelens_analysis" / "individual_reports"
     if config.verbose:
