@@ -45,7 +45,6 @@ RUN wget https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/r
 RUN cd /tmp && \
     git clone https://github.com/facebookresearch/optimizers.git && \
     cd optimizers && \
-    sed -i 's/requires-python = ">=3.12"/requires-python = ">=3.10"/' pyproject.toml && \
     sed -i 's/requires-python = ">=.*"/requires-python = ">=3.10"/' pyproject.toml && \
     python3.10 -m pip install . || echo "Shampoo install failed, continuing..." && \
     cd / && \
