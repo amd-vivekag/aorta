@@ -464,6 +464,11 @@ class TestParseProcessGroups:
         with pytest.raises(ValueError, match="Non-integer"):
             parse_process_groups("[0,1.5,2]")
 
+    def test_negative_rank_raises(self):
+        from aorta.utils.distributed import parse_process_groups
+        with pytest.raises(ValueError, match="Negative rank"):
+            parse_process_groups("[0,-1,2]")
+
     def test_large_ranks(self):
         from aorta.utils.distributed import parse_process_groups
         assert parse_process_groups("[100,200,300]") == {0: [100, 200, 300]}
@@ -510,6 +515,11 @@ class TestParseSize:
         from aorta.hw_queue_eval.cli import _parse_size
         with pytest.raises(ValueError, match="Invalid size"):
             _parse_size("M")
+
+    def test_negative_value_raises(self):
+        from aorta.hw_queue_eval.cli import _parse_size
+        with pytest.raises(ValueError, match="non-negative"):
+            _parse_size("-10M")
 
 
 class TestWorkloadRegistry:

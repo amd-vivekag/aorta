@@ -289,6 +289,16 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
         if self.mode != "compute_only":
             elem_size = torch.tensor([], dtype=self.comm_data_type).element_size()
             num_elements = max(1, self.comm_size_bytes // elem_size)
+            # Two buffers (comm + scratch) are allocated
+            alloc_bytes = num_elements * elem_size * 2
+            if alloc_bytes > 4 * 1024 ** 3:
+                logger.warning(
+                    "Comm tensor allocation is %.1f GiB (comm_size_bytes=%d, "
+                    "dtype=%s). This may cause out-of-memory errors.",
+                    alloc_bytes / 1024 ** 3,
+                    self.comm_size_bytes,
+                    self.comm_data_type,
+                )
             comm_device = self._get_device_for_stream(self._comm_stream_idx)
             self._comm_tensor = torch.randn(
                 num_elements, dtype=self.comm_data_type, device=comm_device
@@ -385,6 +395,8 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
             return 0.0
 
         if self.mode == "comms_only":
+            if self._comm_tensor.nelement() == 0:
+                return 0.0
             total_bytes = (
                 iterations
                 * self.num_coll_per_iter

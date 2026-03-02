@@ -141,6 +141,12 @@ def parse_process_groups(spec: str) -> Dict[int, List[int]]:
             raise ValueError(
                 f"Empty process group at index {idx} in spec {spec!r}."
             )
+        negative = [r for r in ranks if r < 0]
+        if negative:
+            raise ValueError(
+                f"Negative rank(s) {negative} in process-group spec {spec!r} "
+                f"(group {idx})."
+            )
         groups[idx] = ranks
     return groups
 

@@ -75,15 +75,23 @@ def _parse_size(value: str) -> int:
     value = value.strip().upper()
     multipliers = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
     try:
+        result: int
         for suffix, mult in multipliers.items():
             if value.endswith(suffix):
-                return int(float(value[:-1]) * mult)
-        return int(value)
+                result = int(float(value[:-1]) * mult)
+                break
+        else:
+            result = int(value)
     except (TypeError, ValueError):
         raise ValueError(
             f"Invalid size value '{original}'. "
             "Expected an integer or a number with K/M/G suffix, e.g. '128M' or '1024'."
         ) from None
+    if result < 0:
+        raise ValueError(
+            f"Invalid size value '{original}'. Size must be non-negative."
+        )
+    return result
 
 
 def get_workload_instance(name: str, **kwargs):
@@ -220,7 +228,14 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
             if wl_mode is not None:
                 kwargs["mode"] = wl_mode
             if mm_dim is not None:
-                parts = [int(x.strip()) for x in mm_dim.split(",")]
+                try:
+                    parts = [int(x.strip()) for x in mm_dim.split(",")]
+                except ValueError:
+                    click.echo(
+                        "Error: --mm-dim must contain integers, e.g. '2048,2048,2048'",
+                        err=True,
+                    )
+                    sys.exit(1)
                 if len(parts) == 1:
                     kwargs["mm_dim"] = (parts[0], parts[0], parts[0])
                 elif len(parts) == 3:
@@ -228,13 +243,25 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
                 else:
                     click.echo("Error: --mm-dim must be M,N,K or a single value", err=True)
                     sys.exit(1)
+                if any(d <= 0 for d in kwargs["mm_dim"]):
+                    click.echo("Error: --mm-dim dimensions must be positive integers", err=True)
+                    sys.exit(1)
             if num_compute is not None:
+                if num_compute <= 0:
+                    click.echo("Error: --num-compute must be a positive integer", err=True)
+                    sys.exit(1)
                 kwargs["num_compute_per_iter"] = num_compute
             if num_coll is not None:
+                if num_coll <= 0:
+                    click.echo("Error: --num-coll must be a positive integer", err=True)
+                    sys.exit(1)
                 kwargs["num_coll_per_iter"] = num_coll
             if comm_size is not None:
                 kwargs["comm_size_bytes"] = _parse_size(comm_size)
             if compute_streams is not None:
+                if compute_streams <= 0:
+                    click.echo("Error: --compute-streams must be a positive integer", err=True)
+                    sys.exit(1)
                 kwargs["compute_streams"] = compute_streams
             if comp_dtype is not None:
                 kwargs["comp_data_type"] = comp_dtype
