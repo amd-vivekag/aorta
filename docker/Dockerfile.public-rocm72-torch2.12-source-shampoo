@@ -4,6 +4,7 @@ USER root
 
 RUN apt-get update && apt-get install -y wget git && rm -rf /var/lib/apt/lists/*
 
+
 # Install pre-built PyTorch wheel (built from source commit 580a6e2 against ROCm 7.2)
 COPY wheels/torch-2.12.0a0+git580a6e2-cp310-cp310-linux_x86_64.whl /tmp/
 RUN pip install /tmp/torch-2.12.0a0+git580a6e2-cp310-cp310-linux_x86_64.whl --force-reinstall --no-deps && \
@@ -21,7 +22,11 @@ RUN cd /tmp && \
     cd / && \
     rm -rf /tmp/optimizers
 
-RUN python3.10 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
+RUN echo "=== hipBLASLt version ===" && \
+    cat /opt/rocm/lib/cmake/hipblaslt/hipblaslt-config-version.cmake | grep PACKAGE_VERSION && \
+    echo "=== HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32 support ===" && \
+    strings /opt/rocm/lib/libhipblaslt.so | grep HIPBLASLT_OVERRIDE_COMPUTE_TYPE_XF32 && \
+    python3.10 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
     python3.10 -c "import torch; print(f'HIP: {torch.version.hip}')" && \
     python3.10 -c "import torch; print(f'ROCm: {torch.version.rocm}')" && \
     python3.10 -c "import distributed_shampoo; print('[OK] Shampoo installed')"

@@ -14,7 +14,7 @@
 
 services:
   torchenv-rocm70:
-    container_name: training-overlap-bugs-rocm70_9-1
+    container_name: training-rocm72-toch212
     build:
       context: .
       dockerfile: Dockerfile.public-rocm72-base

@@ -1,0 +1,37 @@
+services:
+  torchenv-rocm72-shampoo:
+    container_name: training-rocm72-torch2.12-shampoo
+    build:
+      context: .
+      dockerfile: Dockerfile.public-rocm72-torch2.12-source-shampoo
+      network: host
+    user: root
+    privileged: true
+    network_mode: host
+    group_add:
+      - video
+    ipc: host
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - RCCL_FOLDER=/rccl
+      - LD_LIBRARY_PATH=/rccl/build/release:${LD_LIBRARY_PATH:-}
+      - TORCH_NCCL_HIGH_PRIORITY=1
+      - AMDGPU_DRIVER_VARIANT=${AMDGPU_DRIVER_VARIANT:-}
+
+    volumes:
+      - ${AORTA_WORKSPACE:-..}:/workspace/aorta
+      - ${RCCL_PATH:-/tmp/rccl_placeholder}:/rccl
+      - ${PYTORCH_PATH:-/apps/oyazdanb/pytorch}:/workspace/pytorch:rw
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    working_dir: /workspace/aorta
+    shm_size: 17G
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    stdin_open: true
+    tty: true
