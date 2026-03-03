@@ -8,14 +8,14 @@ For multiple configs see [../gemm_analysis/README.md](../gemm_analysis/README.md
 
 ```bash
 # Complete analysis
-python scripts/tracelens_single_config/run_full_analysis.py \
+python packages/aorta-report/scripts/tracelens_single_config/run_full_analysis.py \
   --baseline /path/to/baseline/traces \
   --test /path/to/test/traces \
   --output /path/to/output \
   --all
 
 # Skip TraceLens if already done
-python scripts/tracelens_single_config/run_full_analysis.py \
+python packages/aorta-report/scripts/tracelens_single_config/run_full_analysis.py \
   --baseline /path/to/baseline \
   --test /path/to/test \
   --output /path/to/output \

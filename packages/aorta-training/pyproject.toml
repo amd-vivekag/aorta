@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aorta-training"
+version = "0.3.0"
+description = "FSDP2 compute-communication overlap training benchmarks"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "AMD ROCm Team"}]
+dependencies = [
+    "aorta-core>=0.3.0",
+    "pyyaml>=6.0",
+]
+
+[tool.uv.sources]
+aorta-core = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aorta.training*"]

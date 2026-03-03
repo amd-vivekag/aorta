@@ -149,7 +149,7 @@ torchrun --nproc_per_node=8 -m aorta.hw_queue_eval run comms_compute_overlap \
 Compare sweep results:
 
 ```bash
-python scripts/analyze_sweep_results.py \
+python packages/aorta-report/scripts/analyze_sweep_results.py \
   --baseline sweep_v1.json \
   --test sweep_v2.json
 ```
@@ -157,7 +157,7 @@ python scripts/analyze_sweep_results.py \
 Profile with rocprofv3:
 
 ```bash
-bash scripts/hw_queue/profile_queues.sh hetero_kernels 8
+bash packages/aorta-hw-queue/scripts/profile_queues.sh hetero_kernels 8
 ```
 
 ## Architecture

@@ -21,11 +21,7 @@ from typing import Any, Dict, Optional
 import optuna
 import yaml
 
-# Add src to path
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SRC_ROOT = REPO_ROOT / "src"
-if SRC_ROOT.exists():
-    sys.path.insert(0, str(SRC_ROOT))
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 log = logging.getLogger(__name__)
 
@@ -253,9 +249,6 @@ def run_training_trial(
     # Enable RCCL debug logging to verify stream/channel usage
     env["RCCL_DEBUG"] = "INFO"  # Use "TRACE" for more verbose output
     env["RCCL_DEBUG_SUBSYS"] = "INIT,COLL"  # Show initialization and collective operations
-
-    # Set PYTHONPATH
-    env["PYTHONPATH"] = str(SRC_ROOT)
 
     # Build torchrun command
     cmd = [

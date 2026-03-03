@@ -33,7 +33,7 @@ if [ "${GPU_COUNT}" -lt 1 ]; then
   GPU_COUNT=1
 fi
 
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/packages/aorta-training/src:${REPO_ROOT}/packages/aorta-core/src:${PYTHONPATH:-}"
 
 rocprofv3 "${ROC_PROF_ARGS[@]}" -d "${RUN_DIR}" --output-format json -- \
   torchrun \

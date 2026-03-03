@@ -76,10 +76,12 @@ experiments/2026-01-10/rccl-warp-speed/
 
 ```bash
 # Navigate to the aorta package directory
-cd /path/to/aorta-after-merge/aorta
+cd /path/to/aorta
 
 # Install the package with report dependencies
-pip install -e ".[report]"
+pip install -e packages/aorta-report/
+# Or install from GitHub
+pip install "git+https://github.com/ROCm/aorta.git#subdirectory=packages/aorta-report"
 ```
 
 **Option 2: Install individual dependencies**
@@ -104,13 +106,13 @@ pip install git+https://github.com/AMD-AGI/TraceLens.git
 ### Install with uv (faster alternative)
 
 ```bash
-cd /path/to/aorta-after-merge/aorta
+cd /path/to/aorta
 
 # Install the package with report dependencies
-uv pip install -e ".[report]"
+uv pip install -e packages/aorta-report/
 
-# Or install from requirements.txt
-uv pip install -r requirements.txt
+# Or install all packages from workspace
+uv sync --all-packages
 ```
 
 ### Verify Installation

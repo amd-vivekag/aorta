@@ -22,7 +22,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Set Python path
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${REPO_ROOT}/packages/aorta-training/src:${REPO_ROOT}/packages/aorta-core/src:${PYTHONPATH:-}"
 
 # Create output directory
 OUTPUT_DIR="${REPO_ROOT}/artifacts_hang_repro_rocprof"

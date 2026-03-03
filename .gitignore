@@ -88,3 +88,21 @@ node_ip_list.txt
 
 # Experiment results
 results/
+
+# uv lockfile is committed; python version pin is local
+.python-version
+
+# Cursor IDE
+.cursor/
+
+# Legacy source directory (packages moved to packages/)
+src/
+
+# Local experiment data
+sdpa/
+shampoo_cifar/
+
+# Docker build artifacts
+docker/wheels/
+docker/hipblaslt_install/
+docker/.env.example

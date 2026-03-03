@@ -57,7 +57,7 @@ torchrun --nproc_per_node 4 train.py \
 To measure theoretical compute/SDMA overlap on ROCm without modifying the full training loop:
 
 ```bash
-python scripts/run_sdma_prototype.py --device 0 --matrix-size 4096 --copy-mb 64
+python packages/aorta-training/scripts/run_sdma_prototype.py --device 0 --matrix-size 4096 --copy-mb 64
 ```
 
 The script:

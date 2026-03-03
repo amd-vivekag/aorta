@@ -126,24 +126,20 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/ROCm/aorta.git
 cd aorta
 
-# Create and activate a virtual environment
-uv venv && source .venv/bin/activate
+# Install all workspace packages in editable mode
+uv sync --all-packages
 
-# Install PyTorch nightly for ROCm 7.1
-uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+# Install PyTorch nightly for ROCm 7.2
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.2/
 
-# Install dependencies for analysis scripts
-uv pip install -r requirements.txt
-
-# For contributors: install development tools (pytest, pre-commit, etc.)
-uv pip install -r requirements-dev.txt
+# For contributors: install pre-commit hooks
 pre-commit install
 ```
 
 **What runs locally:**
 - `scripts/utils/merge_gpu_trace_ranks.py` - Merge distributed traces
 - `analysis/overlap_report.py` - Generate analysis reports
-- `scripts/analyze_*.py` - Analysis utilities
+- `packages/aorta-report/scripts/analyze_*.py` - Analysis utilities
 - Test suite (`pytest tests/`)
 
 ## Additional Notes

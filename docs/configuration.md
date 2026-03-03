@@ -17,7 +17,7 @@ All configuration knobs can be adjusted via `config/default.yaml` or dotted `--o
 | | `training.output_dir` | Point to unique directories to keep profiler JSONL and artefacts isolated for each run. |
 | **Profiler** | `profiling.enabled`, `wait/warmup/active/repeat` | Adjust capture cadence. Smaller windows capture more frequently; larger windows reduce overhead and focus on steady state. |
 | | `profiling.tensorboard`, `profiling.chrome_trace` | Select output format. Chrome traces are disabled automatically on ROCm; enable only on CUDA systems. |
-| **SDMA experiments** | `scripts/run_sdma_prototype.py` args | `--matrix-size`, `--copy-mb`, `--iterations` - Isolate GEMM + SDMA overlap to benchmark hardware capability. |
+| **SDMA experiments** | `packages/aorta-training/scripts/run_sdma_prototype.py` args | `--matrix-size`, `--copy-mb`, `--iterations` - Isolate GEMM + SDMA overlap to benchmark hardware capability. |
 
 ## RCCL Environment Variables
 

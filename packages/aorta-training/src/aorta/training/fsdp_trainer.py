@@ -24,9 +24,9 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from aorta.data import SyntheticDatasetConfig, create_dataloader
-from aorta.models import ModelConfig, RankingTransformerModel
-from aorta.profiling.stream_profiler import StreamProfiler
+from aorta.training.data import SyntheticDatasetConfig, create_dataloader
+from aorta.training.models import ModelConfig, RankingTransformerModel
+from aorta.training.profiling.stream_profiler import StreamProfiler
 from aorta.utils import detect_accelerator, get_device, get_distributed_backend, load_config, merge_cli_overrides, setup_logging
 
 log = logging.getLogger(__name__)

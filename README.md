@@ -61,12 +61,12 @@ AORTA generates comprehensive performance reports comparing ROCm versions across
 ## Repository Layout
 
 ```
-src/aorta/
-├── training/          # FSDP2 trainer with multi-stream overlap instrumentation
-├── hw_queue_eval/     # Hardware queue evaluation framework
-├── models/            # Synthetic ranking transformer
-├── profiling/         # Stream profiler for overlap measurement
-└── utils/             # Config loading, timing, device detection
+packages/
+├── aorta-core/        # Shared utils (config, timing, device detection)
+├── aorta-report/      # Reporting CLI and analysis pipelines
+├── aorta-race/        # Race condition detector
+├── aorta-hw-queue/    # Hardware queue evaluation framework
+└── aorta-training/    # FSDP training benchmarks
 
 config/                # YAML configurations for different scenarios
 scripts/               # Launch scripts, profiling, analysis tools
@@ -78,26 +78,32 @@ analysis/              # Overlap report generation
 We recommend using [uv](https://github.com/astral-sh/uv) for fast, reliable Python environment management.
 
 ```bash
-# Install uv (if not already installed)
+# Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create and activate a virtual environment
-uv venv && source .venv/bin/activate
+# Clone and install all packages
+git clone https://github.com/ROCm/aorta.git
+cd aorta
+uv sync --all-packages
 
-# Install PyTorch nightly for ROCm 7.1
-uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+# Install PyTorch nightly for ROCm 7.2
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.2/
+```
 
-# Install remaining dependencies
-uv pip install -r requirements.txt
+### Install Individual Packages
 
-# For full installation including hw_queue_eval
-uv pip install -e ".[hw-queue]"
+```bash
+# Install only the report tool
+pip install "git+https://github.com/ROCm/aorta.git#subdirectory=packages/aorta-report"
+
+# Install only the race detector
+pip install "git+https://github.com/ROCm/aorta.git#subdirectory=packages/aorta-race"
 ```
 
 ## Development
 
 ```bash
-uv pip install -r requirements-dev.txt
+uv sync --all-packages
 pre-commit install
 pytest tests/
 ```

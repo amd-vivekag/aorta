@@ -40,10 +40,10 @@ aorta/
 │   │   ├── distributed_multinode.yaml  # Default config
 │   │   └── shampoo_opt_multi_node.yaml # Shampoo + race experiments config
 │   └── shampoo_opt.yaml                # Shampoo optimizer config
-├── src/aorta/
-│   ├── training/
+├── packages/
+│   ├── aorta-training/src/aorta/training/
 │   │   └── fsdp_trainer.py             # Main FSDP trainer
-│   └── race/                           # Standalone race condition reproducer
+│   └── aorta-race/src/aorta/race/      # Standalone race condition reproducer
 │       ├── __init__.py                 # Public API exports
 │       ├── __main__.py                 # CLI entry point
 │       ├── config.py                   # ReproducerConfig, RaceConfig
@@ -193,7 +193,7 @@ cat experiments/multinode_*/outputs/rank_00_metrics.jsonl | tail -n 5  # Metrics
 
 ## Race Experiments
 
-The `src/aorta/race/` module provides tools to inject controlled race conditions for testing distributed training robustness.
+The `aorta.race` module provides tools to inject controlled race conditions for testing distributed training robustness.
 
 ### Configuration
 

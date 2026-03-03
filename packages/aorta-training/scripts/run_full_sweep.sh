@@ -7,7 +7,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 cd "$REPO_ROOT"
 
@@ -31,7 +31,7 @@ echo "Storage: $STORAGE"
 echo "=========================================="
 echo ""
 
-python scripts/optuna_sweep.py \
+python "$SCRIPT_DIR/optuna_sweep.py" \
   --num-trials "$NUM_TRIALS" \
   --max-steps "$MAX_STEPS" \
   --num-gpus "$NUM_GPUS" \

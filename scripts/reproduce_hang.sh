@@ -36,7 +36,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Set Python path
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${REPO_ROOT}/packages/aorta-training/src:${REPO_ROOT}/packages/aorta-core/src:${PYTHONPATH:-}"
 
 echo "=========================================="
 echo "Reproducing Multi-Stream Hang"

@@ -395,7 +395,7 @@ while IFS= read -r HOST || [[ -n "$HOST" ]]; do
     DOCKER_ENV_FLAGS=$(build_docker_env_flags)
     DOCKER_CMD="docker exec \
         -e GPU_MAX_HW_QUEUES=$HW_QUEUES \
-        -e PYTHONPATH=/workspace/aorta/src \
+        -e PYTHONPATH=/workspace/aorta/packages/aorta-training/src:/workspace/aorta/packages/aorta-core/src:/workspace/aorta/packages/aorta-race/src:/workspace/aorta/packages/aorta-hw-queue/src \
         $DOCKER_ENV_FLAGS \
         $DOCKER_CONTAINER \
         bash -c 'cd /workspace/aorta && $TORCHRUN_CMD'"

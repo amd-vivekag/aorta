@@ -2,14 +2,6 @@
 """Run the SDMA overlap prototype benchmark."""
 
 import argparse
-from pathlib import Path
-import sys
-
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SRC_ROOT = REPO_ROOT / "src"
-if SRC_ROOT.exists():
-    sys.path.insert(0, str(SRC_ROOT))
 
 from aorta.experiments import BenchmarkConfig, run_sdma_benchmark
 

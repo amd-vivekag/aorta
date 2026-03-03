@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aorta-hw-queue"
+version = "0.3.0"
+description = "GPU hardware queue evaluation framework for stream concurrency testing"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "AMD ROCm Team"}]
+dependencies = [
+    "aorta-core>=0.3.0",
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "tabulate>=0.9.0",
+]
+
+[project.optional-dependencies]
+profiling = [
+    "matplotlib>=3.5.0",
+    "seaborn>=0.12.0",
+]
+
+[tool.uv.sources]
+aorta-core = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aorta.hw_queue_eval*"]

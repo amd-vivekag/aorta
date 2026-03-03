@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aorta-report"
+version = "0.3.0"
+description = "CLI tool for TraceLens analysis and GPU performance report generation"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "AMD ROCm Team"}]
+dependencies = [
+    "click>=8.0.0",
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "openpyxl>=3.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "beautifulsoup4>=4.12.0",
+]
+
+[project.scripts]
+aorta-report = "aorta.report:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aorta.report*"]

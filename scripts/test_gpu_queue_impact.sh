@@ -29,7 +29,7 @@ export RCCL_SDMA_WORKERS_PER_CHANNEL=4
 export RCCL_BUFFER_SIZE=512000
 export RCCL_DEBUG=WARN  # Less verbose for cleaner output
 
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${REPO_ROOT}/packages/aorta-training/src:${REPO_ROOT}/packages/aorta-core/src:${PYTHONPATH:-}"
 
 # Create results directory
 RESULTS_DIR="${REPO_ROOT}/gpu_queue_impact_results"

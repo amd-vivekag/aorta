@@ -21,7 +21,7 @@ docker exec -it training-overlap-bugs-rocm70_9-1 bash
 ### 2. Run Training Sweep
 
 ```bash
-bash scripts/gemm_analysis/run_train_various_channels.sh \
+bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --channels 28,42,56,70 \
   --threads 256,512 \
   --config config/single_node/gemm_overlap_comm.yaml
@@ -48,9 +48,9 @@ jobs:
 
 Run the sweep with the CU-only YAML:
 ```bash
-bash scripts/gemm_analysis/run_train_various_channels.sh \
+bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --rocprof \
-  --rocprof-input scripts/gemm_analysis/rocprof_cu_only.yaml \
+  --rocprof-input packages/aorta-report/scripts/gemm_analysis/rocprof_cu_only.yaml \
   --channels 28,42,56 --threads 256,512 \
   --config config/single_node/gemm_overlap_comm.yaml
 ```
@@ -98,12 +98,12 @@ TraceLens can analyze both PyTorch profiler traces and ROCprof traces.
 
 **For PyTorch profiler traces (default):**
 ```bash
-bash scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_20251124_222204
+bash packages/aorta-report/scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_20251124_222204
 ```
 
 **For ROCprof traces:**
 ```bash
-bash scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_20251217_103450 --rocprof
+bash packages/aorta-report/scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_20251217_103450 --rocprof
 ```
 
 The `--rocprof` flag:
@@ -115,7 +115,7 @@ The `--rocprof` flag:
 ### 4. Extract Top GEMM Kernels
 
 ```bash
-python scripts/gemm_analysis/analyze_gemm_reports.py \
+python packages/aorta-report/scripts/gemm_analysis/analyze_gemm_reports.py \
   --base-path experiments/sweep_20251124_222204/tracelens_analysis \
   --threads 256 512 \
   --channels 28 42 56 70 \
@@ -153,32 +153,32 @@ experiments/sweep_YYYYMMDD_HHMMSS/
 
 ```bash
 # Run complete sweep
-bash scripts/gemm_analysis/run_train_various_channels.sh \
+bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --channels 28,42,56,70 \
   --threads 256,512 \
   --config config/single_node/gemm_overlap_comm.yaml
 
 # Run with rocprof tracing (all kernels with stats)
-bash scripts/gemm_analysis/run_train_various_channels.sh \
+bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --rocprof --stats \
   --channels 28,42,56,70 \
   --threads 256,512
 
 # Run with rocprof using CU-only YAML (recommended)
-bash scripts/gemm_analysis/run_train_various_channels.sh \
+bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --rocprof --stats \
-  --rocprof-input scripts/gemm_analysis/rocprof_cu_only.yaml \
+  --rocprof-input packages/aorta-report/scripts/gemm_analysis/rocprof_cu_only.yaml \
   --channels 28,42,56,70 \
   --threads 256,512
 
 # Generate TraceLens reports (PyTorch profiler)
-bash scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_YYYYMMDD_HHMMSS
+bash packages/aorta-report/scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_YYYYMMDD_HHMMSS
 
 # Generate TraceLens reports (ROCprof)
-bash scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_YYYYMMDD_HHMMSS --rocprof
+bash packages/aorta-report/scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_YYYYMMDD_HHMMSS --rocprof
 
 # Extract top GEMM kernels
-python scripts/gemm_analysis/analyze_gemm_reports.py \
+python packages/aorta-report/scripts/gemm_analysis/analyze_gemm_reports.py \
   --base-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis \
   --threads 256 512 --channels 28 42 56 70 --top-k 5
 ```
@@ -198,7 +198,7 @@ Visualization, overlap analysis, and reporting tools for GEMM kernel performance
 Create comprehensive visualization of GEMM kernel variance:
 
 ```bash
-python scripts/gemm_analysis/plot_gemm_variance.py \
+python packages/aorta-report/scripts/gemm_analysis/plot_gemm_variance.py \
   --csv-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
   --output-dir experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/plots
 ```
@@ -213,7 +213,7 @@ Generates:
 Enhance variance data with kernel execution timestamps:
 
 ```bash
-python scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
+python packages/aorta-report/scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
   --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
   --base-path experiments/sweep_YYYYMMDD_HHMMSS
 ```
@@ -225,7 +225,7 @@ Output: `top5_gemm_kernels_time_variance_with_timestamps.csv`
 Identify NCCL collective operations overlapping with GEMM kernels:
 
 ```bash
-python scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
+python packages/aorta-report/scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
   --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
   --tracelens-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis
 ```
@@ -237,7 +237,7 @@ Output: `top5_gemm_kernels_time_variance_with_collective_overlap.csv`
 Generate side-by-side comparison of two experiment sweeps:
 
 ```bash
-python scripts/gemm_analysis/create_embeded_html_report.py \
+python packages/aorta-report/scripts/gemm_analysis/create_embeded_html_report.py \
   --sweep1 experiments/sweep_20251121_155219 \
   --sweep2 experiments/sweep_20251124_222204 \
   --label1 "Base ROCm" \
@@ -258,7 +258,7 @@ and process_comms.py scripts.
 Aggregate GPU timeline data across all ranks and configurations:
 
 ```bash
-python scripts/gemm_analysis/process_gpu_timeline.py \
+python packages/aorta-report/scripts/gemm_analysis/process_gpu_timeline.py \
   --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
 ```
 
@@ -273,7 +273,7 @@ Output: `gpu_timeline_all_configs_mean.xlsx` with multiple sheets:
 Extract and aggregate NCCL collective operation data:
 
 ```bash
-python scripts/gemm_analysis/process_comms.py \
+python packages/aorta-report/scripts/gemm_analysis/process_comms.py \
   --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
 ```
 
@@ -304,24 +304,24 @@ experiments/sweep_YYYYMMDD_HHMMSS/
 
 ```bash
 # Generate all visualizations
-python scripts/gemm_analysis/plot_gemm_variance.py \
+python packages/aorta-report/scripts/gemm_analysis/plot_gemm_variance.py \
   --csv-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv
 
 # Add timestamps and analyze overlap
-python scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
+python packages/aorta-report/scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
   --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
   --base-path experiments/sweep_YYYYMMDD_HHMMSS
 
-python scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
+python packages/aorta-report/scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
   --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
   --tracelens-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis
 
 # Process Excel reports
-python scripts/gemm_analysis/process_gpu_timeline.py --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
-python scripts/gemm_analysis/process_comms.py --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
+python packages/aorta-report/scripts/gemm_analysis/process_gpu_timeline.py --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
+python packages/aorta-report/scripts/gemm_analysis/process_comms.py --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
 
 # Create comparison report
-python scripts/gemm_analysis/create_embeded_html_report.py \
+python packages/aorta-report/scripts/gemm_analysis/create_embeded_html_report.py \
   --sweep1 experiments/sweep1 --sweep2 experiments/sweep2 \
   --label1 "Baseline" --label2 "Optimized" --output comparison.html
 ```

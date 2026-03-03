@@ -32,7 +32,7 @@ NUM_GPUS=${1:-8}  # Default to 8 GPUs for maximum stress
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${REPO_ROOT}/packages/aorta-training/src:${REPO_ROOT}/packages/aorta-core/src:${PYTHONPATH:-}"
 
 OUTPUT_DIR="${REPO_ROOT}/artifacts_hang_repro"
 mkdir -p "${OUTPUT_DIR}"

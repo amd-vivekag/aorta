@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aorta-race"
+version = "0.3.0"
+description = "RCCL race condition reproducer and detector for multi-GPU training"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "AMD ROCm Team"}]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aorta.race*"]

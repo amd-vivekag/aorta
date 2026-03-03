@@ -43,7 +43,7 @@ if [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then
 fi
 export HIP_VISIBLE_DEVICES
 export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-DETAIL}
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/packages/aorta-training/src:${REPO_ROOT}/packages/aorta-core/src:${PYTHONPATH:-}"
 
 torchrun \
   --nproc_per_node "${NPROC}" \

@@ -1,0 +1,71 @@
+name: Test Packages
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  smoke-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install workspace packages
+        run: uv sync --all-packages
+
+      - name: Install PyTorch CPU
+        run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+        # CPU-only build: GitHub Actions runners have no GPUs.
+        # This only validates that package imports resolve correctly.
+
+      - name: Run import smoke tests
+        run: uv run pytest tests/test_imports.py -v
+
+  individual-install:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package:
+          - aorta-core
+          - aorta-report
+          - aorta-race
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.10
+        run: uv python install 3.10
+
+      - name: Install PyTorch CPU
+        run: uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+        # CPU-only: just for import validation on CI runners without GPUs.
+
+      - name: Install ${{ matrix.package }} independently
+        run: uv pip install --system ./packages/${{ matrix.package }}/
+
+      - name: Verify import
+        run: |
+          if [ "${{ matrix.package }}" = "aorta-core" ]; then
+            python -c "from aorta.utils import detect_accelerator; print('aorta-core OK')"
+          elif [ "${{ matrix.package }}" = "aorta-report" ]; then
+            python -c "from aorta.report import cli; print('aorta-report OK')"
+          elif [ "${{ matrix.package }}" = "aorta-race" ]; then
+            python -c "from aorta.race.config import RaceConfig; print('aorta-race OK')"
+          fi
