@@ -379,6 +379,7 @@ class HWQueueLoader:
                     single_run = SingleRunData.from_dict(data)
                     sweep_data = SweepData(
                         workload_name=workload_name,
+                        timestamp=getattr(single_run, "timestamp", ""),
                         results=[single_run],
                         environment=EnvironmentData(),
                         analysis=ScalingAnalysisData(
