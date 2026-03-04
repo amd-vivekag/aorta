@@ -27,11 +27,11 @@ RUN yum update -y --skip-broken \
     hip-runtime-amd \
     rocm-core || echo "Updated available ROCm packages"
 
-
 # Install TraceLens and additional Python packages
 # TODO : Add a pinned commit check to avoid malicious download
 RUN python3.10 -m pip install git+https://github.com/AMD-AGI/TraceLens.git || echo "TraceLens install failed, continuing..."
 RUN python3.10 -m pip install openpyxl seaborn pandas matplotlib pyyaml tqdm tensorboard
+RUN python3.10 -m pip install git+https://github.com/AMD-AGI/Magpie.git
 
 # Download and install rocprof-trace-decoder to enable `--att` flag in rocprofv3
 # TODO : Add a pinned checksum check to avoid malicious download.
