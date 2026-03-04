@@ -234,8 +234,8 @@ class HWQueueLoader:
         try:
             with open(path, "r") as f:
                 return json.load(f)
-        except json.JSONDecodeError as e:
-            raise HWQueueLoaderError(f"Invalid JSON in {path}: {e}")
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            raise HWQueueLoaderError(f"Failed to load JSON from {path}: {e}") from e
 
     @staticmethod
     def _is_sweep_format(data: Dict[str, Any]) -> bool:
