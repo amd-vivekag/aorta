@@ -366,6 +366,13 @@ class HWQueueLoader:
 
                 if HWQueueLoader._is_sweep_format(data):
                     sweep_data = SweepData.from_dict(data)
+                    # Normalize workload_name to match the filename-derived key
+                    try:
+                        setattr(sweep_data, "workload_name", workload_name)
+                    except Exception:
+                        # If SweepData does not have workload_name for some reason,
+                        # we still proceed using the filename-derived dict key.
+                        pass
                     results[workload_name] = sweep_data
                 elif HWQueueLoader._is_single_run_format(data):
                     # Wrap single run in sweep format for consistency
