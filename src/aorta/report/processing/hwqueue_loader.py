@@ -326,13 +326,17 @@ class HWQueueLoader:
         """
         Load all workload result JSON files from a directory.
 
-        Expects files named `*_results.json` in sweep format.
+        Expects files named `*_results.json`. Each file may be either:
+        - Sweep format (with a top-level 'results' array), or
+        - Single-run format (with fields like 'throughput' and 'stream_count'),
+          which will be wrapped into a SweepData containing a single run.
 
         Args:
             path: Path to directory containing result files
 
         Returns:
-            Dictionary mapping workload name to SweepData
+            Dictionary mapping workload name to SweepData. Single-run files are
+            normalized into SweepData instances with one SingleRunData entry.
 
         Raises:
             HWQueueLoaderError: If directory doesn't exist or contains no valid files
