@@ -238,14 +238,19 @@ class HWQueueLoader:
             raise HWQueueLoaderError(f"Failed to load JSON from {path}: {e}") from e
 
     @staticmethod
-    def _is_sweep_format(data: Dict[str, Any]) -> bool:
+    def _is_sweep_format(data: Any) -> bool:
         """Check if data is in sweep format (has 'results' array)."""
-        return "results" in data and isinstance(data["results"], list)
+        return isinstance(data, dict) and "results" in data and isinstance(data["results"], list)
 
     @staticmethod
-    def _is_single_run_format(data: Dict[str, Any]) -> bool:
+    def _is_single_run_format(data: Any) -> bool:
         """Check if data is in single run format."""
-        return "throughput" in data and "stream_count" in data and "results" not in data
+        return (
+            isinstance(data, dict)
+            and "throughput" in data
+            and "stream_count" in data
+            and "results" not in data
+        )
 
     @staticmethod
     def load_single_run(path: Path) -> SingleRunData:
