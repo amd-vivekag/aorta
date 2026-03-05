@@ -31,7 +31,7 @@ class CompiledRegion(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm(x)
-        x = torch.gelu(self.fc1(x))
+        x = torch.nn.functional.gelu(self.fc1(x))
         x = self.fc2(x)
         return x + residual
 
@@ -74,6 +74,7 @@ class TorchCompileWorkload(MultiGPUMixin, BaseWorkload):
         use_compile: bool = False,  # Disabled by default (may not work in all envs)
         compile_mode: str = "reduce-overhead",  # "default", "reduce-overhead", "max-autotune"
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize torch.compile workload.
@@ -93,6 +94,7 @@ class TorchCompileWorkload(MultiGPUMixin, BaseWorkload):
         self.use_compile = use_compile
         self.compile_mode = compile_mode
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._region_a: Optional[nn.Module] = None
         self._region_b: Optional[nn.Module] = None

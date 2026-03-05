@@ -9,7 +9,7 @@ training:
   grad_clip_norm: 1.0
   log_interval: 5
   max_steps: 200
-  output_dir: artifacts
+  output_dir: experiments
 
 optimizer:
   lr: 0.0003

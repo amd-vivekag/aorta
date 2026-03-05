@@ -93,6 +93,7 @@ class ContinuousBatchWorkload(MultiGPUMixin, InferenceWorkload):
         decode_batch_size: int = 16,
         max_seq_length: int = 2048,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize continuous batching workload.
@@ -117,6 +118,7 @@ class ContinuousBatchWorkload(MultiGPUMixin, InferenceWorkload):
         self.decode_batch_size = decode_batch_size
         self.max_seq_length = max_seq_length
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._layers: List[AttentionBlock] = []
         self._devices: List[str] = []

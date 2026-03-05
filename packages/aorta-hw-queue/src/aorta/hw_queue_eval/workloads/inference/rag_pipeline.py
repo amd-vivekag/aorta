@@ -122,6 +122,7 @@ class RAGPipelineWorkload(MultiGPUMixin, InferenceWorkload):
         top_k: int = 10,
         generation_length: int = 128,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize RAG pipeline workload.
@@ -148,6 +149,7 @@ class RAGPipelineWorkload(MultiGPUMixin, InferenceWorkload):
         self.top_k = top_k
         self.generation_length = generation_length
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._embedding_model: Optional[EmbeddingModel] = None
         self._reranker_model: Optional[RerankerModel] = None

@@ -77,21 +77,49 @@ jobs:
             bash scripts/gemm_analysis/run_tracelens_analysis.sh ${{ steps.setup.outputs.sweep_dir }}
           "
 
-      - name: Extract top GEMM kernels
+      - name: Install aorta-report package
         working-directory: aorta
         run: |
-          # Parse channels and threads into space-separated format
-          CHANNELS=$(echo "${{ github.event.inputs.channels || '28,56' }}" | tr ',' ' ')
-          THREADS=$(echo "${{ github.event.inputs.threads || '256,512' }}" | tr ',' ' ')
+          docker exec ${{ env.CONTAINER_NAME }} bash -c "
+            pip install ./packages/aorta-report/
+          "
+
+      - name: Run GEMM analysis pipeline
+        working-directory: aorta
+        run: |
+          CHANNELS_FLAG=""
+          for ch in $(echo "${{ github.event.inputs.channels || '28,56' }}" | tr ',' ' '); do
+            CHANNELS_FLAG="$CHANNELS_FLAG -c $ch"
+          done
+          THREADS_FLAG=""
+          for th in $(echo "${{ github.event.inputs.threads || '256,512' }}" | tr ',' ' '); do
+            THREADS_FLAG="$THREADS_FLAG -t $th"
+          done
 
           docker exec ${{ env.CONTAINER_NAME }} bash -c "
-            python scripts/gemm_analysis/analyze_gemm_reports.py \
-              --base-path ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis \
-              --threads $THREADS \
-              --channels $CHANNELS \
-              --ranks 0 1 2 3 4 5 6 7 \
+            aorta-report pipeline gemm \
+              --sweep-dir ${{ steps.setup.outputs.sweep_dir }} \
+              -o ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis \
+              $THREADS_FLAG $CHANNELS_FLAG \
               --top-k ${{ github.event.inputs.top_k || '5' }}
           "
+
+      - name: Analyze collective overlap
+        working-directory: aorta
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} bash -c "
+          python packages/aorta-report/scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
+            --input-csv ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
+            --tracelens-path ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis"
+
+      - name: Process GPU timeline and NCCL data
+        working-directory: aorta
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} bash -c "
+          aorta-report process gpu-timeline --mode sweep \
+            --sweep-dir ${{ steps.setup.outputs.sweep_dir }} && \
+          aorta-report process comms \
+            --sweep-dir ${{ steps.setup.outputs.sweep_dir }}"
 
       - name: Upload sweep results
         uses: actions/upload-artifact@v4
@@ -99,55 +127,6 @@ jobs:
           name: gemm-sweep-results
           path: aorta/${{ steps.setup.outputs.sweep_dir }}
           retention-days: 30
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Install Python dependencies
-        working-directory: aorta
-        run: |
-          docker exec ${{ env.CONTAINER_NAME }} bash -c "pip install -r requirements.txt"
-
-      - name: Generate variance plots
-        working-directory: aorta
-        run: |
-          docker exec ${{ env.CONTAINER_NAME }} bash -c "
-          python scripts/gemm_analysis/plot_gemm_variance.py \
-            --csv-path ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
-            --output-dir ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis/plots"
-
-      - name: Add timestamp information
-        working-directory: aorta
-        run: |
-          docker exec ${{ env.CONTAINER_NAME }} bash -c "
-          python scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
-            --input-csv ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
-            --base-path ${{ steps.setup.outputs.sweep_dir }}"
-
-      - name: Analyze collective overlap
-        working-directory: aorta
-        run: |
-          docker exec ${{ env.CONTAINER_NAME }} bash -c "
-          python scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
-            --input-csv ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
-            --tracelens-path ${{ steps.setup.outputs.sweep_dir }}/tracelens_analysis"
-
-      - name: Process GPU timeline
-        working-directory: aorta
-        run: |
-          docker exec ${{ env.CONTAINER_NAME }} bash -c "
-          python scripts/gemm_analysis/process_gpu_timeline.py \
-            --sweep-dir ${{ steps.setup.outputs.sweep_dir }}"
-
-      - name: Process NCCL communication data
-        working-directory: aorta
-        run: |
-          docker exec ${{ env.CONTAINER_NAME }} bash -c "
-          python scripts/gemm_analysis/process_comms.py \
-            --sweep-dir ${{ steps.setup.outputs.sweep_dir }}"
 
       - name: Stop Docker container
         if: always()

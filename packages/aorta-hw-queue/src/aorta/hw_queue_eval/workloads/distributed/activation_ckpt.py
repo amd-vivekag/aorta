@@ -11,7 +11,7 @@ This tests the overlap of recomputation with gradient computation.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -73,6 +73,7 @@ class ActivationCheckpointWorkload(MultiGPUMixin, DistributedWorkload):
         seq_length: int = 512,
         simulate_collectives: bool = True,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize activation checkpointing workload.
@@ -94,6 +95,7 @@ class ActivationCheckpointWorkload(MultiGPUMixin, DistributedWorkload):
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._blocks: List[CheckpointBlock] = []
         self._checkpoints: Dict[int, torch.Tensor] = {}
@@ -191,6 +193,7 @@ class ActivationCheckpointWorkload(MultiGPUMixin, DistributedWorkload):
 
             # Recompute activations for this segment
             with torch.cuda.stream(recompute_stream):
+                ckpt = ckpt.detach().requires_grad_(True)
                 recomputed = ckpt
                 for i in range(start_idx, end_idx):
                     recomputed = self._blocks[i](recomputed)

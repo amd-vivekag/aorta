@@ -13,7 +13,7 @@ training:
   grad_clip_norm: 1.0
   log_interval: 5
   max_steps: 500  # More steps to increase chance of hang
-  output_dir: artifacts_hang_repro
+  output_dir: experiments/hang_repro
   inject_allreduce_copies: true  # ENABLE: Inject all_reduce → host-device copy pattern
   allreduce_stress_level: 5  # 5 all_reduce cycles per iteration with host-device copies
 

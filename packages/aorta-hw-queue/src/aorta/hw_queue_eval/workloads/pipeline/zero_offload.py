@@ -11,7 +11,7 @@ This tests memory-bounded training scenarios with CPU offloading.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -65,6 +65,7 @@ class ZeROOffloadWorkload(MultiGPUMixin, BaseWorkload):
         layer_size: int = 4096,
         batch_size: int = 16,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize ZeRO-Offload workload.
@@ -80,6 +81,7 @@ class ZeROOffloadWorkload(MultiGPUMixin, BaseWorkload):
         self.layer_size = layer_size
         self.batch_size = batch_size
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._layers: List[LargeLinearBlock] = []
         self._cpu_params: List[torch.Tensor] = []
@@ -190,11 +192,11 @@ class ZeROOffloadWorkload(MultiGPUMixin, BaseWorkload):
             with torch.cuda.stream(offload_stream):
                 # Simulate offloading gradient/optimizer state
                 for param in self._layers[i].parameters():
-                    if param.grad is not None:
-                        # Copy gradient to CPU (would update optimizer state)
+                    if param.grad is not None and param.grad.dim() == 2:
                         grad_cpu = param.grad.cpu()
-                        # Simulate optimizer step on CPU
-                        self._cpu_opt_states[i].add_(grad_cpu[:self.layer_size, :self.layer_size] * 0.01)
+                        rows = min(grad_cpu.shape[0], self.layer_size)
+                        cols = min(grad_cpu.shape[1], self.layer_size)
+                        self._cpu_opt_states[i][:rows, :cols].add_(grad_cpu[:rows, :cols] * 0.01)
                         param.grad = None
 
     def get_throughput_unit(self) -> str:

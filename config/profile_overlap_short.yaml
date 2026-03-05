@@ -9,7 +9,7 @@ training:
   grad_clip_norm: 1.0
   log_interval: 5
   max_steps: 20  # Short run for profiling
-  output_dir: artifacts/profile_overlap_short
+  output_dir: experiments/profile_overlap_short
   inject_allreduce_copies: true  # Enable stress pattern
   allreduce_stress_level: 5      # Moderate stress level
 

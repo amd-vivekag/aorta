@@ -19,12 +19,15 @@ This is the most direct test for hardware queue switch latency issues.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from aorta.hw_queue_eval.workloads.base import SyntheticWorkload
 from aorta.hw_queue_eval.workloads.registry import WorkloadRegistry
+
+logger = logging.getLogger(__name__)
 
 
 @WorkloadRegistry.register
@@ -48,6 +51,7 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
     recommended_streams = 8
     switch_latency_sensitivity = "critical"
     memory_requirements_gb = 4.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
@@ -55,7 +59,8 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
         small_kernel_size: int = 1024,
         large_to_small_ratio: int = 10,  # small kernels per large GEMM
         interleave_pattern: str = "alternating",  # "alternating", "batched", "random"
-        use_multi_gpu: bool = True,  # Use all available GPUs by default
+        use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize the heterogeneous kernel workload.
@@ -66,6 +71,7 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
             large_to_small_ratio: Number of small kernels per large GEMM
             interleave_pattern: How to interleave operations
             use_multi_gpu: If True, distribute work across all available GPUs
+            num_gpus: Limit number of GPUs (None = all available)
         """
         super().__init__()
         self.large_gemm_size = large_gemm_size
@@ -73,6 +79,7 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
         self.large_to_small_ratio = large_to_small_ratio
         self.interleave_pattern = interleave_pattern
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         # Will be set in setup()
         self._large_tensors_a: List[torch.Tensor] = []
@@ -96,12 +103,13 @@ class HeterogeneousKernelWorkload(SyntheticWorkload):
 
         # Determine devices to use
         if self.use_multi_gpu and torch.cuda.is_available():
-            num_gpus = torch.cuda.device_count()
-            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
-            print(f"Multi-GPU mode: Using {num_gpus} GPUs")
+            total = torch.cuda.device_count()
+            count = min(self.num_gpus, total) if self.num_gpus is not None else total
+            self._devices = [f"cuda:{i}" for i in range(count)]
+            logger.info("Multi-GPU mode: Using %d GPUs", count)
         else:
             self._devices = [device]
-            print(f"Single-GPU mode: Using {device}")
+            logger.info("Single-GPU mode: Using %s", device)
 
         self._device = self._devices[0]  # Primary device
 
@@ -305,12 +313,14 @@ class TinyKernelStressWorkload(SyntheticWorkload):
     recommended_streams = 16
     switch_latency_sensitivity = "critical"
     memory_requirements_gb = 0.5
+    multi_gpu_capable = True
 
     def __init__(
         self,
         tensor_size: int = 256,
         ops_per_stream: int = 100,
-        use_multi_gpu: bool = True,  # Use all available GPUs by default
+        use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize tiny kernel stress workload.
@@ -319,11 +329,13 @@ class TinyKernelStressWorkload(SyntheticWorkload):
             tensor_size: Size of each tensor
             ops_per_stream: Operations per stream per iteration
             use_multi_gpu: If True, distribute work across all available GPUs
+            num_gpus: Limit number of GPUs (None = all available)
         """
         super().__init__()
         self.tensor_size = tensor_size
         self.ops_per_stream = ops_per_stream
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
         self._per_stream_tensors: List[List[torch.Tensor]] = []
         self._devices: List[str] = []
         self._stream_to_device: Dict[int, str] = {}
@@ -335,12 +347,13 @@ class TinyKernelStressWorkload(SyntheticWorkload):
 
         # Determine devices to use
         if self.use_multi_gpu and torch.cuda.is_available():
-            num_gpus = torch.cuda.device_count()
-            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
-            print(f"Multi-GPU mode: Using {num_gpus} GPUs")
+            total = torch.cuda.device_count()
+            count = min(self.num_gpus, total) if self.num_gpus is not None else total
+            self._devices = [f"cuda:{i}" for i in range(count)]
+            logger.info("Multi-GPU mode: Using %d GPUs", count)
         else:
             self._devices = [device]
-            print(f"Single-GPU mode: Using {device}")
+            logger.info("Single-GPU mode: Using %s", device)
 
         self._device = self._devices[0]  # Primary device
 
@@ -400,11 +413,13 @@ class LargeGEMMOnlyWorkload(SyntheticWorkload):
     recommended_streams = 4
     switch_latency_sensitivity = "low"
     memory_requirements_gb = 8.0
+    multi_gpu_capable = True
 
     def __init__(
         self,
         gemm_size: Tuple[int, int, int] = (8192, 8192, 8192),
-        use_multi_gpu: bool = True,  # Use all available GPUs by default
+        use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize large GEMM workload.
@@ -412,10 +427,12 @@ class LargeGEMMOnlyWorkload(SyntheticWorkload):
         Args:
             gemm_size: (M, N, K) dimensions
             use_multi_gpu: If True, distribute work across all available GPUs
+            num_gpus: Limit number of GPUs (None = all available)
         """
         super().__init__()
         self.gemm_size = gemm_size
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
         self._matrices_a: List[torch.Tensor] = []
         self._matrices_b: List[torch.Tensor] = []
         self._devices: List[str] = []
@@ -428,12 +445,13 @@ class LargeGEMMOnlyWorkload(SyntheticWorkload):
 
         # Determine devices to use
         if self.use_multi_gpu and torch.cuda.is_available():
-            num_gpus = torch.cuda.device_count()
-            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
-            print(f"Multi-GPU mode: Using {num_gpus} GPUs")
+            total = torch.cuda.device_count()
+            count = min(self.num_gpus, total) if self.num_gpus is not None else total
+            self._devices = [f"cuda:{i}" for i in range(count)]
+            logger.info("Multi-GPU mode: Using %d GPUs", count)
         else:
             self._devices = [device]
-            print(f"Single-GPU mode: Using {device}")
+            logger.info("Single-GPU mode: Using %s", device)
 
         self._device = self._devices[0]  # Primary device
 

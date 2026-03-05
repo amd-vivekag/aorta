@@ -5,7 +5,7 @@ A comprehensive framework for stress-testing AMD GPU hardware queue mapping
 with workloads requiring >4 concurrent hardware queues.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __author__ = "AMD ROCm Team"
 
 from aorta.hw_queue_eval.core.harness import HarnessConfig, HarnessResult, StreamHarness

@@ -92,8 +92,7 @@ jobs:
         working-directory: aorta
         run: |
           docker exec ${{ env.CONTAINER_NAME }} bash -c "
-            pip install -r requirements.txt
-            pip install pandas openpyxl matplotlib seaborn numpy
+            pip install ./packages/aorta-report/
           "
 
       - name: Run RCCL warp speed comparison tests
@@ -158,11 +157,10 @@ jobs:
               echo \"Comparing baseline ($BASELINE_CU cu, $BASELINE_THREADS threads) vs test (\$CU_COUNT cu, \$THREADS threads)\"
               echo '========================================'
 
-              python scripts/tracelens_single_config/run_full_analysis.py \
-                --baseline \"$BASELINE_DIR\" \
-                --test \"\$TEST_DIR\" \
-                --output \"\$COMPARISON_OUTPUT\" \
-                --all
+              aorta-report pipeline summary \
+                -b \"$BASELINE_DIR\" \
+                -t \"\$TEST_DIR\" \
+                -o \"\$COMPARISON_OUTPUT\"
             done
           "
 
@@ -202,12 +200,9 @@ jobs:
             OUTPUT_DIR=\"${EXPERIMENT_DIR}/compare_all_runs\"
             mkdir -p \"\$OUTPUT_DIR\"
 
-            python scripts/tracelens_single_config/run_full_analysis.py \
-              --baseline \"$BASELINE_DIR\" \
-              --test $TEST_DIRS \
-              --output \"\$OUTPUT_DIR\" \
-              --skip-tracelens \
-              --compare-all-runs
+            python packages/aorta-report/scripts/tracelens_single_config/compare_all_runs.py \
+              --inputs \"$BASELINE_DIR\" $TEST_DIRS \
+              --output \"\$OUTPUT_DIR\"
           "
 
       - name: Generate GitHub Step Summary

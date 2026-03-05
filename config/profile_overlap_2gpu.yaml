@@ -9,7 +9,7 @@ training:
   grad_clip_norm: 1.0
   log_interval: 2
   max_steps: 12  # Very short run for quick profiling
-  output_dir: artifacts/profile_overlap_2gpu
+  output_dir: experiments/profile_overlap_2gpu
   inject_allreduce_copies: true  # Enable stress pattern to reproduce inefficiency
   allreduce_stress_level: 3      # Moderate stress level
 

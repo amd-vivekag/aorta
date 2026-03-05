@@ -335,7 +335,7 @@ if [ "${AGGREGATE_RESULTS}" = true ]; then
     echo "# For each thread configuration:"
     for THREADS in "${THREADS_TO_RUN[@]}"; do
         echo "# THREADS=${THREADS}:"
-        echo "python scripts/merge_gpu_traces.py \\"
+        echo "python scripts/utils/merge_gpu_trace_ranks.py \\"
         for CHANNELS in "${CHANNELS_TO_RUN[@]}"; do
             echo "  ${BASE_OUTPUT_DIR}/${THREADS}thread/nccl_${CHANNELS}channels/torch_profiler/rank0/trace_step*.json \\"
         done | head -n -1

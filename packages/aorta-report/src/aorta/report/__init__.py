@@ -12,7 +12,7 @@ Usage:
     python -m aorta.report --help
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 from .cli import cli, main
 

@@ -257,17 +257,23 @@ else
 
             echo "Processing $thread/${ch}ch (all 8 ranks)..."
 
-            # Use trace_pattern instead of trace_dir for better subdirectory support
-            # It is not guaranteed that trace files will have the exact same name in all the ranks.
-            # To avoid file not found errors with `--trace_pattern` flag in TraceLens, we first
-            # create a directory called `trace` in all rank folders and then mv the respective
-            # trace file in the rank folder to the canonical `trace/pt.trace.json` path.
-            # This will satisfy TraceLens's requirement of only one `*` being present in the trace pattern
-            # while also avoiding FileNotFoundErrors due to different filenames.
-            find $TRACE_DIR/rank* -name "*.json" -exec sh -c 'mkdir -p "$(dirname "$0")/trace" && mv "$0" "$(dirname "$0")/trace/pt.trace.json"' {} \;
+            # TraceLens --trace_pattern requires a single glob that matches one
+            # trace per rank.  Trace filenames can differ across ranks, so we
+            # create a canonical rank*/trace.json link (symlink preferred, copy
+            # as fallback for Docker overlay mounts).  Non-destructive: the
+            # original trace files are never moved or deleted.
+            for rank_subdir in "$TRACE_DIR"/rank*; do
+                CANONICAL="$rank_subdir/trace.json"
+                [ -e "$CANONICAL" ] && continue
+                SRC=$(find "$rank_subdir" -name "*.json" -type f 2>/dev/null | head -1)
+                [ -z "$SRC" ] && continue
+                ln -s "$(realpath "$SRC")" "$CANONICAL" 2>/dev/null \
+                    || cp "$SRC" "$CANONICAL" 2>/dev/null \
+                    || echo "  [WARN] Cannot create trace link for $(basename "$rank_subdir")"
+            done
 
             TraceLens_generate_multi_rank_collective_report_pytorch \
-                --trace_pattern "$TRACE_DIR/rank*/trace/pt.trace.json" \
+                --trace_pattern "$TRACE_DIR/rank*/trace.json" \
                 --world_size 8 \
                 --output_xlsx_path "$OUTPUT" \
                 --detailed_analysis \

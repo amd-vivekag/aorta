@@ -4,21 +4,25 @@ Profile GEMM kernel performance across multiple NCCL configurations.
 
 ## Prerequisites
 
-- Docker with ROCm support
-- TraceLens installed
+- AMD GPU with ROCm (latest stable recommended)
+- PyTorch with ROCm support ([install guide](https://pytorch.org/get-started/locally/))
+- `aorta-report` package installed
+- [TraceLens](https://github.com/AMD-AGI/TraceLens) -- AMD-AGI's trace analysis library, used by `aorta-report` to generate per-rank performance reports and collective NCCL reports from PyTorch profiler or ROCprof traces
+
+```bash
+# Install aorta-report with TraceLens in one step
+pip install -e "packages/aorta-report/[tracelens]"
+
+# Or install them separately
+pip install -e packages/aorta-report/
+pip install git+https://github.com/AMD-AGI/TraceLens.git
+```
+
+Works on bare-metal or inside any PyTorch ROCm container (e.g., `rocm/pytorch`).
 
 ## Pipeline Steps
 
-### 1. Build Docker Container
-
-```bash
-cd docker
-docker compose -f docker-compose.rocm70_9-1.yaml build
-docker compose -f docker-compose.rocm70_9-1.yaml up -d
-docker exec -it training-overlap-bugs-rocm70_9-1 bash
-```
-
-### 2. Run Training Sweep
+### 1. Run Training Sweep
 
 ```bash
 bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
@@ -29,24 +33,41 @@ bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
 
 #### rocprof Tracing Options
 
-Add rocprofv3 kernel tracing to capture detailed GEMM performance:
+Add rocprofv3 kernel tracing to capture detailed GEMM performance. Two YAML configs are provided:
 
-Simple YAML-based tracing (recommended)
----------------------------------------
+Two rocprofv3 configs are provided:
 
-Use the `rocprof_cu_only.yaml` configuration file for CU utilization metrics:
+**`rocprof_cu_only.yaml`** -- Minimal, CU utilization counters only:
 
 ```yaml
 jobs:
-  - kernel_include_regex: "(gemm|Cijk_.*)"  # pattern for kernels to trace
-    kernel_trace: true                      # enable kernel tracing
-    stats: true                             # timing statistics only (not CU utilization)
-    output_format: [json, csv]              # add perfetto for Chrome tracing
-    sys_trace: false
-    advanced_thread_trace: false            # leave false unless ATT decoder is installed
+  - kernel_include_regex: "(gemm|Cijk_.*)"
+    kernel_trace: true
+    output_format: [csv]
+    pmc:
+      - SQ_BUSY_CU_CYCLES     # CU utilization
+      - SQ_WAVES               # Active waves (occupancy)
+      - SQ_WAVE_CYCLES         # Total wave cycles
+      - SQ_INSTS_MFMA          # Matrix ops (GEMM-specific)
 ```
 
-Run the sweep with the CU-only YAML:
+**`rocprof_input.yaml`** -- Full counters + timing stats + Perfetto traces:
+
+```yaml
+jobs:
+  - kernel_include_regex: "(gemm|Cijk_.*)"
+    kernel_trace: true
+    stats: true                             # timing statistics
+    output_format: [json, csv, perfetto]    # generates .pftrace for Chrome tracing
+    sys_trace: false
+    advanced_thread_trace: false            # leave false unless ATT decoder is installed
+    pmc:
+      - SQ_BUSY_CU_CYCLES                  # plus many more counters
+      # ... (see file for full list)
+```
+
+Run the sweep with the CU-only YAML (recommended starting point):
+
 ```bash
 bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --rocprof \
@@ -54,10 +75,11 @@ bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
   --channels 28,42,56 --threads 256,512 \
   --config config/single_node/gemm_overlap_comm.yaml
 ```
+
 Notes:
-- Kernel filtering/stats come from the YAML. The current rocprofv3 build ignores CLI kernel filters, so use the YAML to include/exclude kernels.
-- Remove `advanced_thread_trace` or keep it `false` unless the ATT decoder debs are installed.
-- **Important**: `stats: true` only collects timing statistics, NOT CU utilization metrics.
+- Kernel filtering and counters come from the YAML. The current rocprofv3 build ignores CLI kernel filters, so use the YAML to include/exclude kernels.
+- Keep `advanced_thread_trace: false` unless the ATT decoder debs are installed.
+- `stats: true` only collects timing statistics, NOT hardware counter metrics. For CU utilization, use the `pmc:` section.
 - **Output Files**: rocprof generates 5 files per rank/process:
   - `PID_agent_info.csv`: Hardware information about CPUs and GPUs
   - `PID_counter_collection.csv`: **Main file with CU utilization metrics** (focus on this)
@@ -92,7 +114,7 @@ Notes:
 - `SQ_INSTS_MFMA`: Matrix FMA instructions (critical for GEMM performance)
 - `SQ_INSTS_VALU`: Vector ALU instructions (general compute)
 
-### 3. Generate TraceLens Reports
+### 2. Generate TraceLens Reports
 
 TraceLens can analyze both PyTorch profiler traces and ROCprof traces.
 
@@ -112,18 +134,71 @@ The `--rocprof` flag:
 - Generates individual reports per rank (no collective reports for ROCprof)
 - Provides detailed kernel-level performance metrics including grid/block dimensions
 
-### 4. Extract Top GEMM Kernels
+### 3. Run GEMM Analysis Pipeline
+
+Use the `aorta-report` CLI to run the full GEMM analysis pipeline:
 
 ```bash
-python packages/aorta-report/scripts/gemm_analysis/analyze_gemm_reports.py \
-  --base-path experiments/sweep_20251124_222204/tracelens_analysis \
-  --threads 256 512 \
-  --channels 28 42 56 70 \
-  --ranks 0 1 2 3 4 5 6 7 \
+aorta-report pipeline gemm \
+  --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS \
+  -o experiments/sweep_YYYYMMDD_HHMMSS/analysis \
+  -t 256 -t 512 -c 28 -c 42 -c 56 -c 70 \
   --top-k 5
 ```
 
-This generates `top5_gemm_kernels_time_variance.csv` with the kernels showing highest time variance across runs.
+If TraceLens reports already exist, skip re-running them:
+
+```bash
+aorta-report pipeline gemm \
+  --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS \
+  -o experiments/sweep_YYYYMMDD_HHMMSS/analysis \
+  --skip-tracelens
+```
+
+Or run individual steps:
+
+```bash
+# Extract top GEMM kernels
+aorta-report analyze gemm \
+  experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis \
+  -t 256 -t 512 -c 28 -c 42 -c 56 -c 70 --top-k 5
+
+# Enhance with timestamps
+aorta-report process gemm-variance \
+  experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
+  --base-path experiments/sweep_YYYYMMDD_HHMMSS
+
+# Generate variance plots
+aorta-report generate plots --type gemm \
+  -i experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
+  -o experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/plots
+
+# Process GPU timeline data
+aorta-report process gpu-timeline \
+  experiments/sweep_YYYYMMDD_HHMMSS --mode sweep
+
+# Process NCCL communication data
+aorta-report process comms \
+  experiments/sweep_YYYYMMDD_HHMMSS
+
+# Generate sweep comparison HTML
+aorta-report generate html --mode sweep \
+  --sweep1 experiments/sweep1 --sweep2 experiments/sweep2 \
+  --label1 "Baseline" --label2 "Optimized" -o comparison.html
+```
+
+### 4. Analyze Collective Overlap (standalone script)
+
+This analysis is not yet in the CLI. Use the standalone script to identify NCCL
+collective operations overlapping with GEMM kernels:
+
+```bash
+python packages/aorta-report/scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
+  --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
+  --tracelens-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis
+```
+
+Output: `top5_gemm_kernels_time_variance_with_collective_overlap.csv`
 
 ## Output Structure
 
@@ -146,147 +221,6 @@ experiments/sweep_YYYYMMDD_HHMMSS/
     │   ├── individual_reports/perf_*ch_rank*.xlsx
     │   └── collective_reports/collective_*ch.xlsx
     ├── 512thread/
-    └── top5_gemm_kernels_time_variance.csv
-```
-
-## Quick Reference
-
-```bash
-# Run complete sweep
-bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
-  --channels 28,42,56,70 \
-  --threads 256,512 \
-  --config config/single_node/gemm_overlap_comm.yaml
-
-# Run with rocprof tracing (all kernels with stats)
-bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
-  --rocprof --stats \
-  --channels 28,42,56,70 \
-  --threads 256,512
-
-# Run with rocprof using CU-only YAML (recommended)
-bash packages/aorta-report/scripts/gemm_analysis/run_train_various_channels.sh \
-  --rocprof --stats \
-  --rocprof-input packages/aorta-report/scripts/gemm_analysis/rocprof_cu_only.yaml \
-  --channels 28,42,56,70 \
-  --threads 256,512
-
-# Generate TraceLens reports (PyTorch profiler)
-bash packages/aorta-report/scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_YYYYMMDD_HHMMSS
-
-# Generate TraceLens reports (ROCprof)
-bash packages/aorta-report/scripts/gemm_analysis/run_tracelens_analysis.sh experiments/sweep_YYYYMMDD_HHMMSS --rocprof
-
-# Extract top GEMM kernels
-python packages/aorta-report/scripts/gemm_analysis/analyze_gemm_reports.py \
-  --base-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis \
-  --threads 256 512 --channels 28 42 56 70 --top-k 5
-```
-# GEMM Visualization and Reporting
-
-Visualization, overlap analysis, and reporting tools for GEMM kernel performance data.
-
-## Prerequisites
-
-- Python packages: pandas, openpyxl, matplotlib, seaborn
-- Completed GEMM sweep profiling with generated `top5_gemm_kernels_time_variance.csv`
-
-## Pipeline Steps
-
-### 1. Generate Variance Plots
-
-Create comprehensive visualization of GEMM kernel variance:
-
-```bash
-python packages/aorta-report/scripts/gemm_analysis/plot_gemm_variance.py \
-  --csv-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
-  --output-dir experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/plots
-```
-
-Generates:
-- Box plots by thread count, channel count, and rank
-- Violin plots showing distribution
-- Thread-channel interaction plots
-
-### 2. Add Timestamp Information
-
-Enhance variance data with kernel execution timestamps:
-
-```bash
-python packages/aorta-report/scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
-  --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
-  --base-path experiments/sweep_YYYYMMDD_HHMMSS
-```
-
-Output: `top5_gemm_kernels_time_variance_with_timestamps.csv`
-
-### 3. Analyze Collective Overlap
-
-Identify NCCL collective operations overlapping with GEMM kernels:
-
-```bash
-python packages/aorta-report/scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
-  --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
-  --tracelens-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis
-```
-
-Output: `top5_gemm_kernels_time_variance_with_collective_overlap.csv`
-
-### 4. Create Comparison HTML Report
-
-Generate side-by-side comparison of two experiment sweeps:
-
-```bash
-python packages/aorta-report/scripts/gemm_analysis/create_embeded_html_report.py \
-  --sweep1 experiments/sweep_20251121_155219 \
-  --sweep2 experiments/sweep_20251124_222204 \
-  --label1 "Base ROCm" \
-  --label2 "ROCm 7.0" \
-  --output sweep_comparison.html
-```
-
-Creates self-contained HTML with embedded images.
-
-Note: Currently supports pairwise (2-sweep) comparison. For comparing multiple sweeps,
-run multiple pairwise comparisons or aggregate data using the process_gpu_timeline.py
-and process_comms.py scripts.
-
-## Additional Analysis Tools
-
-### Process GPU Timeline
-
-Aggregate GPU timeline data across all ranks and configurations:
-
-```bash
-python packages/aorta-report/scripts/gemm_analysis/process_gpu_timeline.py \
-  --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
-```
-
-Output: `gpu_timeline_all_configs_mean.xlsx` with multiple sheets:
-- All_Data - Complete dataset
-- Pivot_Time_ms - Matrix view of time
-- Pivot_Percent - Matrix view of percentages
-- Summary_By_Config - Key metrics per configuration
-
-### Process NCCL Communication Data
-
-Extract and aggregate NCCL collective operation data:
-
-```bash
-python packages/aorta-report/scripts/gemm_analysis/process_comms.py \
-  --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
-```
-
-Output: `nccl_master_all_configs.xlsx` and `.csv` with:
-- Communication latency statistics
-- Bandwidth metrics
-- Time skew analysis
-
-## Output Structure
-
-```
-experiments/sweep_YYYYMMDD_HHMMSS/
-└── tracelens_analysis/
     ├── top5_gemm_kernels_time_variance.csv
     ├── top5_gemm_kernels_time_variance_with_timestamps.csv
     ├── top5_gemm_kernels_time_variance_with_collective_overlap.csv
@@ -300,28 +234,12 @@ experiments/sweep_YYYYMMDD_HHMMSS/
         └── variance_thread_channel_interaction.png
 ```
 
-## Quick Reference
+## Scripts in this Directory
 
-```bash
-# Generate all visualizations
-python packages/aorta-report/scripts/gemm_analysis/plot_gemm_variance.py \
-  --csv-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv
-
-# Add timestamps and analyze overlap
-python packages/aorta-report/scripts/gemm_analysis/enhance_gemm_variance_with_timestamps.py \
-  --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance.csv \
-  --base-path experiments/sweep_YYYYMMDD_HHMMSS
-
-python packages/aorta-report/scripts/gemm_analysis/gemm_report_with_collective_overlap.py \
-  --input-csv experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis/top5_gemm_kernels_time_variance_with_timestamps.csv \
-  --tracelens-path experiments/sweep_YYYYMMDD_HHMMSS/tracelens_analysis
-
-# Process Excel reports
-python packages/aorta-report/scripts/gemm_analysis/process_gpu_timeline.py --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
-python packages/aorta-report/scripts/gemm_analysis/process_comms.py --sweep-dir experiments/sweep_YYYYMMDD_HHMMSS
-
-# Create comparison report
-python packages/aorta-report/scripts/gemm_analysis/create_embeded_html_report.py \
-  --sweep1 experiments/sweep1 --sweep2 experiments/sweep2 \
-  --label1 "Baseline" --label2 "Optimized" --output comparison.html
-```
+| Script | Purpose |
+|--------|---------|
+| `run_train_various_channels.sh` | Shell orchestration for NCCL channel/thread sweep training runs |
+| `run_tracelens_analysis.sh` | Shell orchestration for TraceLens report generation on sweeps |
+| `gemm_report_with_collective_overlap.py` | Adds NCCL collective overlap info to GEMM variance CSV |
+| `rocprof_cu_only.yaml` | rocprofv3 config for CU utilization tracing |
+| `rocprof_input.yaml` | rocprofv3 config (general) |

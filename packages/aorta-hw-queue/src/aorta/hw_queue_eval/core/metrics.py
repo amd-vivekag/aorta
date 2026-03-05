@@ -601,16 +601,24 @@ def compare_results(
             else:
                 comparison["unchanged"].append(metric_info)
 
-    # Compare latencies
-    for latency_metric in ["p50_ms", "p95_ms", "p99_ms"]:
-        baseline_lat = baseline.get("latency", {}).get(latency_metric, 0)
-        test_lat = test.get("latency", {}).get(latency_metric, 0)
+    # Compare latencies — support both serialised key layouts:
+    #   HarnessResult.to_dict() -> {"latency_ms": {"p50": ..., "p95": ..., "p99": ...}}
+    #   Legacy / compare_baselines.py -> {"latency": {"p50_ms": ...}}
+    for metric_key in ["p50", "p95", "p99"]:
+        baseline_lat = (
+            baseline.get("latency_ms", {}).get(metric_key, 0)
+            or baseline.get("latency", {}).get(f"{metric_key}_ms", 0)
+        )
+        test_lat = (
+            test.get("latency_ms", {}).get(metric_key, 0)
+            or test.get("latency", {}).get(f"{metric_key}_ms", 0)
+        )
 
         if baseline_lat > 0:
             # For latency, increase is regression
             change = (test_lat - baseline_lat) / baseline_lat
             metric_info = {
-                "metric": f"latency_{latency_metric}",
+                "metric": f"latency_{metric_key}",
                 "baseline": baseline_lat,
                 "test": test_lat,
                 "change_pct": change * 100,

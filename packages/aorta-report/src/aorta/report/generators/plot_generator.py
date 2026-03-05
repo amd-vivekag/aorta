@@ -265,7 +265,7 @@ def generate_plots(
         if not excel_input.exists():
             raise FileNotFoundError(f"Excel file not found: {excel_input}")
         results["summary"] = generate_summary_plots(
-            excel_input, output_dir, dpi, verbose
+            excel_input, output_dir, labels=None, dpi=dpi, verbose=verbose
         )
 
     if plot_type in ("gemm", "all"):

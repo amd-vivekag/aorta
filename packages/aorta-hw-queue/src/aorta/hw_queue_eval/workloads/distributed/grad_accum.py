@@ -11,7 +11,7 @@ This is common in large-batch training with gradient accumulation.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -69,6 +69,7 @@ class GradientAccumulationWorkload(MultiGPUMixin, DistributedWorkload):
         output_size: int = 1000,
         simulate_collectives: bool = True,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize gradient accumulation workload.
@@ -90,6 +91,7 @@ class GradientAccumulationWorkload(MultiGPUMixin, DistributedWorkload):
         self.input_size = input_size
         self.output_size = output_size
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._model: nn.Module = None
         self._inputs: List[torch.Tensor] = []

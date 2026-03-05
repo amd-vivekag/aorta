@@ -3,7 +3,7 @@
 
 import argparse
 
-from aorta.experiments import BenchmarkConfig, run_sdma_benchmark
+from aorta.training.experiments import BenchmarkConfig, run_sdma_benchmark
 
 
 def parse_args() -> argparse.Namespace:

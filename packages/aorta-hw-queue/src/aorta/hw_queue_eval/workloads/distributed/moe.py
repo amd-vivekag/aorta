@@ -11,7 +11,7 @@ With 8-16 experts, this naturally stresses high stream counts.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -98,6 +98,7 @@ class MoEWorkload(MultiGPUMixin, DistributedWorkload):
         seq_length: int = 512,
         simulate_collectives: bool = True,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize MoE workload.
@@ -121,6 +122,7 @@ class MoEWorkload(MultiGPUMixin, DistributedWorkload):
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._gating: Optional[GatingNetwork] = None
         self._experts: List[ExpertMLP] = []

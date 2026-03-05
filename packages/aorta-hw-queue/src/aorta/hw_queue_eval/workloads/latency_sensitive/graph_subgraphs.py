@@ -11,7 +11,7 @@ This tests maximum parallel execution when there are no dependencies.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -82,6 +82,7 @@ class GraphSubgraphsWorkload(MultiGPUMixin, BaseWorkload):
         batch_size: int = 32,
         subgraph_layers: int = 3,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize subgraph workload.
@@ -103,6 +104,7 @@ class GraphSubgraphsWorkload(MultiGPUMixin, BaseWorkload):
         self.batch_size = batch_size
         self.subgraph_layers = subgraph_layers
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._subgraphs: List[Subgraph] = []
         self._aggregator: nn.Module = None
@@ -119,14 +121,18 @@ class GraphSubgraphsWorkload(MultiGPUMixin, BaseWorkload):
         self._setup_multi_gpu(stream_count, device, self.use_multi_gpu)
 
         # Stream assignments
-        # Reserve first and last for input/aggregate
+        # Reserve first and last for input/aggregate (requires >= 3 streams)
+        if stream_count < 3:
+            raise ValueError(
+                f"graph_subgraphs requires at least 3 streams "
+                f"(got {stream_count}, min_streams={self.min_streams})"
+            )
         available_streams = stream_count - 2
         self._input_stream = 0
         self._subgraph_streams = []
 
         for i in range(self.num_subgraphs):
-            # Round-robin assign subgraphs to available streams
-            stream_idx = 1 + (i % max(1, available_streams))
+            stream_idx = 1 + (i % available_streams)
             self._subgraph_streams.append(stream_idx)
 
         self._aggregate_stream = stream_count - 1

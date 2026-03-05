@@ -9,7 +9,7 @@ Creates comprehensive report with:
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -421,7 +421,7 @@ def create_final_excel_report(
     baseline_label: str = "Baseline",
     test_label: str = "Test",
     verbose: bool = False,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Create comprehensive final Excel report.
 

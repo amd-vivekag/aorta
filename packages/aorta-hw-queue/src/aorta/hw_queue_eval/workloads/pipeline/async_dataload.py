@@ -11,7 +11,7 @@ This tests the ability to hide data transfer latency.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -79,6 +79,7 @@ class AsyncDataLoadWorkload(MultiGPUMixin, BaseWorkload):
         num_prefetch: int = 2,
         num_classes: int = 1000,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize async data loading workload.
@@ -96,6 +97,7 @@ class AsyncDataLoadWorkload(MultiGPUMixin, BaseWorkload):
         self.num_prefetch = num_prefetch
         self.num_classes = num_classes
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._model = None
         self._cpu_data: List[torch.Tensor] = []
@@ -185,14 +187,15 @@ class AsyncDataLoadWorkload(MultiGPUMixin, BaseWorkload):
             with torch.cuda.stream(preprocess_stream):
                 # Simulate preprocessing: normalize, augment
                 data = self._gpu_buffers[batch_idx]
+                target_device = data.device
 
                 # Normalize (ImageNet-style)
-                mean = torch.tensor([0.485, 0.456, 0.406], device=self._device).view(1, 3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=self._device).view(1, 3, 1, 1)
+                mean = torch.tensor([0.485, 0.456, 0.406], device=target_device).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=target_device).view(1, 3, 1, 1)
                 normalized = (data - mean) / std
 
                 # Random horizontal flip simulation
-                flip_mask = torch.rand(self.batch_size, 1, 1, 1, device=self._device) > 0.5
+                flip_mask = torch.rand(self.batch_size, 1, 1, 1, device=target_device) > 0.5
                 flipped = torch.where(flip_mask, normalized.flip(-1), normalized)
 
                 self._preprocessed[batch_idx].copy_(flipped)

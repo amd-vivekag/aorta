@@ -7,7 +7,7 @@ training:
   mixed_precision: bf16
   max_steps: 10
   grad_clip_norm: 1.0
-  output_dir: artifacts/optuna_tracelens_sweep_fixed/trial_0000
+  output_dir: experiments/optuna_tracelens_sweep_fixed/trial_0000
   log_interval: 20
   additional_compute_streams: 4
   lightweight_op_waves: 4

@@ -95,6 +95,7 @@ class FSDPTPWorkload(MultiGPUMixin, DistributedWorkload):
         batch_size: int = 8,
         seq_length: int = 512,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize FSDP+TP workload.
@@ -116,6 +117,7 @@ class FSDPTPWorkload(MultiGPUMixin, DistributedWorkload):
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         # Size presets
         size_configs = {

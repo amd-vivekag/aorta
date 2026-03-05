@@ -5,19 +5,14 @@ Generates individual per-rank performance reports and multi-rank collective repo
 using TraceLens with GEMM patches for ROCm Tensile kernel recognition.
 """
 
+import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
-import numpy as np
+
 import pandas as pd
 
+from ..utils import geometric_mean
 from .tracelens_wrapper import TraceLensWrapper
-
-
-def geometric_mean(values: np.ndarray) -> float:
-    """Calculate geometric mean, handling zeros."""
-    values = np.array(values)
-    values = np.where(values == 0, 1e-10, values)
-    return float(np.exp(np.mean(np.log(values))))
 
 
 def detect_trace_directory(input_dir: Path) -> Tuple[Path, Path]:
@@ -166,6 +161,13 @@ def process_gpu_timeline(
     return output_path
 
 
+# TODO: Add rocprof trace support. This requires:
+#   1. Detecting rocprof_traces/pass_1/*_results.json layout (PID-based, not rank-based)
+#   2. Mapping PID files to ranks by sort order
+#   3. Calling wrapper.generate_perf_report_rocprof() instead of generate_perf_report()
+#   4. Skipping collective reports (not supported for rocprof)
+#   The wrapper method already exists (TraceLensWrapper.generate_perf_report_rocprof).
+#   See scripts/gemm_analysis/run_tracelens_analysis.sh for reference implementation.
 def analyze_single_config(
     input_dir: Path,
     output_dir: Optional[Path] = None,
@@ -253,7 +255,7 @@ def analyze_single_config(
             if rank_name.startswith("rank"):
                 rank_num = rank_name[4:]  # Remove "rank" prefix
                 try:
-                    rank_num = int(rank_num.lstrip("_").lstrip("0") or "0")
+                    rank_num = int(rank_num.lstrip("_"))
                 except ValueError:
                     rank_num = rank_name
 
@@ -294,19 +296,22 @@ def analyze_single_config(
 
         output_file = collective_reports_dir / "collective_all_ranks.xlsx"
 
-        # Create trace.json symlinks for consistent pattern
+        # Create trace.json links for consistent pattern expected by TraceLens.
+        # Prefer symlinks; fall back to copying (needed on Docker overlay mounts).
         for rank_dir in rank_dirs:
             trace_file = find_trace_file(rank_dir)
             if trace_file:
-                symlink_path = rank_dir / "trace.json"
-                if not symlink_path.exists():
+                link_path = rank_dir / "trace.json"
+                if link_path.exists():
+                    continue
+                try:
+                    relative_path = trace_file.relative_to(rank_dir)
+                    link_path.symlink_to(relative_path)
+                except OSError:
                     try:
-                        # Use relative path from rank_dir to trace_file
-                        # This handles cases where trace is in subdirectory (e.g., trace/pt.trace.json)
-                        relative_path = trace_file.relative_to(rank_dir)
-                        symlink_path.symlink_to(relative_path)
-                    except (OSError, FileExistsError, ValueError):
-                        pass  # Symlink already exists or cannot be created
+                        shutil.copy2(trace_file, link_path)
+                    except OSError:
+                        print(f"  Warning: cannot link or copy trace for {rank_dir.name}")
 
         trace_pattern = str(torch_prof_dir / "rank*" / "trace.json")
 

@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 
+ROCM_GEMM_PATTERN = re.compile(r"^.*C[a-z]{3}_A[a-z]{3}_B[a-z]{3}.*$")
+
+
 class TraceLensWrapper:
     """GEMM-patched TraceLens wrapper."""
 
@@ -38,8 +41,7 @@ class TraceLensWrapper:
 
             def patched_is_rocm_gemm(kernel_name):
                 """Enhanced ROCm GEMM pattern matching for Tensile kernels."""
-                pattern = r"^.*C[a-z]{3}_A[a-z]{3}_B[a-z]{3}.*$"
-                return bool(re.match(pattern, kernel_name))
+                return bool(ROCM_GEMM_PATTERN.match(kernel_name))
 
             def patched_parse_rocm_gemm(kernel_name):
                 """Parse ROCm GEMM kernel details."""
@@ -90,11 +92,11 @@ class TraceLensWrapper:
 
             def patched_is_gemm_kernel(kernel_event: dict) -> bool:
                 """Enhanced GEMM kernel detection."""
-                assert kernel_event["cat"] == "kernel"
+                if kernel_event.get("cat") != "kernel":
+                    return False
                 kernel_name = kernel_event["name"]
 
-                pattern = r"^.*C[a-z]{3}_A[a-z]{3}_B[a-z]{3}.*$"
-                is_rocm_gemm = bool(re.match(pattern, kernel_name))
+                is_rocm_gemm = bool(ROCM_GEMM_PATTERN.match(kernel_name))
                 is_cuda_gemm = kernel_name.startswith("nvjet") or "cublasLt" in kernel_name
 
                 return is_rocm_gemm or is_cuda_gemm
@@ -136,8 +138,7 @@ class TraceLensWrapper:
 
                 if result == "other" and "kernel_details" in row and len(row["kernel_details"]) > 0:
                     kernel_name = row["kernel_details"][0]["name"]
-                    pattern = r"^.*C[a-z]{3}_A[a-z]{3}_B[a-z]{3}.*$"
-                    if re.match(pattern, kernel_name):
+                    if ROCM_GEMM_PATTERN.match(kernel_name):
                         return "GEMM"
 
                 return result
@@ -207,6 +208,7 @@ class TraceLensWrapper:
 
         return output_path
 
+    # TODO: Wire into analyze_single_config() — see TODO in analyze_single.py
     def generate_perf_report_rocprof(
         self,
         trace_path: Path,

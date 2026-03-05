@@ -2,6 +2,8 @@
 
 Scripts for multi-node distributed training with custom NCCL channel and thread configurations.
 
+> **See also:** [aorta-training README](../../packages/aorta-training/README.md) for single-node quick start and config reference, or the [User Guide](../../packages/aorta-training/docs/user-guide.md) for the full reference on all training options.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)

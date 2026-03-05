@@ -108,6 +108,7 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
         comp_data_type: str | torch.dtype = torch.float32,
         comm_data_type: str | torch.dtype = torch.float32,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Args:
@@ -158,6 +159,7 @@ class CommsComputeOverlapWorkload(MultiGPUMixin, DistributedWorkload):
         self.collective = collective
         self.comm_size_bytes = comm_size_bytes
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
         self._requested_compute_streams: Optional[int] = compute_streams
         self.comp_data_type: torch.dtype = _resolve_dtype(comp_data_type)
         self.comm_data_type: torch.dtype = _resolve_dtype(comm_data_type)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import json
 import logging
 import os
@@ -39,6 +40,10 @@ class OptimizerConfig:
     weight_decay: float = 1e-2
     betas: tuple[float, float] = (0.9, 0.98)
     eps: float = 1e-8
+    # Shampoo-specific
+    precondition_frequency: int = 50
+    max_preconditioner_dim: int = 8192
+    start_preconditioning_step: int = 50
 
 
 @dataclass
@@ -56,7 +61,7 @@ class TrainingConfig:
     grad_clip_norm: float = 1.0
     mixed_precision: str = "bf16"  # options: none, fp16, bf16
     log_interval: int = 10
-    output_dir: Path = Path("artifacts")
+    output_dir: Path = Path("experiments")
     inject_allreduce_copies: bool = False  # Inject all_reduce + host-device copies to trigger hang
     allreduce_stress_level: int = 1  # Number of all_reduce ops per iteration (1-10)
 
@@ -392,6 +397,33 @@ class MetricsLogger:
         return obj
 
 
+class LossLogger:
+    """Writes a lightweight CSV of loss values every step (rank 0 only)."""
+
+    FIELDS = ("global_step", "epoch", "step", "loss", "grad_norm", "lr")
+
+    def __init__(self, output_dir: Path) -> None:
+        self.path = output_dir / "loss.csv"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.handle)
+        self.writer.writerow(self.FIELDS)
+        self.handle.flush()
+
+    def log(self, global_step: int, epoch: int, step: int,
+            loss: float, grad_norm: Optional[float], lr: float) -> None:
+        self.writer.writerow((
+            global_step, epoch, step,
+            f"{loss:.6f}",
+            f"{grad_norm:.6f}" if grad_norm is not None else "",
+            f"{lr:.8f}",
+        ))
+        self.handle.flush()
+
+    def close(self) -> None:
+        self.handle.close()
+
+
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     return {key: tensor.to(device, non_blocking=True) for key, tensor in batch.items()}
 
@@ -462,6 +494,7 @@ def training_loop(
         scaler = None
 
     metrics_logger = MetricsLogger(training_cfg.output_dir, rank)
+    loss_logger = LossLogger(training_cfg.output_dir) if rank == 0 else None
 
     total_steps = training_cfg.max_steps or len(dataloader) * training_cfg.epochs
     global_step = 0
@@ -593,6 +626,15 @@ def training_loop(
 
                     iteration_payload.update(collect_rocm_metrics(enable_rocm_metrics))
                     metrics_logger.log(iteration_payload)
+                    if loss_logger is not None:
+                        loss_logger.log(
+                            global_step=global_step,
+                            epoch=epoch,
+                            step=step,
+                            loss=iteration_payload["loss"],
+                            grad_norm=iteration_payload["grad_norm"],
+                            lr=iteration_payload["lr"],
+                        )
 
                     if global_step % training_cfg.log_interval == 0 and rank == 0:
                         log.info(
@@ -619,6 +661,8 @@ def training_loop(
                     break
 
     metrics_logger.close()
+    if loss_logger is not None:
+        loss_logger.close()
 
 
 def configure_optimizer(model: nn.Module, cfg: OptimizerConfig, dist_mode: str = "ddp") -> torch.optim.Optimizer:
@@ -631,13 +675,22 @@ def configure_optimizer(model: nn.Module, cfg: OptimizerConfig, dist_mode: str =
             num_trainers_per_group=-1,  # Use all ranks in the group
             communicate_params=False,
         )
-        log.info("Using DistributedShampoo optimizer with DDPDistributedConfig")
+        log.info(
+            "Using DistributedShampoo optimizer with DDPDistributedConfig "
+            "(precondition_freq=%s, max_precond_dim=%s, start_precond_step=%s)",
+            cfg.precondition_frequency,
+            cfg.max_preconditioner_dim,
+            cfg.start_preconditioning_step,
+        )
         optimizer = DistributedShampoo(
             model.parameters(),
             lr=cfg.lr,
             betas=cfg.betas,
             epsilon=cfg.eps,
             weight_decay=cfg.weight_decay,
+            max_preconditioner_dim=cfg.max_preconditioner_dim,
+            precondition_frequency=cfg.precondition_frequency,
+            start_preconditioning_step=cfg.start_preconditioning_step,
             distributed_config=distributed_config,
         )
     else:

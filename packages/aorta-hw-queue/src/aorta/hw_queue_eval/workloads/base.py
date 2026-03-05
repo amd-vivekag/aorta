@@ -51,12 +51,14 @@ class MultiGPUMixin:
     _stream_to_device: Dict[int, str]
     _device: str
     use_multi_gpu: bool
+    num_gpus: Optional[int]
 
     def _setup_multi_gpu(
         self,
         stream_count: int,
         device: str,
         use_multi_gpu: bool,
+        num_gpus: Optional[int] = None,
     ) -> None:
         """
         Setup multi-GPU device mapping.
@@ -71,10 +73,15 @@ class MultiGPUMixin:
             stream_count: Total number of streams
             device: Default/fallback device
             use_multi_gpu: If True, use all available GPUs; if False, use only device
+            num_gpus: Limit number of GPUs (None = all available).
+                      Falls back to self.num_gpus if not provided.
         """
+        if num_gpus is None:
+            num_gpus = getattr(self, "num_gpus", None)
         if use_multi_gpu and torch.cuda.is_available():
-            num_gpus = torch.cuda.device_count()
-            self._devices = [f"cuda:{i}" for i in range(num_gpus)]
+            total = torch.cuda.device_count()
+            count = min(num_gpus, total) if num_gpus is not None else total
+            self._devices = [f"cuda:{i}" for i in range(count)]
         else:
             self._devices = [device]
 
@@ -97,8 +104,9 @@ class MultiGPUMixin:
         """Get multi-GPU configuration for inclusion in get_config()."""
         return {
             "use_multi_gpu": getattr(self, "use_multi_gpu", False),
+            "num_gpus_requested": getattr(self, "num_gpus", None),
             "devices": getattr(self, "_devices", []),
-            "num_gpus": len(getattr(self, "_devices", [])),
+            "num_gpus_active": len(getattr(self, "_devices", [])),
             "stream_to_device": getattr(self, "_stream_to_device", {}),
         }
 

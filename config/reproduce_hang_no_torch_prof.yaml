@@ -12,7 +12,7 @@ training:
   grad_clip_norm: 1.0
   log_interval: 5
   max_steps: 100
-  output_dir: artifacts_hang_repro
+  output_dir: experiments/hang_repro
 
 optimizer:
   lr: 0.0003

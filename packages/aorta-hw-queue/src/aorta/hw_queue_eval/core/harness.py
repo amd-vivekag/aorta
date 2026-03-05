@@ -14,7 +14,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -56,7 +56,8 @@ class HarnessConfig:
     collect_kernel_timings: bool = True
     warmup_gpu_before_run: bool = True
     reset_memory_stats_before_run: bool = True
-    use_multi_gpu: bool = True  # If True, distribute streams across all available GPUs
+    use_multi_gpu: bool = False  # If True, distribute streams across all available GPUs
+    num_gpus: Optional[int] = None  # Limit number of GPUs (None = all available)
     devices: Optional[List[str]] = None  # Explicit list of devices (auto-detected if None)
 
     def __post_init__(self):
@@ -67,6 +68,9 @@ class HarnessConfig:
         # Auto-detect devices if multi-GPU is enabled but no explicit list provided
         if self.use_multi_gpu and self.devices is None:
             self.devices = get_available_devices() or [self.device]
+        # Limit to num_gpus if specified
+        if self.num_gpus is not None and self.devices:
+            self.devices = self.devices[:self.num_gpus]
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

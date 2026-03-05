@@ -12,11 +12,12 @@ Supports two modes:
 import glob
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
+from ..utils import geometric_mean
 from .analyze_single import analyze_single_config
 
 
@@ -127,14 +128,6 @@ def discover_and_run_tracelens(
     print("=" * 80)
 
     return output_base
-
-
-def geometric_mean(values: np.ndarray) -> float:
-    """Calculate geometric mean, handling zeros."""
-    values = np.array(values)
-    # Replace zeros with small value to avoid log(0)
-    values = np.where(values == 0, 1e-10, values)
-    return float(np.exp(np.mean(np.log(values))))
 
 
 def parse_perf_filename(filename: str) -> tuple:

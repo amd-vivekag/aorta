@@ -20,13 +20,11 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from aorta.utils import IS_ROCM
 
 
 @dataclass

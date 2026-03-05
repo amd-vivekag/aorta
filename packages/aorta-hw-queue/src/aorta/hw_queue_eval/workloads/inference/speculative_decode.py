@@ -100,6 +100,7 @@ class SpeculativeDecodeWorkload(MultiGPUMixin, InferenceWorkload):
         batch_size: int = 1,
         vocab_size: int = 32000,
         use_multi_gpu: bool = True,
+        num_gpus: Optional[int] = None,
     ):
         """
         Initialize speculative decoding workload.
@@ -124,6 +125,7 @@ class SpeculativeDecodeWorkload(MultiGPUMixin, InferenceWorkload):
         self.batch_size = batch_size
         self.vocab_size = vocab_size
         self.use_multi_gpu = use_multi_gpu
+        self.num_gpus = num_gpus
 
         self._draft_model: Optional[SimpleLM] = None
         self._main_model: Optional[SimpleLM] = None

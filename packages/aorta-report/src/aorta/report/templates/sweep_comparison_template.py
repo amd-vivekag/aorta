@@ -144,12 +144,12 @@ def get_comparison_template(label1: str, label2: str, sweep1_path: Path, sweep2_
 <th>Path</th>
 </tr>
 <tr>
-<td><strong>Sweep 1</strong></td>
-<td>{label1}</td>
+<td><strong>Sweep 1</strong> ({label1})</td>
+<td>{sweep1_path}</td>
 </tr>
 <tr>
-<td><strong>Sweep 2</strong></td>
-<td>{label2}</td>
+<td><strong>Sweep 2</strong> ({label2})</td>
+<td>{sweep2_path}</td>
 </tr>
 </table>
 

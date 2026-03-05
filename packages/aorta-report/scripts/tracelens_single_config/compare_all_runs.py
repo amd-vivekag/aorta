@@ -288,7 +288,7 @@ def plot_gpu_time_percentage_change(df, labels, output_dir: Path):
     print(f"Saved: {output_file}")
 
 
-def calculate_gpu_timepercentage_change(df, labels):
+def calculate_gpu_time_percentage_change(df, labels):
     base_label = labels[0]
     for label in labels[1:]:
         df[f"percentage_change_{label}"] = (
@@ -436,7 +436,7 @@ def process_and_save_data(input_dirs, output_dir):
     )
 
     # Calculate the percentage change in gpu time
-    summary_df = calculate_gpu_timepercentage_change(summary_df, labels)
+    summary_df = calculate_gpu_time_percentage_change(summary_df, labels)
 
     # Save the data to an excel file
     with pd.ExcelWriter(
@@ -474,14 +474,11 @@ def generate_html_report(plots_dir, output_path):
         plots_dir: Directory containing plot files
         output_path: Path for the output HTML file
     """
-    html_script_path = Path(__file__).parent / "create_final_html.py"
     cmd = [
-        "python3",
-        str(html_script_path),
-        "--plot-files-directory",
-        str(plots_dir),
-        "--output-html",
-        str(output_path),
+        "aorta-report", "generate", "html",
+        "--mode", "performance",
+        "--plots-dir", str(plots_dir),
+        "-o", str(output_path),
     ]
     if run_command(cmd, "Creating final HTML"):
         print(f"Final HTML file created at: {output_path}")

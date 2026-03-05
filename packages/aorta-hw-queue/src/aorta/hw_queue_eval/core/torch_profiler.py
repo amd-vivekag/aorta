@@ -329,11 +329,14 @@ class TorchProfilerWrapper:
             result.chrome_trace_path = chrome_path
 
         if self.config.export_tensorboard:
+            import shutil
             tb_dir = self.output_dir / "tensorboard" / run_name
             tb_dir.mkdir(parents=True, exist_ok=True)
-            # Note: For single-shot profiling, we export chrome trace to TB dir
             chrome_tb = tb_dir / "trace.json"
-            prof.export_chrome_trace(str(chrome_tb))
+            if result.chrome_trace_path and result.chrome_trace_path.exists():
+                shutil.copy2(result.chrome_trace_path, chrome_tb)
+            else:
+                prof.export_chrome_trace(str(chrome_tb))
             result.tensorboard_dir = tb_dir
 
         return self._extract_statistics(prof, result)
