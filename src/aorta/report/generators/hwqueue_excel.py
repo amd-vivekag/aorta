@@ -15,11 +15,11 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # Import data classes from loader
 from ..processing.hwqueue_loader import SingleRunData, SweepData
+from .excel_report import sanitize_table_name, add_excel_table
 
 
 # Color constants
@@ -28,49 +28,6 @@ WHITE = "FFFFFF"
 GREEN = "63BE7B"
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
-
-
-def _sanitize_table_name(name: str) -> str:
-    """Create valid Excel table name."""
-    table_name = name.replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
-    if not table_name[0].isalpha():
-        table_name = "Tbl_" + table_name
-    return table_name[:255]
-
-
-def _add_excel_table(worksheet, table_name: str, start_row: int = 1) -> bool:
-    """Convert worksheet data to Excel table format."""
-    max_row = worksheet.max_row
-    max_col = worksheet.max_column
-
-    if max_row <= start_row:
-        return False
-
-    # Ensure all column headers are strings
-    for col_idx in range(1, max_col + 1):
-        cell = worksheet.cell(row=start_row, column=col_idx)
-        if cell.value is not None and not isinstance(cell.value, str):
-            cell.value = str(cell.value)
-
-    start_cell = f"A{start_row}"
-    end_cell = f"{get_column_letter(max_col)}{max_row}"
-    table_ref = f"{start_cell}:{end_cell}"
-
-    try:
-        tab = Table(displayName=table_name, ref=table_ref)
-        style = TableStyleInfo(
-            name="TableStyleMedium2",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        tab.tableStyleInfo = style
-        worksheet.add_table(tab)
-        return True
-    except Exception as e:
-        print(f"    Warning: Could not create table {table_name}: {e}")
-        return False
 
 
 def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
@@ -84,8 +41,8 @@ def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
             continue
 
         # Create unique table name
-        table_name = _sanitize_table_name(f"HWQ_{sheet_name}")
-        if _add_excel_table(ws, table_name):
+        table_name = sanitize_table_name(f"HWQ_{sheet_name}")
+        if add_excel_table(ws, table_name):
             if verbose:
                 print(f"    Converted to table: {sheet_name}")
 
