@@ -71,6 +71,11 @@ class HWQueuePipelineConfig:
                 "Must provide either --input or both --baseline-dir and --test-dir"
             )
 
+        # Validate regression threshold fraction (e.g., 0.05 = 5%)
+        if not (0.0 <= self.threshold <= 1.0):
+            raise ValueError(
+                f"Invalid threshold {self.threshold}: must be between 0.0 and 1.0 (fractional percent)."
+            )
 
 @dataclass
 class HWQueuePipelineResult:
