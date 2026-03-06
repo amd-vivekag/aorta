@@ -137,7 +137,7 @@ class EnvironmentData:
     hip_version: str = ""
     torch_version: str = ""
     gpu_count: int = 0
-    gpus: List[str] = field(default_factory=list)
+    gpus: List[Dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "EnvironmentData":
