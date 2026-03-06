@@ -130,10 +130,15 @@ def generate_sweep_summary(data: "SweepData") -> SweepSummary:
         # Compute from results
         throughputs = [r.throughput for r in data.results]
         stream_counts = [r.stream_count for r in data.results]
-        # Compute efficiency (actual / ideal where ideal = single_stream * n)
+        # Compute efficiency (actual / ideal where ideal uses normalized single-stream throughput)
         base_throughput = throughputs[0] if throughputs else 1
+        baseline_streams = stream_counts[0] if stream_counts else 1
+        if base_throughput > 0 and baseline_streams > 0:
+            single_stream_throughput = base_throughput / baseline_streams
+        else:
+            single_stream_throughput = 0
         efficiencies = [
-            t / (base_throughput * s) if base_throughput > 0 and s > 0 else 0
+            (t / (single_stream_throughput * s)) if single_stream_throughput > 0 and s > 0 else 0
             for t, s in zip(throughputs, stream_counts)
         ]
 
