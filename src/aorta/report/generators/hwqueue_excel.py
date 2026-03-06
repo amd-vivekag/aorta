@@ -374,7 +374,7 @@ def _apply_comparison_formatting(
             for row in range(1, ws.max_row + 1):
                 try:
                     cell_value = ws.cell(row=row, column=col_idx).value
-                    if cell_value:
+                    if cell_value is not None and cell_value != "":
                         max_length = max(max_length, len(str(cell_value)))
                 except Exception as e:
                     if verbose:
