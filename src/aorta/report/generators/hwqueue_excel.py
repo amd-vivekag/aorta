@@ -9,10 +9,14 @@ Phase 4 will add comparison mode (Mode C).
 """
 
 from pathlib import Path
+# TODO: Check after final merge - unused typing imports (Dict, Any, List, Optional, Tuple)
+# may be needed once comparison mode (Mode C) is implemented in Phase 4.
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
+# TODO: Check after final merge - ColorScaleRule, Alignment, Border, Side are unused;
+# intended for conditional formatting/styling to be applied in a future phase.
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -22,6 +26,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from ..processing.hwqueue_loader import SingleRunData, SweepData
 
 
+# TODO: Check after final merge - RED, WHITE, GREEN, HEADER_FILL, HEADER_FONT are defined
+# but not yet applied; intended for header/conditional formatting in a future phase.
 # Color constants
 RED = "F8696B"
 WHITE = "FFFFFF"
