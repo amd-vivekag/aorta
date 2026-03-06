@@ -419,7 +419,7 @@ class HWQueueLoader:
         dir_environment = HWQueueLoader._load_environment_from_dir(path)
 
         # Find all *_results.json files
-        json_files = list(path.glob("*_results.json"))
+        json_files = sorted(path.glob("*_results.json"))
 
         if not json_files:
             raise HWQueueLoaderError(
