@@ -10,9 +10,12 @@ This module provides:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -148,6 +151,30 @@ class EnvironmentData:
             driver_type=data.get("driver_type", ""),
             hip_version=data.get("hip_version", ""),
             torch_version=data.get("torch_version", ""),
+            gpu_count=data.get("gpu_count", 0),
+            gpus=data.get("gpus", []),
+        )
+
+    @classmethod
+    def from_environment_info(cls, data: Optional[Dict[str, Any]]) -> "EnvironmentData":
+        """Create from a nested environment_info.json dictionary.
+
+        The environment_info.json produced by ``aorta.utils.device.log_environment_info``
+        uses a nested structure (``driver`` and ``rocm`` sub-dicts) rather than the
+        flat structure stored inside sweep result files.  This factory method handles
+        that nested layout so callers do not need to flatten it manually.
+        """
+        if data is None:
+            return cls()
+        driver = data.get("driver") or {}
+        rocm = data.get("rocm") or {}
+        return cls(
+            hostname=data.get("hostname", ""),
+            kernel=driver.get("kernel", ""),
+            dkms_version=driver.get("dkms_version", ""),
+            driver_type=driver.get("driver_type", ""),
+            hip_version=rocm.get("hip_version", ""),
+            torch_version=rocm.get("torch_version", ""),
             gpu_count=data.get("gpu_count", 0),
             gpus=data.get("gpus", []),
         )
@@ -327,6 +354,35 @@ class HWQueueLoader:
             )
 
     @staticmethod
+    def _load_environment_from_dir(path: Path) -> EnvironmentData:
+        """Load environment information from a directory-level environment_info.json.
+
+        When a run directory is produced by ``run-priority`` (or similar tooling),
+        an ``environment_info.json`` file written by
+        ``aorta.utils.device.log_environment_info`` is typically present alongside
+        the per-workload result files.  This helper reads that file and returns an
+        :class:`EnvironmentData` instance so that single-run wrappers in
+        :meth:`load_directory` can carry accurate system metadata instead of an
+        empty placeholder.
+
+        Args:
+            path: Directory that may contain ``environment_info.json``.
+
+        Returns:
+            :class:`EnvironmentData` populated from the file, or an empty
+            :class:`EnvironmentData` when the file is absent or unreadable.
+        """
+        env_file = path / "environment_info.json"
+        if not env_file.is_file():
+            return EnvironmentData()
+        try:
+            data = HWQueueLoader._load_json(env_file)
+            return EnvironmentData.from_environment_info(data)
+        except Exception as exc:
+            log.warning("Failed to load environment_info.json from %s: %s", path, exc)
+            return EnvironmentData()
+
+    @staticmethod
     def load_directory(path: Path) -> Dict[str, SweepData]:
         """
         Load all workload result JSON files from a directory.
@@ -335,6 +391,11 @@ class HWQueueLoader:
         - Sweep format (with a top-level 'results' array), or
         - Single-run format (with fields like 'throughput' and 'stream_count'),
           which will be wrapped into a SweepData containing a single run.
+
+        If an ``environment_info.json`` file is present in the directory (as
+        written by ``aorta.utils.device.log_environment_info``), its contents
+        are used to populate the :class:`EnvironmentData` of any single-run
+        wrappers so that system metadata is preserved consistently.
 
         Args:
             path: Path to directory containing result files
@@ -353,6 +414,9 @@ class HWQueueLoader:
 
         results: Dict[str, SweepData] = {}
         errors: List[str] = []
+
+        # Load directory-level environment info once for use in single-run wrappers.
+        dir_environment = HWQueueLoader._load_environment_from_dir(path)
 
         # Find all *_results.json files
         json_files = list(path.glob("*_results.json"))
@@ -380,13 +444,14 @@ class HWQueueLoader:
                         pass
                     results[workload_name] = sweep_data
                 elif HWQueueLoader._is_single_run_format(data):
-                    # Wrap single run in sweep format for consistency
+                    # Wrap single run in sweep format for consistency, using the
+                    # directory-level environment info when available.
                     single_run = SingleRunData.from_dict(data)
                     sweep_data = SweepData(
                         workload_name=workload_name,
                         timestamp=getattr(single_run, "timestamp", ""),
                         results=[single_run],
-                        environment=EnvironmentData(),
+                        environment=dir_environment,
                         analysis=ScalingAnalysisData(
                             stream_counts=[single_run.stream_count],
                             throughputs=[single_run.throughput],
