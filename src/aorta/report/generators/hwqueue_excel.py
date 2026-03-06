@@ -9,7 +9,7 @@ Phase 4 will add comparison mode (Mode C).
 """
 
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -38,7 +38,12 @@ def _sanitize_table_name(name: str) -> str:
     return table_name[:255]
 
 
-def _add_excel_table(worksheet, table_name: str, start_row: int = 1) -> bool:
+def _add_excel_table(
+    worksheet,
+    table_name: str,
+    start_row: int = 1,
+    warnings: Optional[List[str]] = None,
+) -> bool:
     """Convert worksheet data to Excel table format."""
     max_row = worksheet.max_row
     max_col = worksheet.max_column
@@ -69,13 +74,16 @@ def _add_excel_table(worksheet, table_name: str, start_row: int = 1) -> bool:
         worksheet.add_table(tab)
         return True
     except Exception as e:
-        print(f"    Warning: Could not create table {table_name}: {e}")
+        if warnings is not None:
+            warnings.append(f"Could not create table {table_name}: {e}")
         return False
 
 
 def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
     """Apply formatting to the Excel file after writing."""
     wb = load_workbook(output_path)
+    table_warnings: List[str] = []
+    used_table_names: Set[str] = set()
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -83,9 +91,17 @@ def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
         if ws.max_row <= 1:
             continue
 
-        # Create unique table name
-        table_name = _sanitize_table_name(f"HWQ_{sheet_name}")
-        if _add_excel_table(ws, table_name):
+        # Create a table name that is unique workbook-wide
+        base_name = _sanitize_table_name(f"HWQ_{sheet_name}")
+        table_name = base_name
+        counter = 1
+        while table_name in used_table_names:
+            suffix = f"_{counter}"
+            table_name = (base_name[: 255 - len(suffix)] + suffix)
+            counter += 1
+        used_table_names.add(table_name)
+
+        if _add_excel_table(ws, table_name, warnings=table_warnings):
             if verbose:
                 print(f"    Converted to table: {sheet_name}")
 
@@ -103,6 +119,10 @@ def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
             ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
 
     wb.save(output_path)
+
+    if verbose and table_warnings:
+        for warning in table_warnings:
+            print(f"    Warning: {warning}")
 
 
 def generate_single_run_excel(
