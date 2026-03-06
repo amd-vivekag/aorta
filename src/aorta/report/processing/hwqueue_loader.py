@@ -465,6 +465,9 @@ class HWQueueLoader:
             baseline_dir, test_dir
         )
 
+        # TODO: Optimize by passing an allowlist to load_directory() or pre-filtering
+        # the result file list so only common workloads are loaded, avoiding unnecessary
+        # I/O and JSON parsing when result directories are large.
         baseline_data = HWQueueLoader.load_directory(baseline_dir)
         test_data = HWQueueLoader.load_directory(test_dir)
 
