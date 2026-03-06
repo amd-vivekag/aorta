@@ -42,14 +42,41 @@ class SweepSummary:
     # Raw values for detailed display
     latency_ratio: float  # P99 at peak / P99 at 1 stream
 
-    def get_overall_status(self) -> str:
-        """Get CSS class for overall status."""
-        if "✗" in self.scaling_verdict[0] or "✗" in self.latency_verdict[0]:
+    # Normalized status fields used for logic/CSS: "good", "warning", "poor"
+    scaling_status: str = "good"
+    latency_status: str = "good"
+
+    def __post_init__(self) -> None:
+        """Normalize status fields based on verdicts if not explicitly set."""
+        valid_statuses = {"good", "warning", "poor"}
+
+        if self.scaling_status not in valid_statuses:
+            self.scaling_status = self._infer_status_from_verdict_text(
+                self.scaling_verdict[0]
+            )
+
+        if self.latency_status not in valid_statuses:
+            self.latency_status = self._infer_status_from_verdict_text(
+                self.latency_verdict[0]
+            )
+
+    @staticmethod
+    def _infer_status_from_verdict_text(verdict_text: str) -> str:
+        """Best-effort mapping from legacy verdict text to normalized status."""
+        # Preserve existing behavior: treat "✗" as poor, "⚠" as warning, else good.
+        if "✗" in verdict_text:
             return "poor"
-        elif "⚠" in self.scaling_verdict[0] or "⚠" in self.latency_verdict[0]:
+        if "⚠" in verdict_text:
             return "warning"
-        else:
-            return "good"
+        return "good"
+
+    def get_overall_status(self) -> str:
+        """Get CSS class for overall status based on normalized statuses."""
+        if self.scaling_status == "poor" or self.latency_status == "poor":
+            return "poor"
+        if self.scaling_status == "warning" or self.latency_status == "warning":
+            return "warning"
+        return "good"
 
 
 @dataclass
