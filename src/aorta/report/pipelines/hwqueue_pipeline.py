@@ -76,7 +76,6 @@ class HWQueuePipelineConfig:
             raise ValueError(
                 f"Invalid threshold {self.threshold}: must be between 0.0 and 1.0 (fraction, e.g. 0.05 = 5%)."
             )
-
 @dataclass
 class HWQueuePipelineResult:
     """Result from HW Queue pipeline execution."""
