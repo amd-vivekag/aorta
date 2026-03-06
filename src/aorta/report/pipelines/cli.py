@@ -406,7 +406,7 @@ def pipeline_hwqueue(
           --threshold 0.10 \\
           --output ./comparison/
     """
-    from .hwqueue_pipeline import run_hwqueue_pipeline, HWQueuePipelineConfig
+    from . import run_hwqueue_pipeline, HWQueuePipelineConfig
 
     verbose = ctx.obj.get("verbose", False)
     quiet = ctx.obj.get("quiet", False)
