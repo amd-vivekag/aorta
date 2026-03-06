@@ -9,19 +9,29 @@ Phase 4 will add comparison mode (Mode C).
 """
 
 from pathlib import Path
+<<<<<<< copilot/sub-pr-100-again
 from typing import Dict, Any, List, Optional, Set, Tuple
+=======
+# TODO: Check after final merge - unused typing imports (Dict, Any, List, Optional, Tuple)
+# may be needed once comparison mode (Mode C) is implemented in Phase 4.
+from typing import Dict, Any, List, Optional, Tuple
+>>>>>>> prosenj_cli_hq_eval_report_phase_3
 
 import pandas as pd
 from openpyxl import load_workbook
+# TODO: Check after final merge - ColorScaleRule, Alignment, Border, Side are unused;
+# intended for conditional formatting/styling to be applied in a future phase.
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # Import data classes from loader
 from ..processing.hwqueue_loader import SingleRunData, SweepData
+from .excel_report import sanitize_table_name, add_excel_table
 
 
+# TODO: Check after final merge - RED, WHITE, GREEN, HEADER_FILL, HEADER_FONT are defined
+# but not yet applied; intended for header/conditional formatting in a future phase.
 # Color constants
 RED = "F8696B"
 WHITE = "FFFFFF"
@@ -30,6 +40,7 @@ HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="s
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 
 
+<<<<<<< copilot/sub-pr-100-again
 def _sanitize_table_name(name: str) -> str:
     """Create valid Excel table name."""
     table_name = name.replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
@@ -79,6 +90,8 @@ def _add_excel_table(
         return False
 
 
+=======
+>>>>>>> prosenj_cli_hq_eval_report_phase_3
 def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
     """Apply formatting to the Excel file after writing."""
     wb = load_workbook(output_path)
@@ -91,6 +104,7 @@ def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
         if ws.max_row <= 1:
             continue
 
+<<<<<<< copilot/sub-pr-100-again
         # Create a table name that is unique workbook-wide
         base_name = _sanitize_table_name(f"HWQ_{sheet_name}")
         table_name = base_name
@@ -102,6 +116,11 @@ def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
         used_table_names.add(table_name)
 
         if _add_excel_table(ws, table_name, warnings=table_warnings):
+=======
+        # Create unique table name
+        table_name = sanitize_table_name(f"HWQ_{sheet_name}")
+        if add_excel_table(ws, table_name):
+>>>>>>> prosenj_cli_hq_eval_report_phase_3
             if verbose:
                 print(f"    Converted to table: {sheet_name}")
 
