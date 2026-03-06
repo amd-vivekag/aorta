@@ -624,13 +624,37 @@ def _build_environment_comparison_sheet(
 
     rows = [
         {"Property": "Label", baseline_label: baseline_label, test_label: test_label},
-        {"Property": "Hostname", baseline_label: b_env.hostname or "N/A", test_label: t_env.hostname or "N/A"},
-        {"Property": "GPU_Count", baseline_label: b_env.gpu_count or "N/A", test_label: t_env.gpu_count or "N/A"},
+        {
+            "Property": "Hostname",
+            baseline_label: b_env.hostname if b_env.hostname is not None else "N/A",
+            test_label: t_env.hostname if t_env.hostname is not None else "N/A",
+        },
+        {
+            "Property": "GPU_Count",
+            baseline_label: b_env.gpu_count if b_env.gpu_count is not None else "N/A",
+            test_label: t_env.gpu_count if t_env.gpu_count is not None else "N/A",
+        },
         {"Property": "GPU_Model", baseline_label: b_gpu_model, test_label: t_gpu_model},
-        {"Property": "HIP_Version", baseline_label: b_env.hip_version or "N/A", test_label: t_env.hip_version or "N/A"},
-        {"Property": "PyTorch_Version", baseline_label: b_env.torch_version or "N/A", test_label: t_env.torch_version or "N/A"},
-        {"Property": "Driver_Type", baseline_label: b_env.driver_type or "N/A", test_label: t_env.driver_type or "N/A"},
-        {"Property": "Kernel", baseline_label: b_env.kernel or "N/A", test_label: t_env.kernel or "N/A"},
+        {
+            "Property": "HIP_Version",
+            baseline_label: b_env.hip_version if b_env.hip_version is not None else "N/A",
+            test_label: t_env.hip_version if t_env.hip_version is not None else "N/A",
+        },
+        {
+            "Property": "PyTorch_Version",
+            baseline_label: b_env.torch_version if b_env.torch_version is not None else "N/A",
+            test_label: t_env.torch_version if t_env.torch_version is not None else "N/A",
+        },
+        {
+            "Property": "Driver_Type",
+            baseline_label: b_env.driver_type if b_env.driver_type is not None else "N/A",
+            test_label: t_env.driver_type if t_env.driver_type is not None else "N/A",
+        },
+        {
+            "Property": "Kernel",
+            baseline_label: b_env.kernel if b_env.kernel is not None else "N/A",
+            test_label: t_env.kernel if t_env.kernel is not None else "N/A",
+        },
     ]
 
     return pd.DataFrame(rows)
