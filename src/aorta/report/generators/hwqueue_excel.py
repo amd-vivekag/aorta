@@ -374,7 +374,7 @@ def _apply_comparison_formatting(
             for row in range(1, ws.max_row + 1):
                 try:
                     cell_value = ws.cell(row=row, column=col_idx).value
-                    if cell_value:
+                    if cell_value is not None and cell_value != "":
                         max_length = max(max_length, len(str(cell_value)))
                 except Exception as e:
                     if verbose:
@@ -551,14 +551,16 @@ def _build_throughput_by_streams_sheet(
             b_val = b_by_streams.get(sc)
             t_val = t_by_streams.get(sc)
 
+
             # TODO: use `is not None` checks instead of truthiness to correctly
             # handle 0.0 throughput values (e.g. `round(b_val, 2) if b_val is not None else None`)
-            row[f"{sc}_Base"] = round(b_val, 2) if b_val else None
-            row[f"{sc}_Test"] = round(t_val, 2) if t_val else None
+            row[f"{sc}_Base"] = round(b_val, 2) if b_val is not None else None
+            row[f"{sc}_Test"] = round(t_val, 2) if t_val is not None else None
 
             # TODO: use `is not None` and explicit `b_val != 0` to avoid skipping
             # valid Δ% calculations when throughput is 0
-            if b_val and t_val and b_val > 0:
+            if b_val is not None and t_val is not None and b_val > 0:
+
                 change = (t_val - b_val) / b_val * 100
                 row[f"{sc}_Δ%"] = round(change, 1)
             else:
@@ -596,10 +598,11 @@ def _build_latency_by_streams_sheet(
             b_val = b_by_streams.get(sc)
             t_val = t_by_streams.get(sc)
 
-            row[f"{sc}_Base"] = round(b_val, 3) if b_val else None
-            row[f"{sc}_Test"] = round(t_val, 3) if t_val else None
+            row[f"{sc}_Base"] = round(b_val, 3) if b_val is not None else None
+            row[f"{sc}_Test"] = round(t_val, 3) if t_val is not None else None
 
-            if b_val and t_val and b_val > 0:
+
+            if b_val is not None and t_val is not None and b_val > 0:
                 change = (t_val - b_val) / b_val * 100
                 row[f"{sc}_Δ%"] = round(change, 1)
             else:
@@ -626,6 +629,9 @@ def _build_environment_comparison_sheet(
     b_gpu_model = b_env.gpus[0] if b_env.gpus else "N/A"
     t_gpu_model = t_env.gpus[0] if t_env.gpus else "N/A"
 
+    # TODO: baseline_label and test_label are assumed to be distinct (enforced by the caller);
+    # if they were ever equal, the dict keys would collide and the baseline column would be
+    # overwritten. Consider enforcing distinct labels or using stable column headers if needed.
     rows = [
         {"Property": "Label", baseline_label: baseline_label, test_label: test_label},
         {
