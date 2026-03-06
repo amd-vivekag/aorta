@@ -175,7 +175,12 @@ def generate_sweep_summary(data: "SweepData") -> SweepSummary:
     sorted_results = sorted(data.results, key=lambda r: r.stream_count)
     if sorted_results:
         p99_at_1 = sorted_results[0].latency.p99
-        p99_at_peak = data.results[peak_idx].latency.p99 if peak_idx < len(data.results) else p99_at_1
+        # Find the result corresponding to the peak stream count to get correct peak latency
+        peak_result = next(
+            (r for r in sorted_results if r.stream_count == peak_streams),
+            sorted_results[-1],
+        )
+        p99_at_peak = peak_result.latency.p99
         latency_ratio = p99_at_peak / p99_at_1 if p99_at_1 > 0 else 1.0
     else:
         latency_ratio = 1.0
