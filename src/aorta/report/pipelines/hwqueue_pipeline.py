@@ -274,8 +274,13 @@ def _run_comparison_pipeline(config: HWQueuePipelineConfig) -> HWQueuePipelineRe
                 t = test_data[wl_name]
                 b_best_s, b_best_t = b.get_best_throughput()
                 t_best_s, t_best_t = t.get_best_throughput()
-                change = ((t_best_t - b_best_t) / b_best_t * 100) if b_best_t > 0 else 0
-                print(f"    {wl_name}: {b_best_t:.0f} -> {t_best_t:.0f} ({change:+.1f}%)")
+                if b_best_t > 0:
+                    change = (t_best_t - b_best_t) / b_best_t * 100
+                    change_str = f"{change:+.1f}%"
+                else:
+                    # Avoid misleading 0% change when baseline throughput is 0.
+                    change_str = "N/A (baseline 0)"
+                print(f"    {wl_name}: {b_best_t:.0f} -> {t_best_t:.0f} ({change_str})")
 
         result.steps_completed.append("load_data")
 
