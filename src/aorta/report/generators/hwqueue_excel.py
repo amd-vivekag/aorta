@@ -376,8 +376,12 @@ def _apply_comparison_formatting(
                     cell_value = ws.cell(row=row, column=col_idx).value
                     if cell_value:
                         max_length = max(max_length, len(str(cell_value)))
-                except:
-                    pass
+                except Exception as e:
+                    if verbose:
+                        print(
+                            f"    Warning: Could not read cell {sheet_name}!"
+                            f"{col_letter}{row} for width calculation: {e}"
+                        )
             ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
 
         # Apply color scale to change columns
