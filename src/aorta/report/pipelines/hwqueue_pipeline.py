@@ -261,12 +261,12 @@ def _run_comparison_pipeline(config: HWQueuePipelineConfig) -> HWQueuePipelineRe
         if not common:
             raise HWQueueLoaderError("No common workloads found between baseline and test")
 
-        # TODO: Optimization opportunity: `find_common_workloads()` is called above,
-        # but `load_comparison_data()` internally calls `find_common_workloads()` again,
-        # duplicating directory scanning work. Consider either using only
-        # `load_comparison_data()` (and taking common/baseline_only/test_only from its
-        # return), or loading the directories once and filtering using the
-        # already-computed `common` list.
+        # TODO: Optimize to avoid duplicate find_common_workloads() call (already done above)
+        # `find_common_workloads()` is called above, but `load_comparison_data()` internally
+        # calls `find_common_workloads()` again, duplicating directory scanning work.
+        # Consider either using only `load_comparison_data()` (and taking
+        # common/baseline_only/test_only from its return), or loading the directories
+        # once and filtering using the already-computed `common` list.
         # Load data for common workloads
         baseline_data, test_data, _, _, _ = HWQueueLoader.load_comparison_data(
             config.baseline_dir, config.test_dir
