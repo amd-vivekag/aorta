@@ -190,7 +190,14 @@ class SweepData:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SweepData":
         """Create from dictionary."""
-        results = [SingleRunData.from_dict(r) for r in data.get("results", [])]
+        raw_results = data.get("results", [])
+        results = []
+        for i, r in enumerate(raw_results):
+            if not isinstance(r, dict):
+                raise HWQueueLoaderError(
+                    f"Invalid schema: 'results[{i}]' must be a dict, got {type(r).__name__}"
+                )
+            results.append(SingleRunData.from_dict(r))
         return cls(
             workload_name=data.get("workload", "unknown"),
             results=results,
