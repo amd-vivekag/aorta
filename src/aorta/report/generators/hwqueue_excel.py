@@ -96,9 +96,9 @@ def _apply_formatting(output_path: Path, verbose: bool = False) -> None:
             for row in range(1, ws.max_row + 1):
                 try:
                     cell_value = ws.cell(row=row, column=col_idx).value
-                    if cell_value:
+                    if cell_value is not None:
                         max_length = max(max_length, len(str(cell_value)))
-                except:
+                except Exception:
                     pass
             ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
 
