@@ -82,7 +82,7 @@ class HWQueuePipelineResult:
     """Result from HW Queue pipeline execution."""
 
     success: bool
-    mode: str  # "single_run", "sweep", "comparison"
+    mode: str  # "single_run", "sweep", "comparison", or "unknown"
     output_dir: Path
 
     # Generated files
