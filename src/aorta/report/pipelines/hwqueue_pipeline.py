@@ -193,7 +193,7 @@ def generate_sweep_summary(data: "SweepData") -> SweepSummary:
     elif peak_efficiency >= 0.40:
         scaling_verdict = ("⚠ Fair", "Significant overhead at high stream counts")
     else:
-        scaling_verdict = ("⚠ Poor", "Severe diminishing returns")
+        scaling_verdict = ("✗ Poor", "Severe diminishing returns")
 
     # Determine latency verdict
     if latency_ratio <= 1.5:
