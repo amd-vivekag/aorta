@@ -18,6 +18,7 @@ class SyntheticDatasetConfig:
     vocab_size: int = 50_000
     num_dense_features: int = 8
     seed: int = 13
+    positive_rate: float = 0.5
 
 
 class SyntheticRankingDataset(Dataset):
@@ -44,7 +45,9 @@ class SyntheticRankingDataset(Dataset):
             generator=generator,
             dtype=torch.int64,
         )
-        target = torch.rand(seq_len, generator=generator)
+        target = torch.bernoulli(
+            torch.full((seq_len,), self.cfg.positive_rate), generator=generator
+        )
         importance = torch.rand(seq_len, generator=generator)
 
         return {
