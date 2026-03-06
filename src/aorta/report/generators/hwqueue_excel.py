@@ -595,6 +595,7 @@ def _build_latency_by_streams_sheet(
             row[f"{sc}_Base"] = round(b_val, 3) if b_val is not None else None
             row[f"{sc}_Test"] = round(t_val, 3) if t_val is not None else None
 
+
             if b_val is not None and t_val is not None and b_val > 0:
                 change = (t_val - b_val) / b_val * 100
                 row[f"{sc}_Δ%"] = round(change, 1)
@@ -622,6 +623,9 @@ def _build_environment_comparison_sheet(
     b_gpu_model = b_env.gpus[0] if b_env.gpus else "N/A"
     t_gpu_model = t_env.gpus[0] if t_env.gpus else "N/A"
 
+    # TODO: baseline_label and test_label are assumed to be distinct (enforced by the caller);
+    # if they were ever equal, the dict keys would collide and the baseline column would be
+    # overwritten. Consider enforcing distinct labels or using stable column headers if needed.
     rows = [
         {"Property": "Label", baseline_label: baseline_label, test_label: test_label},
         {
