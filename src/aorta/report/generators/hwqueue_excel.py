@@ -592,10 +592,10 @@ def _build_latency_by_streams_sheet(
             b_val = b_by_streams.get(sc)
             t_val = t_by_streams.get(sc)
 
-            row[f"{sc}_Base"] = round(b_val, 3) if b_val else None
-            row[f"{sc}_Test"] = round(t_val, 3) if t_val else None
+            row[f"{sc}_Base"] = round(b_val, 3) if b_val is not None else None
+            row[f"{sc}_Test"] = round(t_val, 3) if t_val is not None else None
 
-            if b_val and t_val and b_val > 0:
+            if b_val is not None and t_val is not None and b_val != 0:
                 change = (t_val - b_val) / b_val * 100
                 row[f"{sc}_Δ%"] = round(change, 1)
             else:
