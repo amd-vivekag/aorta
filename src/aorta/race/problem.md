@@ -16,6 +16,95 @@ Driver version: 6.16.6 ( rocm-smi --showdriverversion)
 
 ---
 
+## CUDA Stream Sanitizer (CSAN) Results on Meta's NaN Workload
+
+**Date:** March 2026
+**Configuration:** `ROC_AQL_QUEUE_SIZE=1024`, `GPU_MAX_HW_QUEUES=1`, `CSAN=1`
+
+Meta ran the PyTorch CUDA Stream Sanitizer against their eval workload to detect stream-level data races.
+
+### What CSAN Detected
+
+CSAN found a **data race on a tensor** (data pointer `139991783932688`) between two streams:
+
+| | Stream | Operation | Pipeline Stage |
+|---|--------|-----------|----------------|
+| **Access 1** | `data_dist_stream` (id `140011564741504`) | `aten::empty.memory_format` -- allocating a new tensor | `wait_sparse_data_dist` |
+| **Access 2** | `default_stream` (id `0`) | `c10d::alltoall_base_` -- reading input tensor | `model_fwd` |
+
+### Code Paths from Stack Traces
+
+**data_dist_stream side:**
+`trainer.py` -> `_train_loop` -> `progress()` -> `wait_sparse_data_dist()` -> `KJTAllToAllTensorsAwaitable.__init__()` at `dist_data.py:402` -> `torch.empty(...)`.
+The CachingAllocator (CCA) returned a memory block at the raced address.
+
+**default_stream side:**
+`alltoall_base_(input=..., async_op=True)` -- the NCCL/RCCL all-to-all collective was still reading from a tensor at that same address as its input argument. The collective was launched asynchronously.
+
+### The Race Scenario
+
+```
+Timeline:
+  default_stream:     alltoall_base_(input=0x7F4B...0A10, async_op=True) --> still reading input
+  data_dist_stream:   torch.empty() --> CCA returns block at 0x7F4B...0A10 --> OVERWRITES
+```
+
+The CachingAllocator reused the memory block while the async `alltoall_base_` on the default stream was still reading from it.
+
+### Meta's Interpretation
+
+> "CSAN detected race between the data_dist_stream and the default_stream. The former is requesting a buffer during wait_sparse_data_dist stage of pipelining, while the latter is doing some NCCL ops (all2all here, but I've also seen reduce scatter etc.) during model_fwd. My interpretation: when the data_dist_stream requests the buffer, CachingAllocator handed out a block that was still in use by the default stream."
+
+### Three Hypotheses Discussed
+
+**Hypothesis 1: NCCL/RCCL dropped a tensor reference (RULED OUT)**
+
+Meta initially suspected that NCCL internal code failed to keep a reference to the all-to-all input tensor, allowing the CCA to recycle it. They examined a specific PR that introduced a new tensor to hold the A2A input but failed to keep refs. However, `ProcessGroupNCCL.cpp` correctly stashes both inputs and outputs of async collective ops. They could not reproduce the race by manually queuing async comms + allocating on another stream.
+
+**Hypothesis 2: HIP event completion reports success prematurely (STRONGEST LEAD)**
+
+Proposed by Jeremy Hadidjojo at Meta. The mechanism:
+
+1. When a cross-stream buffer is deleted, the CachingAllocator inserts `hipEvent` on every stream using it
+2. The block doesn't get freed until all events report completion
+3. If `hipEventQuery()` returns `hipSuccess` **before the GPU actually finishes** using the memory, the CCA would recycle the block too early
+
+This would be an AMD-specific bug in HIP event management -- the event signals completion to the CPU before the GPU has actually finished the associated kernel/collective.
+
+This hypothesis is consistent with the Shampoo experiment matrix:
+
+- **Row 2** (`GPU_MAX_HW_QUEUES=2` fixes): Fewer HW queues = fewer concurrent operations = smaller window for premature event completion
+- **Row 4** (H2D on default stream fixes): No cross-stream event needed -- same-stream ordering guaranteed by queue semantics
+- **Row 6** (same non-default stream still races): Even on the same user-stream, if RCCL internally uses sub-streams or the HW queue mapping differs from default stream, event behavior changes
+- **Row 8** (`NCCL_LAUNCH_ORDER_IMPLICIT=1` fixes): Forces RCCL to serialize launches, making events complete in order
+- **Row 11** (logging masks bug): Extra serialization from logging gives events time to "catch up"
+
+**Hypothesis 3: CSAN false positive due to async c10d::Work**
+
+Raised by Jeff Daily. CSAN may not understand the semantics of `async_op=True` in NCCL collectives. When `alltoall_base_` returns a `c10d.Work` handle, the GPU operation continues after the Python call returns. CSAN hooks at the dispatcher level and records accesses at dispatch time -- it may not model the extended GPU-side lifetime of async collective ops. If CSAN thinks the `alltoall_base_` is "done" when the Python call returns, it would incorrectly flag a subsequent allocation as a race.
+
+However, even if the CSAN report is a false positive in its detection mechanism, the NaN is real. The report may still be pointing at the right tensor and the right streams.
+
+### Assessment
+
+**Hypothesis 2 (premature HIP event completion) is the strongest lead** because:
+
+1. It's AMD-specific -- CUDA's event implementation is battle-tested; HIP's maps to HSA signals which have different completion semantics
+2. It explains the full Shampoo experiment matrix (serialization, default stream, implicit launch order all reduce the window for premature completion)
+3. It's mechanistically sound -- the CCA relies on `hipEventQuery()` to decide when to recycle blocks, and if HSA signals report completion before memory writes are globally visible, the CCA would hand out still-in-use memory
+
+### Recommended Next Steps
+
+1. **Test the HIP event hypothesis:** Patch PyTorch's CachingAllocator to call `hipEventSynchronize()` instead of `hipEventQuery()` in `process_events()`. If NaN disappears, this confirms premature HIP event completion.
+
+2. **Check HSA signal behavior:** On the AMD side, verify that `hsa_signal_wait_*()` used by HIP events correctly waits for memory write visibility (not just kernel completion). There may be a missing cache flush / memory fence between the RCCL kernel's last memory write and the HSA signal being decremented.
+
+3. **Validate CSAN on CUDA:** Run the same workload on NVIDIA with CSAN enabled. If the same race is flagged on CUDA but doesn't produce NaN, it confirms a CSAN false positive for async ops. If it's NOT flagged on CUDA, the race is AMD-specific.
+
+4. **Instrument CCA event polling:** Add logging to `process_events()` to record when events are queried, when they return complete, and when blocks are recycled. Compare the recycled block addresses against active RCCL collective inputs to catch premature reuse in the act.
+
+---
+
 ## March 6, 2026 -- Facts and Hypotheses after Meta Debug Session
 
 ---
@@ -120,7 +209,7 @@ The pipeline object manages buffer reuse across iterations. If it has any HIP-sp
 
 ---
 
-Jan 1, 2026
+## Jan 1, 2026
 
 ## Shampoo NaN Issue
 
