@@ -4,6 +4,16 @@
 
 We are AMD engineers helping our customer Meta debug a NaN issue on their recommendation system workload. Meta is not able to share the proprietary codebase for us to reproduce. The NaN issue does not happen on NVIDIA hardware.
 
+## System Setup
+
+PyTorch version: 2.11.0
+Gcn arch name: gfx950:sramecc+:xnack-
+ROCm version: 7.0.2.0-17-9428210
+Rocblas version: 5.0.2-20250912-42-1205-g554bb20204
+Hipblaslt version: 100200-7e32d53eb1
+Model precision: fp32
+Driver version: 6.16.6 ( rocm-smi --showdriverversion)
+
 ---
 
 ## March 6, 2026 -- Facts and Hypotheses after Meta Debug Session
@@ -109,6 +119,8 @@ The pipeline object manages buffer reuse across iterations. If it has any HIP-sp
 - `AQL=1024 + report_interval=10` at bs=4096 -- Reducing metric reporting frequency doesn't help
 
 ---
+
+Jan 1, 2026
 
 ## Shampoo NaN Issue
 
