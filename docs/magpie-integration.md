@@ -1,101 +1,20 @@
 # Magpie Integration
 
-Aorta optionally integrates with [Magpie](https://github.com/AMD-AGI/Magpie), AMD-AGI's GPU kernel evaluation toolkit, to gain two capabilities that aorta does not provide natively:
+Aorta integrates with [Magpie](https://github.com/AMD-AGI/Magpie), AMD-AGI's GPU kernel evaluation toolkit, in one area:
 
-- **GPU hardware control** -- Lock GPU clocks and set power limits for deterministic, reproducible benchmarks.
 - **Magpie report adapter** -- Import Magpie benchmark workspaces into aorta's report pipeline for unified analysis and comparison.
 
-Magpie is a **read-only, optional dependency**. All integration code lives in the aorta codebase; no changes to Magpie are required.
+The report adapter reads Magpie's file-based workspace output and does not import any Magpie Python modules, so Magpie does not need to be installed for the adapter to work.
 
-## Installation
+**GPU hardware control** (lock-clock, power-limit) is implemented natively in aorta using direct `rocm-smi` / `nvidia-smi` subprocess calls. It does not depend on Magpie.
 
-Magpie is pulled directly from GitHub (the same pattern used for TraceLens):
+## GPU Hardware Control (native)
 
-```bash
-# Install aorta with Magpie support
-pip install -e ".[magpie]"
+GPU hardware control (lock-clock, power-limit) is implemented directly in `src/aorta/utils/gpu_control.py` using subprocess calls to `rocm-smi` (AMD) and `nvidia-smi` (NVIDIA). It does **not** depend on Magpie.
 
-# Or install everything
-pip install -e ".[all]"
-```
+See the CLI flags `--lock-clocks` and `--power-limit` on the `run` and `sweep` commands, or use `GPUControlConfig` / `GPUControlManager` programmatically.
 
-This resolves `magpie-eval` via `git+https://github.com/AMD-AGI/Magpie.git` as declared in `pyproject.toml`.
-
-**Using a local Magpie checkout instead:** If you are developing Magpie locally, install it in editable mode first and then install aorta without the magpie extra so pip does not overwrite your local version:
-
-```bash
-# Install your local Magpie checkout
-pip install -e /path/to/Magpie
-
-# Then install aorta (skip the magpie extra since it is already satisfied)
-pip install -e ".[hw-queue,report]"
-```
-
-**Docker:** The `rocm70_9-1` Docker images (`docker/Dockerfile.rocm70_9-1`, `docker/Dockerfile.rocm70_9-1-shampoo`, `docker/rccl_test/Dockerfile.rocm70_9-1`) include Magpie pre-installed alongside TraceLens. No additional install step is needed inside these containers.
-
-When Magpie is not installed, aorta continues to work normally. GPU control flags are silently ignored (with a warning), and the report adapter operates on Magpie's file-based output without importing any Magpie modules.
-
-## GPU Hardware Control
-
-### Why it matters
-
-GPU boosting and thermal throttling introduce variance between benchmark runs. Locking clocks to a fixed level and capping power ensures that `hw_queue_eval` results are reproducible and comparable across runs.
-
-### CLI usage
-
-Both the `run` and `sweep` commands accept GPU control flags:
-
-```bash
-# Lock AMD GPU clocks to level 3 (mid-range)
-python -m aorta.hw_queue_eval run hetero_kernels --streams 8 --lock-clocks 3
-
-# Lock clocks and cap power at 200W
-python -m aorta.hw_queue_eval run hetero_kernels --streams 8 \
-    --lock-clocks 3 --power-limit 200
-
-# Sweep with locked clocks for consistent scaling curves
-python -m aorta.hw_queue_eval sweep hetero_kernels --streams 1,2,4,8,16 \
-    --lock-clocks 5 --power-limit 300
-```
-
-| Flag | Type | Description |
-| --- | --- | --- |
-| `--lock-clocks` | int | AMD GPU clock level (0-7, where 7 is highest) |
-| `--power-limit` | int | GPU power cap in watts |
-
-When GPU control is active, the harness:
-
-1. Applies the clock/power settings before the warmup phase.
-2. Captures a hardware snapshot (clocks, power, temperature) into the result metadata.
-3. Resets the GPU to default settings after measurement completes.
-
-### Programmatic usage
-
-```python
-from aorta.utils import GPUControlConfig, GPUControlManager
-
-config = GPUControlConfig(
-    enabled=True,
-    gpu_clock_level=3,
-    power_limit_watts=200,
-    reset_on_exit=True,
-)
-
-# As a context manager
-with GPUControlManager(config) as mgr:
-    run_benchmark()
-# GPU settings restored automatically
-
-# Or manually
-mgr = GPUControlManager(config)
-snapshot = mgr.apply()   # returns hardware state dict
-run_benchmark()
-mgr.reset()
-```
-
-### Result metadata
-
-When GPU control is active, the `HarnessResult` metadata includes a `gpu_hardware_state` key with per-device information (clocks, power draw, temperature, etc.) captured at benchmark start.
+For full documentation, see the inline docstrings in `gpu_control.py`.
 
 ## Magpie Report Adapter
 
@@ -190,12 +109,9 @@ print(comparison["summary"]["overall"])  # "improvement", "regression", or "neut
 ## Architecture
 
 ```
-Magpie (untouched, optional)
-  |
-  v  (try/except ImportError)
 aorta
   ├── src/aorta/utils/gpu_control.py
-  │     Imports Magpie.utils.gpu.GPUController / MultiGPUController
+  │     Native GPU control via rocm-smi / nvidia-smi subprocess calls
   │     Exposes GPUControlConfig + GPUControlManager
   │
   ├── src/aorta/hw_queue_eval/core/harness.py
@@ -205,7 +121,7 @@ aorta
   │     --lock-clocks / --power-limit flags
   │
   ├── src/aorta/report/magpie_adapter.py
-  │     Reads Magpie workspace files (no Magpie imports)
+  │     Reads Magpie workspace files (file I/O only, no Magpie imports)
   │
   └── src/aorta/report/cli.py
         aorta-report magpie list|show|import|compare
@@ -217,12 +133,11 @@ aorta
 
 | Symbol | Type | Description |
 | --- | --- | --- |
-| `HAS_MAGPIE` | `bool` | `True` if Magpie is importable |
 | `GPUControlConfig` | dataclass | Power limit, clock levels, device IDs, reset-on-exit |
-| `GPUControlManager` | class | Context manager wrapping Magpie's `MultiGPUController` |
+| `GPUControlManager` | class | Context manager using direct subprocess calls for GPU control |
 | `GPUControlManager.apply()` | method | Apply config, return hardware snapshot dict |
 | `GPUControlManager.reset()` | method | Reset GPUs to defaults |
-| `GPUControlManager.available` | property | `True` if control is enabled and Magpie is installed |
+| `GPUControlManager.available` | property | `True` if control is enabled |
 
 ### `aorta.report.magpie_adapter`
 

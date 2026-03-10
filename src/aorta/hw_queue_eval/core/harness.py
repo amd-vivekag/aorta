@@ -60,7 +60,7 @@ class HarnessConfig:
     reset_memory_stats_before_run: bool = True
     use_multi_gpu: bool = True  # If True, distribute streams across all available GPUs
     devices: Optional[List[str]] = None  # Explicit list of devices (auto-detected if None)
-    gpu_control: Optional[GPUControlConfig] = None  # GPU power/frequency control via Magpie
+    gpu_control: Optional[GPUControlConfig] = None  # GPU power/frequency control
 
     def __post_init__(self):
         if self.stream_count < 1:

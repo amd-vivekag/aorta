@@ -163,9 +163,9 @@ def cli():
               type=click.Choice(["float32", "float16", "bfloat16"]),
               help="Data type for communication tensors")
 @click.option("--lock-clocks", type=int, default=None,
-              help="Lock GPU clock level (AMD: 0-7) via Magpie for deterministic results")
+              help="Lock GPU clock level (AMD: 0-7) for deterministic results")
 @click.option("--power-limit", type=int, default=None,
-              help="Set GPU power limit in watts via Magpie")
+              help="Set GPU power limit in watts")
 def run(workload: str, streams: int, iterations: int, warmup: int,
         output: Optional[str], device: str, sync_mode: str, quiet: bool,
         profile: bool, profile_dir: str,
@@ -336,7 +336,7 @@ def run(workload: str, streams: int, iterations: int, warmup: int,
         harness = StreamHarness(config)
 
         if gpu_ctl_enabled:
-            click.echo("GPU CONTROL (via Magpie):")
+            click.echo("GPU CONTROL:")
             if lock_clocks is not None:
                 click.echo(f"  Clock level locked to: {lock_clocks}")
             if power_limit is not None:
@@ -589,9 +589,9 @@ def _print_interpretation(workload: str, info, result, streams: int) -> None:
 @click.option("--output", "-o", default=None, help="Output JSON file")
 @click.option("--device", "-d", default="cuda:0", help="Target device")
 @click.option("--lock-clocks", type=int, default=None,
-              help="Lock GPU clock level (AMD: 0-7) via Magpie for deterministic results")
+              help="Lock GPU clock level (AMD: 0-7) for deterministic results")
 @click.option("--power-limit", type=int, default=None,
-              help="Set GPU power limit in watts via Magpie")
+              help="Set GPU power limit in watts")
 def sweep(workload: str, streams: str, iterations: int, warmup: int,
           output: Optional[str], device: str, lock_clocks: Optional[int],
           power_limit: Optional[int]):

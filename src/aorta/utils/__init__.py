@@ -60,7 +60,7 @@ from .timing import (
     StreamTimer,
     TimingContext,
 )
-from .gpu_control import GPUControlConfig, GPUControlManager, HAS_MAGPIE
+from .gpu_control import GPUControlConfig, GPUControlManager
 
 __all__ = [
     # Config
@@ -112,8 +112,7 @@ __all__ = [
     "TimingContext",
     "StreamTimer",
     "CPUTimer",
-    # GPU hardware control (via Magpie)
+    # GPU hardware control
     "GPUControlConfig",
     "GPUControlManager",
-    "HAS_MAGPIE",
 ]
