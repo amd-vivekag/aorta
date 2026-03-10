@@ -88,7 +88,7 @@ node_ip_list.txt
 
 # Experiment results
 results/
-
+*gpucore*
 
 .cursor/
 sdpa/
