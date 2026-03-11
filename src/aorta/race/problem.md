@@ -14,6 +14,19 @@ Hipblaslt version: 100200-7e32d53eb1
 Model precision: fp32
 Driver version: 6.16.6 ( rocm-smi --showdriverversion)
 
+## Stack
+
+- **Model:** DLRMv3 / HSTU (Hierarchical Sequential Transduction Unit) -- [MLCommons reference](https://github.com/mlcommons/inference/tree/master/recommendation/dlrm_v3)
+- **Framework:** PyTorch 2.11.0 + ROCm 7.0.2, `torch.compile` with Triton backend
+- **Embeddings:** TorchRec `EmbeddingCollection` -- 1B item table (dim=64, bf16), user + category tables, sharded across GPUs via `KeyedJaggedTensor`
+- **Training pipeline:** TorchRec `TrainPipelineSparseDist` -- 3-stage pipeline with triple-buffered device tensors:
+  - `memcpy_stream`: H2D copy from pinned host memory (iteration N+2)
+  - `data_dist_stream`: RCCL `all_to_all` embedding redistribution (iteration N+1)
+  - `default_stream`: compiled forward pass + metrics (iteration N)
+- **Collectives:** RCCL `all_to_all_single` / `reduce_scatter` via `ProcessGroupNCCL` with `async_op=True`
+- **Dense forward:** 5-layer multi-head self-attention + FFN + LayerNorm, output MLP (256 -> 1), bf16 mixed precision
+- **Hardware:** AMD Instinct MI350X (gfx950), 252 GB HBM per GPU
+
 ---
 
 ## CUDA Stream Sanitizer (CSAN) Results on Meta's NaN Workload
