@@ -81,7 +81,217 @@ Trace: debug_trace.json
 5. Where the first NaN appears — if you have any existing NaN detection even just which step it first appears on and whether it's in the loss, gradients, or parameters, that context will save us time. If not, we can work through it together during the session.
 Nans have been undeterministic. It has appeared in SDPA fwd, SDPA backward, torch.log, tensor.div, and across a range of steps from < 1000 to > 20000. Most likely, these operations are just catching the nans and raising errors. If we enable nan detection for all operators, that introduces enough synchronization that the nan goes away. (edited)
 
+---
 
+## March 11, 2026 -- Trace Analysis: Shampoo DDPDistributedConfig Stream Race
+
+### Trace Metadata
+
+- **File:** `data/shampoo_debug_trace.json`
+- **Host:** twshared9373.01.maz5.facebook.com
+- **Job:** aps-ig_ctr_new_v0_MI350X_echen40_debug-0c535ade63 (trainer rank 0)
+- **Hardware:** 8x MI350X (gfx950), 64 GPUs total (8 nodes)
+- **Steps captured:** 5 consecutive steps (ProfilerStep#1998 through #2002), ~650ms/step
+- **Total events:** 1,160,176
+
+### Trace Structure
+
+**CPU threads:**
+- `thread 6076 (trainer_main)`: Main training thread -- 494K events, runs forward + optimizer + collectives
+- `thread 46687 (pt_autograd_0)`: Backward pass -- 452K events, runs autograd + backward collectives
+- `thread 17976/17975 (pt_gloo_runloop)`: Gloo broadcast for Shampoo DDPDistributedConfig sync
+
+**GPU streams:**
+- **Stream 0 (default):** 66K kernel events, 1.36s busy -- forward pass, backward, optimizer, AND some NCCL collectives
+- **Stream 4 (NCCL):** 235 NCCL kernel events, 0.91s busy -- all_to_all for TorchRec embedding redistribution
+- **Stream 8:** 2.2K events -- H2D memcpy (memcpy_stream for pipeline prefetch)
+- **Stream 9:** 1.6K events -- D2D memcpy + fbgemm permute kernels (data_dist_stream)
+- **Streams 16-30 (15 streams):** 1-2 bf16-to-fp32 conversion kernels each -- Shampoo gradient copy streams
+
+### Model Architecture (reconstructed from trace)
+
+**Batch & sequence:** batch_size=1024 (per GPU, 64 GPUs = 65K global), seq_len=200, d_model=96, bf16 precision
+
+**Embedding tables (FBGEMM TBE, sharded via TorchRec `all_to_all`, rowwise AdaGrad optimizer):**
+
+| Group | Tables | Total Rows (this rank) | Dim | Weight (fp16) | Type |
+|-------|--------|------------------------|-----|---------------|------|
+| 1 | 1 | 1.1M | 8 | 0.02 GB | unweighted |
+| 2 | 1 | 16.0M | 8 | 0.24 GB | unweighted |
+| 3 | 1 | 32.5M | 8 | 0.48 GB | unweighted |
+| 4 | 1 | 3.4K | 8 | <0.01 GB | unweighted |
+| 5 | 1 | 838K | 8 | 0.01 GB | unweighted |
+| 6 | 2 | 33.5M | 8 | 0.50 GB | unweighted |
+| 7 | 14 | 32.4M | 128 | 7.72 GB | unweighted |
+| 8 | 1 | 6.7M | 128 | 1.60 GB | weighted |
+| **Total** | **22** | **~123M** | | **10.57 GB** | **5.67B params** |
+
+Group 7 (14 tables, dim=128) accounts for 73% of all embedding parameters. Group 8 is the only weighted table (per-feature importance weights). Tables are sharded across 64 GPUs, so global table sizes are 64x larger.
+
+**HSTU attention block:** 14 SDPA calls per step (7 layers), two head configurations:
+- 32-head: Q=[1024,1,32,96], KV=[1024,1,200,96] (5 calls)
+- 16-head: Q=[1024,1,16,96], KV=[1024,1,200,96] (9 calls)
+- Uses CK Flash Attention forward (`ck_tile`), AITer backward (`aiter::fmha_bwd`)
+
+**Normalization:** 148x LayerNorm (on `[1024,200,96]`, `[1024,32,96]`, `[1024,16,96]`) + 61x RMSNorm (on MLP dims: 512, 2304, 3840, 4608)
+
+**Dense MLP widths:** 96, 128, 192, 256, 512, 960, 1024, 1536, 2048, 2176, 3840, 4608, 5120. Final fan-out: `[512 -> 30720]` and `[512 -> 15360]`. BMM cross-interactions: `[1024,40,384] x [1024,384,128]`
+
+**1D causal conv:** `conv2d([1024,96,200,1], [96,96,3,1])` -- kernel=3 over 200 timesteps
+
+**Activations:** 214x sigmoid (gating), 60x relu, 20x gelu, 8x silu, 27x log_sigmoid
+
+**Loss (multi-task):** 7x cross_entropy `[1024,1024]` + 50x BCE `[1024,1]` + 4x BCE `[1048576]`
+
+**GPU compute profile (single step):**
+
+| Category | Kernels | Time | % |
+|----------|---------|------|---|
+| Elementwise | 7,476 | 97.9ms | 38% |
+| Other (multi_tensor, cat) | 745 | 43.0ms | 17% |
+| GEMM/matmul | 1,186 | 40.1ms | 16% |
+| NCCL (_all_gather_base) | 1 | 22.7ms | 9% |
+| Embedding/TBE | 30 | 16.8ms | 7% |
+| Reduce | 788 | 12.4ms | 5% |
+| Index select | 14 | 10.2ms | 4% |
+| LayerNorm | 82 | 8.6ms | 3% |
+| Flash Attention | 56 | 1.4ms | 0.6% |
+
+### Key Findings
+
+#### Finding 1: Shampoo DDPDistributedConfig Uses 15 Separate Streams for Gradient Conversion
+
+Streams 16 through 30 each run exactly 1-2 `bfloat16tofloat32_copy_kernel` invocations during each step. These occur at 40-70% of the step duration (during the backward pass), with 3 streams activated per step (one group of 3 new streams per step).
+
+This is the Shampoo optimizer converting bf16 gradients to fp32 for preconditioner accumulation. Each parameter group gets its own stream. **These streams have no visible synchronization with the default stream** in the trace -- no `hipEventRecord`/`hipStreamWaitEvent` pairs are visible between them and stream 0.
+
+#### Finding 2: Step 1999 is a Shampoo Preconditioner Computation Step
+
+Step 1999 has a distinctly different collective profile from all other steps:
+
+| Step | Main Thread Collectives |
+|------|------------------------|
+| 1998 | 35x all_to_all, 1x _all_gather_base |
+| **1999** | **35x all_to_all, 1x _all_gather_base, 3x all_reduce_barrier, 6x all_gather** |
+| 2000 | 35x all_to_all, 1x _all_gather_base |
+| 2001 | 35x all_to_all, 1x _all_gather_base |
+| 2002 | 35x all_to_all, 1x _all_gather_base |
+
+The extra collectives in step 1999 (+475 to +550ms) are the Shampoo `DDPDistributedConfig` preconditioner distribution pattern:
+- 3x `c10d::barrier` (all_reduce_barrier) -- synchronize before preconditioner exchange
+- 6x `nccl:all_gather` -- distribute computed preconditioners across ranks (input types: `long` [2] for metadata, `double` [8x28] / [4x28] for preconditioner matrices)
+
+The `all_gather` input shapes (`[8,28]` and `[4,28]` of type `double`) are Shampoo's Kronecker-factor preconditioner matrices being gathered across the 64-rank world.
+
+#### Finding 3: 14 NCCL Kernels Execute on Stream 0 (Default Stream)
+
+There are 14 NCCL kernels running on the **default stream** (stream 0), not on the dedicated NCCL stream 4. These break down as:
+
+**Per-step _all_gather_base (one per step, 16-23ms each):**
+These occur at ~70-75% of each step and correspond to the Shampoo DDPDistributedConfig `_all_gather_base` call. They run on stream 0 because Shampoo's optimizer step executes on the default stream.
+
+| Step | GPU ts | Duration | GPU annotation |
+|------|--------|----------|---------------|
+| 1998 | ...378528 | 22.7ms | nccl:_all_gather_base |
+| 1999 | ...041692 | 16.7ms | nccl:_all_gather_base |
+| 2000 | ...751095 | 22.6ms | nccl:_all_gather_base |
+| 2001 | ...382008 | 18.3ms | nccl:_all_gather_base |
+| 2002 | ...020294 | 22.7ms | nccl:_all_gather_base |
+
+**Step 1999 extra Shampoo collectives (9 kernels, 0.2-3.1ms each):**
+- 3x `nccl:all_reduce_barrier` (0.2ms, 3.1ms, 1.3ms)
+- 6x `nccl:all_gather` (0.3-1.6ms each)
+
+**No NCCL overlap between stream 0 and stream 4.** NCCL kernels on stream 0 and stream 4 never execute concurrently -- the GPU serializes them.
+
+#### Finding 4: Massive Cross-Stream Overlap Between Stream 0 and Stream 4
+
+There are **3,463 overlap windows** (>10us each) where compute kernels on stream 0 and NCCL kernels on stream 4 execute simultaneously. The largest overlaps are:
+
+| Overlap | Stream 0 Kernel | Stream 4 NCCL | Duration |
+|---------|----------------|---------------|----------|
+| 7.3ms | split_embedding_backward (adagrad) | ncclDevKernel_Generic_2 | 10.6ms |
+| 7.1ms | split_embedding_backward (adagrad) | ncclDevKernel_Generic_2 | 11.7ms |
+| 6.5ms | split_embedding_backward (adagrad) | ncclDevKernel_Generic_2 | 10.4ms |
+| 4.2ms | split_embedding_backward (adagrad) | ncclDevKernel_Generic_2 | 14.5ms |
+| 2.2ms | group_index_select_backward | ncclDevKernel_Generic_2 | 4.2ms |
+
+The fbgemm `split_embedding_backward` kernels (7ms each) and NCCL all_to_all kernels (10-44ms each) run in parallel -- the backward embedding gradient computation and the TorchRec data redistribution overlap heavily.
+
+#### Finding 5: CPU-GPU Lag Is Small (NOT the AQL Issue)
+
+- **p50 lag:** 27us (0.03ms)
+- **p99 lag:** 49.7ms
+- **max lag:** 69.7ms (0.1 steps ahead)
+
+The CPU is at most 0.1 training steps ahead of the GPU. This is NOT the Issue A (AQL queue depth) pattern, where the CPU was 3-4 iterations ahead. The AQL mitigations (`ROC_AQL_QUEUE_SIZE` is not set in this trace) are not the primary concern here.
+
+#### Finding 6: _all_gather_base is Preceded by Massive aten::empty_strided Allocation Burst
+
+Before each `_all_gather_base` launch at ~70% of the step, there is a burst of 20-26 `aten::empty_strided` calls (each <1us). These are the Shampoo optimizer allocating output buffers for the all_gather result. The CachingAllocator is returning blocks from its free pool.
+
+**This is the exact CSAN-flagged pattern:** the CachingAllocator handing out blocks while an async collective on another stream may still be reading from them.
+
+### New Hypothesis: Shampoo DDPDistributedConfig Stream Synchronization Bug
+
+The trace reveals a specific mechanism for the NaN that is **distinct from Issue A (AQL) and Issue B (large batch)**:
+
+**The Shampoo DDPDistributedConfig creates 15 separate CUDA streams (streams 16-30) for bf16-to-fp32 gradient conversion.** These streams are used during the backward pass to copy gradients into fp32 buffers for preconditioner accumulation. The preconditioner computation and its NCCL collectives then run on stream 0 (the default stream).
+
+The race condition:
+1. During the backward pass (~40% of step), Shampoo launches bf16->fp32 copy kernels on streams 16-30
+2. These streams read from the same gradient tensors that stream 0 is computing (backward pass writes gradients)
+3. There is no visible stream synchronization between streams 16-30 and stream 0
+4. Shampoo then computes preconditioners on stream 0 using the fp32 buffers, but those buffers may not be fully written yet
+5. The `_all_gather_base` at ~70% of the step then distributes potentially-corrupted preconditioner data across all ranks
+6. Once corrupted preconditioners are applied to parameters, NaN propagates
+
+This would explain:
+- **NaN is nondeterministic**: Depends on GPU scheduling of kernels across streams
+- **NaN goes away with synchronization**: Any sync drains the bf16->fp32 streams
+- **NaN appears in diverse ops**: Corrupted parameters produce NaN in any subsequent computation
+- **Not fixed by AQL tuning**: This is an intra-step stream sync bug, not a cross-iteration queue depth issue
+- **GPU_MAX_HW_QUEUES=2 helps**: Fewer HW queues means more serialization between the 15 copy streams and stream 0
+
+### Reproduction Plan (Our Side)
+
+1. **Write a minimal Shampoo multi-stream reproducer:**
+   - Create a model with multiple parameter groups
+   - Use `DistributedShampoo` with `DDPDistributedConfig`
+   - Launch bf16->fp32 gradient copies on N separate streams (matching Shampoo's pattern)
+   - Run `_all_gather_base` on stream 0 to distribute preconditioners
+   - Check for NaN in gathered output after ~1000 iterations
+   - Compare behavior with/without `hipStreamSynchronize` on the copy streams before preconditioner computation
+
+2. **Instrument Shampoo's stream usage:**
+   - Clone [facebookresearch/optimizers](https://github.com/facebookresearch/optimizers)
+   - Add `torch.cuda.synchronize()` between the bf16->fp32 copy and the preconditioner matmul
+   - If NaN disappears, this confirms the stream sync bug
+
+3. **Test with HSA_FORCE_FINE_GRAIN_PCIE=1:**
+   - If the issue is cache coherence between streams, fine-grained memory should eliminate it
+
+### Questions for Meta to Verify
+
+1. **Does Shampoo's DDPDistributedConfig explicitly synchronize the bf16->fp32 copy streams before computing preconditioners?**
+   Specifically, in `distributed_shampoo.py`, after the gradient copy kernels are launched on per-parameter streams, is there a `stream.synchronize()` or `event.wait()` before the preconditioner matrix multiply?
+
+2. **Can you add `torch.cuda.synchronize()` ONLY between the gradient copy and the preconditioner computation in Shampoo (not everywhere)?**
+   This is more targeted than enabling full NaN detection. If NaN disappears with just this one sync point, it confirms the stream race.
+
+3. **Which Shampoo version are you using? Has `use_separate_streams_for_gradient_computation` been modified or is it the default?**
+   The trace shows 15 distinct streams (16-30) for gradient conversion, which means `DDPDistributedConfig` is using separate streams. Confirming this setting narrows the fix.
+
+4. **Does this NaN also reproduce with `DDPDistributedConfig(num_trainers_per_group=1)` (i.e., no cross-rank preconditioner sharing)?**
+   If it still NaNs with `num_trainers_per_group=1`, the race is in the local stream sync, not the all_gather. If it goes away, the race is in the collective input buffer.
+
+5. **Can you run with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` to see if CCA behavior changes?**
+   `expandable_segments:True` (currently set) may affect how the CCA reuses blocks across streams, widening the race window.
+
+6. **Is `torch.compile` wrapping the Shampoo optimizer step, or only the model forward?**
+   If compile wraps the optimizer, it may be removing stream synchronization that eager mode would insert.
+
+---
 
 ## CUDA Stream Sanitizer (CSAN) Results on Meta's NaN Workload
 
