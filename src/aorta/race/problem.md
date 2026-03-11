@@ -6,13 +6,13 @@ We are AMD engineers helping our customer Meta debug a NaN issue on their recomm
 
 ## System Setup
 
-PyTorch version: 2.11.0
-Gcn arch name: gfx950:sramecc+:xnack-
-ROCm version: 7.0.2.0-17-9428210
-Rocblas version: 5.0.2-20250912-42-1205-g554bb20204
-Hipblaslt version: 100200-7e32d53eb1
-Model precision: fp32
-Driver version: 6.16.6 ( rocm-smi --showdriverversion)
+- PyTorch version: 2.11.0
+- Gcn arch name: gfx950:sramecc+:xnack-
+- ROCm version: 7.0.2.0-17-9428210
+- Rocblas version: 5.0.2-20250912-42-1205-g554bb20204
+- Hipblaslt version: 100200-7e32d53eb1
+- Model precision: fp32
+- Driver version: 6.16.6 ( rocm-smi --showdriverversion)
 
 ## Stack
 
@@ -26,8 +26,62 @@ Driver version: 6.16.6 ( rocm-smi --showdriverversion)
 - **Collectives:** RCCL `all_to_all_single` / `reduce_scatter` via `ProcessGroupNCCL` with `async_op=True`
 - **Dense forward:** 5-layer multi-head self-attention + FFN + LayerNorm, output MLP (256 -> 1), bf16 mixed precision
 - **Hardware:** AMD Instinct MI350X (gfx950), 252 GB HBM per GPU
+- **Shampoo Optimizer:"" [github] (https://github.com/facebookresearch/optimizers/blob/main/distributed_shampoo/README.md)
 
 ---
+
+## Shampoo Nan Trace
+
+**Date:** March, 10 2026
+
+trace file: /mnt/vast/huzhao/projects/aorta/data/shampoo_debug_trace.json
+
+1.  One failing training trace covering 2-5 consecutive steps — ideally with stream labels visible so we can walk through forward, backward, optimizer, and any collectives together
+Trace: debug_trace.json
+
+2. A few yes/no questions about the training loop behavior:
+    • Is there any .item(), .cpu(), or synchronize() call between loss.backward() and optimizer.step()?
+	Backward and optimizer uses the same stream, so they’re synchronized
+    • Is loss or any metric logged to the host every step, or only every K steps? If every K, what is K?
+	Every step, k=1
+    • Is GradScaler (or any gradient scaling) used?
+	No
+    • Is autocast used, and does it wrap only the forward pass or also the optimizer step?
+	Only the forward pass 
+    • Does the training loop do anything between optimizer.step() and the next forward pass? (e.g., LR scheduler step, checkpoint save, any sync).
+	Yes, metric reports
+
+3. A few Shampoo configuration values (no code needed, just the values):
+    • Is DDPDistributedConfig enabled?
+	Yes
+    • precondition_frequency value:
+	4500
+    • start_preconditioning_step value:
+	4500
+    • Does the NaN first appear before or after start_preconditioning_step?
+	Undeterministic
+    • Have you tried disabling DDPDistributedConfig? If so, does the NaN go
+       Away
+	No
+
+4. Environment variables you're running with — in particular GPU_MAX_HW_QUEUES, ROC_AQL_QUEUE_SIZE, and any NCCL_* / RCCL_* settings.
+
+- GPU_MAX_HW_QUEUES=2
+- NCCL_MAX_NCHANNELS=48
+- HSA_KERNARG_POOL_SIZE=4194304
+- HSA_NO_SCRATCH_RECLAIM=1
+- AMDGCN_USE_BUFFER_OPS=1
+- TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
+- FBGEMM_NO_JK=1
+- FBGEMM_TBE_V2=1
+- FBGEMM_TBE_ROCM_HIP_BACKWARD_KERNEL=1
+- FBGEMM_BOUNDS_CHECK_INDICES_V2=1
+- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+5. Where the first NaN appears — if you have any existing NaN detection even just which step it first appears on and whether it's in the loss, gradients, or parameters, that context will save us time. If not, we can work through it together during the session.
+Nans have been undeterministic. It has appeared in SDPA fwd, SDPA backward, torch.log, tensor.div, and across a range of steps from < 1000 to > 20000. Most likely, these operations are just catching the nans and raising errors. If we enable nan detection for all operators, that introduces enough synchronization that the nan goes away. (edited)
+
+
 
 ## CUDA Stream Sanitizer (CSAN) Results on Meta's NaN Workload
 
@@ -105,6 +159,8 @@ However, even if the CSAN report is a false positive in its detection mechanism,
 1. It's AMD-specific -- CUDA's event implementation is battle-tested; HIP's maps to HSA signals which have different completion semantics
 2. It explains the full Shampoo experiment matrix (serialization, default stream, implicit launch order all reduce the window for premature completion)
 3. It's mechanistically sound -- the CCA relies on `hipEventQuery()` to decide when to recycle blocks, and if HSA signals report completion before memory writes are globally visible, the CCA would hand out still-in-use memory
+
+However, we are not able to reproduce HIP event issue on our side.
 
 ### Recommended Next Steps
 
