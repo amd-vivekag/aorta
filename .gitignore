@@ -16,6 +16,7 @@ MANIFEST
 # Environment variables and settings
 .env
 .venv
+*.venv
 env/
 venv/
 ENV/
@@ -90,5 +91,6 @@ node_ip_list.txt
 results/
 *gpucore*
 
+.venv*
 # Local-only docs
 src/aorta/race/problem.md

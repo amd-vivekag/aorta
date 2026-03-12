@@ -189,23 +189,6 @@ This matches Meta's CSAN report exactly: the CCA hands out `send_buf`'s block be
 
 3. **Check `torch.compile` interaction**: Does compilation strip `record_stream` calls that exist in eager mode?
 
-### Ask Meta to test `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
-
-This is the simplest diagnostic: set the environment variable `PYTORCH_NO_CUDA_MEMORY_CACHING=1` and re-run the NaN workload. This disables the CachingAllocator entirely -- every allocation goes through `hipMalloc()` and every free goes through `hipFree()`, which is a synchronizing operation that waits for all streams to finish before releasing memory.
-
-- **If NaN disappears**: the bug is in the CCA's block recycling path (missing `record_stream` or premature `hipEventQuery`). No code changes required, just an env var.
-- **If NaN persists**: the corruption source is elsewhere (kernel bug, Triton codegen, RCCL data corruption), and CCA recycling is not the cause.
-
-This is much simpler than patching `hipEventSynchronize` into the CCA, and requires zero code changes on Meta's side. It will be significantly slower due to `hipMalloc`/`hipFree` overhead on every allocation, but for a diagnostic run that's acceptable.
-
-### If CCA is confirmed: find the missing `record_stream`
-
-Have Meta insert explicit `record_stream` calls at the pipeline stage boundaries in their TorchRec eval workload. If this fixes the NaN without needing `GPU_MAX_HW_QUEUES=1` or disabling the CCA, it pinpoints exactly where the annotation is missing.
-
-### Fix the CCA's stream tracking for RCCL ops
-
-If RCCL's async collectives do not call `record_stream` on their input buffers, this should be added in PyTorch's RCCL process group implementation (`ProcessGroupNCCL.cpp`).
-
 ---
 
 ## 7. How to Reproduce
