@@ -5,7 +5,7 @@
 # Target build configuration:
 #   PyTorch version:   2.11.0
 #   GCN arch name:     gfx950:sramecc+:xnack-
-#   ROCm version:      7.0.2.1 (compute-rocm-rel-7.0.2.1/6) — closest to client's 7.0.2.0
+#   ROCm version:      7.0.2.1 (compute-rocm-rel-7.0.2.1/6)
 #   Rocblas version:   5.0.2-20250912-42-1199-g2584e35062
 #   Hipblaslt version: 100200-7e32d53eb1
 #
@@ -436,7 +436,7 @@ echo ""
 echo " Target configuration:"
 echo "   PyTorch version:   ${EXPECTED_PYTORCH_VERSION}"
 echo "   GCN arch:          ${EXPECTED_GCN_ARCH}"
-echo "   ROCm version:      ${EXPECTED_ROCM_VERSION} (docker) — client has 7.0.2.0"
+echo "   ROCm version:      ${EXPECTED_ROCM_VERSION} (docker)"
 echo "   Rocblas:            (verify via rpm -q rocblas inside container)"
 echo "   Hipblaslt:          (verify via rpm -q hipblaslt inside container)"
 echo ""

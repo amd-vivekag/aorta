@@ -1,0 +1,71 @@
+# CCA Cross-Stream Race: Calibrated Reproducer (compile ON -- secondary)
+#
+# Same as eval_exp_cca_calibrated.yaml but with torch.compile enabled.
+# With 5 layers, torch.compile had T_cpu=108ms for the compiled graph dispatch
+# (significant per-dispatch overhead on ROCm/HIP). This compresses the
+# T_cpu/T_gpu ratio and may close the intra-iteration race window.
+#
+# Run this AFTER the compile-OFF variant to determine if torch.compile
+# is a confounder (masks the race) or a trigger (required for the race).
+#
+# Usage:
+#   GPU_MAX_HW_QUEUES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_cca_calibrated_compile.yaml
+
+mode: eval_pipelined
+
+# 5-layer DLRMv3 (same as calibrated baseline)
+model_type: dlrm_v3
+batch_size: 512
+feature_dim: 32
+hidden_dim: 1024
+model_layers: 4
+
+# Attention: 5 layers + seq_len=500
+seq_len: 500
+hstu_attn_num_layers: 5
+hstu_num_heads: 4
+embedding_dim: 512
+
+# Prediction head
+over_arch_layers: 3
+
+# Pipeline structure (compile ON -- the key difference)
+use_compile: true
+use_bfloat16: true
+enable_pipelining: true
+use_datadist_stream: true
+simulate_metrics: true
+
+# Zero inter-iteration sync
+sync_policy: none
+
+# CCA cross-stream race reproduction
+cca_cross_stream_alloc: true
+cca_record_stream: false
+cca_num_pressure_tensors: 200
+cca_integrity_check: true
+
+# Iterations
+warmup_iterations: 0
+verify_iterations: 2000
+log_interval: 50
+stop_on_first_corruption: true
+
+# HW queue settings (production default)
+gpu_max_hw_queues: 2
+
+# Data
+pre_generate_data: true
+pre_generate_pool_size: 8
+
+# Heavier datadist
+embed_tensor_size: 2000000
+p2p_tensor_size: 1000000
+
+# Skip post-loop diagnostics
+skip_lag_diagnostics: true
+
+# Profiler off
+profile: false

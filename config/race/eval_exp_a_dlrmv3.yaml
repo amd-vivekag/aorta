@@ -1,0 +1,63 @@
+# Experiment A: Queue Depth Race -- DLRMv3-inspired (HSTU) Model
+#
+# Trace-faithful baseline: seq_len=200 (~15ms GPU work) with real datadist
+# dependency on the forward path.  The datadist output (embed_shard from
+# reduce_scatter) is projected and added to the dense features that the
+# compiled forward actually reads, so any RCCL signaling or cache coherence
+# bug directly poisons the forward input.
+#
+# For stress variants use --seq-len 500 (A12) or --hstu-num-layers 7+.
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_a_dlrmv3.yaml
+
+mode: eval_pipelined
+
+# DLRMv3-inspired model (attention + MLP, no GPU embeddings)
+model_type: dlrm_v3
+batch_size: 512
+feature_dim: 32
+hidden_dim: 1024
+model_layers: 4
+
+# Attention: trace-faithful baseline
+seq_len: 200
+hstu_attn_num_layers: 5
+hstu_num_heads: 4
+embedding_dim: 512
+
+# Prediction head
+over_arch_layers: 3
+
+# Pipeline structure
+use_compile: true
+enable_pipelining: true
+use_datadist_stream: true
+simulate_metrics: true
+
+# Zero inter-iteration sync (CPU races ahead)
+sync_policy: none
+
+# Iterations
+warmup_iterations: 0
+verify_iterations: 5000
+log_interval: 100
+stop_on_first_corruption: true
+
+# HW queue settings
+gpu_max_hw_queues: 4
+gpu_padding_dispatches: 0
+
+# Data: small pool to reduce pinned memory footprint
+pre_generate_data: true
+pre_generate_pool_size: 8
+
+# Heavier datadist (now on the forward data path)
+embed_tensor_size: 2000000
+p2p_tensor_size: 1000000
+
+# Profiler off for reproduction (adds host overhead)
+profile: false
+profile_iterations: 0
+profile_output_dir: traces

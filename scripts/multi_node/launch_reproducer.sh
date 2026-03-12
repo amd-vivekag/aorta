@@ -18,7 +18,8 @@ usage() {
     echo ""
     echo "Basic Options:"
     echo "  -d, --docker CONTAINER    Docker container name (required)"
-    echo "  -m, --mode MODE           Reproducer mode: default, ddp, fsdp (default: default)"
+    echo "  -m, --mode MODE           Reproducer mode: default, ddp, fsdp, eval_pipelined"
+    echo "      --config FILE         YAML config file (eval_pipelined presets)"
     echo "      --fsdp-shard-size N   FSDP shard size per rank (default: 100000)"
     echo "  -p, --nproc NPROC         Processes per node (default: 8)"
     echo "  -w, --warmup N            Warmup iterations (default: 100)"
@@ -33,33 +34,37 @@ usage() {
     echo "      --master-port PORT    Master port (default: auto-select)"
     echo "  -h, --help                Show this help"
     echo ""
-    echo "Customer-Tested Environment Variables:"
+    echo "Environment Variable Controls:"
     echo "  -q, --hw-queues N         GPU_MAX_HW_QUEUES (4=expose bug, 2=mask)"
+    echo "      --aql-queue-size N    ROC_AQL_QUEUE_SIZE (default 16384, 1024 mitigates Exp A)"
     echo "      --signal-pool N       ROC_SIGNAL_POOL_SIZE (tried 16384 - still NaN)"
     echo "      --disable-sdma        HSA_ENABLE_SDMA=0 (tried - still NaN)"
     echo "      --blit-copy N         GPU_FORCE_BLIT_COPY_SIZE (tried 128 - still NaN)"
-    echo "      --nccl-implicit       NCCL_LAUNCH_ORDER_IMPLICIT=1 (no NaN but SLOW)"
+    echo "      --nccl-implicit       NCCL_LAUNCH_ORDER_IMPLICIT=1 + RCCL_ENABLE_CONTEXT_TRACKING=1"
     echo "      --disable-cheap-fence RCCL_GFX9_CHEAP_FENCE_OFF=1 (tried - still NaN)"
     echo "      --disable-clr-batch   DEBUG_CLR_BATCH_CPU_SYNC_SIZE=0 (tried - still NaN)"
     echo ""
     echo "Examples:"
     echo "  # Default mode (TorchRec-like) - most common test"
-    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --hw-queues 4"
+    echo "  $0 --docker my-container --hw-queues 4"
+    echo ""
+    echo "  # Eval pipelined -- Experiment A (reproduce NaN)"
+    echo "  $0 --docker my-container --config config/race/eval_exp_a_reproduce.yaml"
+    echo ""
+    echo "  # Eval pipelined -- Experiment A (mitigated, AQL in config)"
+    echo "  $0 --docker my-container --config config/race/eval_exp_a_mitigated.yaml"
+    echo ""
+    echo "  # Eval pipelined -- Experiment B (reproduce NaN)"
+    echo "  $0 --docker my-container --config config/race/eval_exp_b_reproduce.yaml"
     echo ""
     echo "  # DDP mode (gradient all_reduce + H2D prefetch)"
-    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --mode ddp --deterministic"
+    echo "  $0 --docker my-container --mode ddp --deterministic"
     echo ""
     echo "  # FSDP mode (per-layer all_gather + reduce_scatter)"
-    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --mode fsdp --hw-queues 4"
-    echo ""
-    echo "  # Test with settings that MASK the bug (comparison)"
-    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --hw-queues 2"
+    echo "  $0 --docker my-container --mode fsdp --hw-queues 4"
     echo ""
     echo "  # Same-stream mode (definitive runtime bug test)"
-    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --hw-queues 4 --same-stream"
-    echo ""
-    echo "  # Test NCCL_LAUNCH_ORDER_IMPLICIT workaround"
-    echo "  $0 --docker training-overlap-bugs-rocm70_9-1-shampoo --hw-queues 4 --nccl-implicit"
+    echo "  $0 --docker my-container --hw-queues 4 --same-stream"
     echo ""
     exit 1
 }
@@ -89,8 +94,10 @@ OPTIMIZER=""
 FSDP_SHARD_SIZE=""
 LABEL=""
 MASTER_PORT=""
+CONFIG_FILE=""
+AQL_QUEUE_SIZE=""
 
-# Customer-tested env var flags
+# Environment variable flags
 SIGNAL_POOL=""
 DISABLE_SDMA=""
 BLIT_COPY=""
@@ -157,11 +164,19 @@ while [[ $# -gt 0 ]]; do
             LABEL="$2"
             shift 2
             ;;
+        --config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --aql-queue-size)
+            AQL_QUEUE_SIZE="$2"
+            shift 2
+            ;;
         --master-port)
             MASTER_PORT="$2"
             shift 2
             ;;
-        # Customer-tested env var flags
+        # Environment variable flags
         --signal-pool)
             SIGNAL_POOL="$2"
             shift 2
@@ -223,11 +238,14 @@ WORLD_SIZE=$((NPROC_PER_NODE * NUM_NODES))
 
 # Create experiment directory
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_DIR="$AORTA_ROOT/experiments/reproducer_${MODE}_hw${HW_QUEUES}_${TIMESTAMP}${LABEL:+_$LABEL}"
+AQL_TAG="${AQL_QUEUE_SIZE:+_aql${AQL_QUEUE_SIZE}}"
+EXPERIMENT_DIR="$AORTA_ROOT/experiments/reproducer_${MODE}_hw${HW_QUEUES}${AQL_TAG}_${TIMESTAMP}${LABEL:+_$LABEL}"
 mkdir -p "$EXPERIMENT_DIR/logs"
 
 # Build extra flags for Python CLI
 EXTRA_FLAGS=""
+[[ -n "$CONFIG_FILE" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --config $CONFIG_FILE"
+[[ -n "$AQL_QUEUE_SIZE" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --aql-queue-size $AQL_QUEUE_SIZE"
 [[ -n "$SIGNAL_POOL" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --signal-pool-size $SIGNAL_POOL"
 [[ -n "$DISABLE_SDMA" ]] && EXTRA_FLAGS="$EXTRA_FLAGS $DISABLE_SDMA"
 [[ -n "$BLIT_COPY" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --blit-copy-size $BLIT_COPY"
@@ -241,8 +259,10 @@ Experiment: Minimal RCCL Race Condition Reproducer
 Timestamp: $TIMESTAMP
 Label: ${LABEL:-unlabeled}
 Mode: $MODE
+Config file: ${CONFIG_FILE:-none}
 Docker: $DOCKER_CONTAINER
 GPU_MAX_HW_QUEUES: $HW_QUEUES
+ROC_AQL_QUEUE_SIZE: ${AQL_QUEUE_SIZE:-"(not set via CLI; may be set in YAML config)"}
 Warmup iterations: $WARMUP
 Verify iterations: $VERIFY
 H2D prefetch: ${PREFETCH:-no}
@@ -271,12 +291,20 @@ if [[ -f "$AORTA_ROOT/config/race/minimal_reproducer.yaml" ]]; then
     cp "$AORTA_ROOT/config/race/minimal_reproducer.yaml" "$CONFIG_DIR/"
 fi
 
+# Copy the YAML config preset if specified
+if [[ -n "$CONFIG_FILE" && -f "$AORTA_ROOT/$CONFIG_FILE" ]]; then
+    cp "$AORTA_ROOT/$CONFIG_FILE" "$CONFIG_DIR/"
+fi
+
 # Save the ACTUAL config used for this test (CLI args override defaults)
 cat > "$CONFIG_DIR/run_config.yaml" << EOF
 # Actual configuration used for this test run
 # Generated by launch_reproducer.sh on $(date)
 #
 # Note: CLI arguments override the defaults in minimal_reproducer.yaml
+
+mode: $MODE
+config_file: ${CONFIG_FILE:-none}
 
 # Iteration settings
 warmup_iterations: $WARMUP
@@ -298,16 +326,19 @@ same_stream_mode: $([ -z "$SAME_STREAM" ] && echo "false" || echo "true")
 
 # Hardware settings
 gpu_max_hw_queues: $HW_QUEUES
+aql_queue_size: ${AQL_QUEUE_SIZE:-null}
 
 # Environment variables
 env_vars:
   GPU_MAX_HW_QUEUES: $HW_QUEUES
-  ROC_SIGNAL_POOL_SIZE: ${SIGNAL_POOL:-default}
-  HSA_ENABLE_SDMA: ${DISABLE_SDMA:+0}${DISABLE_SDMA:-default}
-  GPU_FORCE_BLIT_COPY_SIZE: ${BLIT_COPY:-default}
-  NCCL_LAUNCH_ORDER_IMPLICIT: ${NCCL_IMPLICIT:+1}${NCCL_IMPLICIT:-default}
-  RCCL_GFX9_CHEAP_FENCE_OFF: ${DISABLE_CHEAP_FENCE:+1}${DISABLE_CHEAP_FENCE:-default}
-  DEBUG_CLR_BATCH_CPU_SYNC_SIZE: ${DISABLE_CLR_BATCH:+0}${DISABLE_CLR_BATCH:-default}
+  ROC_AQL_QUEUE_SIZE: ${AQL_QUEUE_SIZE:-null}
+  ROC_SIGNAL_POOL_SIZE: ${SIGNAL_POOL:-null}
+  HSA_ENABLE_SDMA: ${DISABLE_SDMA:+0}${DISABLE_SDMA:-null}
+  GPU_FORCE_BLIT_COPY_SIZE: ${BLIT_COPY:-null}
+  NCCL_LAUNCH_ORDER_IMPLICIT: ${NCCL_IMPLICIT:+1}${NCCL_IMPLICIT:-null}
+  RCCL_ENABLE_CONTEXT_TRACKING: ${NCCL_IMPLICIT:+1}${NCCL_IMPLICIT:-null}
+  RCCL_GFX9_CHEAP_FENCE_OFF: ${DISABLE_CHEAP_FENCE:+1}${DISABLE_CHEAP_FENCE:-null}
+  DEBUG_CLR_BATCH_CPU_SYNC_SIZE: ${DISABLE_CLR_BATCH:+0}${DISABLE_CLR_BATCH:-null}
 
 # Cluster settings
 nodes: $NUM_NODES
@@ -323,15 +354,13 @@ fi
 echo "Config saved to: $CONFIG_DIR/run_config.yaml"
 
 echo "=========================================="
-echo "Minimal RCCL Race Condition Reproducer"
+echo "RCCL Race Condition Reproducer"
 echo "=========================================="
-echo ""
-echo "This reproducer uses PROPER SYNCHRONIZATION everywhere."
-echo "If corruption occurs, it indicates a RUNTIME BUG in RCCL/HIP."
 echo ""
 echo "Configuration:"
 echo "  Docker container: $DOCKER_CONTAINER"
 echo "  Mode: $MODE"
+[[ -n "$CONFIG_FILE" ]] && echo "  Config file: $CONFIG_FILE"
 echo "  Nodes: $NUM_NODES | World size: $WORLD_SIZE GPUs"
 echo "  Warmup: $WARMUP | Verify: $VERIFY iterations"
 echo "  H2D prefetch: ${PREFETCH:-no}"
@@ -341,12 +370,13 @@ echo "  Deterministic: ${DETERMINISTIC:-no}"
 echo "  Bucketed: ${BUCKETED:-no}"
 echo "  Optimizer: ${OPTIMIZER:-none}"
 echo ""
-echo "Customer-tested env vars:"
+echo "Environment variables:"
 echo "  GPU_MAX_HW_QUEUES: $HW_QUEUES"
+[[ -n "$AQL_QUEUE_SIZE" ]] && echo "  ROC_AQL_QUEUE_SIZE: $AQL_QUEUE_SIZE"
 [[ -n "$SIGNAL_POOL" ]] && echo "  ROC_SIGNAL_POOL_SIZE: $SIGNAL_POOL"
 [[ -n "$DISABLE_SDMA" ]] && echo "  HSA_ENABLE_SDMA: 0"
 [[ -n "$BLIT_COPY" ]] && echo "  GPU_FORCE_BLIT_COPY_SIZE: $BLIT_COPY"
-[[ -n "$NCCL_IMPLICIT" ]] && echo "  NCCL_LAUNCH_ORDER_IMPLICIT: 1"
+[[ -n "$NCCL_IMPLICIT" ]] && echo "  NCCL_LAUNCH_ORDER_IMPLICIT: 1 + RCCL_ENABLE_CONTEXT_TRACKING: 1"
 [[ -n "$DISABLE_CHEAP_FENCE" ]] && echo "  RCCL_GFX9_CHEAP_FENCE_OFF: 1"
 [[ -n "$DISABLE_CLR_BATCH" ]] && echo "  DEBUG_CLR_BATCH_CPU_SYNC_SIZE: 0"
 echo ""
@@ -393,9 +423,12 @@ while IFS= read -r HOST || [[ -n "$HOST" ]]; do
 
     # Build docker exec command with environment variables from set_env_variables.sh
     DOCKER_ENV_FLAGS=$(build_docker_env_flags)
+    AQL_ENV_FLAG=""
+    [[ -n "$AQL_QUEUE_SIZE" ]] && AQL_ENV_FLAG="-e ROC_AQL_QUEUE_SIZE=$AQL_QUEUE_SIZE"
     DOCKER_CMD="docker exec \
         -e GPU_MAX_HW_QUEUES=$HW_QUEUES \
         -e PYTHONPATH=/workspace/aorta/src \
+        $AQL_ENV_FLAG \
         $DOCKER_ENV_FLAGS \
         $DOCKER_CONTAINER \
         bash -c 'cd /workspace/aorta && $TORCHRUN_CMD'"

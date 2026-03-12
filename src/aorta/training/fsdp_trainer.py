@@ -549,7 +549,7 @@ def training_loop(
                                     dist.all_reduce(temp_storage, op=dist.ReduceOp.SUM)
 
                                     # Force blocking host-device copy (triggers hipMemcpyWithStream)
-                                    # This is the pattern that causes the hang according to customer
+                                    # This is the pattern that causes the hang in production
                                     tensor_cpu = temp_storage.cpu()  # Device → Host copy
                                     tensor_back = tensor_cpu.to(device, non_blocking=False)  # Host → Device blocking copy
 

@@ -2,188 +2,34 @@
 
 ## What This Tool Does
 
-This is a standalone test that checks whether **RCCL/HIP has a runtime-level bug** that silently corrupts data during multi-GPU distributed training.
+A standalone test that checks whether **RCCL/HIP has a runtime-level bug** that silently corrupts data during multi-GPU distributed training. The test uses **correct synchronization everywhere** -- if data corruption still occurs, the bug is **in the runtime itself**, not in application code.
 
-The key idea: the test uses **correct synchronization everywhere**. If data corruption still occurs, the bug is **in the runtime itself** (RCCL or HIP), not in application code.
+## Eval Workload (Start Here)
 
-### The Problem It Detects
+For the **pipelined eval NaN investigation** (Experiments A, B, CCA), see **[EXPERIMENTS.md](EXPERIMENTS.md)** -- that document contains the full test matrix, commands, decision trees, and YAML configs for reproducing and diagnosing NaN in pipelined eval loops.
 
-In multi-GPU training, different operations run on different CUDA streams in parallel:
-
-1. **H2D** ("Host-to-Device"): Copies a batch of data from CPU memory to GPU memory on a dedicated `memcpy_stream`.
-2. **datadist** ("data distribution"): Runs `all_to_all` collective communication (exchanging sparse embeddings across GPUs, TorchRec-style) on a dedicated `datadist_stream`.
-3. **Compute + gradient sync**: Forward pass, backward pass, and `all_reduce` on the `default_stream`.
-
-These streams are supposed to be safely coordinated via `wait_stream()` calls. But under certain HW queue configurations (`GPU_MAX_HW_QUEUES=4`), a runtime bug in RCCL/HIP can cause the synchronization to be violated internally, leading to **silent data corruption** -- data that arrives on the GPU is stale, partial, or wrong.
-
-### How It Detects Corruption
-
-Every iteration, the test:
-1. Fills all buffers with **known values** (e.g., `batch = iteration % 1000`, `send_buf = rank`, `reduce_buf = rank + 1`).
-2. Runs the full multi-stream pipeline with proper `wait_stream()` synchronization.
-3. Checks that every buffer still has the expected value after the pipeline completes.
-
-If `batch_gpu` was supposed to be `42.0` but contains `41.0`, that is proof of data corruption despite correct synchronization -- a runtime bug.
-
-## Key Concepts
-
-### H2D (Host-to-Device)
-
-The operation that copies training data from CPU ("host") to GPU ("device"). In the code, this is `batch_gpu.copy_(batch_cpu, non_blocking=True)` running on a separate `memcpy_stream`. This is how real training pipelines overlap data loading with compute.
-
-All modes support two H2D strategies, controlled by `--prefetch`:
-
-| Strategy | Flag | How It Works | Where in Code |
-|----------|------|-------------|---------------|
-| **Single-buffered** | (default) | Copy current batch at start of each iteration, wait, then use it | `base.py` → `_h2d_transfer()` |
-| **Double-buffered** | `--prefetch` | Prefetch next batch during current backward pass, swap buffers at end | `base.py` → `_h2d_prefetch_next()`, `_h2d_swap_buffers()` |
-
-Single-buffered is simpler and tests a different timing profile. Double-buffered matches real DDP/FSDP training pipelines where data loading overlaps with compute.
-
-### datadist (Data Distribution)
-
-The `all_to_all` collective communication that simulates TorchRec's distributed embedding exchange. In real recommendation models, each GPU holds a shard of the embedding table, and `all_to_all` redistributes lookup results across GPUs. This runs on a separate `datadist_stream`.
-
-Only the **default** mode uses datadist. DDP mode does not use `all_to_all` -- it uses gradient `all_reduce` instead.
-
-| Mode | Communication Pattern | Where in Code |
-|------|----------------------|---------------|
-| **default** | `all_to_all` + `all_reduce` | `modes/default.py` → `_run_alltoall()`, `_run_allreduce()` |
-| **ddp** | gradient `all_reduce` only | `modes/ddp.py` → `_gradient_allreduce()` |
-| **fsdp** | per-layer `all_gather` + `reduce_scatter` | `modes/fsdp.py` → `_forward_layer()`, `_backward_layer()` |
-
-### Warmup Iterations (`--warmup N`)
-
-Run N iterations of the full pipeline **without checking for corruption**.
-
-Why? Runtime bugs in RCCL/HIP are often timing-sensitive. They only manifest after the runtime has built up internal state (signal pools, caches, HW queue assignments) over many iterations. Running warmup gets the runtime into the "hot" state where bugs are more likely to appear. Without warmup, the runtime may still be in a cold/serial state that masks the bug.
-
-During warmup, the test still runs `torch.cuda.synchronize()` each step so GPU work actually executes (not just queued).
-
-### Verify Iterations (`--verify N`)
-
-Run N iterations of the full pipeline **and check every buffer after each step**. This is where corruption is actually detected. More iterations = higher confidence. Use `--verify 10000` or more for thorough testing.
-
-## Modes (`--mode`)
-
-The `--mode` flag selects which workload pattern to test. Different distributed training frameworks have different communication patterns, and each may trigger the bug differently.
-
-### default (TorchRec-like)
-
-```
- memcpy_stream:   [fill batch_cpu → copy to batch_gpu]
-                                                        │ wait_stream()
-                                                        ▼
-  default_stream:                                      [Forward(batch_gpu)] → [Backward] ──────→ [all_reduce]
-                                                                                            ▲
-  datadist_stream:                                                          [all_to_all] ──┘ wait_stream()
-```
-
-This is the default. It simulates a TorchRec recommendation model with:
-- H2D: batch data copied to GPU on `memcpy_stream`
-- datadist: `all_to_all` on `datadist_stream` (overlaps with backward)
-- Compute: forward/backward GEMMs on `default_stream`
-- all_reduce: gradient sync on `default_stream`
-
-Verifies: H2D correctness, all_to_all correctness, all_reduce correctness.
+**Quick smoke test** (run inside the docker container):
 
 ```bash
-torchrun --nproc_per_node=8 -m aorta.race --mode default \
-    --warmup 100 --verify 10000
+# Experiment A: queue depth race (expect NaN ~350 iters)
+torchrun --nproc_per_node=2 -m aorta.race \
+    --config config/race/eval_exp_a_reproduce.yaml
+
+# CCA cross-stream race (expect integrity violation)
+GPU_MAX_HW_QUEUES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=2 -m aorta.race \
+    --config config/race/eval_exp_cca_calibrated.yaml
+
+# Control: mitigated with AQL=1024 (expect clean)
+torchrun --nproc_per_node=2 -m aorta.race \
+    --config config/race/eval_exp_a_mitigated.yaml
 ```
 
-### ddp (Distributed Data Parallel)
-
-```
-Single-buffered (default):
-    memcpy_stream:  [H2D] → batch_gpu
-    default_stream:          [Forward] → [Backward] → [all_reduce grads]
-
-Double-buffered (--prefetch):
-    Iteration N:
-        memcpy_stream:  [H2D batch_N+1 (prefetch)] ────────────────────┐
-                                                                        │ overlap
-        default_stream: [Forward(batch_N)] → [Backward] → [all_reduce grads]
-                                                                        │
-                        ← swap buffers ─────────────────────────────────┘
-```
-
-Simulates DDP training with:
-- H2D: single-buffered (default) or double-buffered prefetch (`--prefetch`)
-- Compute: forward/backward GEMMs with autograd
-- Gradient all_reduce: averages actual computed gradients across ranks
-- No `all_to_all` (DDP doesn't use it)
-
-Supports two gradient sync strategies:
-- **Non-bucketed** (default): One bulk all_reduce after all of backward finishes
-- **Bucketed** (`--bucketed`): Per-layer all_reduce interleaved with backward (matches real PyTorch DDP)
-
-```
-Bucketed (--bucketed):
-    default_stream: [Forward] → [Bwd L2 + AR L2] → [Bwd L1 + AR L1] → [Bwd L0 + AR L0]
-```
-
-Verifies: H2D correctness, gradient consistency across ranks.
-
-```bash
-# Single-buffered (default)
-torchrun --nproc_per_node=8 -m aorta.race --mode ddp \
-    --warmup 100 --verify 10000 --deterministic
-
-# Double-buffered (prefetch overlaps with backward)
-torchrun --nproc_per_node=8 -m aorta.race --mode ddp --prefetch \
-    --warmup 100 --verify 10000 --deterministic
-
-# Bucketed (per-layer backward + all_reduce overlap)
-torchrun --nproc_per_node=8 -m aorta.race --mode ddp --bucketed \
-    --warmup 100 --verify 10000 --deterministic
-```
-
-### fsdp (Fully Sharded Data Parallel)
-
-```
-memcpy_stream:   [H2D] ─────────────────────────────────────────────────────┐
-                                                                             │ wait
-default_stream:  [all_gather L0 → GEMM L0 → all_gather L1 → GEMM L1 → ...]│
-                 [... → GEMM bwd L1 → reduce_scatter L1 →                   │
-                        GEMM bwd L0 → reduce_scatter L0]                    │
-                 [optimizer step]
-```
-
-Simulates FSDP training with:
-- H2D: single-buffered (default) or double-buffered prefetch (`--prefetch`)
-- Per-layer `all_gather`: reconstructs full parameters from shards before compute
-- Per-layer `reduce_scatter`: shards gradients back across ranks after backward
-- GEMMs interleaved with collectives (if compute enabled)
-- No separate communication stream (all collectives on default stream)
-
-Unlike default and DDP modes which use one or two bulk collectives, FSDP interleaves many small `all_gather`/`reduce_scatter` operations with per-layer compute. This creates a fundamentally different overlap and timing profile that may trigger different runtime bugs.
-
-Verifies: H2D correctness, all_gather correctness, reduce_scatter correctness.
-
-```bash
-# Single-buffered
-torchrun --nproc_per_node=8 -m aorta.race --mode fsdp \
-    --warmup 100 --verify 10000
-
-# Double-buffered (prefetch overlaps with backward)
-torchrun --nproc_per_node=8 -m aorta.race --mode fsdp --prefetch \
-    --warmup 100 --verify 10000
-
-# Custom shard size
-torchrun --nproc_per_node=8 -m aorta.race --mode fsdp \
-    --fsdp-shard-size 200000 --warmup 100 --verify 10000
-```
-
-## Quick Start
+## Quick Start (Other Modes)
 
 ```bash
 # Default mode (TorchRec-like) — most common test
 GPU_MAX_HW_QUEUES=4 torchrun --nproc_per_node=8 -m aorta.race \
-    --warmup 10 --verify 100
-
-# Default mode with double-buffered H2D prefetch
-GPU_MAX_HW_QUEUES=4 torchrun --nproc_per_node=8 -m aorta.race --prefetch \
     --warmup 10 --verify 100
 
 # DDP mode (gradient all_reduce pattern)
@@ -199,54 +45,104 @@ torchrun --nproc_per_node=8 -m aorta.race --same-stream
 
 # Multi-node (via launch script)
 ./scripts/multi_node/launch_reproducer.sh \
-    --docker <container-name> \
-    --hw-queues 4 \
-    --warmup 100 \
-    --verify 10000
+    --docker <container-name> --hw-queues 4 --warmup 100 --verify 10000
 ```
 
-## Test Configurations
+## Modes
 
-| Test | Command | What It Does |
-|------|---------|--------------|
-| **Baseline** | `--hw-queues 4` | Full HW queue parallelism -- most likely to trigger the bug |
-| **Serialized** | `--hw-queues 2` | Reduced parallelism -- if bug disappears, it's parallelism-related |
-| **Same-Stream** | `--same-stream` | H2D + datadist on same stream. Corruption here = definitive runtime bug |
-| **No Compute** | `--no-compute` | Skip GEMM simulation (~5ms/step). Fast iteration but may not hit timing window |
-| **H2D Prefetch** | `--prefetch` | Double-buffered H2D overlapping with backward (works with any mode) |
-| **DDP Mode** | `--mode ddp` | Tests gradient all_reduce pattern (different comm pattern) |
-| **DDP Bucketed** | `--mode ddp --bucketed` | Per-layer backward + all_reduce overlap (real DDP pattern) |
-| **FSDP Mode** | `--mode fsdp` | Tests per-layer all_gather + reduce_scatter (many small collectives) |
-| **NCCL Implicit** | `--nccl-implicit-order` | Serialize NCCL ops via `NCCL_LAUNCH_ORDER_IMPLICIT=1` |
+| Mode | Pattern | What It Tests |
+|------|---------|---------------|
+| `default` | H2D + `all_to_all` + `all_reduce` | TorchRec-like recommendation model |
+| `ddp` | H2D + gradient `all_reduce` | Distributed Data Parallel training |
+| `fsdp` | Per-layer `all_gather` + `reduce_scatter` | Fully Sharded Data Parallel training |
+| `eval_pipelined` | Pipelined eval with `torch.compile`, metrics, datadist | NaN investigation (Experiments A, B, CCA) |
 
-## Command-Line Options
+### default (TorchRec-like)
 
-### Core Options
+```
+ memcpy_stream:   [fill batch_cpu → copy to batch_gpu]
+                                                       │ wait_stream()
+                                                       ▼
+  default_stream:                                     [Forward(batch_gpu)] → [Backward] ──────→ [all_reduce]
+                                                                                           ▲
+  datadist_stream:                                                         [all_to_all] ──┘ wait_stream()
+```
+
+Simulates a TorchRec recommendation model with H2D on `memcpy_stream`, `all_to_all` on `datadist_stream`, and compute + `all_reduce` on `default_stream`. Verifies H2D, all_to_all, and all_reduce correctness.
+
+### ddp (Distributed Data Parallel)
+
+Simulates DDP training with H2D (single or double-buffered with `--prefetch`), forward/backward with autograd, and gradient `all_reduce`. Supports non-bucketed (default) and bucketed per-layer all_reduce (`--bucketed`).
+
+```bash
+torchrun --nproc_per_node=8 -m aorta.race --mode ddp \
+    --warmup 100 --verify 10000 --deterministic
+
+# Bucketed (per-layer backward + all_reduce overlap)
+torchrun --nproc_per_node=8 -m aorta.race --mode ddp --bucketed \
+    --warmup 100 --verify 10000 --deterministic
+```
+
+### fsdp (Fully Sharded Data Parallel)
+
+Simulates FSDP training with per-layer `all_gather` (reconstruct parameters) and `reduce_scatter` (shard gradients). Many small collectives interleaved with compute creates a different timing profile from bulk collectives.
+
+```bash
+torchrun --nproc_per_node=8 -m aorta.race --mode fsdp \
+    --warmup 10 --verify 100
+```
+
+### eval_pipelined (Pipelined Eval NaN Investigation)
+
+Replicates a pipelined eval loop to investigate NaN from three distinct root causes. Uses `torch.compile`, accumulated metrics (NE/MAE/calibration), DDP wrapper, and double-buffered pipeline with datadist.
+
+Full documentation: **[EXPERIMENTS.md](EXPERIMENTS.md)**
+
+## Test Matrix
+
+| Test | Command | What It Proves |
+|------|---------|----------------|
+| **Baseline** | `--hw-queues 4` | Full HW queue parallelism -- most likely to trigger |
+| **Serialized** | `--hw-queues 2` | Reduced parallelism -- if clean, parallelism-related |
+| **Same-Stream** | `--same-stream` | Single stream. Corruption = definitive runtime bug |
+| **No Compute** | `--no-compute` | Fast iteration, may not hit timing window |
+| **H2D Prefetch** | `--prefetch` | Double-buffered H2D (any mode) |
+| **DDP Bucketed** | `--mode ddp --bucketed` | Per-layer backward + all_reduce overlap |
+| **FSDP** | `--mode fsdp` | Many small all_gather + reduce_scatter |
+| **NCCL Implicit** | `--nccl-implicit-order` | Serialize RCCL ops via implicit ordering |
+| **Eval Exp A** | `--config config/race/eval_exp_a_reproduce.yaml` | Queue depth race (NaN ~350 iters) |
+| **Eval Exp B** | `--config config/race/eval_exp_b_reproduce.yaml` | Large batch + pipeline NaN |
+| **Eval CCA** | `--config config/race/eval_exp_cca_calibrated.yaml` | CCA cross-stream recycling race |
+
+## CLI Options
+
+### Core
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--mode MODE` | `default` | Workload mode: `default`, `ddp`, `fsdp` |
-| `--warmup N` | 100 | Warmup iterations (runs pipeline, skips corruption checks) |
-| `--verify N` | 10000 | Verification iterations (runs pipeline and checks for corruption) |
-| `--no-compute` | - | Skip GEMM compute simulation (faster but less realistic timing) |
-| `--same-stream` | - | Put H2D and datadist on same CUDA stream |
-| `--no-stop-on-first` | - | Continue running after first corruption (count total) |
-| `--gemm-size N` | 5120 | GEMM matrix size (controls compute duration) |
-| `--gemm-layers N` | 26 | Number of GEMM layers (controls compute duration) |
-| `--optimizer OPT` | `none` | Optimizer: `none`, `adamw`, `sgd`, `shampoo` (for DDP mode) |
-| `--deterministic` | - | Fixed seeds for cross-rank gradient verification (for DDP mode) |
-| `--bucketed` | - | Per-layer gradient all_reduce overlapping with backward (for DDP mode) |
-| `--fsdp-shard-size N` | 100000 | FSDP shard size per rank (for FSDP mode) |
+| `--mode MODE` | `default` | Workload: `default`, `ddp`, `fsdp`, `eval_pipelined` |
+| `--config PATH` | - | YAML config file (CLI overrides YAML) |
+| `--warmup N` | 100 | Warmup iterations (no verification) |
+| `--verify N` | 10000 | Verification iterations |
+| `--no-compute` | - | Skip GEMM simulation |
+| `--same-stream` | - | H2D and datadist on same stream |
+| `--prefetch` | - | Double-buffered H2D prefetch |
+| `--no-stop-on-first` | - | Continue after first corruption |
+| `--deterministic` | - | Fixed seeds for DDP gradient verification |
+| `--bucketed` | - | Per-layer gradient all_reduce (DDP) |
+| `--fsdp-shard-size N` | 100000 | FSDP shard size per rank |
+| `--optimizer OPT` | `none` | Optimizer: `none`, `adamw`, `sgd`, `shampoo` |
 
 ### Environment Variable Flags
 
 | Flag | Env Variable | Effect |
 |------|--------------|--------|
-| `--hw-queues N` | `GPU_MAX_HW_QUEUES=N` | Control HW queue count (4 = exposes bug, 2 = masks it) |
-| `--nccl-implicit-order` | `NCCL_LAUNCH_ORDER_IMPLICIT=1` | Serialize NCCL ops |
+| `--hw-queues N` | `GPU_MAX_HW_QUEUES=N` | HW queue count (4 = exposes bug) |
+| `--nccl-implicit-order` | `NCCL_LAUNCH_ORDER_IMPLICIT=1` + `RCCL_ENABLE_CONTEXT_TRACKING=1` | Serialize RCCL |
 | `--disable-sdma` | `HSA_ENABLE_SDMA=0` | Disable SDMA engine |
-| `--signal-pool-size N` | `ROC_SIGNAL_POOL_SIZE=N` | HSA signal pool size |
 | `--disable-cheap-fence` | `RCCL_GFX9_CHEAP_FENCE_OFF=1` | Disable fence optimization |
+| `--aql-queue-size N` | `ROC_AQL_QUEUE_SIZE=N` | AQL queue depth (1024 mitigates Exp A) |
+| `--signal-pool-size N` | `ROC_SIGNAL_POOL_SIZE=N` | HSA signal pool size |
 
 ## Output
 
@@ -256,7 +152,7 @@ PASSED: No corruption in 10100 iterations with proper synchronization
 VERDICT: No runtime bug detected with current settings.
 ```
 
-### Fail (Runtime Bug Detected)
+### Fail
 ```
 RUNTIME BUG DETECTED: 15 corruptions in 5432 iterations
 Corruption occurred DESPITE proper synchronization - this is a bug in RCCL/HIP runtime
@@ -274,8 +170,6 @@ VERDICT: RUNTIME BUG DETECTED!
 
 ## Adding a New Mode
 
-To test a new workload pattern, create a new mode file. Each mode controls its own H2D strategy, communication pattern, and verification checks. See `modes/fsdp.py` for a complete example.
-
 1. Create `modes/your_mode.py` inheriting from `BaseReproducer`
 2. Implement `setup_buffers()` and `run_iteration()`
 3. Register in `modes/__init__.py`
@@ -285,8 +179,9 @@ See `developer_guide.md` for the full walkthrough.
 
 ## References
 
-- **Background & Concepts:** `src/aorta/race/background.md` -- Detailed explanation of distributed training patterns, collectives, streams, and the race condition bug
-- **Config Reference:** `config/race/`
-- **Environment Variables:** `config/race/customer_env_vars.yaml`
+- **Eval Workload & NaN Experiments:** [EXPERIMENTS.md](EXPERIMENTS.md) -- **Start here** for pipelined eval testing (Experiments A, B, CCA with full decision trees, commands, and configs)
+- **RCCL Fence Stress Test:** `scripts/rccl_fence_stress.py` -- Concurrent collectives from multiple process groups
+- **Background & Concepts:** `background.md` -- Distributed training patterns, streams, and the race condition
+- **YAML Configs:** `config/race/eval_exp_*.yaml`
 - **Multi-node Scripts:** `scripts/multi_node/launch_reproducer.sh`
-- **Developer Guide:** `src/aorta/race/developer_guide.md`
+- **Developer Guide:** `developer_guide.md`

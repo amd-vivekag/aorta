@@ -1,0 +1,93 @@
+# CCA Cross-Stream Race: Calibrated Reproducer (compile OFF -- primary)
+#
+# Uses 5-layer DLRMv3 with LARGE seq_len to achieve T_cpu << T_gpu:
+#   - T_cpu: ~2ms (5 layers = low CPU dispatch count)
+#   - T_gpu: ~80ms (seq_len=500, O(S^2) attention = heavy GPU compute)
+#   - T_cpu/T_gpu ratio: ~0.025 (CPU drops ref while GPU is 2.5% through forward)
+#
+# Key insight: seq_len controls GPU compute (O(S^2) attention) WITHOUT increasing
+# CPU dispatch count. More layers increase BOTH T_cpu and T_gpu equally (each layer
+# adds ~3.3ms CPU dispatch), but seq_len only increases T_gpu.
+#
+# 70-layer DLRMv3 failed because T_cpu=236ms ≈ T_gpu=244ms (ratio=0.97).
+# 5-layer DLRMv3 at seq_len=500 gives T_cpu=2ms << T_gpu=80ms (ratio=0.025).
+#
+# The CCA race is intra-iteration: datadist_stream frees and recycles a block
+# while default_stream's forward is still reading it. With T_cpu << T_gpu, the
+# CPU enqueues the ref-drop in ~2ms while the GPU forward takes ~80ms.
+#
+# Hypotheses tested:
+#   H1: missing record_stream (--no-cca-record-stream)
+#   H2: premature hipEventQuery (test with --cca-event-sync to confirm)
+#
+# Usage:
+#   GPU_MAX_HW_QUEUES=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_cca_calibrated.yaml
+#
+# Numeric stability baseline (run first):
+#   GPU_MAX_HW_QUEUES=2 torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_cca_calibrated.yaml --disable-pipelining
+#
+# Discriminators (run after NaN reproduces):
+#   PYTORCH_NO_CUDA_MEMORY_CACHING=1 ... (CCA involved?)
+#   ... --cca-record-stream            (H1: record_stream is fix?)
+#   ... --cca-event-sync               (H2: hipEventQuery premature?)
+#   ... --disable-pipelining           (pipelining is trigger?)
+
+mode: eval_pipelined
+
+# 5-layer DLRMv3 (low CPU dispatch, high GPU compute via seq_len)
+model_type: dlrm_v3
+batch_size: 512
+feature_dim: 32
+hidden_dim: 1024
+model_layers: 4
+
+# Attention: 5 layers (low T_cpu) + seq_len=500 (high T_gpu via O(S^2))
+seq_len: 500
+hstu_attn_num_layers: 5
+hstu_num_heads: 4
+embedding_dim: 512
+
+# Prediction head
+over_arch_layers: 3
+
+# Pipeline structure (compile OFF is critical for T_cpu << T_gpu)
+use_compile: false
+use_bfloat16: true
+enable_pipelining: true
+use_datadist_stream: true
+simulate_metrics: true
+
+# Zero inter-iteration sync (CPU races ahead)
+sync_policy: none
+
+# CCA cross-stream race reproduction
+cca_cross_stream_alloc: true
+cca_record_stream: false
+cca_num_pressure_tensors: 200
+cca_integrity_check: true
+
+# Iterations
+warmup_iterations: 0
+verify_iterations: 2000
+log_interval: 50
+stop_on_first_corruption: true
+
+# HW queue settings (production default: HWQ=2)
+gpu_max_hw_queues: 2
+
+# Data: small pool to reduce pinned memory
+pre_generate_data: true
+pre_generate_pool_size: 8
+
+# Heavier datadist (on the forward data path)
+embed_tensor_size: 2000000
+p2p_tensor_size: 1000000
+
+# Skip post-loop diagnostics (avoids NCCL timeout with sync_policy=none + high lag)
+skip_lag_diagnostics: true
+
+# Profiler off for reproduction
+profile: false

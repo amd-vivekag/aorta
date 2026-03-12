@@ -1,0 +1,56 @@
+# Experiment A: Queue Depth Race -- Reproduce NaN
+#
+# Replicates the pipelined eval loop where CPU races ahead of GPU.
+# Uses TorchRec-style DLRM model for realistic GPU workload.
+# Expected: NaN when AQL queue fills up (CPU races ahead of GPU).
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_a_reproduce.yaml
+#
+# To reproduce with single GPU (no datadist):
+#   torchrun --nproc_per_node=1 -m aorta.race \
+#       --config config/race/eval_exp_a_reproduce.yaml
+
+mode: eval_pipelined
+
+# TorchRec-style DLRM model
+model_type: dlrm
+batch_size: 512
+feature_dim: 256
+hidden_dim: 1024
+model_layers: 4
+
+# DLRM embedding tables (64 tables, 100K rows, 128 dim)
+num_embedding_tables: 64
+embedding_rows: 100000
+embedding_dim: 128
+sparse_pooling_factor: 20
+over_arch_layers: 5
+
+# Pipeline structure
+use_compile: true
+enable_pipelining: true
+use_datadist_stream: true
+simulate_metrics: true
+
+# Zero inter-iteration sync (CPU races ahead)
+sync_policy: none
+
+# Iterations
+warmup_iterations: 0
+verify_iterations: 500
+log_interval: 50
+stop_on_first_corruption: true
+
+# HW queue settings
+gpu_max_hw_queues: 4
+
+# Data
+pre_generate_data: true
+
+# Profiling off by default for reproduction -- adds host overhead that can
+# reduce CPU submit lead and mask Experiment A.  Use --profile to enable.
+profile: false
+profile_iterations: 5
+profile_output_dir: traces

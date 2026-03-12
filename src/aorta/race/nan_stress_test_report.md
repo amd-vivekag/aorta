@@ -2,14 +2,14 @@
 
 ## Problem Statement
 
-Customers report non-deterministic NaN values and hard crashes (`HSA_STATUS_ERROR_EXCEPTION`)
+Reports of non-deterministic NaN values and hard crashes (`HSA_STATUS_ERROR_EXCEPTION`)
 during large-scale recommendation system training. The issue:
 
 - **Present** when `GPU_MAX_HW_QUEUES=4` (default)
 - **Absent** when `GPU_MAX_HW_QUEUES=2`
 - **Absent** when `NCCL_LAUNCH_ORDER_IMPLICIT=1`
 
-The customer workload combines: DDP gradient all\_reduce, Distributed Shampoo optimizer
+The production workload combines: DDP gradient all\_reduce, Distributed Shampoo optimizer
 (with AllGather during `optimizer.step()`), TorchRec-style sharded embeddings with
 `all_to_all` on a dedicated `datadist_stream`, H2D double-buffered data loading on a
 `memcpy_stream`, and `bf16` mixed precision — all running concurrently across multiple
@@ -17,19 +17,19 @@ CUDA streams on AMD MI300X / MI350X GPUs.
 
 ## Reproduction Approach
 
-We built a standalone stress test that replicates the customer's multi-stream workload
+We built a standalone stress test that replicates the production multi-stream workload
 without requiring the full training infrastructure. The test maximizes stream contention
 by combining:
 
 1. **Real model** — 18-layer ranking transformer with 350K-vocab embedding, matching
-   customer architecture
+   production architecture
 2. **Distributed Shampoo** — with `DDPDistributedConfig`, `precondition_frequency=50`,
    `max_preconditioner_dim=8192`
 3. **Embedding stress simulator** — 8 large embedding tables (2M × 128 each), lookups
    on 4 dedicated `embedding_streams`, redistributed via `all_to_all` on `datadist_stream`
 4. **H2D double-buffering** — pinned CPU buffers copied asynchronously on `memcpy_stream`
 5. **DDP** — standard `DistributedDataParallel` with gradient all\_reduce
-6. **Gradient accumulation** — 2 micro-steps per optimizer step (matching customer config)
+6. **Gradient accumulation** — 2 micro-steps per optimizer step (matching production config)
 
 This creates 7+ concurrent CUDA streams per rank: `default_stream`, `memcpy_stream`,
 `datadist_stream`, 4 × `embedding_streams`, plus Shampoo's internal communication streams.
@@ -143,7 +143,7 @@ NCCL-level error.
 ## Key Findings
 
 1. **The crash is strictly `GPU_MAX_HW_QUEUES` dependent.** HWQ=1 and HWQ=2 pass
-   reliably; HWQ=4 crashes non-deterministically. This matches the customer report exactly.
+   reliably; HWQ=4 crashes non-deterministically. This matches production observations exactly.
 
 2. **The crash requires high stream contention.** It only occurs when multiple CUDA
    streams (memcpy, embedding, datadist, default, Shampoo comm) are all active
@@ -151,7 +151,7 @@ NCCL-level error.
 
 3. **The crash is a hardware exception, not a NaN.** The error is
    `HSA_STATUS_ERROR_EXCEPTION` (illegal memory access), not a floating-point NaN. The
-   NaN that customers observe may be a secondary symptom if the crash is caught/recovered,
+   NaN observed in production may be a secondary symptom if the crash is caught/recovered,
    leaving corrupted GPU memory that produces NaN in subsequent operations.
 
 4. **The crash point is non-deterministic.** It occurs at different training steps across

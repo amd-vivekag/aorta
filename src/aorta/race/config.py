@@ -39,7 +39,8 @@ class ReproducerConfig:
     Available modes:
     - "default": TorchRec-like pattern (H2D + all_to_all + all_reduce)
     - "ddp": DDP pattern (H2D with double-buffered prefetch + gradient all_reduce)
-    - "minimal": Legacy monolithic reproducer (backward compat)
+    - "fsdp": FSDP pattern (per-layer all_gather + reduce_scatter)
+    - "eval_pipelined": Pipelined eval loop for NaN investigation (Experiments A/B)
     """
 
     # =========================================================================
@@ -236,6 +237,302 @@ class ReproducerConfig:
     - 4+: Full parallelism (exposes timing-sensitive bugs)
     """
 
+    # =========================================================================
+    # Eval pipelined mode (eval_pipelined)
+    # =========================================================================
+    batch_size: int = 512
+    """Batch size (first dimension of model input). Affects kernel parameters."""
+
+    feature_dim: int = 256
+    """Input feature dimension for the eval model."""
+
+    hidden_dim: int = 1024
+    """Hidden dimension for the eval model MLP layers."""
+
+    model_layers: int = 4
+    """Number of hidden layers in the eval model."""
+
+    use_compile: bool = False
+    """
+    Apply torch.compile to the eval model.
+
+    When enabled, the forward pass is compiled (CompiledFullGraph pattern).
+    Different batch sizes produce different compiled kernels.
+    """
+
+    # TorchRec-like DLRM model settings
+    model_type: str = "mlp"
+    """
+    Model type for eval_pipelined mode.
+
+    - "mlp": Simple MLP (fast, for quick tests). Memory-BW bound, ~0.1ms/iter.
+    - "dlrm": TorchRec-style DLRM (embedding tables + bottom/over-arch MLPs).
+              Memory-BW bound, ~0.5ms/iter.
+    - "dlrm_v3": DLRMv3-inspired model with HSTU-style causal attention on
+                 configurable-length sequences. Compute-bound via O(seq_len^2)
+                 attention -- the only model heavy enough to create CPU-GPU lag
+                 for Experiment A NaN reproduction. No GPU-side embedding tables;
+                 sparse lookups happen on CPU and results are transferred.
+    """
+
+    num_embedding_tables: int = 64
+    """Number of embedding tables (DLRM model). Production TorchRec uses 50-200."""
+
+    embedding_rows: int = 100_000
+    """Rows per embedding table. Production uses 1K-10M per table."""
+
+    embedding_dim: int = 128
+    """Embedding dimension per table. Production uses 32-256."""
+
+    sparse_pooling_factor: int = 20
+    """Average number of sparse feature lookups per sample per table."""
+
+    over_arch_layers: int = 5
+    """Number of over-arch MLP layers (DLRM model)."""
+
+    # HSTU attention settings (dlrm_v3 model type)
+    hstu_num_heads: int = 4
+    """Number of attention heads in HSTU layers (dlrm_v3 model type)."""
+
+    hstu_attn_num_layers: int = 5
+    """Number of HSTU attention layers (dlrm_v3 model type)."""
+
+    seq_len: int = 200
+    """
+    Sequence length for attention in dlrm_v3 model.
+
+    Controls GPU forward pass duration via O(seq_len^2) attention cost.
+    Longer sequences = heavier GPU work = more CPU-GPU lag.
+    User interaction history sequences in production are 200-16K tokens.
+
+    Approximate GPU time per forward (MI300X, 5 attn layers, embed_dim=512, bs=512):
+      seq_len=17:   ~0.5ms  (GPU keeps up, no NaN)
+      seq_len=100:  ~5ms    (GPU starts falling behind)
+      seq_len=200:  ~15ms   (CPU 2-3 iters ahead -- Experiment A range)
+      seq_len=500:  ~80ms   (deep AQL fill)
+    """
+
+    use_bfloat16: bool = False
+    """
+    Run dense forward pass in bfloat16 autocast.
+
+    Matches production precision. bfloat16 has 7 mantissa bits
+    vs 23 in fp32, making NaN more likely from small data corruptions.
+    """
+
+    pre_generate_pool_size: Optional[int] = None
+    """
+    Number of CPU batches to pre-generate and cycle through.
+
+    None = auto: pre-generates all iterations for mlp/dlrm (small data),
+    or 20 batches for dlrm_v3 (large seq_embeddings data).
+    For dlrm_v3 at seq_len=200, bs=512, feature_dim=256: each batch is
+    ~26MB, so 20 batches = ~520MB pinned CPU memory.
+    """
+
+    enable_pipelining: bool = True
+    """
+    Enable pipelined prefetch (double-buffered).
+
+    When enabled, iteration N+1's data is prefetched on side streams while
+    iteration N's compute runs on the default stream. Disabling makes each
+    iteration fully independent (no cross-iteration buffer sharing).
+    """
+
+    use_datadist_stream: bool = True
+    """
+    Use a separate datadist stream for data distribution collectives.
+
+    When disabled, all work runs on the default stream (serialized).
+    Automatically disabled for single-GPU runs.
+    """
+
+    simulate_metrics: bool = True
+    """
+    Simulate metric computation (NE, MAE, calibration) on the default stream
+    after the forward pass, matching the eval pipeline's update_metrics and
+    update_reg_metrics stages.
+    """
+
+    use_ddp_wrapper: bool = True
+    """Wrap the model in DistributedDataParallel (when world_size > 1)."""
+
+    sync_policy: str = "end_only"
+    """
+    Inter-iteration CPU-GPU synchronization policy.
+
+    - "none": Zero sync in the loop. CPU races ahead freely.
+    - "end_only": Sync only after all iterations complete.
+    - "periodic": Sync every nan_check_interval iterations.
+    - "every_iter": Sync after each iteration.
+    - "all_pipeline_points": Sync at every stream interaction point
+      (drains AQL queue to zero; for Experiment B).
+    """
+
+    nan_check_interval: int = 50
+    """
+    Check for NaN every N iterations (when sync_policy is 'periodic').
+
+    Lower values detect NaN iteration more precisely but add more sync
+    points that may reduce the CPU-GPU lag needed for Experiment A.
+    """
+
+    embed_tensor_size: int = 500_000
+    """Size of embedding tensors for datadist reduce_scatter."""
+
+    p2p_tensor_size: int = 100_000
+    """Size of tensors for point-to-point send/recv in datadist."""
+
+    fresh_buffers_each_iter: bool = False
+    """
+    Allocate fresh GPU buffers every iteration (no address reuse).
+
+    For Experiment B hypothesis testing: if NaN disappears with fresh
+    buffers, the bug is related to buffer address reuse (cache staleness
+    or allocator recycling).
+    """
+
+    gpu_padding_dispatches: int = 0
+    """
+    Extra no-op kernel dispatches per iteration to inflate the AQL queue
+    fill rate. Helps ensure the CPU races ahead of the GPU.
+    """
+
+    pre_generate_data: bool = True
+    """
+    Pre-generate all CPU batch data before the run loop.
+
+    Minimizes CPU-side overhead per iteration so the CPU can submit
+    dispatches as fast as possible (maximizes CPU-GPU lag).
+    """
+
+    profile: bool = False
+    """
+    Enable torch.profiler tracing. Generates a Chrome trace JSON file
+    that can be viewed in chrome://tracing or Perfetto UI.
+    Profiles a window of iterations after warmup.
+    """
+
+    profile_iterations: int = 5
+    """Number of iterations to profile (after warmup)."""
+
+    profile_output_dir: str = "traces"
+    """Directory to write profiler trace files."""
+
+    aql_queue_size: Optional[int] = None
+    """
+    Set ROC_AQL_QUEUE_SIZE environment variable (before CUDA init).
+
+    Controls the AQL hardware queue depth on AMD GPUs:
+    - None: use system default (16384 on AMD)
+    - 1024: matches NVIDIA queue depth, mitigates Experiment A
+    - 512: aggressive backpressure
+
+    Stored in config so YAML presets are fully self-contained.
+    Applied before CUDA/HIP initialization.
+    """
+
+    # =========================================================================
+    # CCA cross-stream allocation (CSAN race reproduction)
+    # =========================================================================
+    cca_cross_stream_alloc: bool = False
+    """
+    Enable dynamic cross-stream tensor allocation to reproduce the CCA
+    event race detected by CSAN in TorchRec pipelines.
+
+    When enabled, pipeline buffers (datadist shards, H2D batches, seq
+    embeddings) are allocated dynamically each iteration via torch.empty()
+    on their respective side streams, instead of being pre-allocated at
+    setup.  Old buffers are freed after being used on the default stream,
+    triggering CCA's event-based cross-stream recycling.
+
+    Without record_stream(), CCA only tracks the allocation stream.  When
+    the side stream's event completes (its reduce_scatter / copy_ is done),
+    CCA marks the block free -- even though the default stream may still be
+    reading it during forward.  A subsequent torch.empty() on the side
+    stream recycles the block, causing the side stream to overwrite data the
+    default stream is reading.
+
+    This matches the TorchRec pattern where KJTAllToAllTensorsAwaitable
+    calls torch.empty() on data_dist_stream while alltoall_base_ on the
+    default stream still reads from the same memory block (the exact race
+    CSAN detected).
+    """
+
+    cca_record_stream: bool = True
+    """
+    Call record_stream() when tensors cross from side streams to the
+    default stream.
+
+    When True (default), after wait_stream() and before forward reads the
+    tensor, record_stream(default_stream) is called.  This tells CCA that
+    the default stream also uses this block, so CCA records events on both
+    the allocation stream AND the default stream.  The block is not recycled
+    until both events complete -- which prevents the race.
+
+    When False, CCA only knows about the allocation stream.  As soon as
+    the side stream's event completes, CCA marks the block free, even if
+    forward on the default stream is still reading it.  This is the
+    condition that produces NaN.
+
+    Use True to confirm that record_stream is the fix.
+    Use False to reproduce the CSAN race and trigger NaN.
+    """
+
+    cca_num_pressure_tensors: int = 0
+    """
+    Number of additional "pressure" tensors to create and free on the
+    default stream each iteration.  Each tensor is the same size as
+    the datadist shard to maximize the chance CCA recycles them when
+    the side stream calls torch.empty().
+
+    Increases the rate of CCA cross-stream recycling, simulating TorchRec's
+    intermediate tensor creation pattern.  Set to 4-8 for additional
+    pressure; 0 disables (only pipeline buffers are dynamic).
+    """
+
+    skip_lag_diagnostics: bool = False
+    """
+    Skip post-loop CPU-GPU lag diagnostics (calibration iterations,
+    dispatch profiling, and AQL queue analysis).
+
+    The diagnostics run 13 extra iterations with collectives after the
+    main loop (10 calibration + 3 profiled).  With sync_policy=none,
+    these can trigger NCCL watchdog timeouts because the GPU is still
+    draining hundreds of queued collectives from the main loop when
+    the diagnostics try to run more.
+
+    Set to True when running with sync_policy=none on slow models or
+    when hitting NCCL timeouts after the main loop completes.
+    """
+
+    cca_integrity_check: bool = False
+    """
+    Enable GPU-side data integrity verification for cross-stream tensors.
+
+    After the datadist_stream writes embed_shard (via reduce_scatter), a
+    checksum is computed ON the datadist_stream and stored.  After the
+    default_stream's wait_stream(), the checksum is re-computed on the
+    default_stream.  If the checksums differ, CCA recycled the memory
+    block between write and read -- direct proof of the race.
+
+    This detects corruption WITHOUT relying on NaN (which requires the
+    forward pass to amplify small errors into overflow).  Works with
+    any model type.  Zero CPU-GPU sync in the loop.
+    """
+
+    cca_event_sync: bool = False
+    """
+    After hipEventQuery returns success, call hipEventSynchronize before
+    allowing CCA to recycle blocks.  Tests whether hipEventQuery's
+    memory ordering is too weak (premature hipEventQuery hypothesis).
+
+    When enabled, at _swap_buffers() time, the old tensors' events are
+    explicitly synchronized before dropping references.  If this fixes
+    the integrity check failures, it proves hipEventQuery returns
+    success before memory writes are globally visible.
+    """
+
 
 @dataclass
 class ReproducerResult:
@@ -357,12 +654,12 @@ class RaceConfig:
     - 1-2: Streams share HW queues → implicit serialization → RACE MASKED
     - 4+: Each stream gets own HW queue → true parallelism → RACE EXPOSED
     
-    Recommended: 4 for race testing, or 3 with client_stream_layout.
+    Recommended: 4 for race testing, or 3 with production_stream_layout.
     """
 
     client_stream_layout: bool = False
     """
-    Use client's stream layout for accurate reproduction of their NaN issue.
+    Use production stream layout for accurate reproduction of the NaN issue.
     
     When enabled:
     - 3 streams only: default_stream, memcpy_stream, datadist_stream
@@ -370,7 +667,7 @@ class RaceConfig:
     - Only H2D and datadist operations on separate racing streams
     - DistributedOpsInterceptor is bypassed (no stream redirection for collectives)
     
-    This matches the client's actual TorchRec-style architecture where:
+    This matches the production TorchRec-style architecture where:
     - memcpy_stream races with default stream (H2D not synced before forward)
     - datadist_stream races with default stream (all_to_all not synced before collective)
     
@@ -461,7 +758,7 @@ class RaceConfig:
     
     When enabled, the all_to_all output tensor is added as noise to batch["dense"],
     creating a real data dependency that forward must read. This more accurately
-    reproduces the client's TorchRec pattern where distributed embeddings race
+    reproduces the TorchRec pattern where distributed embeddings race
     with the forward pass.
     
     Without this, datadist creates synthetic tensors that are discarded,

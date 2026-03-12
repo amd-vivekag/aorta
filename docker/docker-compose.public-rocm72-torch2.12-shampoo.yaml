@@ -25,6 +25,7 @@ services:
       - ${AORTA_WORKSPACE:-..}:/workspace/aorta
       - ${RCCL_PATH:-/tmp/rccl_placeholder}:/rccl
       - ${PYTORCH_PATH:-/apps/oyazdanb/pytorch}:/workspace/pytorch:rw
+      - /apps/oyazdanb/inference:/apps/oyazdanb/inference:ro
     devices:
       - /dev/kfd
       - /dev/dri

@@ -145,7 +145,7 @@ Used by **FSDP** to shard gradients back across GPUs after backward.
 
 ### What TorchRec Does
 
-TorchRec is Meta's framework for recommendation models (e.g., DLRM). These models have two kinds of parameters:
+TorchRec is a framework for recommendation models (e.g., DLRM). These models have two kinds of parameters:
 
 1. **Embedding tables** (sparse, huge): Sharded across GPUs. Each GPU holds a slice of the table.
 2. **Dense layers** (MLP, interaction): Replicated on every GPU.

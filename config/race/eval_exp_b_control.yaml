@@ -1,0 +1,44 @@
+# Experiment B: Large Batch -- Control (pipelining disabled)
+#
+# Same large batch as reproduce config, but pipelining disabled.
+# Each iteration is fully independent (no cross-iteration buffer sharing).
+# Expected: No NaN even at bs=4096.
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_b_control.yaml
+
+mode: eval_pipelined
+
+# TorchRec-style DLRM model with large batch
+model_type: dlrm
+batch_size: 4096
+feature_dim: 256
+hidden_dim: 1024
+model_layers: 4
+
+# DLRM embedding tables
+num_embedding_tables: 64
+embedding_rows: 100000
+embedding_dim: 128
+sparse_pooling_factor: 20
+over_arch_layers: 5
+
+# Pipelining DISABLED -- each iteration is independent
+use_compile: true
+enable_pipelining: false
+use_datadist_stream: true
+simulate_metrics: true
+
+sync_policy: end_only
+
+warmup_iterations: 0
+verify_iterations: 100
+log_interval: 10
+stop_on_first_corruption: true
+
+gpu_max_hw_queues: 4
+pre_generate_data: true
+
+# Reduced AQL queue (matching Experiment B reproduce conditions)
+aql_queue_size: 1024

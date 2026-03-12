@@ -124,7 +124,7 @@ HANG_PATTERNS_FOUND=0
 
 # Check for hipMemcpy
 if grep -q "hipMemcpy" "${OUTPUT_DIR}/hang_debug"/stacktrace_*.txt 2>/dev/null; then
-    echo "✓ Found hipMemcpy in stack trace (matches customer issue pattern)"
+    echo "✓ Found hipMemcpy in stack trace (matches known issue pattern)"
     HANG_PATTERNS_FOUND=$((HANG_PATTERNS_FOUND + 1))
 fi
 
@@ -143,7 +143,7 @@ fi
 # Check GPU queue info
 if [ -f "${OUTPUT_DIR}/hang_debug/rocgdb_gpu_state.txt" ]; then
     if grep -q "rocprim" "${OUTPUT_DIR}/hang_debug/rocgdb_gpu_state.txt"; then
-        echo "✓ Found rocprim kernel (matches customer issue description!)"
+        echo "✓ Found rocprim kernel (matches known issue description!)"
         HANG_PATTERNS_FOUND=$((HANG_PATTERNS_FOUND + 1))
     fi
 

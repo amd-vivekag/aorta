@@ -1,7 +1,7 @@
-# Customer Environment Variables Documentation
+# Environment Variables Reference
 #
-# This file documents all environment variables tested by the customer
-# during the NaN race condition investigation (from meta_discussion.md).
+# This file documents all environment variables tested in production
+# during the NaN race condition investigation.
 #
 # Reference: nan_stream_race_investigation.md (2026-01-29)
 
@@ -28,7 +28,7 @@ GPU_MAX_HW_QUEUES_WORKAROUND:
   notes: |
     With only 2 HW queues, streams must share queues.
     This causes implicit serialization that masks the race condition.
-    This is the customer's current workaround.
+    This is the known workaround.
     
     Usage: GPU_MAX_HW_QUEUES=2 torchrun ...
 
@@ -108,7 +108,7 @@ RCCL_GFX942_CHEAP_FENCE_OFF:
     Usage: RCCL_GFX942_CHEAP_FENCE_OFF=1 torchrun ...
 
 # =============================================================================
-# STREAM CONFIGURATION EXPERIMENTS (from customer)
+# STREAM CONFIGURATION EXPERIMENTS (from production testing)
 # =============================================================================
 
 stream_experiments:

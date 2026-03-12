@@ -1,6 +1,6 @@
 # NaN Stress Test Configuration
 #
-# Aggressive settings designed to reproduce the customer's NaN issue
+# Aggressive settings designed to reproduce the production NaN issue
 # with Distributed Shampoo.  Maximizes stream contention by combining:
 #   - Large embedding tables with all_to_all on datadist_stream
 #   - Real model training with DDP gradient all_reduce
@@ -21,7 +21,7 @@ grad_clip_norm: 1.0
 gradient_accumulation: 2
 compile: false
 
-# Model (matches customer's config from shampoo_opt.yaml)
+# Model (matches production config from shampoo_opt.yaml)
 vocab_size: 350000
 embedding_dim: 256
 num_dense_features: 32
