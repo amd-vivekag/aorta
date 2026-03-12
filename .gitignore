@@ -16,6 +16,7 @@ MANIFEST
 # Environment variables and settings
 .env
 .venv
+*.venv
 env/
 venv/
 ENV/
@@ -96,6 +97,7 @@ shampoo_cifar/
 docker/wheels/
 docker/hipblaslt_install/
 docker/.env.example
+.venv*
 
 # Local-only docs
 src/aorta/race/problem.md
