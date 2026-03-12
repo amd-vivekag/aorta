@@ -96,3 +96,6 @@ shampoo_cifar/
 docker/wheels/
 docker/hipblaslt_install/
 docker/.env.example
+
+# Local-only docs
+src/aorta/race/problem.md
