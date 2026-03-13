@@ -100,4 +100,3 @@ docker/.env.example
 .venv*
 
 # Local-only docs
-src/aorta/race/problem.md
