@@ -32,6 +32,7 @@ RUN apt-get update && \
 # Point repos at Build #17 (amdgpu-build=2299626, rocm-build=compute-rocm-rel-7.0.2.1/17)
 RUN amdgpu-repo --amdgpu-build=2299626 --rocm-build=compute-rocm-rel-7.0.2.1/17
 
+
 RUN apt-get update && apt-get install -y \
     rocm-hip-sdk \
     rocm-libs \
