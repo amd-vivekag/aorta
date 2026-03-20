@@ -57,10 +57,10 @@ USER root
 ARG THEROCK_GIT_REF=main
 
 # Required: AMD GPU family for TheRock (e.g. gfx94X-dcgpu, gfx110X-all)
-ARG THEROCK_AMDGPU_FAMILIES=gfx94X-dcgpu
+ARG THEROCK_AMDGPU_FAMILIES=gfx950
 
 # PyTorch source ref (stable release tag)
-ARG PYTORCH_GIT_REF=v2.7.0
+ARG PYTORCH_GIT_REF=v2.11.0-rc2
 
 # PyTorch GPU arch — should match THEROCK_AMDGPU_FAMILIES
 ARG PYTORCH_ROCM_ARCH=gfx950
@@ -68,9 +68,11 @@ ARG PYTORCH_ROCM_ARCH=gfx950
 # TheRock install prefix (becomes ROCM_HOME)
 ARG ROCM_INSTALL_PREFIX=/opt/rocm
 
-# Set to ON to build only HIP/core runtime (much faster, but no math libs).
-# Leave OFF to build the full stack.
-ARG THEROCK_MINIMAL=OFF
+# Build only HIP/core runtime (much faster, avoids ASAN link failures in
+# unrelated subprojects like SuiteSparse, amdsmi, rdc, grpc).
+# Set to OFF to attempt a full stack build (may require additional
+# per-subproject _SANITIZER=OFF overrides).
+ARG THEROCK_MINIMAL=ON
 
 # ---------------------------------------------------------------------------
 # Stage 1: System packages (TheRock + PyTorch build deps)
@@ -133,11 +135,15 @@ RUN . .venv/bin/activate && \
     if [ "${THEROCK_MINIMAL}" = "ON" ]; then \
         MINIMAL_FLAGS="-DTHEROCK_ENABLE_ALL=OFF \
                        -DTHEROCK_ENABLE_CORE_RUNTIME=ON \
-                       -DTHEROCK_ENABLE_HIP_RUNTIME=ON"; \
+                       -DTHEROCK_ENABLE_HIP_RUNTIME=ON \
+                       -DTHEROCK_ENABLE_COMPILER=ON"; \
     fi && \
     cmake --preset linux-release-host-asan \
         -B build \
         -DTHEROCK_AMDGPU_FAMILIES=${THEROCK_AMDGPU_FAMILIES} \
+        -DBUILD_TESTING=OFF \
+        -Dtherock-SuiteSparse_SANITIZER=OFF \
+        -Damdsmi_SANITIZER=OFF \
         ${MINIMAL_FLAGS}
 
 RUN . .venv/bin/activate && \
