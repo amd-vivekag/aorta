@@ -166,12 +166,6 @@ RUN . .venv/bin/activate && \
 
 RUN cmake --install build --prefix ${ROCM_INSTALL_PREFIX}
 
-# TheRock's RCCL install omits nccl_device.h (a device-level header required
-# by PyTorch v2.11's NCCLSymmetricMemory). Copy it from the RCCL source tree.
-RUN find /build/TheRock -name "nccl_device.h" -type f | head -1 | \
-    xargs -I{} cp {} ${ROCM_INSTALL_PREFIX}/include/ && \
-    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl_device.h
-
 # ---------------------------------------------------------------------------
 # Stage 3: ROCm environment
 # ---------------------------------------------------------------------------
@@ -197,10 +191,6 @@ ENV USE_MEM_EFF_ATTENTION=1
 ENV DISABLE_AOTRITON=1
 ENV CK_TILE_FMHA_FWD_FAST_EXP2=1
 ENV FLASH_NAMESPACE=pytorch_flash
-
-# Limit parallel compilation jobs — ASAN-instrumented compiler uses ~2-3x more
-# memory per process, so unrestricted parallelism OOM-kills subcommands.
-ENV MAX_JOBS=16
 
 # Runtime tuning
 ENV NCCL_MAX_NCHANNELS=48
@@ -240,6 +230,22 @@ RUN git clone --branch ${PYTORCH_GIT_REF} --single-branch \
 RUN cd pytorch && \
     git submodule update --init --recursive && \
     python3 tools/amd_build/build_amd.py
+
+# TheRock's RCCL install omits device-level headers (nccl_device.h,
+# nccl_device/, and generated *_tmp.h files) needed by PyTorch's
+# NCCLSymmetricMemory. The hipified build tree has the complete set —
+# source headers + generated headers — so copy from there.
+RUN HIPIFY_INC=$(find /build/TheRock -path "*/hipify/src/include/nccl_device.h" -type f | head -1 | xargs dirname) && \
+    echo "RCCL hipified include dir: ${HIPIFY_INC}" && \
+    cp -r ${HIPIFY_INC}/nccl_device.h ${ROCM_INSTALL_PREFIX}/include/ && \
+    cp -r ${HIPIFY_INC}/nccl_device ${ROCM_INSTALL_PREFIX}/include/ && \
+    # RCCL generates nccl.h (from nccl.h.in) for internal use but only
+    # installs rccl.h. The device headers include "nccl.h" by that name.
+    RCCL_NCCL_H=$(find /build/TheRock -path "*/rccl*/include/nccl.h" ! -path "*/src/*" -type f | head -1) && \
+    cp ${RCCL_NCCL_H} ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
+    echo "=== Installed RCCL device headers ===" && \
+    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
+    find ${ROCM_INSTALL_PREFIX}/include/nccl_device -type f | sort
 
 # Use the RCCL installed by TheRock instead of PyTorch's bundled NCCL.
 # TheRock installs RCCL headers/libs to /opt/rocm; without this, PyTorch

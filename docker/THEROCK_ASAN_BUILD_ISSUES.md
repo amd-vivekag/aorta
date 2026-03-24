@@ -266,6 +266,198 @@ the difference is that TheRock's install step doesn't place it there.
 
 ---
 
+## Issue 9: `nccl_device/impl/comm__funcs.h` not found (incomplete RCCL header copy)
+
+**Symptom:**
+```
+/opt/rocm/include/nccl_device.h:7:10: fatal error: 'nccl_device/impl/comm__funcs.h' file not found
+    7 | #include "nccl_device/impl/comm__funcs.h"
+```
+
+Build was at `[12173/12781]` — same file (`NCCLSymmetricMemory.cu`) as Issue 8.
+
+**Root cause:** The Issue 8 fix only copied the single `nccl_device.h` file
+from RCCL's source tree. However, `nccl_device.h` uses `#include` directives
+that reference a `nccl_device/` subdirectory containing implementation headers
+(`nccl_device/impl/comm__funcs.h`, etc.). Without the entire subdirectory tree,
+the compiler finds `nccl_device.h` but cannot resolve its transitive includes.
+
+**Resolution:** Instead of copying just the single file, find the RCCL include
+directory and copy both `nccl_device.h` and the entire `nccl_device/`
+subdirectory:
+
+```dockerfile
+RUN RCCL_SRC=$(find /build/TheRock -path "*/rccl/src/include/nccl_device.h" -type f | head -1 | xargs dirname) && \
+    cp ${RCCL_SRC}/nccl_device.h ${ROCM_INSTALL_PREFIX}/include/ && \
+    cp -r ${RCCL_SRC}/nccl_device ${ROCM_INSTALL_PREFIX}/include/ && \
+    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl_device.h && \
+    ls ${ROCM_INSTALL_PREFIX}/include/nccl_device/
+```
+
+**Key learning:** When copying headers from a source tree, always check whether
+the header has transitive includes pointing to sibling directories. A single
+`cp` of one file is rarely sufficient for C/C++ header hierarchies.
+
+---
+
+## Issue 10: `../comm_tmp.h` not found (incomplete RCCL header directory copy)
+
+**Symptom:**
+```
+/opt/rocm/include/nccl_device/impl/comm__types.h:9:10: fatal error: '../comm_tmp.h' file not found
+    9 | #include "../comm_tmp.h"
+```
+
+Two files failed: `nccl_extension.cu` and `NCCLSymmetricMemory.cu` at
+`[11894/12781]` and `[11895/12781]`.
+
+**Root cause:** The Issue 9 fix copied `nccl_device.h` and the `nccl_device/`
+subdirectory, but RCCL's device headers use relative `#include` paths that
+reference sibling files at various directory levels. Specifically,
+`nccl_device/impl/comm__types.h` includes `../comm_tmp.h`, which resolves to
+`nccl_device/comm_tmp.h` — a file that exists in RCCL's `src/include/`
+directory but was either not part of the `nccl_device/` subdirectory or was
+generated during the build.
+
+Cherry-picking individual files or subdirectories from RCCL's source include
+tree doesn't work because the headers have deep cross-references with relative
+paths.
+
+**Resolution:** Copy the **entire contents** of RCCL's `src/include/` directory
+to the install prefix, preserving the full relative include structure:
+
+```dockerfile
+RUN RCCL_INC=$(find /build/TheRock -path "*/rccl/src/include/nccl_device.h" -type f | head -1 | xargs dirname) && \
+    cp -r ${RCCL_INC}/* ${ROCM_INSTALL_PREFIX}/include/ && \
+    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl_device.h && \
+    ls ${ROCM_INSTALL_PREFIX}/include/nccl_device/
+```
+
+**Key learning:** When a source tree has headers with relative `#include`
+paths (`../`, `../../`, etc.), you must copy the entire include subtree — not
+individual files or directories. The relative paths encode assumptions about
+the directory layout.
+
+---
+
+## Issue 11: `comm_tmp.h` still not found — generated file not in source tree
+
+**Symptom:** Same as Issue 10:
+```
+/opt/rocm/include/nccl_device/impl/comm__types.h:9:10: fatal error: '../comm_tmp.h' file not found
+```
+
+**Root cause:** The Issue 10 fix (`cp -r ${RCCL_INC}/*`) copies the entire
+RCCL `src/include/` directory, but `comm_tmp.h` is a **generated** header —
+it's created during RCCL's CMake build process (likely by a code generator
+like `generate.py`) and placed in the **build** directory, not the source
+tree. Since it never existed in `rccl/src/include/nccl_device/`, the
+wildcard copy didn't include it.
+
+**Resolution:** After copying the source headers, search the TheRock build
+tree for build-generated RCCL device headers (like `comm_tmp.h`) and merge
+them into the install prefix:
+
+```dockerfile
+RUN RCCL_INC=$(find /build/TheRock -path "*/rccl/src/include/nccl_device.h" \
+        -type f | head -1 | xargs dirname) && \
+    cp -r ${RCCL_INC}/* ${ROCM_INSTALL_PREFIX}/include/ && \
+    for f in $(find /build/TheRock -path "*/rccl*" -name "comm_tmp.h" -type f); do \
+        DEST_DIR=${ROCM_INSTALL_PREFIX}/include/$(dirname "${f}" | grep -oP 'nccl_device.*'); \
+        mkdir -p "${DEST_DIR}" && cp -n "${f}" "${DEST_DIR}/"; \
+    done && \
+    test -f ${ROCM_INSTALL_PREFIX}/include/nccl_device/comm_tmp.h || \
+        (echo "ERROR: comm_tmp.h not found" && exit 1)
+```
+
+The step now includes a validation check: if `comm_tmp.h` can't be found
+anywhere in the TheRock build tree, the build fails immediately with a
+diagnostic listing all `comm_tmp.h` locations, instead of failing 75 minutes
+later during PyTorch compilation.
+
+**Key learning:** Header directories for projects like RCCL contain a mix of
+source-tree headers and build-generated headers. Copying only the source
+include directory misses generated files. You must merge both source and
+build directories.
+
+---
+
+## Issue 12: `core_tmp.h` not found — more generated headers missing
+
+**Symptom:**
+```
+/opt/rocm/include/nccl_device/impl/../comm_tmp.h:9:10: fatal error: 'core_tmp.h' file not found
+```
+
+**Root cause:** Issues 8–11 attempted to copy RCCL device headers piecemeal:
+first `nccl_device.h`, then `nccl_device/`, then `comm_tmp.h`. Each fix
+uncovered another missing generated header. The RCCL build's hipify step
+(`hipify-perl`) and code generator (`generate.py`) produce multiple `*_tmp.h`
+files (`comm_tmp.h`, `core_tmp.h`, `ptr_tmp.h`, etc.) in the **hipified build
+tree** at `${CMAKE_BINARY_DIR}/hipify/src/include/nccl_device/`. Copying from
+the source tree or searching for individual files by name is a losing game.
+
+**Resolution:** Copy from the **hipified build directory** instead of the
+source tree. The path `*/hipify/src/include/` in TheRock's build tree contains
+the complete set of RCCL device headers — both hipified source headers and
+all generated `*_tmp.h` files:
+
+```dockerfile
+RUN HIPIFY_INC=$(find /build/TheRock -path "*/hipify/src/include/nccl_device.h" \
+        -type f | head -1 | xargs dirname) && \
+    cp -r ${HIPIFY_INC}/nccl_device.h ${ROCM_INSTALL_PREFIX}/include/ && \
+    cp -r ${HIPIFY_INC}/nccl_device ${ROCM_INSTALL_PREFIX}/include/ && \
+    find ${ROCM_INSTALL_PREFIX}/include/nccl_device -type f | sort
+```
+
+**Key learning:** RCCL's build produces a parallel "hipified" include tree
+under `<build>/hipify/src/include/` that mirrors `src/include/` but with
+generated files added. Always copy from this directory — not from the source
+tree — to get the complete header set. This is exactly what RCCL's
+`CMakeLists.txt` should do in its `install()` section (see analysis above).
+
+---
+
+## Issue 13: `nccl.h` not found — RCCL build-internal header not installed
+
+**Symptom:**
+```
+/opt/rocm/include/nccl_device/impl/../core_tmp.h:9:10: fatal error: 'nccl.h' file not found
+```
+
+**Root cause:** RCCL's `CMakeLists.txt` generates two copies of the main
+header from `src/nccl.h.in`:
+
+```cmake
+configure_file(src/nccl.h.in ${PROJECT_BINARY_DIR}/include/rccl/rccl.h)  # installed
+configure_file(src/nccl.h.in ${PROJECT_BINARY_DIR}/include/nccl.h)       # internal only
+```
+
+Only `rccl.h` is installed (to `<prefix>/include/rccl/rccl.h`). The internal
+`nccl.h` is used during RCCL's build via `-I${PROJECT_BINARY_DIR}/include`
+but never installed. The device headers (e.g. `core_tmp.h`) `#include "nccl.h"`
+by that name, which fails when they're placed in `/opt/rocm/include/` without
+the internal `nccl.h`.
+
+The ROCm debian packages ship both `rccl.h` and `nccl.h` in their `-dev`
+package, so this problem doesn't appear with package-based installs.
+
+**Resolution:** Find the generated `nccl.h` in the RCCL build directory and
+copy it to the install prefix:
+
+```dockerfile
+RCCL_NCCL_H=$(find /build/TheRock -path "*/rccl*/include/nccl.h" \
+    ! -path "*/src/*" -type f | head -1) && \
+cp ${RCCL_NCCL_H} ${ROCM_INSTALL_PREFIX}/include/nccl.h
+```
+
+**Key learning:** RCCL has a split-header design: `rccl.h` (public, installed)
+and `nccl.h` (internal, identical content, not installed). When exposing
+internal device headers for consumers like PyTorch, the internal `nccl.h`
+must also be installed.
+
+---
+
 ## Summary of all fixes applied
 
 | # | Issue | Fix | Dockerfile location |
@@ -277,4 +469,9 @@ the difference is that TheRock's install step doesn't place it there.
 | 5 | `nccl_device.h` not found (initial) | Set `USE_SYSTEM_NCCL=1` + RCCL paths (partial fix) | Stage 4: before `setup.py develop` |
 | 6 | PyTorch cloned in wrong directory | Added `WORKDIR /build` before clone | Stage 4: before git clone |
 | 7 | Docker log truncated at 2 MiB | Use `--progress=plain` with `tee` | Build command (not Dockerfile) |
-| 8 | `nccl_device.h` still missing | Copy from RCCL source tree after TheRock install | Stage 2: after `cmake --install` |
+| 8 | `nccl_device.h` still missing | Copy from RCCL source tree after TheRock install (partial) | Stage 2: after `cmake --install` |
+| 9 | `nccl_device/` subdirectory missing | Copy entire `nccl_device/` dir alongside `nccl_device.h` (partial) | Stage 2: after `cmake --install` |
+| 10 | `../comm_tmp.h` relative include missing | Copy entire RCCL `src/include/*` contents (partial) | Stage 4: after submodule init |
+| 11 | `comm_tmp.h` is build-generated, not in source | Find & merge generated headers from RCCL build dir (partial) | Stage 4: after submodule init |
+| 12 | `core_tmp.h` + more generated headers missing | Copy from `hipify/src/include/` build tree | Stage 4: after submodule init |
+| 13 | `nccl.h` not installed (internal-only header) | Copy generated `nccl.h` from RCCL build dir | Stage 4: after submodule init |
