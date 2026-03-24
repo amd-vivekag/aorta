@@ -6,9 +6,11 @@
 # (HOST_ASAN), then builds PyTorch against that instrumented stack.
 #
 # HOST_ASAN instruments host-side C/C++ code with -fsanitize=address but does
-# NOT modify GPU_TARGETS for xnack+ device-side ASAN.  This is useful for
-# catching host memory errors (e.g. in hipEventQuery) on any GPU hardware
-# without requiring xnack-capable devices (gfx942/gfx950).
+# NOT modify GPU_TARGETS for xnack+ device-side ASAN.  The linux-release-host-asan
+# preset applies HOST_ASAN globally to all compiled code; the compiler (amd-llvm)
+# and a few tooling components are excluded per the upstream preset defaults.
+# This is useful for catching host memory errors (e.g. in hipEventQuery) on any
+# GPU hardware without requiring xnack-capable devices (gfx942/gfx950).
 #
 # References:
 #   - TheRock sanitizer docs : https://github.com/ROCm/TheRock/blob/main/docs/development/sanitizers.md
@@ -68,10 +70,10 @@ ARG PYTORCH_ROCM_ARCH=gfx950
 # TheRock install prefix (becomes ROCM_HOME)
 ARG ROCM_INSTALL_PREFIX=/opt/rocm
 
-# Build only HIP/core runtime (much faster, avoids ASAN link failures in
-# unrelated subprojects like SuiteSparse, amdsmi, rdc, grpc).
-# Set to OFF to attempt a full stack build (may require additional
-# per-subproject _SANITIZER=OFF overrides).
+# ON (default): ROCm subset needed to configure PyTorch against TheRock
+# (math + ML + PRIM + comm + compiler + HIP). Skips DC tools (RDC) which
+# break under HOST_ASAN (gRPC protoc / libclang_rt.asan).
+# OFF: default TheRock feature set (still with DC tools disabled below).
 ARG THEROCK_MINIMAL=ON
 
 # ---------------------------------------------------------------------------
@@ -95,6 +97,7 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     python3-pip \
     libegl1-mesa-dev \
+    liblzma-dev \
     texinfo \
     bison \
     flex \
@@ -125,22 +128,34 @@ RUN python3 -m venv .venv && \
     python3 ./build_tools/fetch_sources.py
 
 # Configure with the linux-release-host-asan preset.
-# The preset sets THEROCK_SANITIZER=HOST_ASAN plus per-subproject overrides;
-# we add the mandatory GPU family selection and optional minimal-build flags.
+# The preset sets THEROCK_SANITIZER=HOST_ASAN globally and adds
+# -fsanitize=address to CMAKE_C/CXX_FLAGS for ALL compiled code.
+# Per-component _SANITIZER=OFF only works for TheRock's own sub-projects;
+# third-party deps (yaml-cpp, etc.) always inherit the global ASAN flags.
+# Selectively disabling ASAN on individual components causes link mismatches
+# (ASAN-instrumented static libs linked into non-ASAN executables).
+# Therefore we use the preset as designed with only the overrides from the
+# upstream CMakePresets.json (amd-llvm, hipcc, hipify, etc. OFF).
 #
-# To trim build time, pass --build-arg THEROCK_MINIMAL=ON which restricts the
-# build to core + HIP runtime only (no math/ML/comm libs).
+# PyTorch LoadHIP.cmake (e.g. v2.7) requires: rocrand, hiprand, rocblas, hipblas,
+# miopen, hipfft, hipsparse, rocprim, hipcub, rocthrust, hipsolver, hiprtc,
+# hipblaslt — satisfied by MATH + ML + PRIM + COMM groups with compiler + HIP.
 RUN . .venv/bin/activate && \
     MINIMAL_FLAGS="" && \
     if [ "${THEROCK_MINIMAL}" = "ON" ]; then \
         MINIMAL_FLAGS="-DTHEROCK_ENABLE_ALL=OFF \
                        -DTHEROCK_ENABLE_CORE_RUNTIME=ON \
                        -DTHEROCK_ENABLE_HIP_RUNTIME=ON \
-                       -DTHEROCK_ENABLE_COMPILER=ON"; \
+                       -DTHEROCK_ENABLE_COMPILER=ON \
+                       -DTHEROCK_ENABLE_MATH_LIBS=ON \
+                       -DTHEROCK_ENABLE_ML_LIBS=ON \
+                       -DTHEROCK_ENABLE_PRIM=ON \
+                       -DTHEROCK_ENABLE_COMM_LIBS=ON"; \
     fi && \
     cmake --preset linux-release-host-asan \
         -B build \
         -DTHEROCK_AMDGPU_FAMILIES=${THEROCK_AMDGPU_FAMILIES} \
+        -DTHEROCK_ENABLE_DC_TOOLS=OFF \
         -DBUILD_TESTING=OFF \
         -Dtherock-SuiteSparse_SANITIZER=OFF \
         -Damdsmi_SANITIZER=OFF \
@@ -151,11 +166,20 @@ RUN . .venv/bin/activate && \
 
 RUN cmake --install build --prefix ${ROCM_INSTALL_PREFIX}
 
+# TheRock's RCCL install omits nccl_device.h (a device-level header required
+# by PyTorch v2.11's NCCLSymmetricMemory). Copy it from the RCCL source tree.
+RUN find /build/TheRock -name "nccl_device.h" -type f | head -1 | \
+    xargs -I{} cp {} ${ROCM_INSTALL_PREFIX}/include/ && \
+    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl_device.h
+
 # ---------------------------------------------------------------------------
 # Stage 3: ROCm environment
 # ---------------------------------------------------------------------------
 
 ENV ROCM_HOME=${ROCM_INSTALL_PREFIX}
+ENV ROCM_PATH=${ROCM_INSTALL_PREFIX}
+ENV HIP_PATH=${ROCM_INSTALL_PREFIX}
+ENV CMAKE_PREFIX_PATH=${ROCM_INSTALL_PREFIX}
 ENV PATH=${ROCM_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${ROCM_HOME}/lib:${LD_LIBRARY_PATH}
 
@@ -174,6 +198,10 @@ ENV DISABLE_AOTRITON=1
 ENV CK_TILE_FMHA_FWD_FAST_EXP2=1
 ENV FLASH_NAMESPACE=pytorch_flash
 
+# Limit parallel compilation jobs — ASAN-instrumented compiler uses ~2-3x more
+# memory per process, so unrestricted parallelism OOM-kills subcommands.
+ENV MAX_JOBS=16
+
 # Runtime tuning
 ENV NCCL_MAX_NCHANNELS=48
 ENV HSA_KERNARG_POOL_SIZE=4194304
@@ -186,13 +214,23 @@ ENV FBGEMM_TBE_ROCM_HIP_BACKWARD_KERNEL=1
 ENV FBGEMM_BOUNDS_CHECK_INDICES_V2=1
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-RUN pip3 install --no-cache-dir --break-system-packages \
+# Install modern CMake (required by PyTorch)
+RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ noble main" \
+      > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && \
+    apt-get install -y cmake && \
+    cmake --version
+
+RUN python3 -m venv /opt/pytorch-venv && \
+    /opt/pytorch-venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/pytorch-venv/bin/pip install --no-cache-dir \
     pyyaml \
     typing_extensions \
     numpy \
-    pandas \
-    setuptools \
-    wheel
+    pandas
+
+ENV PATH=/opt/pytorch-venv/bin:${PATH}
 
 WORKDIR /build
 
@@ -202,6 +240,14 @@ RUN git clone --branch ${PYTORCH_GIT_REF} --single-branch \
 RUN cd pytorch && \
     git submodule update --init --recursive && \
     python3 tools/amd_build/build_amd.py
+
+# Use the RCCL installed by TheRock instead of PyTorch's bundled NCCL.
+# TheRock installs RCCL headers/libs to /opt/rocm; without this, PyTorch
+# can't find nccl_device.h needed by NCCLSymmetricMemory.
+ENV USE_SYSTEM_NCCL=1
+ENV NCCL_ROOT=/opt/rocm
+ENV NCCL_INCLUDE_DIR=/opt/rocm/include
+ENV NCCL_LIB_DIR=/opt/rocm/lib
 
 RUN cd pytorch && python3 setup.py develop
 
