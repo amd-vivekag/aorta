@@ -97,6 +97,7 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     python3-pip \
     libegl1-mesa-dev \
+    libdrm-dev \
     liblzma-dev \
     texinfo \
     bison \
@@ -231,25 +232,23 @@ RUN cd pytorch && \
     git submodule update --init --recursive && \
     python3 tools/amd_build/build_amd.py
 
-# TheRock's RCCL install omits device-level headers (nccl_device.h,
-# nccl_device/, and generated *_tmp.h files) needed by PyTorch's
-# NCCLSymmetricMemory. The hipified build tree has the complete set —
-# source headers + generated headers — so copy from there.
-RUN HIPIFY_INC=$(find /build/TheRock -path "*/hipify/src/include/nccl_device.h" -type f | head -1 | xargs dirname) && \
-    echo "RCCL hipified include dir: ${HIPIFY_INC}" && \
-    cp -r ${HIPIFY_INC}/nccl_device.h ${ROCM_INSTALL_PREFIX}/include/ && \
-    cp -r ${HIPIFY_INC}/nccl_device ${ROCM_INSTALL_PREFIX}/include/ && \
-    # RCCL generates nccl.h (from nccl.h.in) for internal use but only
-    # installs rccl.h. The device headers include "nccl.h" by that name.
-    RCCL_NCCL_H=$(find /build/TheRock -path "*/rccl*/include/nccl.h" ! -path "*/src/*" -type f | head -1) && \
-    cp ${RCCL_NCCL_H} ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
-    echo "=== Installed RCCL device headers ===" && \
-    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
-    find ${ROCM_INSTALL_PREFIX}/include/nccl_device -type f | sort
+# TheRock installs rccl.h but not nccl.h. PyTorch's FindNCCL.cmake looks
+# for nccl.h by name. Symlink so PyTorch can discover RCCL.
+RUN ln -sf rccl.h ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
+    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl.h
+
+# RCCL 2.28.3 (TheRock main) lacks ncclDevCommRequirements.railGinBarrierCount
+# added in NCCL 2.28.7. PyTorch's nccl_dev_cap.hpp enables SYMMEM_DEVICE_SUPPORT
+# at >= 2.28.0, which pulls in code that uses this missing field. Raise the
+# threshold to 2.29.0 so the incompatible device-communicator code is skipped.
+# Basic NCCL symmetric memory support (>= 2.27.0) is unaffected and uses only
+# APIs that RCCL 2.28.3 implements (ncclMemAlloc, ncclCommWindowRegister, etc.).
+RUN sed -i 's/NCCL_VERSION(2, 28, 0)/NCCL_VERSION(2, 29, 0)/' \
+    pytorch/torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp && \
+    echo "Patched nccl_dev_cap.hpp — NCCL_HAS_SYMMEM_DEVICE_SUPPORT disabled for RCCL 2.28.x" && \
+    grep -n 'NCCL_HAS_SYMMEM' pytorch/torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp
 
 # Use the RCCL installed by TheRock instead of PyTorch's bundled NCCL.
-# TheRock installs RCCL headers/libs to /opt/rocm; without this, PyTorch
-# can't find nccl_device.h needed by NCCLSymmetricMemory.
 ENV USE_SYSTEM_NCCL=1
 ENV NCCL_ROOT=/opt/rocm
 ENV NCCL_INCLUDE_DIR=/opt/rocm/include
@@ -257,16 +256,20 @@ ENV NCCL_LIB_DIR=/opt/rocm/lib
 
 RUN cd pytorch && python3 setup.py develop
 
-# Verify installations
-RUN python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
-    python3 -c "import torch; print(f'ROCm available: {torch.cuda.is_available()}')" && \
-    python3 -c "import torch; print(f'GPU count: {torch.cuda.device_count()}')"
-
 # ---------------------------------------------------------------------------
 # Default ASAN_OPTIONS — sensible defaults for interactive debugging.
 # Override at runtime: docker run -e ASAN_OPTIONS="..." ...
 # ---------------------------------------------------------------------------
 ENV ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:symbolize=1"
+
+# Verify PyTorch installed correctly. ASAN-instrumented ROCm libraries
+# crash without LD_PRELOAD of the ASAN runtime, so we preload it here.
+# The verify step is best-effort: GPU queries will show 0 devices during
+# the Docker build (no GPU access), but import + version print confirms
+# the build artifacts are loadable.
+RUN ASAN_LIB=$(find /opt/rocm/llvm/lib/clang -name "libclang_rt.asan-x86_64.so" | head -1) && \
+    LD_PRELOAD=${ASAN_LIB} python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
+    echo "PyTorch import OK"
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

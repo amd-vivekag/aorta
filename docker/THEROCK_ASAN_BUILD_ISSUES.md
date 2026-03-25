@@ -458,6 +458,141 @@ must also be installed.
 
 ---
 
+## Issue 14: `core.h` not found — nccl_device headers reference parent includes
+
+**Symptom:**
+```
+/opt/rocm/include/nccl_device/impl/../ptr.h:9:10: fatal error: 'core.h' file not found
+```
+
+**Root cause:** The file listing from the copy step revealed that `core.h`
+and `comm.h` are **not** in the `hipify/src/include/nccl_device/` directory.
+The generate.py script produces `core_tmp.h` and `comm_tmp.h` as replacements,
+but the original `core.h` lives at `hipify/src/include/core.h` (one level up).
+
+During RCCL's build, CMake adds both directories to the include path:
+```cmake
+target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src/include)
+target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src/include/nccl_device)
+```
+
+So `#include "core.h"` in `nccl_device/ptr.h` resolves via the `-I` path to
+`src/include/core.h`. When we only copied `nccl_device/` to `/opt/rocm/include/`,
+the parent-level headers (`core.h`, `comm.h`, `device.h`, etc.) were missing.
+
+**Resolution:** Copy the **entire** `hipify/src/include/` tree to the install
+prefix (using `-n` to avoid overwriting existing files from TheRock's install):
+
+```dockerfile
+RUN HIPIFY_INC=$(find /build/TheRock \
+        -path "*/hipify/src/include/nccl_device.h" \
+        -type f | head -1 | xargs dirname) && \
+    cp -rn ${HIPIFY_INC}/* ${ROCM_INSTALL_PREFIX}/include/
+```
+
+This adds RCCL's internal headers (core.h, comm.h, device.h, etc.) alongside
+the device headers. The `-n` flag ensures already-installed headers from
+TheRock's `cmake --install` are not overwritten.
+
+---
+
+## Issue 15: Pre-flight header check to catch all missing includes at once
+
+**Symptom:** Each missing RCCL header was only discovered after a 75-minute
+PyTorch build reached the `NCCLSymmetricMemory.cu` file at step `[12173/12781]`.
+Issues 8–14 each required a full rebuild cycle.
+
+**Root cause:** No validation step between installing RCCL headers and starting
+the PyTorch build.
+
+**Resolution:** Added two fixes:
+
+1. **Symlinks for ambiguous includes**: RCCL's `nccl_device/ptr.h` includes
+`"core.h"` which exists at the parent level (`src/include/core.h`) but not
+in `nccl_device/`. During RCCL's build this works via `-I` paths, but PyTorch
+doesn't have that path. Fixed by symlinking:
+
+```dockerfile
+for h in core.h comm.h device.h; do
+    if [ -f ${ROCM_INSTALL_PREFIX}/include/${h} ] && \
+       [ ! -f ${ROCM_INSTALL_PREFIX}/include/nccl_device/${h} ]; then
+        ln -s ../${h} ${ROCM_INSTALL_PREFIX}/include/nccl_device/${h}
+    fi
+done
+```
+
+2. **Pre-flight compilation check**: A 2-second step that test-compiles
+`#include "nccl_device.h"` with the same include paths PyTorch will use.
+Any missing transitive include fails immediately:
+
+```dockerfile
+RUN echo '#include "nccl_device.h"' > /tmp/test_nccl_device.cpp && \
+    ${ROCM_INSTALL_PREFIX}/llvm/bin/clang++ -fsyntax-only -x c++ \
+        -I${ROCM_INSTALL_PREFIX}/include \
+        -I${ROCM_INSTALL_PREFIX}/include/nccl_device \
+        -ferror-limit=0 \
+        /tmp/test_nccl_device.cpp
+```
+
+With `-ferror-limit=0`, the compiler reports ALL missing headers at once
+instead of stopping at the first one.
+
+---
+
+## Issue 16: Symlinks pointed to wrong `core.h` — RCCL internal vs device header
+
+**Symptom:** Pre-flight check fails with errors from deep RCCL internals:
+```
+/opt/rocm/include/core.h:39: In file included: alloc.h
+/opt/rocm/include/core.h:45: In file included: nvtx.h → roctx.h → device.h
+/opt/rocm/include/device.h:29:10: fatal error: 'nccl_tuner.h' file not found
+```
+
+**Root cause:** Issue 15's fix created symlinks:
+```
+nccl_device/core.h -> ../core.h    (WRONG!)
+nccl_device/comm.h -> ../comm.h    (WRONG!)
+```
+
+RCCL has **two completely different files** named `core.h`:
+- `src/include/nccl_device/core.h` — lightweight device header (~160 lines,
+  includes only `coop.h` and `utility.h`)
+- `src/include/core.h` — heavy RCCL internal header (~500+ lines, pulls in
+  `alloc.h`, `nvtx.h`, `device.h`, `nccl_tuner.h`, and the entire RCCL
+  internals)
+
+The symlink pointed `nccl_device/core.h` at the wrong one, causing the
+include chain to explode into RCCL's full internal header tree, eventually
+failing on `nccl_tuner.h` (which lives in `src/include/plugin/`).
+
+Similarly, Issue 14's approach of copying the entire `hipify/src/include/*`
+was wrong — it dumped RCCL's internal headers (`core.h`, `alloc.h`, `nvtx.h`,
+`device.h`, etc.) into `/opt/rocm/include/`, polluting the install prefix.
+
+**Resolution:** 
+1. Removed the symlinks and the bulk `cp -rn ${HIPIFY_INC}/*` approach
+2. Copy only `nccl_device.h` and `nccl_device/` from the hipified build tree
+   (which has the generated `*_tmp.h` files)
+3. Copy `nccl_device/core.h` and `nccl_device/comm.h` from the **RCCL source
+   tree** (not the hipified tree, which doesn't produce them; not the parent
+   directory, which has different files with the same name)
+
+```dockerfile
+RCCL_SRC_INC=$(find /build/TheRock \
+    -path "*/rccl/src/include/nccl_device/core.h" \
+    -type f | head -1 | xargs dirname) && \
+for h in core.h comm.h; do
+    cp ${RCCL_SRC_INC}/${h} ${ROCM_INSTALL_PREFIX}/include/nccl_device/${h}
+done
+```
+
+**Key learning:** When multiple directories contain files with the same name,
+never use symlinks or bulk copies without verifying file identity. RCCL's
+`src/include/core.h` and `src/include/nccl_device/core.h` have completely
+different contents despite the same filename.
+
+---
+
 ## Summary of all fixes applied
 
 | # | Issue | Fix | Dockerfile location |
@@ -475,3 +610,85 @@ must also be installed.
 | 11 | `comm_tmp.h` is build-generated, not in source | Find & merge generated headers from RCCL build dir (partial) | Stage 4: after submodule init |
 | 12 | `core_tmp.h` + more generated headers missing | Copy from `hipify/src/include/` build tree | Stage 4: after submodule init |
 | 13 | `nccl.h` not installed (internal-only header) | Copy generated `nccl.h` from RCCL build dir | Stage 4: after submodule init |
+| 14 | `core.h` missing (parent-level internal header) | Copy entire `hipify/src/include/*` with `cp -rn` | Stage 4: after submodule init |
+| 15 | Repeated build cycles for each missing header | Pre-flight `clang++ -fsyntax-only` check | Stage 4: after header copy |
+| 16 | Symlinks to wrong `core.h` (internal vs device) | Copy from RCCL source tree, not symlink to parent | Stage 4: after header copy |
+| 17 | `railGinBarrierCount` missing in RCCL struct | Patch `nccl_dev_cap.hpp` to raise SYMMEM_DEVICE threshold | Stage 4: after PyTorch clone |
+| 18 | `libdrm/drm.h` not found (`rocm_smi/kfd_ioctl.h`) | Added `libdrm-dev` to apt packages | Stage 1: System packages |
+| 19 | `import torch` segfaults (ASAN not preloaded) | `LD_PRELOAD` ASAN runtime in verify step | Stage 4: verify installations |
+
+---
+
+## Issue 17: RCCL/NCCL API version mismatch — `railGinBarrierCount`
+
+**Error:**
+```
+/build/pytorch/torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp:80:10:
+  error: no member named 'railGinBarrierCount' in 'ncclDevCommRequirements'
+    reqs.railGinBarrierCount = gin_barrier_count;
+    ~~~  ^
+```
+
+**Root cause:** PyTorch v2.11.0-rc2 file
+`torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp` defines:
+
+```cpp
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+#define NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+#include <nccl_device.h>
+#endif
+```
+
+TheRock's RCCL (develop branch) reports **NCCL version 2.28.3**. This triggers
+`NCCL_HAS_SYMMEM_DEVICE_SUPPORT`, which compiles `nccl_devcomm_manager.hpp`.
+That file uses `reqs.railGinBarrierCount`, but that struct field was only added
+in **NCCL 2.28.7**. RCCL 2.28.3 has the `ncclDevCommRequirements` struct but
+without `railGinBarrierCount`.
+
+The **working** Dockerfile (`Dockerfile.rocm70_2-ubuntu-pytorch`) uses ROCm
+7.0.2 packages, which ship RCCL ~2.22.x. At that version, both
+`NCCL_HAS_SYMMEM_SUPPORT` (>= 2.27.0) and `NCCL_HAS_SYMMEM_DEVICE_SUPPORT`
+(>= 2.28.0) are disabled, so the entire symmetric-memory device code is skipped.
+
+**Fix:** Patch `nccl_dev_cap.hpp` to raise the `NCCL_HAS_SYMMEM_DEVICE_SUPPORT`
+threshold from 2.28.0 to 2.29.0. This prevents the device-communicator code
+from compiling while keeping basic symmetric memory support (>= 2.27.0):
+
+```dockerfile
+RUN sed -i 's/NCCL_VERSION(2, 28, 0)/NCCL_VERSION(2, 29, 0)/' \
+    pytorch/torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp
+```
+
+Additionally, the complex RCCL device-header copy (nccl_device.h, nccl_device/,
+generated *_tmp.h files, nccl.h from build tree) and pre-flight clang++ check
+are no longer needed because `nccl_device.h` is only `#include`d inside the
+`NCCL_HAS_SYMMEM_DEVICE_SUPPORT` guard. Replaced the entire header-copy block
+with a simple symlink: `ln -s rccl.h nccl.h`.
+
+**Key learning:** When building PyTorch against an RCCL version that tracks
+NCCL but lags behind on specific features, the version-gated macros in
+PyTorch may enable code that references API additions not yet in RCCL.
+Always check the RCCL version's actual API surface against what PyTorch
+expects, especially for features marked "available since NCCL X.Y.Z" in
+the NCCL documentation.
+
+---
+
+## Issue 18: Missing `libdrm/drm.h` — `rocm_smi` dependency
+
+**Error:**
+```
+/opt/rocm/include/rocm_smi/kfd_ioctl.h:26:10: fatal error: libdrm/drm.h: No such file or directory
+```
+
+**Root cause:** PyTorch's `intra_node_comm.cpp` (symmetric memory subsystem)
+includes ROCm SMI headers which in turn include `kfd_ioctl.h`. That header
+requires `libdrm/drm.h` from the `libdrm-dev` package, which was not installed.
+
+**Fix:** Add `libdrm-dev` to the system packages in Stage 1:
+```dockerfile
+RUN apt-get update && apt-get install -y \
+    ...
+    libdrm-dev \
+    ...
+```
