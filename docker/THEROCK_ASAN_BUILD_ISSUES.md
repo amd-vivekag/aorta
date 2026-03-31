@@ -615,11 +615,11 @@ different contents despite the same filename.
 | 16 | Symlinks to wrong `core.h` (internal vs device) | Copy from RCCL source tree, not symlink to parent | Stage 4: after header copy |
 | 17 | `railGinBarrierCount` missing in RCCL struct | Patch `nccl_dev_cap.hpp` to raise SYMMEM_DEVICE threshold | Stage 4: after PyTorch clone |
 | 18 | `libdrm/drm.h` not found (`rocm_smi/kfd_ioctl.h`) | Added `libdrm-dev` to apt packages | Stage 1: System packages |
-| 19 | `import torch` segfaults (ASAN not preloaded) | Do NOT use `LD_PRELOAD`; use NEEDED + `verify_asan_link_order=0` | `asan-entrypoint.sh` |
+| 19 | `import torch` segfaults (ASAN not preloaded) | Do NOT use `LD_PRELOAD`; use NEEDED + `verify_asan_link_order=0` | Dockerfile ENV |
 | 20 | `fbgemm_gpu_py.so: undefined symbol: rsmi_shut_down` | `patchelf --add-needed librocm_smi64.so` on the `.so` | `setup_repro_env.sh` post-build |
 | 21 | `libclang-cpp.so.23.0git` not found at runtime | Add `llvm/lib` + `lib/rocm_sysdeps/lib` to `LD_LIBRARY_PATH` | Dockerfile ENV + setup script |
 | 22 | roctracer `Finalize()` assert crash (exit 134) | PR [#4552](https://github.com/ROCm/rocm-systems/pull/4552); workaround: check stdout | `setup_repro_env.sh` |
-| 23 | ASAN SEGV in `amd::Device::init()` with `LD_PRELOAD` | Load ASAN via NEEDED + `verify_asan_link_order=0` (no `LD_PRELOAD`) | `asan-entrypoint.sh` |
+| 23 | ASAN SEGV in `amd::Device::init()` with `LD_PRELOAD` | Load ASAN via NEEDED + `verify_asan_link_order=0` (no `LD_PRELOAD`) | Dockerfile ENV |
 | 24 | `tensordict` missing deps (`pyvers`, `cloudpickle`) | Install explicitly alongside `--no-deps` | `setup_repro_env.sh` |
 
 ---
@@ -936,12 +936,15 @@ IMAGE_NAME=aorta:therock-host-asan-pytorch
 CONTAINER_NAME=<your-username>-therock-asan
 ```
 
-The Dockerfile also accepts build `ARG`s with these defaults:
+The Dockerfile accepts build `ARG`s with these defaults:
 
 | ARG | Default | Description |
 |-----|---------|-------------|
-| `THEROCK_GIT_REF` | `main` | TheRock branch/tag to build |
-| `THEROCK_AMDGPU_FAMILIES` | `gfx950` | GPU architecture family (e.g. `gfx942` for MI300X, `gfx950` for MI350X) |
+| `THEROCK_TARBALL_VERSION` | `7.12.0` | TheRock tarball version to download for the normal ROCm install |
+| `THEROCK_RELEASE_TYPE` | `stable` | Tarball source: `stable`, `nightlies`, `prereleases`, or `devreleases` |
+| `THEROCK_TARBALL_AMDGPU_FAMILY` | `gfx950-dcgpu` | GPU family for tarball download (note: includes `-dcgpu` suffix) |
+| `THEROCK_GIT_REF` | `therock-7.12` | TheRock source tag for ASAN build (must match tarball version for ABI compat) |
+| `THEROCK_AMDGPU_FAMILIES` | `gfx950` | GPU architecture family for TheRock ASAN cmake build |
 | `PYTORCH_GIT_REF` | `v2.11.0-rc2` | PyTorch version/branch/tag to build |
 | `PYTORCH_ROCM_ARCH` | `gfx950` | PyTorch ROCm GPU architecture |
 | `ROCM_INSTALL_PREFIX` | `/opt/rocm` | ROCm install prefix inside the container |
@@ -949,8 +952,23 @@ The Dockerfile also accepts build `ARG`s with these defaults:
 To override build ARGs, pass them via `--build-arg`:
 
 ```bash
-docker compose ... build --build-arg THEROCK_AMDGPU_FAMILIES=gfx942 ...
+docker compose ... build \
+    --build-arg THEROCK_TARBALL_AMDGPU_FAMILY=gfx94X-dcgpu \
+    --build-arg THEROCK_AMDGPU_FAMILIES=gfx942 ...
 ```
+
+For nightly tarballs:
+
+```bash
+docker compose ... build \
+    --build-arg THEROCK_RELEASE_TYPE=nightlies \
+    --build-arg THEROCK_TARBALL_VERSION=7.9.0rc20251008 \
+    --build-arg THEROCK_GIT_REF=main ...
+```
+
+Available tarball families can be found at the
+[TheRock nightly S3 index](https://therock-nightly-tarball.s3.amazonaws.com/index.html).
+Common families: `gfx950-dcgpu` (MI350X), `gfx94X-dcgpu` (MI300X).
 
 ### 2. Build with docker compose
 
@@ -961,8 +979,9 @@ docker compose -f docker/docker-compose.build.yaml \
     | tee stdout.asan_docker_build.log
 ```
 
-**Build time:** 4–8 hours on a 64-core machine (TheRock compilation dominates).
-Subsequent rebuilds with ccache are significantly faster.
+**Build time:** ~30 minutes on a 64-core machine (the normal ROCm stack is
+downloaded as a pre-built tarball; only the ASAN overlay is built from source).
+Subsequent rebuilds are even faster thanks to BuildKit ccache mounts.
 
 **Using a custom `.env` file:**
 
@@ -974,12 +993,18 @@ docker compose -f docker/docker-compose.build.yaml \
 
 ### 3. Build troubleshooting
 
+- **Tarball download fails**: Verify the tarball URL exists. Check
+  [TheRock nightly tarballs](https://therock-nightly-tarball.s3.amazonaws.com/index.html)
+  for available versions and GPU families. For gfx950, try `nightlies` release
+  type if `stable` is not available yet.
+- **ABI mismatch (ASAN overlay crashes)**: `THEROCK_GIT_REF` must correspond to
+  `THEROCK_TARBALL_VERSION`. E.g. tarball `7.12.0` requires tag `therock-7.12`.
 - **Log truncation** (`[output clipped, log limit 2MiB reached]`): Always use
   `--progress=plain` and pipe to `tee` (see Issue 7)
 - **CMake preset errors**: TheRock presets change across branches. Run
   `cmake --list-presets` inside the TheRock directory to see available presets
-- **Network timeouts**: TheRock fetches many dependencies. Retry the build —
-  Docker layer caching will skip completed stages
+- **Network timeouts**: Retry the build — Docker layer caching will skip
+  completed stages
 
 ## Running the Docker Container
 
@@ -1013,17 +1038,15 @@ use `--device=/dev/kfd --device=/dev/dri`.
 
 ### ASAN activation
 
-The container's entrypoint (`asan-entrypoint.sh`) automatically:
-1. Locates the ASAN overlay libraries in `/opt/rocm-asan/lib/`
-2. Prepends them to `LD_LIBRARY_PATH` (shadowing normal ROCm libs)
-3. Adds the ASAN runtime directory to `LD_LIBRARY_PATH`
-4. Sets `ASAN_OPTIONS` with sensible defaults
-5. Does **not** use `LD_PRELOAD` (see Issue 19/23)
+ASAN is baked into the image via `ENV` directives — no entrypoint script needed.
+The Dockerfile sets `LD_LIBRARY_PATH` to prepend `/opt/rocm-asan/lib` (ASAN overlay)
+and `/opt/rocm-asan/rt` (ASAN runtime symlink) so they shadow the normal ROCm libs.
+This works with `docker run`, `docker exec`, and images loaded from tar files.
 
 To disable ASAN at runtime:
 
 ```bash
-docker run ... -e ASAN_DISABLE=1 aorta:therock-host-asan-pytorch
+docker run ... -e LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib aorta:therock-host-asan-pytorch
 ```
 
 ### Verifying ASAN is active
@@ -1085,16 +1108,18 @@ Results are written to `/tmp/nan_test_<pid>/`.
 
 ## Architecture Overview
 
-The Docker image uses a **two-pass ASAN overlay** architecture:
+The Docker image uses a **tarball + ASAN overlay** architecture:
 
-1. **Pass 1 (normal build):** TheRock is built with `linux-release-package`
-   preset — no ASAN. This produces a clean ROCm installation at `/opt/rocm/`.
+1. **Normal ROCm (tarball):** A pre-built TheRock tarball is downloaded
+   and extracted to `/opt/rocm/`. This provides the complete ROCm stack
+   (compiler, math libs, ML libs, RCCL, etc.) without any source compilation.
    PyTorch is built against these normal libraries.
 
-2. **Pass 2 (ASAN build):** TheRock is rebuilt with `linux-release-host-asan`
-   preset. Only the key shared libraries (`libamdhip64.so`,
-   `libhsa-runtime64.so`, `libhsakmt.so`, `libamd_comgr.so`) are extracted
-   and placed in `/opt/rocm-asan/lib/`.
+2. **ASAN overlay (source build):** TheRock source (pinned to the same
+   release tag as the tarball) is cloned and only core_runtime + hip_runtime
+   are rebuilt with `linux-release-host-asan` preset. The ASAN-instrumented
+   shared libraries (`libamdhip64.so`, `libhsa-runtime64.so`, `libhsakmt.so`,
+   `libamd_comgr.so`) are extracted to `/opt/rocm-asan/lib/`.
 
 3. **Runtime overlay:** The entrypoint prepends `/opt/rocm-asan/lib/` to
    `LD_LIBRARY_PATH`, so the ASAN-instrumented libraries shadow the normal
@@ -1104,4 +1129,5 @@ The Docker image uses a **two-pass ASAN overlay** architecture:
 
 This avoids the problems of building PyTorch under ASAN (hipify hangs,
 compilation crashes, massive slowdowns) while still catching host-side
-memory errors at runtime.
+memory errors at runtime. The tarball approach reduces initial build time
+from ~100 minutes to ~30 minutes.
