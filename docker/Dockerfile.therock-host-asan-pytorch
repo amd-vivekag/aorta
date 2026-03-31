@@ -1,49 +1,91 @@
 # =============================================================================
-# TheRock HOST_ASAN HIP Runtime + PyTorch
+# TheRock HOST_ASAN HIP Runtime + PyTorch  (v2 — two-pass overlay architecture)
 # =============================================================================
 #
-# Builds ROCm/HIP from source via TheRock with host-only AddressSanitizer
-# (HOST_ASAN), then builds PyTorch against that instrumented stack.
+# Architecture
+# ~~~~~~~~~~~~
+# Builds ROCm/HIP from source via TheRock in TWO passes:
 #
-# HOST_ASAN instruments host-side C/C++ code with -fsanitize=address but does
-# NOT modify GPU_TARGETS for xnack+ device-side ASAN.  The linux-release-host-asan
-# preset applies HOST_ASAN globally to all compiled code; the compiler (amd-llvm)
-# and a few tooling components are excluded per the upstream preset defaults.
-# This is useful for catching host memory errors (e.g. in hipEventQuery) on any
-# GPU hardware without requiring xnack-capable devices (gfx942/gfx950).
+#   Pass 1 (Normal)  — Full ROCm stack without ASAN.  Installed to /opt/rocm.
+#                      Provides build toolchain, math/ML/comm libs, compiler,
+#                      and is the link target for PyTorch compilation.
 #
-# References:
-#   - TheRock sanitizer docs : https://github.com/ROCm/TheRock/blob/main/docs/development/sanitizers.md
-#   - HOST_ASAN preset PR    : https://github.com/ROCm/TheRock/pull/3137
-#   - CMakePresets.json       : https://github.com/ROCm/TheRock/blob/main/CMakePresets.json
+#   Pass 2 (ASAN)    — Only core_runtime + hip_runtime rebuilt with HOST_ASAN.
+#                      The resulting ASAN-instrumented libamdhip64.so and
+#                      libhsa-runtime64.so are extracted to /opt/rocm-asan/lib.
 #
-# Build:
+# At container startup the entrypoint prepends /opt/rocm-asan/lib to
+# LD_LIBRARY_PATH (shadowing the normal libs) and adds the ASAN runtime
+# directory so it is found as a NEEDED dependency.  All HIP API calls go
+# through the instrumented libraries while everything else (rocblas, miopen,
+# rccl, Python, hipify, etc.) runs at native speed.
+#
+# NOTE: LD_PRELOAD is NOT used.  The ASAN runtime must load as a dependency,
+# not via LD_PRELOAD, because LD_PRELOAD causes ASAN to globally intercept
+# dlopen/dlsym, which breaks HIP's internal dynamic loading of
+# libhsa-runtime64.so (SEGV in amd::Device::init at a null function pointer).
+# verify_asan_link_order=0 suppresses ASAN's check that it must be loaded
+# first.
+#
+# This catches host-side memory errors (e.g. hipEventQuery races, use-after-
+# free in HIP runtime) without ASAN overhead on Python or build tools.
+#
+# Key design decisions and lessons learned
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# 1. ASAN cannot be applied selectively within a single TheRock build.
+#    The linux-release-host-asan preset sets -fsanitize=address globally;
+#    per-component _SANITIZER=OFF only affects TheRock's own sub-projects,
+#    not third-party static libs (e.g. libyaml-cpp.a) which inherit the
+#    global flags.  Any ASAN/non-ASAN mismatch causes link errors.
+#    Therefore we use TWO separate cmake builds, not one with overrides.
+#
+# 2. PyTorch's hipify (python3 tools/amd_build/build_amd.py) is a regex-
+#    heavy Python script.  Under ASAN (via LD_PRELOAD), every malloc/free
+#    in CPython is intercepted, making hipify ~100x slower and appearing
+#    to hang.  The two-pass architecture avoids this: ASAN is never in
+#    the environment during the build.
+#
+# 3. PyTorch built against the normal (non-ASAN) ROCm libs imports
+#    cleanly without LD_PRELOAD.  The ASAN overlay is only activated at
+#    container startup via the entrypoint.
+#
+# 4. RCCL (TheRock develop branch, ~2.28.x) lacks the railGinBarrierCount
+#    field added in NCCL 2.28.7.  PyTorch's version-gated macro at 2.28.0
+#    enables code that references this field, causing a compile error.
+#    A targeted sed patch raises the threshold to 2.29.0, disabling the
+#    device-communicator code path while keeping basic symmetric memory
+#    support.  This also eliminates the need to copy nccl_device.h and
+#    its entire transitive header chain from the RCCL build tree.
+#
+# 5. ccache is used across both TheRock passes.  The compiler (amd-llvm,
+#    ~8000 files) is exempt from ASAN in the preset, so the second pass
+#    gets near-100% cache hits on the compiler build.
+#
+# Build
+# ~~~~~
 #   docker build \
 #     --build-arg THEROCK_AMDGPU_FAMILIES=gfx94X-dcgpu \
 #     --build-arg PYTORCH_ROCM_ARCH=gfx950 \
+#     --progress=plain \
 #     -f docker/Dockerfile.therock-host-asan-pytorch \
-#     -t therock-host-asan-pytorch .
+#     -t therock-host-asan-pytorch . 2>&1 | tee build.log
 #
-# Run (GPU passthrough):
+#   Use --progress=plain piped to tee to capture the full build log.
+#   Docker BuildKit's default 2 MiB per-step log buffer truncates output
+#   from verbose CK kernel compilation.
+#
+# Run
+# ~~~
 #   docker run -it --rm \
 #     --device=/dev/kfd --device=/dev/dri \
 #     --ipc=host --group-add=video --group-add=render \
-#     -e ASAN_OPTIONS="detect_leaks=1:halt_on_error=0:symbolize=1:log_path=/workspace/asan.log" \
 #     therock-host-asan-pytorch
 #
-# ASAN runtime options (set via ASAN_OPTIONS env var):
-#   detect_leaks=1    - enable leak detection (default off for mixed Python)
-#   halt_on_error=0   - continue execution after the first error
-#   log_path=asan.log - write reports to file instead of stderr
-#   symbolize=1       - show function names in stack traces
+#   ASAN is enabled automatically.  Override options at runtime:
+#     -e ASAN_OPTIONS="detect_leaks=1:halt_on_error=1:log_path=/workspace/asan.log"
 #
-# Sanitizer + Python caveat:
-#   ASAN expects a single instrumented process.  A non-ASAN Python interpreter
-#   loading ASAN-instrumented libamdhip64.so can produce false positives or miss
-#   errors.  For focused hipEventQuery testing, prefer small C++/HIP repros
-#   compiled with TheRock's toolchain under ASAN.  A future follow-up image
-#   using ROCm's pytorch rocm-asan branch (.ci/pytorch/build-rocm-asan.sh) will
-#   provide full host+device ASAN coverage for PyTorch itself.
+#   Disable the ASAN overlay entirely (run like a normal image):
+#     -e ASAN_DISABLE=1
 #
 # =============================================================================
 
@@ -55,34 +97,27 @@ USER root
 # Build arguments
 # ---------------------------------------------------------------------------
 
-# TheRock source ref (branch, tag, or commit SHA)
 ARG THEROCK_GIT_REF=main
-
-# Required: AMD GPU family for TheRock (e.g. gfx94X-dcgpu, gfx110X-all)
 ARG THEROCK_AMDGPU_FAMILIES=gfx950
-
-# PyTorch source ref (stable release tag)
 ARG PYTORCH_GIT_REF=v2.11.0-rc2
-
-# PyTorch GPU arch — should match THEROCK_AMDGPU_FAMILIES
 ARG PYTORCH_ROCM_ARCH=gfx950
-
-# TheRock install prefix (becomes ROCM_HOME)
 ARG ROCM_INSTALL_PREFIX=/opt/rocm
 
-# ON (default): ROCm subset needed to configure PyTorch against TheRock
-# (math + ML + PRIM + comm + compiler + HIP). Skips DC tools (RDC) which
-# break under HOST_ASAN (gRPC protoc / libclang_rt.asan).
-# OFF: default TheRock feature set (still with DC tools disabled below).
-ARG THEROCK_MINIMAL=ON
-
 # ---------------------------------------------------------------------------
-# Stage 1: System packages (TheRock + PyTorch build deps)
+# 1. System packages
 # ---------------------------------------------------------------------------
+# All dependencies needed by TheRock, PyTorch, and runtime scripts.
+#
+# Packages added due to build failures:
+#   libdrm-dev   — rocm_smi/kfd_ioctl.h includes libdrm/drm.h
+#   liblzma-dev  — AOTriton configure requires liblzma even with DISABLE_AOTRITON=1
+#   libtbb-dev   — FBGEMM GPU build requires TBB at setup_repro_env time
+#   ccache       — reuse compiler objects across the two TheRock passes
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
+    build-essential \
     gfortran \
     git \
     ninja-build \
@@ -99,6 +134,7 @@ RUN apt-get update && apt-get install -y \
     libegl1-mesa-dev \
     libdrm-dev \
     liblzma-dev \
+    libtbb-dev \
     texinfo \
     bison \
     flex \
@@ -107,11 +143,12 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     gnupg2 \
     vim \
-    build-essential \
+    tmux \
+    ccache \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# Stage 2: Build TheRock with HOST_ASAN preset
+# 2. TheRock source preparation
 # ---------------------------------------------------------------------------
 
 WORKDIR /build
@@ -121,54 +158,118 @@ RUN git clone --branch ${THEROCK_GIT_REF} --single-branch \
 
 WORKDIR /build/TheRock
 
-# Python venv for TheRock build tooling
 RUN python3 -m venv .venv && \
     . .venv/bin/activate && \
     pip install --upgrade pip && \
     pip install -r requirements.txt && \
     python3 ./build_tools/fetch_sources.py
 
-# Configure with the linux-release-host-asan preset.
-# The preset sets THEROCK_SANITIZER=HOST_ASAN globally and adds
-# -fsanitize=address to CMAKE_C/CXX_FLAGS for ALL compiled code.
-# Per-component _SANITIZER=OFF only works for TheRock's own sub-projects;
-# third-party deps (yaml-cpp, etc.) always inherit the global ASAN flags.
-# Selectively disabling ASAN on individual components causes link mismatches
-# (ASAN-instrumented static libs linked into non-ASAN executables).
-# Therefore we use the preset as designed with only the overrides from the
-# upstream CMakePresets.json (amd-llvm, hipcc, hipify, etc. OFF).
+# ---------------------------------------------------------------------------
+# 3. Pass 1 — Normal TheRock build (full ROCm stack, no ASAN)
+# ---------------------------------------------------------------------------
+# Builds the complete ROCm stack that PyTorch needs: compiler, HIP runtime,
+# math libs (rocblas, hipblas), ML libs (miopen), primitives (composable
+# kernel), and communication libs (rccl).
 #
-# PyTorch LoadHIP.cmake (e.g. v2.7) requires: rocrand, hiprand, rocblas, hipblas,
-# miopen, hipfft, hipsparse, rocprim, hipcub, rocthrust, hipsolver, hiprtc,
-# hipblaslt — satisfied by MATH + ML + PRIM + COMM groups with compiler + HIP.
+# ccache is configured so the compiler objects can be reused by Pass 2.
+
+ENV CCACHE_DIR=/build/ccache
+ENV CCACHE_MAXSIZE=20G
+
 RUN . .venv/bin/activate && \
-    MINIMAL_FLAGS="" && \
-    if [ "${THEROCK_MINIMAL}" = "ON" ]; then \
-        MINIMAL_FLAGS="-DTHEROCK_ENABLE_ALL=OFF \
-                       -DTHEROCK_ENABLE_CORE_RUNTIME=ON \
-                       -DTHEROCK_ENABLE_HIP_RUNTIME=ON \
-                       -DTHEROCK_ENABLE_COMPILER=ON \
-                       -DTHEROCK_ENABLE_MATH_LIBS=ON \
-                       -DTHEROCK_ENABLE_ML_LIBS=ON \
-                       -DTHEROCK_ENABLE_PRIM=ON \
-                       -DTHEROCK_ENABLE_COMM_LIBS=ON"; \
-    fi && \
-    cmake --preset linux-release-host-asan \
-        -B build \
+    cmake --preset linux-release-package \
+        -B build-normal \
         -DTHEROCK_AMDGPU_FAMILIES=${THEROCK_AMDGPU_FAMILIES} \
+        -DTHEROCK_ENABLE_ALL=OFF \
+        -DTHEROCK_ENABLE_CORE_RUNTIME=ON \
+        -DTHEROCK_ENABLE_HIP_RUNTIME=ON \
+        -DTHEROCK_ENABLE_COMPILER=ON \
+        -DTHEROCK_ENABLE_MATH_LIBS=ON \
+        -DTHEROCK_ENABLE_ML_LIBS=ON \
+        -DTHEROCK_ENABLE_PRIM=ON \
+        -DTHEROCK_ENABLE_COMM_LIBS=ON \
         -DTHEROCK_ENABLE_DC_TOOLS=OFF \
         -DBUILD_TESTING=OFF \
-        -Dtherock-SuiteSparse_SANITIZER=OFF \
-        -Damdsmi_SANITIZER=OFF \
-        ${MINIMAL_FLAGS}
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
 RUN . .venv/bin/activate && \
-    cmake --build build --target all
-
-RUN cmake --install build --prefix ${ROCM_INSTALL_PREFIX}
+    cmake --build build-normal --target all
 
 # ---------------------------------------------------------------------------
-# Stage 3: ROCm environment
+# 4. Install normal build to /opt/rocm
+# ---------------------------------------------------------------------------
+
+RUN cmake --install build-normal --prefix ${ROCM_INSTALL_PREFIX}
+
+# RCCL installs rccl.h but PyTorch and other consumers expect nccl.h.
+RUN ln -sf rccl.h ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
+    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl.h
+
+# ---------------------------------------------------------------------------
+# 5. Pass 2 — ASAN TheRock build (core + HIP runtime only)
+# ---------------------------------------------------------------------------
+# Only core_runtime and hip_runtime are rebuilt with HOST_ASAN.  The compiler
+# is included because hip_runtime depends on comgr, but the preset already
+# sets amd-llvm_SANITIZER=OFF so it compiles without ASAN.  With ccache,
+# the ~8000 compiler object files should be near-100% cache hits from Pass 1.
+
+RUN . .venv/bin/activate && \
+    cmake --preset linux-release-host-asan \
+        -B build-asan \
+        -DTHEROCK_AMDGPU_FAMILIES=${THEROCK_AMDGPU_FAMILIES} \
+        -DTHEROCK_ENABLE_ALL=OFF \
+        -DTHEROCK_ENABLE_CORE_RUNTIME=ON \
+        -DTHEROCK_ENABLE_HIP_RUNTIME=ON \
+        -DTHEROCK_ENABLE_COMPILER=ON \
+        -DTHEROCK_ENABLE_DC_TOOLS=OFF \
+        -DBUILD_TESTING=OFF \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+RUN . .venv/bin/activate && \
+    cmake --build build-asan --target all
+
+# ---------------------------------------------------------------------------
+# 6. Extract and validate the ASAN overlay libraries
+# ---------------------------------------------------------------------------
+# Install the ASAN build to a temp prefix, then copy ONLY the shared libs
+# we want to shadow at runtime.  This avoids polluting the image with
+# duplicate compiler binaries, headers, etc.
+
+RUN cmake --install build-asan --prefix /tmp/rocm-asan-full && \
+    mkdir -p /opt/rocm-asan/lib && \
+    for lib in libamdhip64 libhsa-runtime64 libhsakmt libamd_comgr; do \
+        find /tmp/rocm-asan-full/lib -name "${lib}.so*" -exec cp -a {} /opt/rocm-asan/lib/ \; ; \
+    done && \
+    rm -rf /tmp/rocm-asan-full
+
+# Validate that the extracted libs are actually ASAN-instrumented.
+# Catches misconfiguration immediately instead of at runtime.
+RUN echo "=== ASAN overlay libs ===" && \
+    ls -la /opt/rocm-asan/lib/ && \
+    if nm -D /opt/rocm-asan/lib/libamdhip64.so 2>/dev/null | grep -q '__asan_'; then \
+        echo "PASS: libamdhip64.so contains ASAN instrumentation"; \
+    else \
+        echo "FAIL: libamdhip64.so is NOT ASAN-instrumented — check build config" && exit 1; \
+    fi
+
+# ---------------------------------------------------------------------------
+# 7. Cleanup TheRock build trees
+# ---------------------------------------------------------------------------
+# The build-normal and build-asan directories are 100GB+ each.  The ccache
+# directory can also be large.  All needed artifacts are now installed to
+# /opt/rocm and /opt/rocm-asan/lib.
+#
+# The TheRock source tree is preserved for reference (commit, submodule
+# versions) but build artifacts are deleted.
+
+RUN du -sh /build/TheRock/build-normal /build/TheRock/build-asan /build/ccache 2>/dev/null || true && \
+    rm -rf /build/TheRock/build-normal /build/TheRock/build-asan /build/ccache && \
+    echo "Cleaned TheRock build trees"
+
+# ---------------------------------------------------------------------------
+# 8. ROCm environment (points to the normal build)
 # ---------------------------------------------------------------------------
 
 ENV ROCM_HOME=${ROCM_INSTALL_PREFIX}
@@ -176,13 +277,53 @@ ENV ROCM_PATH=${ROCM_INSTALL_PREFIX}
 ENV HIP_PATH=${ROCM_INSTALL_PREFIX}
 ENV CMAKE_PREFIX_PATH=${ROCM_INSTALL_PREFIX}
 ENV PATH=${ROCM_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${ROCM_HOME}/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=${ROCM_HOME}/lib:${ROCM_HOME}/llvm/lib:${ROCM_HOME}/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH}
+# Prevent roctracer from loading as an HSA tool — its Finalize() crashes
+# during Python shutdown when HSA is already torn down.
+ENV HSA_TOOLS_LIB=""
 
 # ---------------------------------------------------------------------------
-# Stage 4: Build PyTorch from source against the ASAN ROCm stack
+# 9. Upgrade cmake for PyTorch
 # ---------------------------------------------------------------------------
+# Install a recent cmake from Kitware.  This is done AFTER the TheRock build
+# to avoid any compatibility risk with TheRock's cmake usage.  PyTorch v2.11
+# benefits from newer cmake features.
 
-# PyTorch build configuration
+RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc \
+      | gpg --dearmor -o /usr/share/keyrings/kitware.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ noble main" \
+      > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && \
+    apt-get install -y cmake && \
+    cmake --version && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 10. Python virtual environment for PyTorch
+# ---------------------------------------------------------------------------
+# Separate venv from TheRock's.  Ubuntu 24.04 enforces PEP 668 — system pip
+# cannot be upgraded, so a venv is required (not optional).
+
+RUN python3 -m venv /opt/pytorch-venv && \
+    /opt/pytorch-venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/pytorch-venv/bin/pip install --no-cache-dir \
+        pyyaml \
+        typing_extensions \
+        numpy \
+        pandas
+
+ENV PATH=/opt/pytorch-venv/bin:${PATH}
+
+# ---------------------------------------------------------------------------
+# 11. PyTorch build configuration
+# ---------------------------------------------------------------------------
+# These environment variables control PyTorch's cmake configuration for ROCm.
+# ASAN is NOT present in the build environment — no LD_PRELOAD, no ASAN libs
+# on LD_LIBRARY_PATH.  This is critical for:
+#   - hipify speed (Python regex without ASAN overhead)
+#   - clean linking (PyTorch links against normal ROCm libs)
+#   - import without LD_PRELOAD (no ASAN symbols required at import time)
+
 ENV _GLIBCXX_USE_CXX11_ABI=1
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ENV USE_ROCM=1
@@ -193,7 +334,6 @@ ENV DISABLE_AOTRITON=1
 ENV CK_TILE_FMHA_FWD_FAST_EXP2=1
 ENV FLASH_NAMESPACE=pytorch_flash
 
-# Runtime tuning
 ENV NCCL_MAX_NCHANNELS=48
 ENV HSA_KERNARG_POOL_SIZE=4194304
 ENV HSA_NO_SCRATCH_RECLAIM=1
@@ -205,23 +345,14 @@ ENV FBGEMM_TBE_ROCM_HIP_BACKWARD_KERNEL=1
 ENV FBGEMM_BOUNDS_CHECK_INDICES_V2=1
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Install modern CMake (required by PyTorch)
-RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ noble main" \
-      > /etc/apt/sources.list.d/kitware.list && \
-    apt-get update && \
-    apt-get install -y cmake && \
-    cmake --version
+ENV USE_SYSTEM_NCCL=1
+ENV NCCL_ROOT=/opt/rocm
+ENV NCCL_INCLUDE_DIR=/opt/rocm/include
+ENV NCCL_LIB_DIR=/opt/rocm/lib
 
-RUN python3 -m venv /opt/pytorch-venv && \
-    /opt/pytorch-venv/bin/pip install --upgrade pip setuptools wheel && \
-    /opt/pytorch-venv/bin/pip install --no-cache-dir \
-    pyyaml \
-    typing_extensions \
-    numpy \
-    pandas
-
-ENV PATH=/opt/pytorch-venv/bin:${PATH}
+# ---------------------------------------------------------------------------
+# 12. Clone PyTorch and initialize submodules
+# ---------------------------------------------------------------------------
 
 WORKDIR /build
 
@@ -229,47 +360,70 @@ RUN git clone --branch ${PYTORCH_GIT_REF} --single-branch \
     https://github.com/pytorch/pytorch.git
 
 RUN cd pytorch && \
-    git submodule update --init --recursive && \
+    git submodule update --init --recursive --depth 1
+
+# ---------------------------------------------------------------------------
+# 13. RCCL compatibility patch
+# ---------------------------------------------------------------------------
+# TheRock's RCCL reports NCCL version 2.28.3, which triggers PyTorch's
+# NCCL_HAS_SYMMEM_DEVICE_SUPPORT guard (>= 2.28.0).  That code path uses
+# ncclDevCommRequirements.railGinBarrierCount — a field added in NCCL 2.28.7
+# that RCCL 2.28.3 does not have.
+#
+# Raising the threshold to 2.29.0 disables only the device-communicator code
+# path; basic symmetric memory support (>= 2.27.0) remains available.
+#
+# This also eliminates the need to copy nccl_device.h and its entire
+# transitive include chain (nccl_device/, *_tmp.h, core.h, comm.h, etc.)
+# from the RCCL build tree — a process that previously required 8 iterative
+# fixes (Issues 8-16 in THEROCK_ASAN_BUILD_ISSUES.md).
+#
+# The grep guard ensures a clean no-op if the pattern is absent in a future
+# PyTorch version that fixes the version check upstream.
+
+RUN cd pytorch && \
+    FILE="torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp" && \
+    if grep -q 'NCCL_VERSION(2, 28, 0)' "$FILE"; then \
+        sed -i 's/NCCL_VERSION(2, 28, 0)/NCCL_VERSION(2, 29, 0)/' "$FILE" && \
+        echo "Patched $FILE: raised SYMMEM_DEVICE_SUPPORT threshold for RCCL 2.28.x" && \
+        grep -n 'NCCL_HAS_SYMMEM' "$FILE"; \
+    else \
+        echo "NOTICE: RCCL compat patch not needed (NCCL_VERSION(2, 28, 0) not found in $FILE)"; \
+    fi
+
+# ---------------------------------------------------------------------------
+# 14. Hipify and build PyTorch
+# ---------------------------------------------------------------------------
+# Hipify converts CUDA source to HIP.  This is safe at native speed because
+# ASAN is not in the build environment.  Under ASAN, the Python regex engine
+# in hipify is intercepted by ASAN's malloc/free hooks, causing ~100x
+# slowdown and apparent hangs.
+
+RUN cd pytorch && \
     python3 tools/amd_build/build_amd.py
 
-# TheRock installs rccl.h but not nccl.h. PyTorch's FindNCCL.cmake looks
-# for nccl.h by name. Symlink so PyTorch can discover RCCL.
-RUN ln -sf rccl.h ${ROCM_INSTALL_PREFIX}/include/nccl.h && \
-    ls -la ${ROCM_INSTALL_PREFIX}/include/nccl.h
-
-# RCCL 2.28.3 (TheRock main) lacks ncclDevCommRequirements.railGinBarrierCount
-# added in NCCL 2.28.7. PyTorch's nccl_dev_cap.hpp enables SYMMEM_DEVICE_SUPPORT
-# at >= 2.28.0, which pulls in code that uses this missing field. Raise the
-# threshold to 2.29.0 so the incompatible device-communicator code is skipped.
-# Basic NCCL symmetric memory support (>= 2.27.0) is unaffected and uses only
-# APIs that RCCL 2.28.3 implements (ncclMemAlloc, ncclCommWindowRegister, etc.).
-RUN sed -i 's/NCCL_VERSION(2, 28, 0)/NCCL_VERSION(2, 29, 0)/' \
-    pytorch/torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp && \
-    echo "Patched nccl_dev_cap.hpp — NCCL_HAS_SYMMEM_DEVICE_SUPPORT disabled for RCCL 2.28.x" && \
-    grep -n 'NCCL_HAS_SYMMEM' pytorch/torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp
-
-# Use the RCCL installed by TheRock instead of PyTorch's bundled NCCL.
-ENV USE_SYSTEM_NCCL=1
-ENV NCCL_ROOT=/opt/rocm
-ENV NCCL_INCLUDE_DIR=/opt/rocm/include
-ENV NCCL_LIB_DIR=/opt/rocm/lib
-
-RUN cd pytorch && python3 setup.py develop
+RUN cd pytorch && \
+    python3 setup.py develop
 
 # ---------------------------------------------------------------------------
-# Default ASAN_OPTIONS — sensible defaults for interactive debugging.
-# Override at runtime: docker run -e ASAN_OPTIONS="..." ...
+# 15. Verify PyTorch (without ASAN)
 # ---------------------------------------------------------------------------
-ENV ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:symbolize=1"
+# PyTorch links against the normal ROCm libs at /opt/rocm/lib.  No ASAN
+# preload is needed for import.  This would segfault if PyTorch were built
+# against ASAN-instrumented libs (unresolved __asan_* symbols).
 
-# Verify PyTorch installed correctly. ASAN-instrumented ROCm libraries
-# crash without LD_PRELOAD of the ASAN runtime, so we preload it here.
-# The verify step is best-effort: GPU queries will show 0 devices during
-# the Docker build (no GPU access), but import + version print confirms
-# the build artifacts are loadable.
-RUN ASAN_LIB=$(find /opt/rocm/llvm/lib/clang -name "libclang_rt.asan-x86_64.so" | head -1) && \
-    LD_PRELOAD=${ASAN_LIB} python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
-    echo "PyTorch import OK"
+RUN python3 -c "import torch; print(f'PyTorch {torch.__version__} — import OK')" && \
+    python3 -c "import torch; print(f'ROCm/HIP: {torch.version.hip}')"
+
+# ---------------------------------------------------------------------------
+# 16. ASAN entrypoint
+# ---------------------------------------------------------------------------
+
+COPY asan-entrypoint.sh /opt/rocm/bin/asan-entrypoint.sh
+RUN chmod +x /opt/rocm/bin/asan-entrypoint.sh
+
+ENV ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:symbolize=1:verify_asan_link_order=0"
 
 WORKDIR /workspace
+ENTRYPOINT ["/opt/rocm/bin/asan-entrypoint.sh"]
 CMD ["/bin/bash"]

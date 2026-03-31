@@ -615,7 +615,12 @@ different contents despite the same filename.
 | 16 | Symlinks to wrong `core.h` (internal vs device) | Copy from RCCL source tree, not symlink to parent | Stage 4: after header copy |
 | 17 | `railGinBarrierCount` missing in RCCL struct | Patch `nccl_dev_cap.hpp` to raise SYMMEM_DEVICE threshold | Stage 4: after PyTorch clone |
 | 18 | `libdrm/drm.h` not found (`rocm_smi/kfd_ioctl.h`) | Added `libdrm-dev` to apt packages | Stage 1: System packages |
-| 19 | `import torch` segfaults (ASAN not preloaded) | `LD_PRELOAD` ASAN runtime in verify step | Stage 4: verify installations |
+| 19 | `import torch` segfaults (ASAN not preloaded) | Do NOT use `LD_PRELOAD`; use NEEDED + `verify_asan_link_order=0` | `asan-entrypoint.sh` |
+| 20 | `fbgemm_gpu_py.so: undefined symbol: rsmi_shut_down` | `patchelf --add-needed librocm_smi64.so` on the `.so` | `setup_repro_env.sh` post-build |
+| 21 | `libclang-cpp.so.23.0git` not found at runtime | Add `llvm/lib` + `lib/rocm_sysdeps/lib` to `LD_LIBRARY_PATH` | Dockerfile ENV + setup script |
+| 22 | roctracer `Finalize()` assert crash (exit 134) | PR [#4552](https://github.com/ROCm/rocm-systems/pull/4552); workaround: check stdout | `setup_repro_env.sh` |
+| 23 | ASAN SEGV in `amd::Device::init()` with `LD_PRELOAD` | Load ASAN via NEEDED + `verify_asan_link_order=0` (no `LD_PRELOAD`) | `asan-entrypoint.sh` |
+| 24 | `tensordict` missing deps (`pyvers`, `cloudpickle`) | Install explicitly alongside `--no-deps` | `setup_repro_env.sh` |
 
 ---
 
@@ -692,3 +697,411 @@ RUN apt-get update && apt-get install -y \
     libdrm-dev \
     ...
 ```
+
+---
+
+## Issue 19 (revised): ASAN SEGV in `amd::Device::init()` when using `LD_PRELOAD`
+
+**Symptom:**
+```
+AddressSanitizer:DEADLYSIGNAL
+==56792==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000
+(pc 0x000000000000 bp 0x7fffffffcfa0 sp 0x7fffffffce28 T0)
+==56792==Hint: pc points to the zero page.
+```
+
+This crash occurred on any `import torch` when `LD_PRELOAD` was set to
+`libclang_rt.asan-x86_64.so` alongside the ASAN-built ROCm libraries.
+
+**Root cause:** `LD_PRELOAD` of the ASAN runtime globally intercepts `dlopen`
+and `dlsym`. HIP's internal initialization (`amd::Device::init()`) uses `dlopen`
+to dynamically load `libhsa-runtime64.so` and resolves function pointers via
+`dlsym`. With ASAN intercepting these calls, the resolved function pointers
+were null, leading to a null-pointer dereference (SEGV at address 0x0).
+
+**Resolution:** Do NOT use `LD_PRELOAD` for the ASAN runtime. Instead, the
+ASAN-built ROCm libraries (in `/opt/rocm-asan/lib/`) already have
+`libclang_rt.asan-x86_64.so` as a `NEEDED` dependency (linked at build time).
+The dynamic linker loads it automatically when the ASAN runtime directory is
+on `LD_LIBRARY_PATH`. Set `verify_asan_link_order=0` in `ASAN_OPTIONS` to
+suppress the ASAN check that it must be the first loaded library:
+
+```bash
+unset LD_PRELOAD
+ASAN_RT_DIR=$(dirname $(find /opt/rocm/llvm/lib/clang -name "libclang_rt.asan-x86_64.so" | head -1))
+export LD_LIBRARY_PATH="/opt/rocm-asan/lib:${ASAN_RT_DIR}:/opt/rocm/lib:/opt/rocm/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib"
+export ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:symbolize=1:verify_asan_link_order=0"
+```
+
+**Key learning:** `LD_PRELOAD` is incompatible with libraries that internally
+use `dlopen`/`dlsym` for lazy loading. The ASAN runtime's global interception
+of these calls breaks the lazy-loading pattern. When the ASAN runtime is loaded
+as a normal shared library dependency (NEEDED), it intercepts only the memory
+operations of the libraries it's linked to, without breaking `dlopen`/`dlsym`.
+
+---
+
+## Issue 20: `fbgemm_gpu_py.so: undefined symbol: rsmi_shut_down`
+
+**Symptom:**
+```
+OSError: /opt/pytorch-venv/lib/python3.12/site-packages/fbgemm_gpu/fbgemm_gpu_py.so:
+    undefined symbol: rsmi_shut_down
+```
+
+**Root cause:** `fbgemm_gpu_py.so` references `rsmi_shut_down` (from ROCm SMI)
+but does not list `librocm_smi64.so` in its ELF `NEEDED` entries. With
+TheRock's install layout, the symbol isn't pulled in transitively — unlike the
+debian-packaged ROCm where transitive dependencies happen to resolve it.
+
+Verified with:
+```bash
+readelf -d fbgemm_gpu_py.so | grep NEEDED | grep -i smi   # empty
+nm -D /opt/rocm/lib/librocm_smi64.so | grep rsmi_shut_down  # present
+```
+
+**Resolution:** After FBGEMM is built and installed, use `patchelf` to
+explicitly add the missing dependency:
+
+```bash
+patchelf --add-needed librocm_smi64.so \
+    /opt/pytorch-venv/lib/python3.12/site-packages/fbgemm_gpu/fbgemm_gpu_py.so
+```
+
+The script checks idempotently via `readelf -d` before patching.
+
+---
+
+## Issue 21: `libclang-cpp.so.23.0git` and `librocm_sysdeps_z.so.1` not found
+
+**Symptom:**
+```
+ImportError: libclang-cpp.so.23.0git: cannot open shared object file
+ImportError: librocm_sysdeps_z.so.1: cannot open shared object file
+```
+
+These failures appeared at runtime during `import torch` or when running
+ASAN test binaries.
+
+**Root cause:** TheRock installs LLVM libraries to `/opt/rocm/llvm/lib/` and
+system dependency shims to `/opt/rocm/lib/rocm_sysdeps/lib/`. Neither of these
+non-standard paths is on the default `LD_LIBRARY_PATH`.
+
+**Resolution:** Include both paths in `LD_LIBRARY_PATH`:
+
+```dockerfile
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib
+```
+
+Note: The correct path for sysdeps is `/opt/rocm/lib/rocm_sysdeps/lib` (not
+`/opt/rocm/rocm_sysdeps/lib`).
+
+---
+
+## Issue 22: roctracer `Finalize()` assertion crash (exit code 134)
+
+**Symptom:**
+```
+python3: .../roctracer/hsa_support.cpp:629: void roctracer::hsa_support::Finalize():
+    Assertion `!"hsa_amd_profiling_async_copy_enable failed"' failed.
+Aborted
+```
+
+Every Python process that imports `torch` and touches HIP exits with
+`SIGABRT` (exit code 134) during shutdown. The import and execution succeed,
+but the assertion fires during process teardown.
+
+**Root cause:** In `hsa_support.cpp`, `Finalize()` calls
+`hsa_amd_profiling_async_copy_enable_fn()` to restore the profiling state.
+During process exit, the C++ static destruction order across shared libraries
+is undefined. If the HSA runtime is already shut down when roctracer's
+`Finalize()` runs, the function call returns an error status, and the
+`assert()` crashes the process.
+
+**Upstream fix:** Draft PR [#4552](https://github.com/ROCm/rocm-systems/pull/4552)
+replaces the `assert()` with a graceful warning and null-pointer check.
+
+**Workaround (until PR merges):** In scripts that verify Python imports,
+check stdout for success strings rather than relying on exit codes:
+
+```bash
+OUTPUT=$($PYTHON -c "import fbgemm_gpu; print('[OK] fbgemm_gpu imported')" 2>&1)
+if echo "$OUTPUT" | grep -q '\[OK\] fbgemm_gpu imported'; then
+    echo "SUCCESS"
+else
+    echo "FAILED"
+fi
+```
+
+---
+
+## Issue 23: `LD_PRELOAD` ASAN + HIP `dlopen` conflict (detailed)
+
+This is a more detailed analysis supplementing Issue 19.
+
+**Investigation path:**
+
+1. With `LD_PRELOAD=libclang_rt.asan-x86_64.so` and ASAN-built libraries on
+   `LD_LIBRARY_PATH`: SEGV at null function pointer in `amd::Device::init()`
+2. Without `LD_PRELOAD` but with ASAN-built libraries on path: `import torch`
+   fails with `ImportError: libclang_rt.asan-x86_64.so` not found (because the
+   ASAN-built libraries have it as a NEEDED dependency)
+3. Without ASAN-built libraries on path (no `/opt/rocm-asan/lib`): `import torch`
+   succeeds with normal (non-ASAN) libraries
+4. With ASAN-built libraries + ASAN runtime dir on `LD_LIBRARY_PATH` + no
+   `LD_PRELOAD` + `verify_asan_link_order=0`: works correctly, reports 8 devices
+
+**Verification that ASAN is active:**
+
+```bash
+# Check process maps show ASAN-built library from /opt/rocm-asan/lib
+python3 -c "
+import torch; torch.cuda.device_count()
+import subprocess, os
+maps = open(f'/proc/{os.getpid()}/maps').read()
+for line in maps.splitlines():
+    if 'libamdhip64' in line or 'libclang_rt.asan' in line:
+        print(line)
+"
+# Should show: /opt/rocm-asan/lib/libamdhip64.so (not /opt/rocm/lib/)
+# Should show: libclang_rt.asan-x86_64.so loaded
+
+# Confirm ASAN symbols present
+nm -D /opt/rocm-asan/lib/libamdhip64.so | grep __asan | head -5
+# Shows: U __asan_after_dynamic_init, __asan_alloca_poison, etc.
+```
+
+---
+
+## Issue 24: Missing `pyvers` and `cloudpickle` for `tensordict`
+
+**Symptom:**
+```
+ModuleNotFoundError: No module named 'pyvers'
+ModuleNotFoundError: No module named 'cloudpickle'
+```
+
+**Root cause:** `tensordict` is installed with `--no-deps` (to avoid pulling
+in an incompatible PyTorch wheel). This skips installing its transitive
+dependencies `pyvers` and `cloudpickle`.
+
+**Resolution:** Explicitly install both alongside `tensordict`:
+
+```bash
+pip install pyvers cloudpickle tensordict --no-deps
+```
+
+---
+---
+
+# Docker Setup Guide
+
+This section describes the prerequisites, build instructions, and runtime
+configuration for the TheRock ASAN + PyTorch Docker image.
+
+## Prerequisites
+
+### Hardware
+- AMD Instinct GPU (MI300X / MI250X / MI210 or similar) with ROCm support
+- Sufficient disk space: ~100 GB for the Docker image build (TheRock build
+  artifacts are large)
+- Recommended: >=64 GB RAM for TheRock compilation
+
+### Software
+- Docker Engine 20.10+ with BuildKit enabled
+- `docker compose` v2 (or `docker-compose` v1.29+)
+- NVIDIA Container Toolkit is **not** needed; this uses AMD ROCm
+- Host must have the `amdgpu` kernel driver loaded (`modprobe amdgpu`)
+- ROCm kernel-mode driver installed on the host (verify: `ls /dev/kfd /dev/dri/render*`)
+
+### Network
+- Internet access during build (clones TheRock, PyTorch, pip packages)
+- GitHub access for `git clone` operations
+
+## Building the Docker Image
+
+### 1. Configure the environment file
+
+Copy and edit the environment file for your GPU target:
+
+```bash
+cp docker/.env.example docker/.env
+```
+
+Set the following in `.env`:
+
+```bash
+DOCKERFILE=Dockerfile.therock-host-asan-pytorch
+IMAGE_NAME=aorta:therock-host-asan-pytorch
+CONTAINER_NAME=<your-username>-therock-asan
+```
+
+The Dockerfile also accepts build `ARG`s with these defaults:
+
+| ARG | Default | Description |
+|-----|---------|-------------|
+| `THEROCK_GIT_REF` | `main` | TheRock branch/tag to build |
+| `THEROCK_AMDGPU_FAMILIES` | `gfx950` | GPU architecture family (e.g. `gfx942` for MI300X, `gfx950` for MI350X) |
+| `PYTORCH_GIT_REF` | `v2.11.0-rc2` | PyTorch version/branch/tag to build |
+| `PYTORCH_ROCM_ARCH` | `gfx950` | PyTorch ROCm GPU architecture |
+| `ROCM_INSTALL_PREFIX` | `/opt/rocm` | ROCm install prefix inside the container |
+
+To override build ARGs, pass them via `--build-arg`:
+
+```bash
+docker compose ... build --build-arg THEROCK_AMDGPU_FAMILIES=gfx942 ...
+```
+
+### 2. Build with docker compose
+
+```bash
+docker compose -f docker/docker-compose.build.yaml \
+    --env-file docker/.env \
+    build --progress=plain 2>&1 \
+    | tee stdout.asan_docker_build.log
+```
+
+**Build time:** 4–8 hours on a 64-core machine (TheRock compilation dominates).
+Subsequent rebuilds with ccache are significantly faster.
+
+**Using a custom `.env` file:**
+
+```bash
+docker compose -f docker/docker-compose.build.yaml \
+    --env-file docker/.env.my-custom \
+    build --progress=plain
+```
+
+### 3. Build troubleshooting
+
+- **Log truncation** (`[output clipped, log limit 2MiB reached]`): Always use
+  `--progress=plain` and pipe to `tee` (see Issue 7)
+- **CMake preset errors**: TheRock presets change across branches. Run
+  `cmake --list-presets` inside the TheRock directory to see available presets
+- **Network timeouts**: TheRock fetches many dependencies. Retry the build —
+  Docker layer caching will skip completed stages
+
+## Running the Docker Container
+
+### Basic run
+
+```bash
+docker compose -f docker/docker-compose.build.yaml \
+    --env-file docker/.env \
+    run --rm torchenv
+```
+
+Or with plain `docker run` (using the image name from `.env`):
+
+```bash
+docker run --rm -it \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    --shm-size=64g \
+    aorta:therock-host-asan-pytorch
+```
+
+### GPU device access
+
+The container requires access to:
+- `/dev/kfd` — ROCm kernel fusion driver
+- `/dev/dri/render*` — GPU render nodes
+
+The `docker-compose.build.yaml` maps these automatically. For `docker run`,
+use `--device=/dev/kfd --device=/dev/dri`.
+
+### ASAN activation
+
+The container's entrypoint (`asan-entrypoint.sh`) automatically:
+1. Locates the ASAN overlay libraries in `/opt/rocm-asan/lib/`
+2. Prepends them to `LD_LIBRARY_PATH` (shadowing normal ROCm libs)
+3. Adds the ASAN runtime directory to `LD_LIBRARY_PATH`
+4. Sets `ASAN_OPTIONS` with sensible defaults
+5. Does **not** use `LD_PRELOAD` (see Issue 19/23)
+
+To disable ASAN at runtime:
+
+```bash
+docker run ... -e ASAN_DISABLE=1 aorta:therock-host-asan-pytorch
+```
+
+### Verifying ASAN is active
+
+Inside the container:
+
+```bash
+# Quick check
+python3 -c "import torch; print('devices:', torch.cuda.device_count())"
+
+# Verify ASAN library is loaded
+python3 -c "
+import torch, os
+torch.cuda.device_count()
+maps = open(f'/proc/{os.getpid()}/maps').read()
+for line in maps.splitlines():
+    if 'rocm-asan' in line or 'libclang_rt.asan' in line:
+        print(line)
+"
+```
+
+Expected: lines showing `/opt/rocm-asan/lib/libamdhip64.so` and
+`libclang_rt.asan-x86_64.so` loaded.
+
+### Entering a running container
+
+To open a second shell into an already-running container (sharing the same
+`/tmp`, filesystem, and GPU access):
+
+```bash
+docker exec -it <container_id_or_name> bash
+```
+
+Find the container ID with `docker ps`.
+
+### Environment variables reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ASAN_DISABLE` | unset | Set to `1` to skip ASAN overlay activation |
+| `ASAN_OPTIONS` | `detect_leaks=0:halt_on_error=0:symbolize=1:verify_asan_link_order=0` | ASAN runtime options |
+| `ASAN_SYMBOLIZER_PATH` | `/opt/rocm/llvm/bin/llvm-symbolizer` | Path to the LLVM symbolizer for readable ASAN traces |
+| `HSA_TOOLS_LIB` | `""` (empty) | Set empty to prevent roctracer from loading (workaround for Issue 22) |
+| `LD_LIBRARY_PATH` | `/opt/rocm-asan/lib:...:/opt/rocm/lib:...` | Library search path; ASAN overlay dir comes first |
+| `ROCM_HOME` | `/opt/rocm` | ROCm installation prefix |
+
+### Running the NaN reproduction test
+
+After entering the container and running `setup_repro_env.sh` (if using the
+`nan_repro_by_jeremy` workflow):
+
+```bash
+bash run_nan_test.sh <num_trials> <num_steps> "<gpu_list>"
+# Example: 6 trials, 3000 steps, GPUs 0-3
+bash run_nan_test.sh 6 3000 "0,1,2,3"
+```
+
+Results are written to `/tmp/nan_test_<pid>/`.
+
+## Architecture Overview
+
+The Docker image uses a **two-pass ASAN overlay** architecture:
+
+1. **Pass 1 (normal build):** TheRock is built with `linux-release-package`
+   preset — no ASAN. This produces a clean ROCm installation at `/opt/rocm/`.
+   PyTorch is built against these normal libraries.
+
+2. **Pass 2 (ASAN build):** TheRock is rebuilt with `linux-release-host-asan`
+   preset. Only the key shared libraries (`libamdhip64.so`,
+   `libhsa-runtime64.so`, `libhsakmt.so`, `libamd_comgr.so`) are extracted
+   and placed in `/opt/rocm-asan/lib/`.
+
+3. **Runtime overlay:** The entrypoint prepends `/opt/rocm-asan/lib/` to
+   `LD_LIBRARY_PATH`, so the ASAN-instrumented libraries shadow the normal
+   ones. PyTorch (compiled against normal libs) transparently uses the ASAN
+   versions at runtime. The ASAN runtime is loaded as a normal NEEDED
+   dependency — not via `LD_PRELOAD`.
+
+This avoids the problems of building PyTorch under ASAN (hipify hangs,
+compilation crashes, massive slowdowns) while still catching host-side
+memory errors at runtime.

@@ -20,6 +20,7 @@ Usage:
 
 Environment:
     ROCM_HOME           — ROCm install prefix (default: /opt/rocm)
+    ASAN_LIB_DIR        — ASAN overlay lib directory (default: /opt/rocm-asan/lib)
     PYTORCH_ROCM_ARCH   — GPU arch for compilation (default: gfx950)
 """
 
@@ -38,6 +39,7 @@ import pytest
 logger = logging.getLogger(__name__)
 
 ROCM_HOME = Path(os.getenv("ROCM_HOME", "/opt/rocm"))
+ASAN_LIB_DIR = Path(os.getenv("ASAN_LIB_DIR", "/opt/rocm-asan/lib"))
 ROCM_ARCH = os.getenv("PYTORCH_ROCM_ARCH", "gfx950")
 CLANG = ROCM_HOME / "llvm" / "bin" / "clang++"
 THIS_DIR = Path(__file__).resolve().parent
@@ -124,6 +126,9 @@ def run_asan_binary(binary: Path, args: list[str] | None = None, timeout: int = 
     LD_PRELOAD of the shared ASAN runtime is required so that the runtime
     initialises before any ASAN-instrumented shared library (libamdhip64, etc.)
     is loaded by the dynamic linker.
+
+    LD_LIBRARY_PATH must include ROCM_HOME/llvm/lib so that binaries compiled
+    with -shared-libasan can find libclang-cpp.so and other LLVM runtime libs.
     """
     asan_lib = find_asan_runtime()
     cmd = [str(binary)] + (args or [])
@@ -134,6 +139,10 @@ def run_asan_binary(binary: Path, args: list[str] | None = None, timeout: int = 
         env["ASAN_SYMBOLIZER_PATH"] = str(symbolizer)
     if asan_lib:
         env["LD_PRELOAD"] = str(asan_lib)
+    llvm_lib_dir = str(ROCM_HOME / "llvm" / "lib")
+    rocm_lib_dir = str(ROCM_HOME / "lib")
+    existing_ldpath = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = f"{llvm_lib_dir}:{rocm_lib_dir}:{existing_ldpath}".rstrip(":")
     result = subprocess.run(
         cmd, capture_output=True, text=True, env=env, timeout=timeout
     )
@@ -206,44 +215,69 @@ class TestASANBuildArtifacts:
 
 
 class TestASANInstrumentation:
-    """Verify that key ROCm libraries contain ASAN symbols."""
+    """Verify that key ROCm libraries contain ASAN symbols.
+
+    With the two-pass overlay architecture, ASAN-instrumented libs live in
+    ASAN_LIB_DIR (/opt/rocm-asan/lib), not in ROCM_HOME/lib.  The normal
+    libs at ROCM_HOME/lib should NOT have ASAN symbols.
+    """
 
     @pytest.mark.parametrize("lib_name", [
         "libamdhip64.so",
         "libhsa-runtime64.so",
     ])
-    def test_library_has_asan_symbols(self, lib_name):
-        lib_path = ROCM_HOME / "lib" / lib_name
+    def test_overlay_library_has_asan_symbols(self, lib_name):
+        lib_path = ASAN_LIB_DIR / lib_name
         if not lib_path.exists():
-            pytest.skip(f"{lib_name} not found at {lib_path}")
+            # Fall back to ROCM_HOME for single-pass builds
+            lib_path = ROCM_HOME / "lib" / lib_name
+        if not lib_path.exists():
+            pytest.skip(f"{lib_name} not found at {ASAN_LIB_DIR} or {ROCM_HOME / 'lib'}")
         assert nm_has_symbol(lib_path, "__asan_report"), \
-            f"{lib_name} does not contain __asan_report — not ASAN-instrumented"
+            f"{lib_name} at {lib_path} does not contain __asan_report — not ASAN-instrumented"
 
     @pytest.mark.parametrize("lib_name", [
         "libamdhip64.so",
         "libhsa-runtime64.so",
     ])
-    def test_library_has_asan_init(self, lib_name):
+    def test_overlay_library_has_asan_init(self, lib_name):
+        lib_path = ASAN_LIB_DIR / lib_name
+        if not lib_path.exists():
+            lib_path = ROCM_HOME / "lib" / lib_name
+        if not lib_path.exists():
+            pytest.skip(f"{lib_name} not found at {ASAN_LIB_DIR} or {ROCM_HOME / 'lib'}")
+        assert nm_has_symbol(lib_path, "__asan_init"), \
+            f"{lib_name} at {lib_path} does not contain __asan_init"
+
+    @pytest.mark.parametrize("lib_name", [
+        "libamdhip64.so",
+        "libhsa-runtime64.so",
+    ])
+    def test_normal_library_not_asan(self, lib_name):
+        """The normal ROCm libs should NOT be ASAN-instrumented."""
         lib_path = ROCM_HOME / "lib" / lib_name
         if not lib_path.exists():
             pytest.skip(f"{lib_name} not found at {lib_path}")
-        assert nm_has_symbol(lib_path, "__asan_init"), \
-            f"{lib_name} does not contain __asan_init"
+        if not ASAN_LIB_DIR.exists():
+            pytest.skip("No overlay directory — single-pass build, skip this check")
+        assert not nm_has_symbol(lib_path, "__asan_report"), \
+            f"Normal {lib_name} at {lib_path} should NOT be ASAN-instrumented"
 
     def test_non_asan_compiler(self):
-        """TheRock's compiler (amd-llvm) should NOT be ASAN-instrumented."""
+        """TheRock's compiler binary should NOT be directly linked to ASAN.
+
+        Uses readelf to check the binary's NEEDED entries rather than ldd,
+        because ldd includes LD_PRELOAD'd libraries (the ASAN runtime is
+        preloaded by the entrypoint, which would cause a false positive).
+        """
         clang_bin = ROCM_HOME / "llvm" / "bin" / "clang"
         if not clang_bin.exists():
             pytest.skip("clang binary not found")
         result = subprocess.run(
-            ["file", str(clang_bin)], capture_output=True, text=True
+            ["readelf", "-d", str(clang_bin)], capture_output=True, text=True
         )
-        # The compiler itself should not link to ASAN runtime
-        result2 = subprocess.run(
-            ["ldd", str(clang_bin)], capture_output=True, text=True
-        )
-        assert "libclang_rt.asan" not in result2.stdout, \
-            "The compiler itself should not be ASAN-instrumented"
+        assert "libclang_rt.asan" not in result.stdout, \
+            "The compiler itself should not be directly linked to ASAN runtime"
 
 
 # ===========================================================================
