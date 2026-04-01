@@ -4,23 +4,14 @@
 # Run inside the ASAN Docker container:
 #   docker run --device=/dev/kfd --device=/dev/dri \
 #     --ipc=host --group-add=video --group-add=render \
-#     therock-host-asan-pytorch  /workspace/asan_tests/verify_asan_pytorch.sh
+#     therock-host-asan-pytorch  bash tests/asan_tests/verify_asan_pytorch.sh
 #
-# This script runs Python with LD_PRELOAD of the ASAN runtime to avoid
-# the "ASan runtime does not come first" crash.
+# ASAN is activated via LD_LIBRARY_PATH (set by Dockerfile ENV).
+# No LD_PRELOAD needed — the ASAN runtime loads as a NEEDED dependency.
 
-set -euo pipefail
+set -uo pipefail
 
 ROCM=${ROCM_HOME:-/opt/rocm}
-ASAN_LIB=$(find "$ROCM/llvm/lib/clang" -name "libclang_rt.asan-x86_64.so" 2>/dev/null | head -1)
-
-if [ -z "$ASAN_LIB" ]; then
-    echo "ERROR: ASAN runtime not found under $ROCM/llvm/lib/clang"
-    exit 1
-fi
-
-export LD_PRELOAD="$ASAN_LIB"
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=0:symbolize=1}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,27 +25,27 @@ asan_reports=0
 run_python() {
     local name="$1"
     local code="$2"
-    local expect_asan="${3:-no}"   # "yes" if we expect ASAN output
 
     echo -n "  [$name] "
+    set +e
     OUTPUT=$(python3 -c "$code" 2>&1)
     RC=$?
+    set -e
 
-    if echo "$OUTPUT" | grep -q "ERROR: AddressSanitizer"; then
-        ((asan_reports++))
+    if grep -q "ERROR: AddressSanitizer" <<< "$OUTPUT"; then
+        asan_reports=$((asan_reports + 1))
     fi
 
     if [ "$RC" -eq 0 ]; then
         echo -e "${GREEN}OK${NC} (rc=0)"
-        ((pass++))
+        pass=$((pass + 1))
     elif [ "$RC" -eq 139 ]; then
-        echo -e "${RED}SEGFAULT${NC} (rc=139) — LD_PRELOAD may not be working"
-        ((fail++))
+        echo -e "${RED}SEGFAULT${NC} (rc=139)"
+        fail=$((fail + 1))
     else
         echo -e "${RED}FAILED${NC} (rc=$RC)"
-        # Show last few lines of output for debugging
         echo "$OUTPUT" | tail -5 | sed 's/^/    /'
-        ((fail++))
+        fail=$((fail + 1))
     fi
 }
 
@@ -62,8 +53,7 @@ echo ""
 echo "=========================================="
 echo " PyTorch + ASAN Verification"
 echo "=========================================="
-echo "  ASAN runtime: $ASAN_LIB"
-echo "  ASAN_OPTIONS: $ASAN_OPTIONS"
+echo "  ASAN_OPTIONS: ${ASAN_OPTIONS:-not set}"
 echo ""
 
 # ===== Section 1: Basic import =====
@@ -119,8 +109,9 @@ if count > 0:
     print(f'  GPU 0: {torch.cuda.get_device_name(0)}')
 "
 
-# Check if GPU is available
+set +e
 GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
+set -e
 
 if [ "$GPU_COUNT" -gt 0 ]; then
     run_python "tensor to GPU" "

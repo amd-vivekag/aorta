@@ -26,7 +26,6 @@ Environment:
 
 import logging
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -123,26 +122,34 @@ def compile_hip_source(source: str, output: Path, extra_flags: list[str] | None 
 def run_asan_binary(binary: Path, args: list[str] | None = None, timeout: int = 60) -> tuple[int, str]:
     """Run an ASAN-instrumented binary. Returns (returncode, combined_output).
 
-    LD_PRELOAD of the shared ASAN runtime is required so that the runtime
-    initialises before any ASAN-instrumented shared library (libamdhip64, etc.)
-    is loaded by the dynamic linker.
+    The ASAN runtime is loaded as a NEEDED dependency via LD_LIBRARY_PATH —
+    NOT via LD_PRELOAD, which breaks HIP's internal dlopen/dlsym (SEGV in
+    amd::Device::init).  verify_asan_link_order=0 suppresses ASAN's check
+    that it must be loaded first.
 
-    LD_LIBRARY_PATH must include ROCM_HOME/llvm/lib so that binaries compiled
-    with -shared-libasan can find libclang-cpp.so and other LLVM runtime libs.
+    The existing LD_LIBRARY_PATH ordering is preserved (keeps the ASAN overlay
+    dir first); extra LLVM/ROCm runtime dirs are appended only if absent.
     """
     asan_lib = find_asan_runtime()
     cmd = [str(binary)] + (args or [])
     env = os.environ.copy()
-    env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=0:symbolize=1"
+    env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=0:symbolize=1:verify_asan_link_order=0"
     symbolizer = ROCM_HOME / "llvm" / "bin" / "llvm-symbolizer"
     if symbolizer.is_file():
         env["ASAN_SYMBOLIZER_PATH"] = str(symbolizer)
-    if asan_lib:
-        env["LD_PRELOAD"] = str(asan_lib)
+
     llvm_lib_dir = str(ROCM_HOME / "llvm" / "lib")
     rocm_lib_dir = str(ROCM_HOME / "lib")
     existing_ldpath = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = f"{llvm_lib_dir}:{rocm_lib_dir}:{existing_ldpath}".rstrip(":")
+    ld_paths = [p for p in existing_ldpath.split(os.pathsep) if p]
+    for extra in (llvm_lib_dir, rocm_lib_dir, str(asan_lib.parent) if asan_lib else None):
+        if extra and extra not in ld_paths:
+            ld_paths.append(extra)
+    if ld_paths:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(ld_paths)
+
+    env.pop("LD_PRELOAD", None)
+
     result = subprocess.run(
         cmd, capture_output=True, text=True, env=env, timeout=timeout
     )
@@ -267,8 +274,8 @@ class TestASANInstrumentation:
         """TheRock's compiler binary should NOT be directly linked to ASAN.
 
         Uses readelf to check the binary's NEEDED entries rather than ldd,
-        because ldd includes LD_PRELOAD'd libraries (the ASAN runtime is
-        preloaded by the entrypoint, which would cause a false positive).
+        because ldd resolves transitive dependencies and LD_LIBRARY_PATH
+        entries, which would cause false positives in the ASAN overlay setup.
         """
         clang_bin = ROCM_HOME / "llvm" / "bin" / "clang"
         if not clang_bin.exists():

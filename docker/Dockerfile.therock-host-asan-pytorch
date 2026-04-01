@@ -115,7 +115,6 @@ RUN apt-get update && apt-get install -y \
     gfortran \
     git \
     ninja-build \
-    cmake \
     g++ \
     pkg-config \
     xxd \

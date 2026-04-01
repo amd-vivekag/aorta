@@ -4,8 +4,9 @@
 # Run inside the ASAN Docker container:
 #   bash tests/asan_tests/verify_asan_active.sh
 #
-# This script auto-activates the ASAN overlay if the entrypoint hasn't run
-# (e.g. when entering via `docker exec`).
+# The ASAN overlay is baked into the image via ENV directives. This script
+# auto-activates it if ASAN_OVERLAY_ACTIVE is not set (e.g. if the env was
+# manually cleared).
 
 set -uo pipefail
 
@@ -29,13 +30,13 @@ check() {
     local result="$2"
     if [ "$result" = "pass" ]; then
         echo -e "  ${GREEN}PASS${NC}  $name"
-        ((pass++))
+        pass=$((pass + 1))
     elif [ "$result" = "skip" ]; then
         echo -e "  ${YELLOW}SKIP${NC}  $name"
-        ((skip++))
+        skip=$((skip + 1))
     else
         echo -e "  ${RED}FAIL${NC}  $name"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 }
 
@@ -47,7 +48,7 @@ ASAN_RT_DIR=""
 [ -n "$ASAN_RT" ] && ASAN_RT_DIR=$(dirname "$ASAN_RT")
 
 if [ "${ASAN_OVERLAY_ACTIVE:-0}" != "1" ]; then
-    echo -e "${YELLOW}ASAN overlay not active (entrypoint may not have run). Activating...${NC}"
+    echo -e "${YELLOW}ASAN overlay not active (ENV may have been cleared). Activating...${NC}"
     echo ""
     if [ -d "$ASAN_OVERLAY_DIR" ] && [ -n "$ASAN_RT_DIR" ]; then
         export LD_LIBRARY_PATH="${ASAN_OVERLAY_DIR}:${ASAN_RT_DIR}:${ROCM}/lib:${ROCM}/llvm/lib:${ROCM}/lib/rocm_sysdeps/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

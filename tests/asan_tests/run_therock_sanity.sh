@@ -22,7 +22,6 @@ set -euo pipefail
 
 ROCM=${ROCM_HOME:-/opt/rocm}
 THEROCK_SRC=${THEROCK_SRC:-/build/TheRock}
-ASAN_LIB=$(find "$ROCM/llvm/lib/clang" -name "libclang_rt.asan-x86_64.so" 2>/dev/null | head -1)
 
 # --- Validate environment ---
 if [ ! -d "$THEROCK_SRC/tests" ]; then
@@ -64,12 +63,12 @@ export AMDGPU_FAMILIES="${AMDGPU_FAMILIES:-${PYTORCH_ROCM_ARCH:-gfx950}}"
 # which skips tests known to fail under ASAN (rocminfo, hipcc).
 export ARTIFACT_GROUP="therock-asan"
 
-# LD_PRELOAD the ASAN runtime so ASAN-instrumented libraries don't crash
-if [ -n "$ASAN_LIB" ]; then
-    export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$ASAN_LIB"
-fi
-
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=0:symbolize=1}"
+# ASAN is activated via LD_LIBRARY_PATH (baked into the Docker image ENV).
+# Do NOT use LD_PRELOAD — it breaks HIP's internal dlopen/dlsym and causes
+# SEGVs in amd::Device::init(). The ASAN runtime loads as a NEEDED dependency
+# of the ASAN-built libraries; verify_asan_link_order=0 suppresses ASAN's
+# complaint about not being loaded first.
+export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=0:symbolize=1:verify_asan_link_order=0}"
 
 # --- Print config ---
 echo "============================================================"
@@ -78,7 +77,6 @@ echo "============================================================"
 echo "  THEROCK_BIN_DIR:   $THEROCK_BIN_DIR"
 echo "  AMDGPU_FAMILIES:   $AMDGPU_FAMILIES"
 echo "  ARTIFACT_GROUP:    $ARTIFACT_GROUP"
-echo "  ASAN_LIB:          ${ASAN_LIB:-not found}"
 echo "  ASAN_OPTIONS:      $ASAN_OPTIONS"
 echo "  Test source:       $THEROCK_SRC/tests/test_rocm_sanity.py"
 echo "============================================================"
