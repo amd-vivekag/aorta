@@ -13,7 +13,7 @@ in the `metrics` dict.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 
 @dataclass
@@ -65,7 +65,20 @@ class Workload(ABC):
 
     Subclasses MUST implement `setup()` and `run()`. `cleanup()` is
     optional and defaults to a no-op.
+
+    Launch-mode declaration:
+        Workloads default to `launch_mode = "single_process"` — `aorta run`
+        is invoked once and runs without a torchrun wrapper. Workloads that
+        require torch.distributed (FSDP, DDP, etc.) override
+        `launch_mode = "distributed"` and set `min_world_size` to the
+        minimum rank count they need. `aorta run` validates the active
+        `WORLD_SIZE` env var against these declarations before calling
+        `setup()` and raises a clear error on mismatch (single_process
+        invoked under torchrun, or distributed invoked without).
     """
+
+    launch_mode: ClassVar[Literal["single_process", "distributed"]] = "single_process"
+    min_world_size: ClassVar[int] = 1
 
     def __init__(self, config: dict[str, Any]) -> None:
         """Store the per-trial config dict.
