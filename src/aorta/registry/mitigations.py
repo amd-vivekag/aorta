@@ -20,11 +20,13 @@ from aorta.registry.types import Mitigation
 
 _GROUP = "aorta.mitigations"
 
-# Only true runtime-level flags belong here — env vars consumed by hipBLASLt or
-# the ROCm runtime, transparent to the workload. Workload-internal env vars
-# (e.g. AMP_DTYPE, SHAMPOO_PRECONDITIONER_DTYPE) only "work" if the workload's
-# training script literally reads os.environ for them; those belong with the
-# workload's own package, registered via the `aorta.mitigations` entry-point group.
+# Only runtime-level flags belong here — env vars read by a runtime or library
+# (ROCm, hipBLASLt, PyTorch, NCCL, OpenMP, the kernel, etc.), transparent to
+# the workload. Workload-internal env vars (e.g. AMP_DTYPE,
+# SHAMPOO_PRECONDITIONER_DTYPE) only "work" if the workload's training script
+# literally reads os.environ for them; those belong with the workload's own
+# package, registered via the `aorta.mitigations` entry-point group.
+# See src/aorta/registry/README.md for the full criterion.
 BUILTIN_MITIGATIONS: dict[str, dict[str, str]] = {
     "none":     {},
     "tf32_off": {"DISABLE_TF32": "1"},  # consumed by hipBLASLt itself
