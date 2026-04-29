@@ -67,6 +67,12 @@ def test_invalid_key_raises(fake_env_eps):
         load_environments()
 
 
+def test_non_string_key_raises_cleanly(fake_env_eps):
+    fake_env_eps([("bad", {1: "x", "docker": "img"}, "plugin_x")])
+    with pytest.raises(RegistryError, match="plugin_x.*non-string keys"):
+        load_environments()
+
+
 def test_non_string_value_raises(fake_env_eps):
     fake_env_eps([("bad", {"docker": 123}, "plugin_x")])
     with pytest.raises(RegistryError, match="plugin_x.*bad.*non-string"):

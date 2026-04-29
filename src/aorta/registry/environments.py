@@ -60,6 +60,13 @@ def load_environments() -> dict[str, Environment]:
                 f"plugin '{plugin_name}' environment '{ep.name}' must resolve to "
                 f"dict[str, str | None]; got {type(spec).__name__}"
             )
+        non_string_keys = [k for k in spec if not isinstance(k, str)]
+        if non_string_keys:
+            raise RegistryError(
+                f"plugin '{plugin_name}' environment '{ep.name}' has non-string "
+                f"keys {[repr(k) for k in non_string_keys]}; allowed keys: "
+                f"{sorted(_VALID_ENV_KEYS)}"
+            )
         invalid = set(spec) - _VALID_ENV_KEYS
         if invalid:
             raise RegistryError(

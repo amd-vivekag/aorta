@@ -7,6 +7,7 @@ actually installing anything.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -19,7 +20,7 @@ class _FakeDist:
 @dataclass
 class _FakeEntryPoint:
     name: str
-    payload: dict
+    payload: Any  # tests pass non-dict payloads (e.g. str) to exercise validation
     dist: _FakeDist
 
     def load(self):

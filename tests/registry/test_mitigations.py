@@ -24,6 +24,8 @@ def test_get_mitigation_unknown_raises_with_helpful_message():
     msg = str(exc.value)
     assert "available:" in msg
     assert "plugin" in msg
+    # str() must NOT wrap message in quotes (KeyError's default repr behavior)
+    assert not msg.startswith("'") and not msg.endswith("'")
 
 
 def test_load_mitigations_includes_builtins(fake_eps):
