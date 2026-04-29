@@ -1,9 +1,12 @@
-"""Tests for the mitigations registry (iteration 1 — built-ins only)."""
+"""Tests for the mitigations registry."""
 
 import pytest
 
-from aorta.registry.errors import UnknownMitigationError
-from aorta.registry.mitigations import get_mitigation
+from aorta.registry.errors import (
+    RegistryCollisionError,
+    UnknownMitigationError,
+)
+from aorta.registry.mitigations import get_mitigation, load_mitigations
 
 
 def test_get_mitigation_returns_env_vars():
@@ -20,3 +23,32 @@ def test_get_mitigation_unknown_raises_with_helpful_message():
     msg = str(exc.value)
     assert "available:" in msg
     assert "plugin" in msg
+
+
+def test_load_mitigations_includes_builtins(fake_eps):
+    fake_eps([])
+    result = load_mitigations()
+    assert "tf32_off" in result
+    assert result["tf32_off"].source_package == "aorta"
+
+
+def test_load_mitigations_discovers_plugin(fake_eps):
+    fake_eps([("plug", {"foo": {"FOO": "1"}}, "fake_plugin")])
+    result = load_mitigations()
+    assert result["foo"].env == {"FOO": "1"}
+    assert result["foo"].source_package == "fake_plugin"
+
+
+def test_collision_between_plugins_raises(fake_eps):
+    fake_eps([
+        ("a", {"foo": {"X": "1"}}, "plugin_a"),
+        ("b", {"foo": {"X": "2"}}, "plugin_b"),
+    ])
+    with pytest.raises(RegistryCollisionError, match="plugin_a.*plugin_b"):
+        load_mitigations()
+
+
+def test_collision_plugin_vs_builtin_raises(fake_eps):
+    fake_eps([("p", {"tf32_off": {"X": "1"}}, "plugin_x")])
+    with pytest.raises(RegistryCollisionError, match="aorta.*plugin_x"):
+        load_mitigations()

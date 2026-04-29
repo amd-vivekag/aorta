@@ -7,3 +7,7 @@ class RegistryError(Exception):
 
 class UnknownMitigationError(KeyError):
     """Raised when a mitigation name is not in the merged registry."""
+
+
+class RegistryCollisionError(RegistryError):
+    """Raised when two contributors register the same mitigation name."""
