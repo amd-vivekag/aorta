@@ -4,9 +4,10 @@
 contributions, keyed by name. Each entry carries its `source_package` so
 collision errors can name the conflicting parties.
 
-Plugin authors register a function in their `pyproject.toml` under the
-`aorta.mitigations` entry-point group. The function returns a dict of
-`mitigation_name -> {env_var_name: value}`.
+Plugin authors register one entry-point per mitigation in their `pyproject.toml`
+under the `aorta.mitigations` group. The entry-point name IS the mitigation
+name; the loaded object is the env-var bundle (`dict[str, str]`). This mirrors
+the existing `aorta.workloads` extension-point pattern.
 """
 
 from importlib.metadata import entry_points
@@ -42,7 +43,7 @@ def load_mitigations() -> dict[str, Mitigation]:
 
     Raises:
         RegistryCollisionError: two contributors registered the same mitigation name.
-        RegistryError: a plugin's entry-point payload was not a dict.
+        RegistryError: a plugin's entry-point payload was not a `dict[str, str]`.
     """
     registry: dict[str, Mitigation] = {
         name: Mitigation(name=name, env=dict(env), source_package="aorta")
@@ -50,23 +51,25 @@ def load_mitigations() -> dict[str, Mitigation]:
     }
 
     for ep in entry_points(group=_GROUP):
-        payload = ep.load()
-        if not isinstance(payload, dict):
-            raise RegistryError(
-                f"plugin '{ep.dist.name}' entry-point '{ep.name}' returned "
-                f"{type(payload).__name__}, expected dict[str, dict[str, str]]"
-            )
+        env = ep.load()
         plugin_name = ep.dist.name
-        for mit_name, env in payload.items():
-            if mit_name in registry:
-                existing = registry[mit_name].source_package
-                raise RegistryCollisionError(
-                    f"mitigation '{mit_name}' registered by both '{existing}' "
-                    f"and '{plugin_name}' — rename one or remove the duplicate"
-                )
-            registry[mit_name] = Mitigation(
-                name=mit_name, env=dict(env), source_package=plugin_name
+        if not isinstance(env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+        ):
+            raise RegistryError(
+                f"plugin '{plugin_name}' mitigation '{ep.name}' must resolve to "
+                f"dict[str, str]; got {type(env).__name__}"
+                + (f" with non-string entries {dict(env)!r}" if isinstance(env, dict) else "")
             )
+        if ep.name in registry:
+            existing = registry[ep.name].source_package
+            raise RegistryCollisionError(
+                f"mitigation '{ep.name}' registered by both '{existing}' "
+                f"and '{plugin_name}' — rename one or remove the duplicate"
+            )
+        registry[ep.name] = Mitigation(
+            name=ep.name, env=dict(env), source_package=plugin_name
+        )
 
     return registry
 

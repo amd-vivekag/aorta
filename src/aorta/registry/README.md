@@ -58,25 +58,28 @@ For workload-coupled flags, customer-specific recipes, experimental things, or
 anything where you maintain your own Python package: ship the mitigation from
 your package via the `aorta.mitigations` entry-point group.
 
-In your package's `pyproject.toml`:
+In your package's `pyproject.toml` — **one entry-point per mitigation**, the
+EP name IS the mitigation name (mirrors how `aorta.workloads` registers
+workloads):
 
 ```toml
 [project.entry-points."aorta.mitigations"]
-my_mits = "my_package.mitigations:get_all"
+my_flag    = "my_package.mitigations:MY_FLAG"
+other_flag = "my_package.mitigations:OTHER_FLAG"
 ```
 
-In your package's source:
+In your package's source — each entry is a plain `dict[str, str]` of env vars:
 
 ```python
 # my_package/mitigations.py
-def get_all() -> dict[str, dict[str, str]]:
-    return {
-        "my_flag": {"MY_ENV_VAR": "1"},
-    }
+MY_FLAG: dict[str, str]    = {"MY_ENV_VAR": "1"}
+OTHER_FLAG: dict[str, str] = {"OTHER_FLAG": "verbose"}
 ```
 
-After `pip install` (or `pip install -e .`), your mitigation appears in
-`aorta mitigations list` tagged with your package name.
+After `pip install` (or `pip install -e .`), each mitigation appears in
+`aorta mitigations list` tagged with your package name. `pip show -f
+my_package` lists every entry-point individually, so you can see at a glance
+which names your dist contributes.
 
 > Plugin authors: re-run `pip install` after editing `pyproject.toml` —
 > entry-points are read at install time, not at import time.
@@ -116,16 +119,13 @@ name = "my-local-mits"
 version = "0.1"
 
 [project.entry-points."aorta.mitigations"]
-local = "my_mits:get_all"
+no_sdma = "my_mits:NO_SDMA"
 ```
 
 `my_mits.py`:
 
 ```python
-def get_all():
-    return {
-        "no_sdma": {"HSA_ENABLE_SDMA": "0"},
-    }
+NO_SDMA = {"HSA_ENABLE_SDMA": "0"}
 ```
 
 Then once:

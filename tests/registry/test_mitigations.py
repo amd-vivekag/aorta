@@ -4,6 +4,7 @@ import pytest
 
 from aorta.registry.errors import (
     RegistryCollisionError,
+    RegistryError,
     UnknownMitigationError,
 )
 from aorta.registry.mitigations import get_mitigation, load_mitigations
@@ -33,7 +34,7 @@ def test_load_mitigations_includes_builtins(fake_eps):
 
 
 def test_load_mitigations_discovers_plugin(fake_eps):
-    fake_eps([("plug", {"foo": {"FOO": "1"}}, "fake_plugin")])
+    fake_eps([("foo", {"FOO": "1"}, "fake_plugin")])
     result = load_mitigations()
     assert result["foo"].env == {"FOO": "1"}
     assert result["foo"].source_package == "fake_plugin"
@@ -41,14 +42,26 @@ def test_load_mitigations_discovers_plugin(fake_eps):
 
 def test_collision_between_plugins_raises(fake_eps):
     fake_eps([
-        ("a", {"foo": {"X": "1"}}, "plugin_a"),
-        ("b", {"foo": {"X": "2"}}, "plugin_b"),
+        ("foo", {"X": "1"}, "plugin_a"),
+        ("foo", {"X": "2"}, "plugin_b"),
     ])
     with pytest.raises(RegistryCollisionError, match="plugin_a.*plugin_b"):
         load_mitigations()
 
 
 def test_collision_plugin_vs_builtin_raises(fake_eps):
-    fake_eps([("p", {"tf32_off": {"X": "1"}}, "plugin_x")])
+    fake_eps([("tf32_off", {"X": "1"}, "plugin_x")])
     with pytest.raises(RegistryCollisionError, match="aorta.*plugin_x"):
+        load_mitigations()
+
+
+def test_non_string_env_value_raises(fake_eps):
+    fake_eps([("bad", {"K": 123}, "plugin_x")])
+    with pytest.raises(RegistryError, match="plugin_x.*bad.*dict\\[str, str\\]"):
+        load_mitigations()
+
+
+def test_non_dict_payload_raises(fake_eps):
+    fake_eps([("bad", "not-a-dict", "plugin_x")])
+    with pytest.raises(RegistryError, match="plugin_x.*bad.*str"):
         load_mitigations()

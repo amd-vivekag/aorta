@@ -39,7 +39,7 @@ def test_get_environment_unknown_raises(fake_env_eps):
 
 def test_load_environments_discovers_plugin(fake_env_eps):
     fake_env_eps([
-        ("envs", {"nan-repro": {"docker": "rocm/private@sha256:abc"}}, "fake_internal"),
+        ("nan-repro", {"docker": "rocm/private@sha256:abc"}, "fake_internal"),
     ])
     result = load_environments()
     assert result["nan-repro"].docker == "rocm/private@sha256:abc"
@@ -48,14 +48,32 @@ def test_load_environments_discovers_plugin(fake_env_eps):
 
 def test_collision_between_plugins_raises(fake_env_eps):
     fake_env_eps([
-        ("a", {"shared": {"docker": "img:1"}}, "plugin_a"),
-        ("b", {"shared": {"docker": "img:2"}}, "plugin_b"),
+        ("shared", {"docker": "img:1"}, "plugin_a"),
+        ("shared", {"docker": "img:2"}, "plugin_b"),
     ])
     with pytest.raises(RegistryCollisionError, match="plugin_a.*plugin_b"):
         load_environments()
 
 
+def test_collision_plugin_vs_builtin_raises(fake_env_eps):
+    fake_env_eps([("local", {}, "plugin_x")])
+    with pytest.raises(RegistryCollisionError, match="aorta.*plugin_x"):
+        load_environments()
+
+
 def test_invalid_key_raises(fake_env_eps):
-    fake_env_eps([("p", {"bad": {"rocm": "6.0"}}, "plugin_x")])
+    fake_env_eps([("bad", {"rocm": "6.0"}, "plugin_x")])
     with pytest.raises(RegistryError, match="plugin_x.*rocm"):
+        load_environments()
+
+
+def test_non_string_value_raises(fake_env_eps):
+    fake_env_eps([("bad", {"docker": 123}, "plugin_x")])
+    with pytest.raises(RegistryError, match="plugin_x.*bad.*non-string"):
+        load_environments()
+
+
+def test_non_dict_payload_raises(fake_env_eps):
+    fake_env_eps([("bad", "not-a-dict", "plugin_x")])
+    with pytest.raises(RegistryError, match="plugin_x.*bad.*str"):
         load_environments()

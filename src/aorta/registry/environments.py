@@ -4,9 +4,10 @@ Mirrors the mitigations registry. Plugin payloads are validated against
 `_VALID_ENV_KEYS` — only `docker` and `venv` are accepted. ROCm version is
 intentionally not a valid key (see `Environment` docstring).
 
-Plugin authors register a function in their `pyproject.toml` under the
-`aorta.environments` entry-point group. The function returns a dict of
-`environment_name -> {docker?: str, venv?: str}`.
+Plugin authors register one entry-point per environment in their `pyproject.toml`
+under the `aorta.environments` group. The entry-point name IS the environment
+name; the loaded object is the recipe (`dict[str, str | None]` with keys
+`docker` and/or `venv`). Mirrors the `aorta.workloads` extension-point pattern.
 """
 
 from importlib.metadata import entry_points
@@ -38,8 +39,8 @@ def load_environments() -> dict[str, Environment]:
 
     Raises:
         RegistryCollisionError: two contributors registered the same environment name.
-        RegistryError: a plugin's payload was not a dict, or contained keys other
-            than `docker` / `venv`.
+        RegistryError: a plugin's payload was not a dict, contained keys other
+            than `docker` / `venv`, or had non-`str | None` values.
     """
     registry: dict[str, Environment] = {
         name: Environment(
@@ -52,32 +53,38 @@ def load_environments() -> dict[str, Environment]:
     }
 
     for ep in entry_points(group=_GROUP):
-        payload = ep.load()
-        if not isinstance(payload, dict):
-            raise RegistryError(
-                f"plugin '{ep.dist.name}' entry-point '{ep.name}' returned "
-                f"{type(payload).__name__}, expected dict[str, dict[str, str | None]]"
-            )
+        spec = ep.load()
         plugin_name = ep.dist.name
-        for env_name, spec in payload.items():
-            invalid = set(spec) - _VALID_ENV_KEYS
-            if invalid:
-                raise RegistryError(
-                    f"plugin '{plugin_name}' environment '{env_name}' has invalid "
-                    f"keys {sorted(invalid)}; allowed keys: {sorted(_VALID_ENV_KEYS)}"
-                )
-            if env_name in registry:
-                existing = registry[env_name].source_package
-                raise RegistryCollisionError(
-                    f"environment '{env_name}' registered by both '{existing}' "
-                    f"and '{plugin_name}' — rename one or remove the duplicate"
-                )
-            registry[env_name] = Environment(
-                name=env_name,
-                docker=spec.get("docker"),
-                venv=spec.get("venv"),
-                source_package=plugin_name,
+        if not isinstance(spec, dict):
+            raise RegistryError(
+                f"plugin '{plugin_name}' environment '{ep.name}' must resolve to "
+                f"dict[str, str | None]; got {type(spec).__name__}"
             )
+        invalid = set(spec) - _VALID_ENV_KEYS
+        if invalid:
+            raise RegistryError(
+                f"plugin '{plugin_name}' environment '{ep.name}' has invalid "
+                f"keys {sorted(invalid)}; allowed keys: {sorted(_VALID_ENV_KEYS)}"
+            )
+        bad_values = {k: v for k, v in spec.items() if v is not None and not isinstance(v, str)}
+        if bad_values:
+            raise RegistryError(
+                f"plugin '{plugin_name}' environment '{ep.name}' has non-string values "
+                f"{ {k: type(v).__name__ for k, v in bad_values.items()} }; "
+                f"each value must be `str | None`"
+            )
+        if ep.name in registry:
+            existing = registry[ep.name].source_package
+            raise RegistryCollisionError(
+                f"environment '{ep.name}' registered by both '{existing}' "
+                f"and '{plugin_name}' — rename one or remove the duplicate"
+            )
+        registry[ep.name] = Environment(
+            name=ep.name,
+            docker=spec.get("docker"),
+            venv=spec.get("venv"),
+            source_package=plugin_name,
+        )
 
     return registry
 
