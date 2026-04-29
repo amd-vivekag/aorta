@@ -66,6 +66,8 @@ src/aorta/
 ├── hw_queue_eval/     # Hardware queue evaluation framework
 ├── models/            # Synthetic ranking transformer
 ├── profiling/         # Stream profiler for overlap measurement
+├── registry/          # Mitigations + environments registry (extension points)
+├── cli/               # `aorta` CLI command groups
 └── utils/             # Config loading, timing, device detection
 
 config/                # YAML configurations for different scenarios
