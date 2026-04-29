@@ -1,7 +1,4 @@
-"""Data types for the mitigations + environments registry.
-
-Iteration 1 only defines `Mitigation` — `Environment` arrives in iteration 3.
-"""
+"""Data types for the mitigations + environments registry."""
 
 from dataclasses import dataclass
 
@@ -18,3 +15,19 @@ class Mitigation:
     name: str
     env: dict[str, str]
     source_package: str  # "aorta" for built-ins, dist name for entry-point contributors
+
+
+@dataclass(frozen=True)
+class Environment:
+    """A baseline process / container recipe for a workload run.
+
+    `docker` and `venv` are independent ways of describing the baseline; either,
+    both, or neither may be set (built-in `local` has neither — current process).
+    No `rocm` field: ROCm version is implicit in the docker image digest or in
+    the host the venv runs on; capture it from `aorta env probe` at runtime.
+    """
+
+    name: str
+    docker: str | None = None
+    venv: str | None = None
+    source_package: str = "aorta"
