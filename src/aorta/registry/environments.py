@@ -11,12 +11,14 @@ name; the loaded object is the recipe (`dict[str, str | None]` with keys
 """
 
 from importlib.metadata import entry_points
+from pathlib import Path
 
 from aorta.registry.errors import (
     RegistryCollisionError,
     RegistryError,
     UnknownEnvironmentError,
 )
+from aorta.registry.sidecar import load_sidecar_environments
 from aorta.registry.types import Environment
 
 _GROUP = "aorta.environments"
@@ -32,15 +34,22 @@ BUILTIN_ENVIRONMENTS: dict[str, dict[str, str | None]] = {
 }
 
 
-def load_environments() -> dict[str, Environment]:
-    """Discover and merge all environments: built-ins first, then entry-point plugins.
+def load_environments(
+    extra_files: list[Path] | None = None,
+) -> dict[str, Environment]:
+    """Discover and merge all environments: built-ins, then entry-point plugins, then sidecars.
+
+    Sidecar files (`extra_files`) are merged in the order given. The same
+    collision rule applies across all three sources — a duplicate name raises
+    `RegistryCollisionError` naming both sides.
 
     No caching — re-reads entry-points each call.
 
     Raises:
         RegistryCollisionError: two contributors registered the same environment name.
         RegistryError: a plugin's payload was not a dict, contained keys other
-            than `docker` / `venv`, or had non-`str | None` values.
+            than `docker` / `venv`, or had non-`str | None` values; or a sidecar
+            file failed schema validation.
     """
     registry: dict[str, Environment] = {
         name: Environment(
@@ -93,16 +102,28 @@ def load_environments() -> dict[str, Environment]:
             source_package=plugin_name,
         )
 
+    for path in extra_files or ():
+        for name, env in load_sidecar_environments(path).items():
+            if name in registry:
+                existing = registry[name].source_package
+                raise RegistryCollisionError(
+                    f"environment '{name}' registered by both '{existing}' "
+                    f"and '{env.source_package}' — rename one or remove the duplicate"
+                )
+            registry[name] = env
+
     return registry
 
 
-def get_environment(name: str) -> Environment:
+def get_environment(
+    name: str, extra_files: list[Path] | None = None
+) -> Environment:
     """Return the Environment dataclass for a given name.
 
     Unlike `get_mitigation` (which returns a dict), environments are richer than
     a flat env-var bundle, so the dataclass IS the public surface.
     """
-    registry = load_environments()
+    registry = load_environments(extra_files=extra_files)
     if name not in registry:
         raise UnknownEnvironmentError(
             f"unknown environment '{name}'; available: {sorted(registry)}; "

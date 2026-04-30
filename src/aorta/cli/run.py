@@ -1,5 +1,7 @@
 """`aorta run` - universal workload runner."""
 
+from pathlib import Path
+
 import click
 
 
@@ -27,6 +29,16 @@ import click
     help="Comma-separated mitigation names from aorta_internal.mitigations.",
 )
 @click.option(
+    "--mitigations-file",
+    "mitigation_files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help=(
+        "JSON file with ad-hoc mitigations and/or environments (repeatable). "
+        "Merged into both registries alongside built-ins and plugins."
+    ),
+)
+@click.option(
     "--steps",
     type=int,
     default=None,
@@ -44,6 +56,7 @@ def run(
     trials: int,
     dockers: str,
     mitigations: str,
+    mitigation_files: tuple[Path, ...],
     steps: int | None,
     results_dir: str,
 ) -> None:

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "mitigations": {
+    "my_flag":   { "MY_ENV_VAR": "1" },
+    "amp_bf16":  { "AMP_DTYPE": "bfloat16" }
+  },
+  "environments": {
+    "my_local_image": { "docker": "myorg/private:test@sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    "host_venv_3_12": { "venv":   "/home/me/.venvs/aorta-3.12" }
+  }
+}

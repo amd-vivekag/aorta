@@ -1,5 +1,7 @@
 """`aorta mitigations` — inspect the merged mitigations registry."""
 
+from pathlib import Path
+
 import click
 
 from aorta.registry import load_mitigations
@@ -11,9 +13,16 @@ def mitigations() -> None:
 
 
 @mitigations.command(name="list")
-def list_() -> None:
+@click.option(
+    "--file",
+    "files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help="JSON file with extra mitigation entries to merge into the listing (repeatable).",
+)
+def list_(files: tuple[Path, ...]) -> None:
     """List every registered mitigation, its source package, and its env vars."""
-    registry = load_mitigations()
+    registry = load_mitigations(extra_files=list(files) or None)
     name_w = max(len("NAME"), *(len(n) for n in registry))
     src_w = max(len("SOURCE"), *(len(m.source_package) for m in registry.values()))
 

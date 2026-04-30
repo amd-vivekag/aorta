@@ -6,7 +6,9 @@ of fake entry-points. Use them to simulate plugins being installed without
 actually installing anything.
 """
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -49,3 +51,14 @@ def fake_eps(monkeypatch):
 def fake_env_eps(monkeypatch):
     """Install fake environment entry-points: fake_env_eps([(name, payload, dist), ...])."""
     return _fake_eps_for(monkeypatch, "aorta.registry.environments.entry_points")
+
+
+@pytest.fixture
+def tmp_sidecar(tmp_path):
+    """Write a tmp JSON sidecar: tmp_sidecar({"version": 1, ...}, name="x.json") -> Path."""
+    def _write(payload: dict, name: str = "sidecar.json") -> Path:
+        p = tmp_path / name
+        p.write_text(json.dumps(payload), encoding="utf-8")
+        return p
+
+    return _write
