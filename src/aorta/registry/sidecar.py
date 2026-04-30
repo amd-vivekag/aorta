@@ -26,11 +26,37 @@ _VALID_ENV_KEYS = frozenset({"docker", "venv"})
 def _source_tag(path: Path) -> str:
     """Source-package tag for sidecar entries: `sidecar:<basename>`.
 
-    Uses the basename (not the full path) so list output stays terse and two
-    sidecars passed by relative-vs-absolute paths still surface as different
-    sources via their filename.
+    Basename only -- keeps list output terse. The same sidecar passed via
+    relative vs. absolute paths therefore produces the same tag, and two
+    different files with the same basename would collapse to one tag (and
+    look indistinguishable in `list` output / collision errors). To prevent
+    that ambiguity, `load_mitigations` / `load_environments` call
+    `check_sidecar_basenames` upfront and reject the load if two sidecar
+    paths share a basename. Resolver collision messages additionally
+    include the full path so the operator knows which file to edit.
     """
     return f"sidecar:{path.name}"
+
+
+def check_sidecar_basenames(extra_files: list[Path] | None) -> None:
+    """Reject sidecar lists where two paths share a basename.
+
+    The source tag (`_source_tag`) is the basename only, so two sidecars
+    with the same filename would render identically in `list` output and
+    in collision errors -- the operator could not tell which file to fix.
+    Catch it upfront with a clear message instead of producing ambiguous
+    downstream output. Same-file-passed-twice falls out of the same check
+    with the same message, which is also what the operator needs to see.
+    """
+    seen: dict[str, Path] = {}
+    for p in extra_files or ():
+        if p.name in seen:
+            raise RegistryError(
+                f"two sidecars share basename '{p.name}': '{seen[p.name]}' "
+                f"and '{p}'; rename one so list output and collision errors "
+                f"can distinguish them"
+            )
+        seen[p.name] = p
 
 
 def _load_json(path: Path) -> dict:

@@ -18,7 +18,7 @@ from aorta.registry.errors import (
     RegistryError,
     UnknownEnvironmentError,
 )
-from aorta.registry.sidecar import load_sidecar_environments
+from aorta.registry.sidecar import check_sidecar_basenames, load_sidecar_environments
 from aorta.registry.types import Environment
 
 _GROUP = "aorta.environments"
@@ -102,15 +102,25 @@ def load_environments(
             source_package=plugin_name,
         )
 
+    check_sidecar_basenames(extra_files)
+    sidecar_paths: dict[str, Path] = {}
     for path in extra_files or ():
         for name, env in load_sidecar_environments(path).items():
             if name in registry:
                 existing = registry[name].source_package
+                existing_path_hint = (
+                    f" (path: {sidecar_paths[name]})"
+                    if name in sidecar_paths
+                    else ""
+                )
                 raise RegistryCollisionError(
-                    f"environment '{name}' registered by both '{existing}' "
-                    f"and '{env.source_package}' — rename one or remove the duplicate"
+                    f"environment '{name}' registered by both "
+                    f"'{existing}'{existing_path_hint} and "
+                    f"'{env.source_package}' (path: {path}) "
+                    f"— rename one or remove the duplicate"
                 )
             registry[name] = env
+            sidecar_paths[name] = path
 
     return registry
 

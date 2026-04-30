@@ -18,7 +18,7 @@ from aorta.registry.errors import (
     RegistryError,
     UnknownMitigationError,
 )
-from aorta.registry.sidecar import load_sidecar_mitigations
+from aorta.registry.sidecar import check_sidecar_basenames, load_sidecar_mitigations
 from aorta.registry.types import Mitigation
 
 _GROUP = "aorta.mitigations"
@@ -80,15 +80,25 @@ def load_mitigations(
             name=ep.name, env=dict(env), source_package=plugin_name
         )
 
+    check_sidecar_basenames(extra_files)
+    sidecar_paths: dict[str, Path] = {}
     for path in extra_files or ():
         for name, mit in load_sidecar_mitigations(path).items():
             if name in registry:
                 existing = registry[name].source_package
+                existing_path_hint = (
+                    f" (path: {sidecar_paths[name]})"
+                    if name in sidecar_paths
+                    else ""
+                )
                 raise RegistryCollisionError(
-                    f"mitigation '{name}' registered by both '{existing}' "
-                    f"and '{mit.source_package}' — rename one or remove the duplicate"
+                    f"mitigation '{name}' registered by both "
+                    f"'{existing}'{existing_path_hint} and "
+                    f"'{mit.source_package}' (path: {path}) "
+                    f"— rename one or remove the duplicate"
                 )
             registry[name] = mit
+            sidecar_paths[name] = path
 
     return registry
 

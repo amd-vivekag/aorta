@@ -88,13 +88,23 @@ which names your dist contributes.
 
 For "I want to try these named bundles on my box, share the file with a
 colleague over Slack, run a triage sweep against them, and throw it away when
-I'm done" — write a JSON file and pass it on the command line:
+I'm done" — write a JSON file and pass it on the command line.
+
+**Wired today** (B3.1):
+
+```bash
+aorta mitigations  list --file ./my-experiments.json
+aorta environments list --file ./my-experiments.json
+```
+
+**Lands with B1 / B2** — the flags below are accepted and the JSON is
+parsed + validated, but `aorta run` and `aorta triage run` themselves
+are not yet implemented and the merged registries are not yet
+consumed:
 
 ```bash
 aorta run    --workload fsdp --mitigations-file ./my-experiments.json --mitigations my_flag
 aorta triage --workload fsdp --mitigations-file ./my-experiments.json ...
-aorta mitigations  list --file ./my-experiments.json
-aorta environments list --file ./my-experiments.json
 ```
 
 `--mitigations-file` is repeatable. Each file may declare mitigations,
