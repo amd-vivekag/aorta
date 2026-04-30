@@ -36,7 +36,7 @@ def triage() -> None:
     multiple=True,
     help=(
         "JSON file with ad-hoc mitigations and/or environments (repeatable). "
-        "Parsed and validated now; consumption by `aorta triage run` lands with task B2."
+        "Click verifies the file exists; JSON parsing + consumption land with task B2."
     ),
 )
 @click.option(

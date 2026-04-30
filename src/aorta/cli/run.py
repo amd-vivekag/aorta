@@ -35,7 +35,7 @@ import click
     multiple=True,
     help=(
         "JSON file with ad-hoc mitigations and/or environments (repeatable). "
-        "Parsed and validated now; consumption by `aorta run` lands with task B1."
+        "Click verifies the file exists; JSON parsing + consumption land with task B1."
     ),
 )
 @click.option(

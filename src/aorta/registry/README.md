@@ -93,14 +93,15 @@ I'm done" — write a JSON file and pass it on the command line.
 **Wired today** (B3.1):
 
 ```bash
-aorta mitigations  list --file ./my-experiments.json
+aorta mitigations list --file ./my-experiments.json
 aorta environments list --file ./my-experiments.json
 ```
 
-**Lands with B1 / B2** — the flags below are accepted and the JSON is
-parsed + validated, but `aorta run` and `aorta triage run` themselves
-are not yet implemented and the merged registries are not yet
-consumed:
+**Lands with B1 / B2** — the flags below are accepted by the CLI (Click
+checks the file exists), but `aorta run` and `aorta triage run` themselves
+are not yet implemented: the JSON is not parsed and the merged registries
+are not yet consumed. Today the commands raise "not yet implemented" before
+reaching the loader:
 
 ```bash
 aorta run    --workload fsdp --mitigations-file ./my-experiments.json --mitigations my_flag
