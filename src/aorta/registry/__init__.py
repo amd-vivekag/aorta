@@ -13,6 +13,10 @@ from aorta.registry.errors import (
     UnknownMitigationError,
 )
 from aorta.registry.mitigations import get_mitigation, load_mitigations
+from aorta.registry.sidecar import (
+    load_sidecar_environments,
+    load_sidecar_mitigations,
+)
 from aorta.registry.types import Environment, Mitigation
 
 __all__ = [
@@ -20,6 +24,8 @@ __all__ = [
     "get_mitigation",
     "load_environments",
     "get_environment",
+    "load_sidecar_mitigations",
+    "load_sidecar_environments",
     "Mitigation",
     "Environment",
     "RegistryError",

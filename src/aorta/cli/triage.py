@@ -1,5 +1,7 @@
 """`aorta triage` - mitigation matrix runner. (Optimize mode deferred to P1 per D11.)"""
 
+from pathlib import Path
+
 import click
 
 
@@ -28,6 +30,16 @@ def triage() -> None:
     help="Comma-separated docker image names.",
 )
 @click.option(
+    "--mitigations-file",
+    "mitigation_files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help=(
+        "JSON file with ad-hoc mitigations and/or environments (repeatable). "
+        "Click verifies the file exists; JSON parsing + consumption land with task B2."
+    ),
+)
+@click.option(
     "--trials",
     type=int,
     default=8,
@@ -52,6 +64,7 @@ def triage_run(
     workload: str,
     mitigations: str,
     dockers: str,
+    mitigation_files: tuple[Path, ...],
     trials: int,
     steps: int | None,
     output_dir: str,

@@ -11,12 +11,14 @@ the existing `aorta.workloads` extension-point pattern.
 """
 
 from importlib.metadata import entry_points
+from pathlib import Path
 
 from aorta.registry.errors import (
     RegistryCollisionError,
     RegistryError,
     UnknownMitigationError,
 )
+from aorta.registry.sidecar import check_sidecar_basenames, load_sidecar_mitigations
 from aorta.registry.types import Mitigation
 
 _GROUP = "aorta.mitigations"
@@ -35,15 +37,22 @@ BUILTIN_MITIGATIONS: dict[str, dict[str, str]] = {
 }
 
 
-def load_mitigations() -> dict[str, Mitigation]:
-    """Discover and merge all mitigations: built-ins first, then entry-point plugins.
+def load_mitigations(
+    extra_files: list[Path] | None = None,
+) -> dict[str, Mitigation]:
+    """Discover and merge all mitigations: built-ins, then entry-point plugins, then sidecars.
 
-    No caching — re-reads entry-points each call. Cheap for MVP; revisit if profiling
-    shows it matters.
+    Sidecar files (`extra_files`) are merged in the order given. The same
+    collision rule applies across all three sources — there is no winner; a
+    duplicate name raises `RegistryCollisionError` naming both sides.
+
+    No caching — re-reads entry-points each call. Cheap for MVP; revisit if
+    profiling shows it matters.
 
     Raises:
         RegistryCollisionError: two contributors registered the same mitigation name.
-        RegistryError: a plugin's entry-point payload was not a `dict[str, str]`.
+        RegistryError: a plugin's entry-point payload was not a `dict[str, str]`,
+            or a sidecar file failed schema validation.
     """
     registry: dict[str, Mitigation] = {
         name: Mitigation(name=name, env=dict(env), source_package="aorta")
@@ -71,15 +80,37 @@ def load_mitigations() -> dict[str, Mitigation]:
             name=ep.name, env=dict(env), source_package=plugin_name
         )
 
+    check_sidecar_basenames(extra_files)
+    sidecar_paths: dict[str, Path] = {}
+    for path in extra_files or ():
+        for name, mit in load_sidecar_mitigations(path).items():
+            if name in registry:
+                existing = registry[name].source_package
+                existing_path_hint = (
+                    f" (path: {sidecar_paths[name]})"
+                    if name in sidecar_paths
+                    else ""
+                )
+                raise RegistryCollisionError(
+                    f"mitigation '{name}' registered by both "
+                    f"'{existing}'{existing_path_hint} and "
+                    f"'{mit.source_package}' (path: {path}) "
+                    f"— rename one or remove the duplicate"
+                )
+            registry[name] = mit
+            sidecar_paths[name] = path
+
     return registry
 
 
-def get_mitigation(name: str) -> dict[str, str]:
+def get_mitigation(
+    name: str, extra_files: list[Path] | None = None
+) -> dict[str, str]:
     """Return the env-var bundle for a mitigation name. Empty dict for 'none'.
 
     Returns a defensive copy — mutating the result does not affect the registry.
     """
-    registry = load_mitigations()
+    registry = load_mitigations(extra_files=extra_files)
     if name not in registry:
         raise UnknownMitigationError(
             f"unknown mitigation '{name}'; available: {sorted(registry)}; "

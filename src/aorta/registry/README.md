@@ -84,6 +84,60 @@ which names your dist contributes.
 > Plugin authors: re-run `pip install` after editing `pyproject.toml` —
 > entry-points are read at install time, not at import time.
 
+### Path 3 — JSON sidecar (ad-hoc, throwaway, shareable)
+
+For "I want to try these named bundles on my box, share the file with a
+colleague over Slack, run a triage sweep against them, and throw it away when
+I'm done" — write a JSON file and pass it on the command line.
+
+**Wired today** (B3.1):
+
+```bash
+aorta mitigations list --file ./my-experiments.json
+aorta environments list --file ./my-experiments.json
+```
+
+**Lands with B1 / B2** — the flags below are accepted by the CLI (Click
+checks the file exists), but `aorta run` and `aorta triage run` themselves
+are not yet implemented: the JSON is not parsed and the merged registries
+are not yet consumed. Today the commands raise "not yet implemented" before
+reaching the loader:
+
+```bash
+aorta run    --workload fsdp --mitigations-file ./my-experiments.json --mitigations my_flag
+aorta triage run --workload fsdp --mitigations-file ./my-experiments.json ...
+```
+
+`--mitigations-file` is repeatable. Each file may declare mitigations,
+environments, or both — both registries are populated from the same file.
+Files are merged left-to-right and combine with built-ins + plugins under
+the same collision rule.
+
+`my-experiments.json`:
+
+```json
+{
+  "version": 1,
+  "mitigations": {
+    "my_flag":  { "MY_ENV_VAR": "1" },
+    "amp_bf16": { "AMP_DTYPE": "bfloat16" }
+  },
+  "environments": {
+    "my_local_image": { "docker": "myorg/private:test@sha256:..." },
+    "host_venv_3_12": { "venv":   "/home/me/.venvs/aorta-3.12" }
+  }
+}
+```
+
+Both top-level keys are optional (a file can ship only mitigations, or only
+environments, or both). `version: 1` is required — it's a forward-compat
+lever; an aorta build that doesn't understand a future `version: 2` rejects
+the file cleanly instead of misinterpreting it.
+
+Sidecar entries list with `source_package = "sidecar:<filename>"` so it's
+obvious which file shipped which entry. Starting template:
+[`examples/mitigations-sidecar.json`](../../../examples/mitigations-sidecar.json).
+
 ## Trying things locally without upstreaming
 
 Sometimes you want to test a mitigation on your own machine without sending a
