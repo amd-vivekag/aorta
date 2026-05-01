@@ -105,7 +105,7 @@ reaching the loader:
 
 ```bash
 aorta run    --workload fsdp --mitigations-file ./my-experiments.json --mitigations my_flag
-aorta triage --workload fsdp --mitigations-file ./my-experiments.json ...
+aorta triage run --workload fsdp --mitigations-file ./my-experiments.json ...
 ```
 
 `--mitigations-file` is repeatable. Each file may declare mitigations,
