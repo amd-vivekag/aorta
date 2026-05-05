@@ -40,7 +40,7 @@ aorta env probe -o runs/exp1/env.json
 
 # Pretty-print + spot-check key fields
 jq . runs/exp1/env.json
-jq '.hipblaslt.commit' runs/exp1/env.json
+jq '.hipblaslt.rocm_release_tweak' runs/exp1/env.json   # schema 1.1: was .commit in 1.0
 jq '.partial' runs/exp1/env.json
 
 # Diff two snapshots from different docker images
@@ -56,25 +56,52 @@ Usage: aorta env probe [OPTIONS]
 
 Options:
   -o, --output FILE  Path to write env.json.  [default: env.json]
+  -v, --verbose      After the brief, also print the full snapshot
+                     JSON to stdout.
   --help             Show this message and exit.
 ```
 
 The CLI is a thin wrapper. It calls `collect_env()`, writes the JSON,
-and prints a six-line summary like:
+and prints a multi-line per-block brief (~18 lines on a populated host).
+After the brief, any `partial_reasons` entries are echoed inline so the
+operator can act on them without `jq`'ing the JSON. A closing
+`[PARTIAL, N reason(s)]` (or `[OK]`) marker repeats the probe state at
+end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.0) [PARTIAL]
-  runtime:  baremetal / python=venv [PARTIAL, 3 reason(s)]
-  rocm:     7.2.1 (dev: None)
-  hip:      7.2.53211-e1a6bc5663 (amd)
-  hipblaslt: commit=dabb6df2b9
-  rdhc:     unavailable (system_health=null)
-  python:   3.12.3 | pytorch: 2.12.0a0+gitf68b851
+Wrote env probe to /tmp/env.json (schema_version=1.1) [PARTIAL]
+  runtime:   baremetal / python=venv
+  rocm:      7.2.1 (dev: None)
+  hip:       7.2.53211-e1a6bc5663 (amd)
+  hipblaslt: 1.2.2 rocm_release_tweak=dabb6df2b9
+  rocblas:   5.2.0 rocm_release_tweak=dabb6df2b9
+  miopen:    3.5.1 rocm_release_tweak=dabb6df2b9
+  rccl:      2.27.7 (code=22707)
+  gpu_arch:  ['gfx942'] (counts={'gfx942': 8})
+  host:      kernel=5.15.0-174-generic machine=x86_64  glibc=2.35
+  ck:        system=1.2.0/23d531c8  ck_tile=yes  libtorch_hip=4067 ck:: syms
+  tensile:   kernel_db=filenames-sha256:743a8d…  [Tensile pip pkg: (not installed); build-time tool, normal]
+  triton:    3.5.1+rocm7.2.1.gita272dfa8
+  fbgemm:    in PyTorch: USE_FBGEMM=True USE_FBGEMM_GENAI=True  [fbgemm_gpu pip pkg: (not installed); separate from torch's vendored copy]
+  aiter:     (not installed) [aiter pip pkg; optional ROCm inference lib]
+  aotriton:  bundled=0.11.1 present=True images_dir=True  [AOTRITON_INSTALLED_PREFIX=(unset)]
+  rdhc:      unavailable (system_health=null)
+  python:    3.12.13 | pytorch: 2.9.1+rocm7.2.1.gitff65f5bc
+  torch build: git_commit=ff65f5bc install=wheel [third_party SHAs: set AORTA_PYTORCH_SRC=<src> or look up github.com/pytorch/pytorch/tree/ff65f5bc/third_party/<name>]
+
+Partial reasons:
+  - system_health: rdhc exited 1 (stderr: sudo: a password is required)
+  - rocm.version_dev: /opt/rocm/.info/version-dev missing, empty, or unreadable
+  - pytorch_build.submodule_commits: wheel install -- direct SHAs not recoverable; ...
+
+[PARTIAL, 3 reason(s)]
 ```
 
 `[PARTIAL]` indicates at least one probe fell back to `None` -- the
 snapshot is still complete (every key present), it just records what
-was missing in `partial_reasons`.
+was missing in `partial_reasons`. Run with `-v`/`--verbose` to also
+dump the full snapshot JSON to stdout (useful for remote operators
+who want to copy-paste without reading `env.json` from disk).
 
 ## Library API
 
@@ -100,7 +127,8 @@ env = EnvSnapshot.from_dict(loaded["env"])
 if snapshot.partial:
     log.warning("env probe partial: %s", snapshot.partial_reasons)
 
-# Six-line human summary, same as the CLI prints
+# Multi-line human summary, same as the CLI prints (~18 lines on a
+# populated host -- one labelled cell per top-level block).
 print(snapshot.summary())
 ```
 
@@ -114,19 +142,31 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | `"1.0"` today; bumps on non-additive changes only |
+| `schema_version` | `str` | constant | Currently `"1.1"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
 | `system_health` | `dict \| null` | `rdhc --quick --json` (subprocess) | verbatim parsed JSON; `null` when rdhc absent / sudo unavailable / timeout / malformed |
 | `rocm` | `dict[str, str \| null]` | `/opt/rocm/.info/version{,_dev}`, `/sys/module/amdgpu/version` | `version`, `version_dev`, `kmd_version` |
 | `hip` | `dict[str, str \| null]` | `hipconfig --version/--platform/--compiler/--runtime/--cpp_config` | five subprocesses; `--version` and `--platform` cannot be combined (no delimiter) |
-| `hipblaslt` | `dict` | header parse + `sha256(libhipblaslt.so)` + sorted-filenames hash of `lib/hipblaslt/library/*` | `commit`, `package_version`, `lib_hash`, `tensile_yaml_revision`, `applied_prs: {}` |
+| `hipblaslt` | `dict` | header parse + `sha256(libhipblaslt.so)` + sorted-filenames hash of `lib/hipblaslt/library/*` | `rocm_release_tweak` (NOT a per-hipBLASLt commit -- it's the ROCm release identifier shared across every library in a release; see note below), `package_version`, `lib_hash`, `kernel_db_revision`, `applied_prs: {}` |
+| `rocblas` | `dict` | header parse + `sha256(librocblas.so)` + sorted-filenames hash of `lib/rocblas/library/*` | Same shape as `hipblaslt`. Header lives at `include/rocblas/internal/rocblas-version.h`. |
+| `miopen` | `dict` | header parse + `sha256(libMIOpen.so)` + sorted-filenames hash of `share/miopen/db/*.txt` | `rocm_release_tweak`, `package_version`, `lib_hash`, `kernel_db_revision`. MIOpen drives convolution kernels on ROCm; kernel-DB drift changes which conv kernel runs. |
+| `rccl` | `dict` | header parse for `NCCL_VERSION_CODE` + `sha256(librccl.so)` | `version_code` (raw int, e.g. `22707`), `version` (decoded `"2.27.7"`), `lib_hash`. RCCL is AMD's NCCL-compatible collectives library. |
+| `gpu_arch` | `dict` | `rocm_agent_enumerator` subprocess (no `/dev/kfd` access typically required) | `agent_count`, `gfx_targets` (sorted unique), `agent_arch_counts` (per-arch distribution -- captures both homogeneous and mixed-arch boxes). |
+| `host` | `dict` | `os.uname()` + `os.confstr("CS_GNU_LIBC_VERSION")` | `kernel_release`, `kernel_version`, `machine`, `glibc_version`. Kernel + glibc drift is the #1 confound for compiled-against-vs-runtime issues with C++ extensions. |
+| `composable_kernel` | `dict` | header at `include/ck/version.h` + `nm -D` of `libtorch_hip.so` piped through `c++filt` + `torch.__config__.show()` flag scan | Two sub-blocks (`system: {version, commit, ck_tile_present}`, `pytorch_bundled: {present, symbol_count}`) plus top-level `pytorch_use_ck_sdpa` / `pytorch_use_ck_gemm` booleans (build-time flags baked into the wheel; NOT runtime env vars). System and bundled CK can drift independently. |
+| `tensile` | `dict` | optional `import Tensile` + sorted-filenames hash over the union of hipBLASLt + rocBLAS kernel DBs | `package_version` (usually `null` outside builders), `kernel_db_combined_hash` |
+| `triton` | `dict` | `import triton; triton.__version__` | `package_version`. ROCm Triton fork bakes the source commit into `__version__`. |
+| `fbgemm` | `dict` | optional `import fbgemm_gpu` + parse of `torch.__config__.show()` for `-DUSE_FBGEMM*` defines | `package_version`, `pytorch_use_fbgemm`, `pytorch_use_fbgemm_genai`. The two booleans capture the build-time decision baked into the PyTorch wheel even when `fbgemm_gpu` isn't a separate pip package. |
+| `aiter` | `dict` | `import aiter; aiter.__version__` | `package_version`. Most installs record `null`; absence is silent. |
+| `aotriton` | `dict` | scan of `<torch>/lib/libaotriton_v2.so*` filenames + `sha256` of the resolved file + presence of `<torch>/lib/aotriton.images/` + `$AOTRITON_INSTALLED_PREFIX` | Default ROCm Flash Attention backend. Bundled in the wheel via `cmake/External/aotriton.cmake` (NOT a `third_party/` git submodule). Fields: `bundled_present`, `bundled_version`, `bundled_lib_hash`, `bundled_images_dir_present`, `installed_prefix`. CK is the alternative backend (toggled via `TORCH_ROCM_FA_PREFER_CK=1`). |
 | `runtime_context` | `dict` | `/.dockerenv`, `/run/.containerenv`, `$SINGULARITY_NAME`, `/proc/1/cgroup`, `sys.prefix`, `$CONDA_DEFAULT_ENV` | `type`, `python_env`, `venv_path`, `conda_env_name` |
 | `docker` | `dict \| null` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars + `/proc/self/cgroup` | `null` on baremetal; image+digest provided by the launcher (the only reliable way from inside a container) |
-| `env_vars` | `dict[str, str \| null]` | canonical 13-name list, explicit | HSA + GPU queue + RCCL + FBGEMM + PyTorch |
+| `env_vars` | `dict[str, str \| null]` | explicit canonical list (currently 31 names; see `CANONICAL_ENV_VARS` in `environment.py` for the live set) | GPU scoping + HSA / runtime + GPU queue / codegen + NCCL/RCCL + FBGEMM + MIOpen + SDPA backend selection + GEMM backend preference + hipBLASLt autotune + PyTorch / inductor. Build-time cmake flags (`USE_ROCM_CK_SDPA`, `USE_ROCM_CK_GEMM`, `USE_FBGEMM*`) are NOT in this list -- they're surfaced under their respective library blocks instead, parsed from `torch.__config__.show()`. |
 | `python_version` | `str` | `platform.python_version()` | always populated |
 | `pytorch_version` | `str \| null` | optional `import torch` (no CUDA/HIP context init) | `null` when torch absent |
+| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. See "PyTorch source-tree submodule probing" below. |
 
 `runtime_context.type` is one of `"docker" | "podman" | "singularity" | "baremetal"`. Adding values is a schema change.
 
@@ -182,6 +222,55 @@ cd rocm-systems/projects/rocm-core/rdhc
 sudo make install
 ```
 
+### Install rdhc's Python deps into the **system** Python
+
+`rdhc` is a Python script (`#!/usr/bin/env python3`) that imports
+`prettytable` and `PyYAML`. The probe runs it via
+`sudo -n -E rdhc --quick --json <tmp>`. Under sudo, `secure_path` in
+`/etc/sudoers` overrides the calling shell's `PATH` (and `-E` does NOT
+override `secure_path` for the `PATH` variable specifically), so
+`#!/usr/bin/env python3` resolves to **system** `python3`
+(`/usr/bin/python3`), NOT whatever venv or conda env aorta itself runs
+in. Installing `prettytable` into your venv has zero effect on the
+subprocess that rdhc actually runs in.
+
+Install rdhc's deps into the system Python where they'll be visible:
+
+```bash
+# rdhc ships its own requirements.txt with the apt/dnf package
+sudo pip3 install -r /opt/rocm/share/rdhc/requirements.txt
+
+# Verify rdhc can now import everything it needs
+/opt/rocm/bin/rdhc --quick --json /tmp/rdhc_check.json && echo OK
+```
+
+If `pip3 install` is blocked by PEP 668 ("externally-managed
+environment"), you have two options that keep rdhc on system python:
+either pass `--break-system-packages` (acceptable for these two
+packages -- `prettytable` and `PyYAML` are well-behaved) or install
+distro packages where versions are recent enough (`apt install
+python3-prettytable python3-yaml`; check `prettytable>=3.14.0` -- on
+Ubuntu 22.04 the apt version is too old, use pip).
+
+### Ubuntu 24.04 + venv: known sudo `-E` PATH gotcha
+
+On Ubuntu 24.04, the default sudoers `secure_path` is even stricter
+about `PATH` preservation than on 22.04, and `sudo -E` does NOT
+preserve the venv's `PATH` even when `aorta env probe` is invoked from
+inside one. Symptom: `system_health: rdhc exited 1` with stderr like
+`prettytable not installed`, even though both rdhc and prettytable
+appear available in the calling shell.
+
+Two fixes:
+
+1. **Install the deps into system Python (recommended)** -- per the
+   section above. Once they're in `/usr/lib/python3/...`, sudo's PATH
+   reset doesn't matter.
+2. Replace `-E` with `--preserve-env=PATH` if you want the venv's
+   `python3` to be the one rdhc runs in. Aorta does not do this
+   automatically yet (planned follow-up); to override, wrap rdhc in a
+   small script and point the sudoers rule at the wrapper.
+
 ### Configure passwordless sudo for `rdhc`
 
 `aorta env probe` runs `sudo -n -E rdhc --quick --json <tmp>`. The `-n`
@@ -234,6 +323,163 @@ ground truth -- it tells you exactly what failed (PATH, sudo-n,
 timeout, malformed JSON). The `(see docs/env-probe.md#installing-rdhc)`
 hint at the end of those reasons points back at this page.
 
+## Schema changelog
+
+Mirrors the in-code comment at `SCHEMA_VERSION` in
+`src/aorta/instrumentation/environment.py`. Recorded here so consumers
+tracking schema evolution don't have to read source.
+
+### `1.1` (current)
+
+Renames (non-additive -- bumped from `1.0`):
+
+* `hipblaslt.commit` -> `hipblaslt.rocm_release_tweak`
+* `rocblas.commit` -> `rocblas.rocm_release_tweak`
+* `miopen.commit` -> `miopen.rocm_release_tweak`
+  (the value is the ROCm-release-shared identifier, not a per-library
+  upstream commit; the old name misled consumers)
+* `hipblaslt.tensile_yaml_revision` -> `hipblaslt.kernel_db_revision`
+* `rocblas.tensile_yaml_revision` -> `rocblas.kernel_db_revision`
+  (matches `miopen.kernel_db_revision`; modern hipBLASLt/rocBLAS ship
+  `.dat` not `.yaml`, so the old name was inaccurate too)
+
+`env_vars` removals (env_vars is an explicit allowlist; removing is a
+breaking change):
+
+* `USE_ROCM_CK_SDPA` and `USE_ROCM_CK_GEMM` -- these are build-time
+  cmake flags, NOT runtime env vars. Setting them in the workload's
+  environment does nothing. Replaced with
+  `composable_kernel.pytorch_use_ck_sdpa` and `pytorch_use_ck_gemm`
+  booleans, parsed from `torch.__config__.show()`.
+
+Additive changes (no bump strictly required, recorded here for
+visibility):
+
+* New top-level blocks: `rocblas`, `composable_kernel`, `tensile`,
+  `triton`, `fbgemm`, `aiter`, `aotriton`, `miopen`, `rccl`,
+  `gpu_arch`, `host`, `pytorch_build`.
+* `env_vars` gained 22 entries (was 13 in 1.0; now 31): GPU scoping
+  (`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`,
+  `HSA_OVERRIDE_GFX_VERSION`), launch (`HIP_LAUNCH_BLOCKING`),
+  PyTorch ROCm arch + inductor (`PYTORCH_ROCM_ARCH`), MIOpen
+  (`MIOPEN_SYSTEM_DB_PATH`, `MIOPEN_USER_DB_PATH`,
+  `MIOPEN_DEBUG_DISABLE_FIND_DB`, `MIOPEN_FIND_MODE`), SDPA backend
+  (`TORCH_ROCM_FA_PREFER_CK`,
+  `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL`), GEMM backend +
+  autotune (`TORCH_BLAS_PREFER_HIPBLASLT`,
+  `TORCH_HIPBLASLT_TUNING_FILE`,
+  `TORCH_HIPBLASLT_TUNING_OVERRIDE_FILE`), and NCCL/RCCL
+  (`NCCL_P2P_LEVEL`, `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`,
+  `RCCL_MSCCL_ENABLE`).
+* `host.glibc_version` strips the redundant `"glibc "` prefix from
+  the value (the field name carries the unit). On 1.0 this was
+  `"glibc 2.35"`; on 1.1 it's `"2.35"`.
+
+### `1.0` (initial release)
+
+Original probe blocks: `system_health`, `rocm`, `hip`, `hipblaslt`,
+`runtime_context`, `docker`, `env_vars`, `python_version`,
+`pytorch_version`. 13 canonical env vars. See git history for the
+original A1 PR (#152).
+
+## Field-naming notes
+
+### `*.rocm_release_tweak` is a release identifier, not a per-library commit
+
+The `hipblaslt`, `rocblas`, and `miopen` blocks each have a
+`rocm_release_tweak` field parsed from `<LIB>_VERSION_TWEAK` defines
+in their respective headers. **Despite the name suggesting "git
+tweak", AMD sets these macros to the ROCm release identifier** -- so
+in any given ROCm release, `hipblaslt.rocm_release_tweak ==
+rocblas.rocm_release_tweak == miopen.rocm_release_tweak`. It is NOT a
+per-library upstream commit SHA.
+
+For per-library binary-level drift detection, use:
+
+* `<lib>.lib_hash` -- changes any time the binary changes, even
+  within the same release tweak (catches local rebuilds, debug
+  variants, cherry-picked patches).
+* `<lib>.kernel_db_revision` (hipblaslt/rocblas) /
+  `miopen.kernel_db_revision` -- catches kernel-DB drift independent
+  of the lib binary.
+* `<lib>.applied_prs` -- a forward-compat slot for explicit PR
+  detectors when a specific patch warrants tracking.
+
+The `composable_kernel.system.commit` field IS a real upstream commit
+(40-char SHA), because CK ships its own `CK_COMMIT_ID` define populated
+from the upstream submodule.
+
+### `hip.version` vs `pytorch_build.hip_version` are deliberately both captured
+
+* `hip.version` -- the **system-installed** HIP version (from
+  `hipconfig --version`). What ROCm is installed on the host.
+* `pytorch_build.hip_version` -- the **compile-time** HIP version
+  PyTorch was built against (from `torch.version.hip`). What the wheel
+  expects.
+
+These will be equal on a host where torch was built against the
+installed HIP. They diverge -- and reveal a real bug class -- when
+someone runs a wheel built against HIP 7.1 on a host with HIP 7.2
+installed (the wheel may load but dispatch to mismatched API surfaces).
+Capturing both is intentional.
+
+## PyTorch source-tree submodule probing
+
+`pytorch_build.git_commit` (always available on any installed PyTorch)
+is the lookup key that pins every vendored `third_party/` submodule
+deterministically -- including AMD-relevant ones like `composable_kernel`,
+`aiter`, and `fbgemm`. The probe captures it from
+`torch.version.git_version`.
+
+To go further and capture the actual bound submodule SHAs in-process,
+point the probe at a PyTorch source tree:
+
+```bash
+# Explicit (recommended): tell aorta where the checkout lives
+AORTA_PYTORCH_SRC=/path/to/pytorch aorta env probe -o env.json
+```
+
+When set, the probe runs `git -C $AORTA_PYTORCH_SRC/third_party/<sub>
+rev-parse HEAD` for each entry in `CANONICAL_PYTORCH_SUBMODULES` and
+records the SHA in `pytorch_build.submodule_commits.<sub>`.
+`pytorch_build.submodule_commits._source = "git"` records the
+provenance.
+
+For pip-installed wheels (the common case), the probe falls back
+gracefully: every `submodule_commits.<sub>` is `null`, and a single
+`partial_reasons` line emits a copy-pasteable URL template:
+
+```
+pytorch_build.submodule_commits: wheel install -- direct SHAs not
+recoverable; resolve via
+github.com/pytorch/pytorch/tree/<git_commit>/third_party/<name>
+(set AORTA_PYTORCH_SRC=<src> to enable in-process probing)
+```
+
+`<git_commit>` is the captured `pytorch_build.git_commit` (substituted
+in if known). The operator can paste the URL into a browser to see the
+exact bound commit for any submodule on the GitHub tree.
+
+**Auto-detection** also covers two cases without `AORTA_PYTORCH_SRC`:
+
+* **Editable installs** (`pip install -e /path/to/pytorch`): detected
+  via the `direct_url.json` marker in `torch-<version>.dist-info/`.
+  `install_kind = "editable"`.
+* **Source-shadowed imports** (running `python -c "import torch"` from
+  inside a checkout where the local `torch/` dir wins over the wheel):
+  detected by walking up from `torch.__file__` for a sibling `.git` +
+  `third_party/`. `install_kind = "source"`.
+
+Adding a new submodule to track is a deliberate three-step change
+(mirrors `CANONICAL_ENV_VARS`):
+
+1. Add to `CANONICAL_PYTORCH_SUBMODULES` in
+   `src/aorta/instrumentation/environment.py`.
+2. Update `TestPytorchBuildBlockShape::test_canonical_submodules_constant_is_stable`
+   AND `test_submodule_commits_keys_stable` in the test file.
+3. Justify in your PR -- which submodule, why it materially affects
+   trial results.
+
 ## Fail-soft contract
 
 `collect_env()` never raises. When something can't be captured:
@@ -260,13 +506,24 @@ Documented absences DO NOT trigger `partial`:
 
 | Environment | Wall time |
 | --- | --- |
-| Baremetal host (no rdhc) | ~0.10 s |
-| Inside a docker image | ~0.8 s |
+| Baremetal host (no rdhc), warm cache | ~2.2 s |
+| Inside a docker image | ~3 s |
 
-Both well inside the <5 s no-rdhc / <15 s with-rdhc targets.
+Most of the time goes to the bundled-CK probe, which runs `nm -D
+--defined-only` over `libtorch_hip.so` (~400 MB on a typical ROCm wheel)
+and pipes the output through `c++filt`. Cold-cache nm over a
+several-hundred-MB binary can stretch to several seconds; the per-tool
+budget for nm/c++filt is `NM_TIMEOUT_SEC = 30 s` (vs `SHORT_TIMEOUT_SEC
+= 5 s` for the smaller subprocesses) so the probe stays inside the
+< 15 s overall target on contended I/O.
 
-No GPU compute. Verified via `rocprofv3 --hip-trace`: zero HIP API
-calls, zero kernel dispatches.
+Without the bundled-CK probe (e.g. when binutils is stripped from the
+container, or for a CPU-only PyTorch wheel), the probe completes in
+under 0.5 s.
+
+No GPU compute. `import torch` will `dlopen` the HIP runtime libraries
+(so `pmap` shows them in the process), but verified via `rocprofv3
+--hip-trace`: zero HIP API calls and zero kernel dispatches.
 
 ## Container detection precedence
 
@@ -296,10 +553,44 @@ sources are:
 | `rocm.version_dev` | `/opt/rocm/.info/version-dev` (often empty on developer builds) |
 | `rocm.kmd_version` | `/sys/module/amdgpu/version` (kernel module sysfs) |
 | `hip.*` | `hipconfig --version` / `--platform` / `--compiler` / `--runtime` / `--cpp_config` |
-| `hipblaslt.commit` | `HIPBLASLT_VERSION_TWEAK` define in `/opt/rocm/include/hipblaslt/hipblaslt-version.h` |
+| `hipblaslt.rocm_release_tweak` | `HIPBLASLT_VERSION_TWEAK` define in `/opt/rocm/include/hipblaslt/hipblaslt-version.h` |
 | `hipblaslt.package_version` | `HIPBLASLT_VERSION_{MAJOR,MINOR,PATCH}` defines in the same header |
 | `hipblaslt.lib_hash` | `sha256(/opt/rocm/lib/libhipblaslt.so)` resolved through symlinks |
-| `hipblaslt.tensile_yaml_revision` | sha256 of sorted filenames of `*.yaml`/`*.dat`/`*.co` under `/opt/rocm/lib/hipblaslt/library/` |
+| `hipblaslt.kernel_db_revision` | sha256 of sorted filenames of `*.yaml`/`*.dat`/`*.co` under `/opt/rocm/lib/hipblaslt/library/` |
+| `rocblas.rocm_release_tweak` | `ROCBLAS_VERSION_TWEAK` define in `/opt/rocm/include/rocblas/internal/rocblas-version.h` |
+| `rocblas.package_version` | `ROCBLAS_VERSION_{MAJOR,MINOR,PATCH}` defines in the same header |
+| `rocblas.lib_hash` | `sha256(/opt/rocm/lib/librocblas.so)` resolved through symlinks |
+| `rocblas.kernel_db_revision` | sha256 of sorted filenames of `*.yaml`/`*.dat`/`*.co` under `/opt/rocm/lib/rocblas/library/` |
+| `miopen.rocm_release_tweak` | `MIOPEN_VERSION_TWEAK` define in `/opt/rocm/include/miopen/version.h` |
+| `miopen.package_version` | `MIOPEN_VERSION_{MAJOR,MINOR,PATCH}` defines in the same header |
+| `miopen.lib_hash` | `sha256(/opt/rocm/lib/libMIOpen.so)` resolved through symlinks |
+| `miopen.kernel_db_revision` | sha256 of sorted filenames of `*.txt` under `/opt/rocm/share/miopen/db/` (changes when conv-kernel set changes; the `MIOPEN_SYSTEM_DB_PATH` env var overrides this directory at runtime) |
+| `rccl.version_code` / `rccl.version` | `NCCL_VERSION_CODE` define in `/opt/rocm/include/rccl/rccl.h`, decoded into `MAJOR.MINOR.PATCH` |
+| `rccl.lib_hash` | `sha256(/opt/rocm/lib/librccl.so)` resolved through symlinks |
+| `gpu_arch.*` | `rocm_agent_enumerator` subprocess (one gfx-target per detected GPU on stdout); `gfx000` placeholder filtered out |
+| `host.kernel_release` / `kernel_version` / `machine` | `os.uname()` |
+| `host.glibc_version` | `os.confstr("CS_GNU_LIBC_VERSION")` with the redundant `"glibc "` prefix stripped (so the value is the bare version string, e.g. `"2.35"`); returns `null` on non-glibc systems like musl / macOS |
+| `composable_kernel.pytorch_use_ck_sdpa` / `.pytorch_use_ck_gemm` | substring search in `torch.__config__.show()` for `-DUSE_ROCM_CK_SDPA` / `-DUSE_ROCM_CK_GEMM`. Build-time flags baked into the PyTorch wheel; setting these as runtime env vars does NOT change behavior. `False` is meaningful (built without the CK SDPA/GEMM path -- dispatches to AOTriton / non-CK rocBLAS instead). |
+| `composable_kernel.system.version` | `CK_VERSION_{MAJOR,MINOR,PATCH}` defines in `/opt/rocm/include/ck/version.h` |
+| `composable_kernel.system.commit` | `CK_COMMIT_ID` define in the same header (full 40-char SHA) |
+| `composable_kernel.system.ck_tile_present` | existence of `/opt/rocm/include/ck_tile/core/config.hpp` |
+| `composable_kernel.pytorch_bundled.symbol_count` | `nm -D --defined-only` of `<torch>/lib/libtorch_hip.so` piped through `c++filt`, counting lines containing `ck::`. `null` when torch absent, lib missing, or binutils stripped from the container. |
+| `tensile.package_version` | `import Tensile; Tensile.__version__` (rare; build-time tool) |
+| `tensile.kernel_db_combined_hash` | sorted-filenames sha256 over the union of the hipBLASLt + rocBLAS kernel DBs (each filename namespaced by parent dir basename) |
+| `triton.package_version` | `import triton; triton.__version__` (ROCm fork puts source commit into the version string) |
+| `fbgemm.package_version` | `import fbgemm_gpu; fbgemm_gpu.__version__` (commonly `null` -- FBGEMM is vendored inside PyTorch) |
+| `fbgemm.pytorch_use_fbgemm` / `fbgemm.pytorch_use_fbgemm_genai` | substring search in `torch.__config__.show()` for the `-DUSE_FBGEMM` and `-DUSE_FBGEMM_GENAI` defines. `False` is meaningful (built-without); `null` only when torch is absent. |
+| `aiter.package_version` | `import aiter; aiter.__version__` |
+| `aotriton.bundled_version` | parsed from `<torch>/lib/libaotriton_v2.so.MAJOR.MINOR.PATCH` filename (highest-versioned wins) |
+| `aotriton.bundled_lib_hash` | `sha256(<torch>/lib/libaotriton_v2.so*)` resolved through symlinks |
+| `aotriton.bundled_images_dir_present` | existence of `<torch>/lib/aotriton.images/` |
+| `aotriton.installed_prefix` | value of `$AOTRITON_INSTALLED_PREFIX` (operator override pointing PyTorch at a system AOTriton install; `null` for the default bundled-wins case) |
+| `pytorch_build.git_commit` | `torch.version.git_version` (always available on installed torch) |
+| `pytorch_build.hip_version` / `.cuda_version` / `.debug` | `torch.version.{hip,cuda,debug}` |
+| `pytorch_build.install_kind` | `"wheel"` (default), `"editable"` (PEP 660 `direct_url.json` + `dir_info.editable=True`), `"source"` (`AORTA_PYTORCH_SRC` env var or walked-up `.git`+`third_party/`), `"unknown"` (torch import failed) |
+| `pytorch_build.source_path` | The detected/configured PyTorch source root; `null` for wheel installs |
+| `pytorch_build.submodule_commits.{composable_kernel,aiter,fbgemm}` | `git -C <source>/third_party/<name> rev-parse HEAD` when a source tree is detected; otherwise `null` and a `partial_reasons` line emits the GitHub URL template for manual lookup |
+| `pytorch_build.submodule_commits._source` | Provenance tag: `"git"` when populated from a source tree, `null` for wheel installs |
 | `system_health` | `sudo -n -E rdhc --quick --json <tempfile>` |
 | `docker.image` / `docker.digest` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars set by the launcher |
 | `docker.container_id` | `/proc/self/cgroup` |
@@ -341,9 +632,6 @@ diff <(jq -S . env_a.json) <(jq -S . env_b.json)
 * `aorta env matrix` (multi-docker fan-out)
 * `aorta env diff env_a.json env_b.json`
 * GPU kernel introspection (anything that runs HIP work)
-* Composable Kernel / rocBLAS commit + build state -- same pattern as
-  the `hipblaslt` block but a different code path; lands when a second
-  incident points at one of them
 * Workload config (`AMP_DTYPE`, `MODEL_DTYPE`, ...) -- captured by
   `aorta run` in the trial result (Task B1), not by env probe
 

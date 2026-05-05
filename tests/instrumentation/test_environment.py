@@ -90,6 +90,26 @@ def all_disabled(isolated_env, tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(env_mod, "HIPBLASLT_LIB_DIR", tmp_path / "no_libs")
     monkeypatch.setattr(env_mod, "HIPBLASLT_TENSILE_DIR", tmp_path / "no_tensile")
+    monkeypatch.setattr(
+        env_mod, "ROCBLAS_VERSION_HEADER", tmp_path / "no_rocblas_header.h"
+    )
+    monkeypatch.setattr(env_mod, "ROCBLAS_LIB_DIR", tmp_path / "no_rocblas_libs")
+    monkeypatch.setattr(
+        env_mod, "ROCBLAS_TENSILE_DIR", tmp_path / "no_rocblas_tensile"
+    )
+    monkeypatch.setattr(env_mod, "CK_VERSION_HEADER", tmp_path / "no_ck.h")
+    monkeypatch.setattr(
+        env_mod, "CK_TILE_CONFIG_HEADER", tmp_path / "no_ck_tile.hpp"
+    )
+    monkeypatch.setattr(
+        env_mod, "MIOPEN_VERSION_HEADER", tmp_path / "no_miopen_version.h"
+    )
+    monkeypatch.setattr(env_mod, "MIOPEN_LIB_DIR", tmp_path / "no_miopen_libs")
+    monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", tmp_path / "no_miopen_db")
+    monkeypatch.setattr(
+        env_mod, "RCCL_VERSION_HEADER", tmp_path / "no_rccl.h"
+    )
+    monkeypatch.setattr(env_mod, "RCCL_LIB_DIR", tmp_path / "no_rccl_libs")
     monkeypatch.setattr(env_mod, "DOCKERENV_MARKER", tmp_path / "no_dockerenv")
     monkeypatch.setattr(
         env_mod, "PODMAN_CONTAINERENV_MARKER", tmp_path / "no_podmanenv"
@@ -127,12 +147,23 @@ class TestPathConstants:
     @pytest.mark.parametrize(
         "constant_name",
         [
+            "ROCM_BIN_DIR",
             "ROCM_VERSION_FILE",
             "ROCM_VERSION_DEV_FILE",
             "KMD_VERSION_FILE",
             "HIPBLASLT_VERSION_HEADER",
             "HIPBLASLT_LIB_DIR",
             "HIPBLASLT_TENSILE_DIR",
+            "ROCBLAS_VERSION_HEADER",
+            "ROCBLAS_LIB_DIR",
+            "ROCBLAS_TENSILE_DIR",
+            "CK_VERSION_HEADER",
+            "CK_TILE_CONFIG_HEADER",
+            "MIOPEN_VERSION_HEADER",
+            "MIOPEN_LIB_DIR",
+            "MIOPEN_KERNEL_DB_DIR",
+            "RCCL_VERSION_HEADER",
+            "RCCL_LIB_DIR",
             "DOCKERENV_MARKER",
             "PODMAN_CONTAINERENV_MARKER",
             "CGROUP_FILE",
@@ -159,12 +190,23 @@ class TestPathConstants:
             and not name.startswith("_")
         }
         assert path_attrs == {
+            "ROCM_BIN_DIR",
             "ROCM_VERSION_FILE",
             "ROCM_VERSION_DEV_FILE",
             "KMD_VERSION_FILE",
             "HIPBLASLT_VERSION_HEADER",
             "HIPBLASLT_LIB_DIR",
             "HIPBLASLT_TENSILE_DIR",
+            "ROCBLAS_VERSION_HEADER",
+            "ROCBLAS_LIB_DIR",
+            "ROCBLAS_TENSILE_DIR",
+            "CK_VERSION_HEADER",
+            "CK_TILE_CONFIG_HEADER",
+            "MIOPEN_VERSION_HEADER",
+            "MIOPEN_LIB_DIR",
+            "MIOPEN_KERNEL_DB_DIR",
+            "RCCL_VERSION_HEADER",
+            "RCCL_LIB_DIR",
             "DOCKERENV_MARKER",
             "PODMAN_CONTAINERENV_MARKER",
             "CGROUP_FILE",
@@ -199,11 +241,23 @@ REQUIRED_TOP_KEYS = {
     "rocm",
     "hip",
     "hipblaslt",
+    "rocblas",
+    "composable_kernel",
+    "tensile",
+    "triton",
+    "fbgemm",
+    "aiter",
+    "aotriton",
+    "miopen",
+    "rccl",
+    "gpu_arch",
+    "host",
     "runtime_context",
     "docker",
     "env_vars",
     "python_version",
     "pytorch_version",
+    "pytorch_build",
 }
 
 
@@ -213,7 +267,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.0"
+        assert snapshot.schema_version == "1.1"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -260,7 +314,7 @@ class TestSchemaCompleteness:
 def _example_snapshot(**overrides) -> object:
     """Build a fully-populated EnvSnapshot for round-trip testing."""
     base = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "captured_at": "2026-04-28T12:00:00Z",
         "system_health": {"rdhc_version": "1.4.0", "tests": {}},
         "rocm": {
@@ -276,11 +330,68 @@ def _example_snapshot(**overrides) -> object:
             "cpp_config": "-D__HIP_PLATFORM_AMD__",
         },
         "hipblaslt": {
-            "commit": "dabb6df2b9",
+            "rocm_release_tweak": "dabb6df2b9",
             "package_version": "1.2.2",
             "lib_hash": "sha256:abc",
-            "tensile_yaml_revision": "filenames-sha256:def",
+            "kernel_db_revision": "filenames-sha256:def",
             "applied_prs": {},
+        },
+        "rocblas": {
+            "rocm_release_tweak": "dabb6df2b9",
+            "package_version": "5.2.0",
+            "lib_hash": "sha256:bbb",
+            "kernel_db_revision": "filenames-sha256:ccc",
+            "applied_prs": {},
+        },
+        "composable_kernel": {
+            "system": {
+                "version": "1.2.0",
+                "commit": "23d531c8ae9721ac990116751542ab63e11d27c8",
+                "ck_tile_present": True,
+            },
+            "pytorch_bundled": {"present": True, "symbol_count": 4067},
+            "pytorch_use_ck_sdpa": True,
+            "pytorch_use_ck_gemm": True,
+        },
+        "tensile": {
+            "package_version": None,
+            "kernel_db_combined_hash": "filenames-sha256:eee",
+        },
+        "triton": {"package_version": "3.5.1+rocm7.2.1.gita272dfa8"},
+        "fbgemm": {
+            "package_version": None,
+            "pytorch_use_fbgemm": True,
+            "pytorch_use_fbgemm_genai": True,
+        },
+        "aiter": {"package_version": None},
+        "aotriton": {
+            "bundled_present": True,
+            "bundled_version": "0.11.1",
+            "bundled_lib_hash": "sha256:abc",
+            "bundled_images_dir_present": True,
+            "installed_prefix": None,
+        },
+        "miopen": {
+            "rocm_release_tweak": "dabb6df2b9",
+            "package_version": "3.5.1",
+            "lib_hash": "sha256:miopenhash",
+            "kernel_db_revision": "filenames-sha256:miopendb",
+        },
+        "rccl": {
+            "version_code": 22707,
+            "version": "2.27.7",
+            "lib_hash": "sha256:rcclhash",
+        },
+        "gpu_arch": {
+            "agent_count": 8,
+            "gfx_targets": ["gfx942"],
+            "agent_arch_counts": {"gfx942": 8},
+        },
+        "host": {
+            "kernel_release": "5.15.0-174-generic",
+            "kernel_version": "#184-Ubuntu SMP Fri Mar 13 18:41:50 UTC 2026",
+            "machine": "x86_64",
+            "glibc_version": "2.35",
         },
         "runtime_context": {
             "type": "docker",
@@ -296,6 +407,20 @@ def _example_snapshot(**overrides) -> object:
         "env_vars": dict.fromkeys(CANONICAL_ENV_VARS),
         "python_version": "3.12.3",
         "pytorch_version": "2.12.0",
+        "pytorch_build": {
+            "git_commit": "ff65f5bc672795c5e5033900ea0a0c4f8566c8cf",
+            "hip_version": "7.2.53211-e1a6bc5663",
+            "cuda_version": None,
+            "debug": False,
+            "install_kind": "wheel",
+            "source_path": None,
+            "submodule_commits": {
+                "_source": None,
+                "composable_kernel": None,
+                "aiter": None,
+                "fbgemm": None,
+            },
+        },
         "partial": False,
         "partial_reasons": [],
     }
@@ -326,7 +451,7 @@ class TestEnvSnapshot:
         d = _example_snapshot().to_dict()
         d["future_field_not_yet_added"] = {"hello": "world"}
         rebuilt = EnvSnapshot.from_dict(d)
-        assert rebuilt.schema_version == "1.0"
+        assert rebuilt.schema_version == "1.1"
 
     def test_from_dict_defaults_partial_reasons_when_missing(self):
         """Older env.json without partial_reasons still loads (defaults to [])."""
@@ -335,10 +460,22 @@ class TestEnvSnapshot:
         rebuilt = EnvSnapshot.from_dict(d)
         assert rebuilt.partial_reasons == []
 
-    def test_summary_includes_partial_marker_when_partial(self):
+    def test_summary_does_not_duplicate_partial_marker(self):
+        """The brief returned by ``summary()`` is the *body* of what the
+        CLI prints. The CLI itself frames the brief with a header line
+        (``Wrote env probe to ... [PARTIAL]``) and a closing line
+        (``[PARTIAL, N reason(s)]``), so a third copy of "PARTIAL"
+        embedded in the summary body would be redundant. Asserts the
+        body stays clean of PARTIAL markers regardless of state.
+        """
         partial_snap = _example_snapshot(partial=True, partial_reasons=["x: y"])
         clean_snap = _example_snapshot()
-        assert "PARTIAL" in partial_snap.summary()
+        # Neither should leak "PARTIAL" into the body. The marker is
+        # the CLI's job, not summary()'s. (We do still want the field
+        # values themselves to differ -- the partial vs clean snapshot
+        # produce different `partial_reasons` lengths visible to the
+        # caller via .partial_reasons, which is what the CLI prints.)
+        assert "PARTIAL" not in partial_snap.summary()
         assert "PARTIAL" not in clean_snap.summary()
 
     def test_summary_treats_empty_system_health_as_present(self):
@@ -346,18 +483,30 @@ class TestEnvSnapshot:
         ``{}`` (subprocess succeeded, nothing to report). The earlier
         truthiness check ``if self.system_health`` would summarise that as
         unavailable -- ``is not None`` is the right check.
+
+        Asserts on the **rdhc:** line specifically rather than the
+        whole brief, because other lines (e.g. ``aotriton``) use
+        "present" as a field-name key (``bundled_present=True``) which
+        would false-positive a substring search across the full text.
         """
         snap_empty = _example_snapshot(system_health={})
         snap_null = _example_snapshot(system_health=None)
         snap_populated = _example_snapshot(system_health={"rdhc_version": "1.4.0"})
 
+        def rdhc_line(snap) -> str:
+            for line in snap.summary().splitlines():
+                if line.lstrip().startswith("rdhc:"):
+                    return line
+            raise AssertionError("no rdhc: line in summary")
+
         # Empty dict and populated dict should both render as 'present'
-        assert "present" in snap_empty.summary()
-        assert "unavailable" not in snap_empty.summary()
-        assert "present" in snap_populated.summary()
+        # in the rdhc line
+        assert "present" in rdhc_line(snap_empty)
+        assert "unavailable" not in rdhc_line(snap_empty)
+        assert "present" in rdhc_line(snap_populated)
         # Only None should render as 'unavailable'
-        assert "unavailable" in snap_null.summary()
-        assert "present" not in snap_null.summary()
+        assert "unavailable" in rdhc_line(snap_null)
+        assert "present" not in rdhc_line(snap_null)
 
     def test_summary_is_multiline_human_readable(self):
         snap = _example_snapshot()
@@ -419,10 +568,61 @@ class TestCollectEnvContract:
         lib_dir = tmp_path / "lib"
         lib_dir.mkdir()
         (lib_dir / "libhipblaslt.so").write_bytes(b"binary")
+        (lib_dir / "librocblas.so").write_bytes(b"rocblas-binary")
 
         tensile_dir = tmp_path / "tensile"
         tensile_dir.mkdir()
         (tensile_dir / "TensileLibrary_X.dat").write_bytes(b"x")
+
+        # rocblas inputs (header in its own internal/ subdir to mirror prod layout)
+        rocblas_header_dir = tmp_path / "include" / "rocblas" / "internal"
+        rocblas_header_dir.mkdir(parents=True)
+        (rocblas_header_dir / "rocblas-version.h").write_text(
+            "#define ROCBLAS_VERSION_MAJOR 5\n"
+            "#define ROCBLAS_VERSION_MINOR 2\n"
+            "#define ROCBLAS_VERSION_PATCH 0\n"
+            "#define ROCBLAS_VERSION_TWEAK dabb6df2b9\n"
+        )
+        rocblas_tensile_dir = tmp_path / "rocblas_tensile"
+        rocblas_tensile_dir.mkdir()
+        (rocblas_tensile_dir / "Kernels.so-000-gfx942.hsaco").write_bytes(b"k")
+        (rocblas_tensile_dir / "TensileLibrary_gfx942.dat").write_bytes(b"t")
+
+        # CK inputs (header-only)
+        ck_header_dir = tmp_path / "include" / "ck"
+        ck_header_dir.mkdir(parents=True)
+        (ck_header_dir / "version.h").write_text(
+            "#define CK_VERSION 1.2.0\n"
+            "#define CK_VERSION_MAJOR 1\n"
+            "#define CK_VERSION_MINOR 2\n"
+            "#define CK_VERSION_PATCH 0\n"
+            "#define CK_COMMIT_ID 23d531c8ae9721ac990116751542ab63e11d27c8\n"
+        )
+        ck_tile_dir = tmp_path / "include" / "ck_tile" / "core"
+        ck_tile_dir.mkdir(parents=True)
+        (ck_tile_dir / "config.hpp").write_text("// ck_tile config\n")
+
+        # MIOpen inputs
+        miopen_header_dir = tmp_path / "include" / "miopen"
+        miopen_header_dir.mkdir(parents=True)
+        (miopen_header_dir / "version.h").write_text(
+            "#define MIOPEN_VERSION_MAJOR 3\n"
+            "#define MIOPEN_VERSION_MINOR 5\n"
+            "#define MIOPEN_VERSION_PATCH 1\n"
+            "#define MIOPEN_VERSION_TWEAK dabb6df2b9\n"
+        )
+        (lib_dir / "libMIOpen.so").write_bytes(b"miopen-binary")
+        miopen_db_dir = tmp_path / "miopen_db"
+        miopen_db_dir.mkdir()
+        (miopen_db_dir / "gfx942_64.db.txt").write_text("kernel db")
+
+        # RCCL inputs
+        rccl_header_dir = tmp_path / "include" / "rccl"
+        rccl_header_dir.mkdir(parents=True)
+        (rccl_header_dir / "rccl.h").write_text(
+            "#define NCCL_VERSION_CODE 22707\n"
+        )
+        (lib_dir / "librccl.so").write_bytes(b"rccl-binary")
 
         monkeypatch.setattr(env_mod, "ROCM_VERSION_FILE", rocm_info / "version")
         monkeypatch.setattr(env_mod, "ROCM_VERSION_DEV_FILE", rocm_info / "version_dev")
@@ -432,6 +632,24 @@ class TestCollectEnvContract:
         )
         monkeypatch.setattr(env_mod, "HIPBLASLT_LIB_DIR", lib_dir)
         monkeypatch.setattr(env_mod, "HIPBLASLT_TENSILE_DIR", tensile_dir)
+        monkeypatch.setattr(
+            env_mod,
+            "ROCBLAS_VERSION_HEADER",
+            rocblas_header_dir / "rocblas-version.h",
+        )
+        monkeypatch.setattr(env_mod, "ROCBLAS_LIB_DIR", lib_dir)
+        monkeypatch.setattr(env_mod, "ROCBLAS_TENSILE_DIR", rocblas_tensile_dir)
+        monkeypatch.setattr(env_mod, "CK_VERSION_HEADER", ck_header_dir / "version.h")
+        monkeypatch.setattr(env_mod, "CK_TILE_CONFIG_HEADER", ck_tile_dir / "config.hpp")
+        monkeypatch.setattr(
+            env_mod, "MIOPEN_VERSION_HEADER", miopen_header_dir / "version.h"
+        )
+        monkeypatch.setattr(env_mod, "MIOPEN_LIB_DIR", lib_dir)
+        monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", miopen_db_dir)
+        monkeypatch.setattr(
+            env_mod, "RCCL_VERSION_HEADER", rccl_header_dir / "rccl.h"
+        )
+        monkeypatch.setattr(env_mod, "RCCL_LIB_DIR", lib_dir)
         monkeypatch.setattr(env_mod, "DOCKERENV_MARKER", tmp_path / "no_dockerenv")
         monkeypatch.setattr(
             env_mod, "PODMAN_CONTAINERENV_MARKER", tmp_path / "no_podmanenv"
@@ -459,18 +677,102 @@ class TestCollectEnvContract:
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
-        # Pretend torch is importable with a version
+        # Pretend torch is importable with a version. Also stand up the
+        # surfaces the new fbgemm / composable_kernel probes peek at:
+        #   * torch.__config__.show() returns a build string mentioning
+        #     -DUSE_FBGEMM and -DUSE_FBGEMM_GENAI (so fbgemm flags = True)
+        #   * torch.__file__ + a tmp libtorch_hip.so so the CK-bundled
+        #     probe finds something to run nm/c++filt against. We
+        #     redirect both subprocesses through ``fake_run`` so it
+        #     reports a tiny stdout containing one ck:: symbol.
         import builtins
         import types
+
+        fake_torch_dir = tmp_path / "fake_torch"
+        (fake_torch_dir / "lib").mkdir(parents=True)
+        (fake_torch_dir / "lib" / "libtorch_hip.so").write_bytes(b"fake")
+        # Stand up a fake bundled AOTriton (the new aotriton probe
+        # would otherwise add a partial reason for "no libaotriton_v2.so*").
+        (fake_torch_dir / "lib" / "libaotriton_v2.so.0.11.1").write_bytes(b"aot")
+        (fake_torch_dir / "lib" / "aotriton.images").mkdir()
+        fake_torch_init = fake_torch_dir / "__init__.py"
+        fake_torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __version__="2.12.0",
+            __file__=str(fake_torch_init),
+            __config__=types.SimpleNamespace(
+                show=lambda: "CXX_FLAGS=-DUSE_FBGEMM -DUSE_FBGEMM_GENAI"
+            ),
+            # torch.version.* surface required by _capture_pytorch_build.
+            # On a clean full probe we want no partial reasons, so set
+            # all four fields. install_kind will be "source" because we
+            # also create a fake third_party tree below.
+            version=types.SimpleNamespace(
+                git_version="ff65f5bc672795c5e5033900ea0a0c4f8566c8cf",
+                hip="7.2.5",
+                cuda=None,
+                debug=False,
+            ),
+        )
+
+        # Stand up a fake source tree with .git + third_party so
+        # _detect_pytorch_install_kind walks up from torch.__file__ and
+        # finds it. AORTA_PYTORCH_SRC is the explicit path; that's the
+        # cleaner option for tests.
+        fake_src = tmp_path / "fake_pytorch_src"
+        (fake_src / "third_party").mkdir(parents=True)
+        for name in ("composable_kernel", "aiter", "fbgemm"):
+            sub = fake_src / "third_party" / name
+            sub.mkdir()
+            (sub / ".git").write_text("gitdir: ../../.git/modules/" + name)
+        monkeypatch.setenv("AORTA_PYTORCH_SRC", str(fake_src))
 
         real_import = builtins.__import__
 
         def fake_import(name, *args, **kwargs):
             if name == "torch":
-                return types.SimpleNamespace(__version__="2.12.0")
+                return fake_torch
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        # Have shutil.which find nm/c++filt so the bundled-CK probe runs.
+        monkeypatch.setattr(env_mod.shutil, "which", lambda name: "/usr/bin/" + name)
+
+        # Wrap fake_run so nm + c++filt produce a synthetic ck:: hit.
+        original_fake_run = fake_run
+
+        def fake_run_with_nm(cmd, **kwargs):
+            if cmd[0].endswith("nm"):
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0,
+                    stdout="0000 T mangled_symbol\n", stderr="",
+                )
+            if cmd[0].endswith("c++filt"):
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0,
+                    stdout="ck::tensor_operation::SomeKernel\n", stderr="",
+                )
+            if cmd[0].endswith("rocm_agent_enumerator"):
+                # Mimic the real binary's stdout: one gfx target per
+                # GPU. The clean-probe fixture asserts no partial
+                # reasons fire, so we need a non-empty result here.
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0,
+                    stdout="gfx942\ngfx942\n", stderr="",
+                )
+            if cmd[0].endswith("git") and "rev-parse" in cmd:
+                # Synthesize a deterministic 40-char hex SHA per submodule
+                # path so _git_rev_parse_head's hex-validity check passes.
+                sub_name = Path(cmd[2]).name
+                fake_sha = (sub_name + "0" * 40)[:40].lower().replace("_", "0")
+                fake_sha = "".join(c if c in "0123456789abcdef" else "0" for c in fake_sha)
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=fake_sha + "\n", stderr="",
+                )
+            return original_fake_run(cmd, **kwargs)
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run_with_nm)
 
         snapshot = collect_env()
         assert snapshot.partial is False, (
@@ -479,7 +781,12 @@ class TestCollectEnvContract:
         assert snapshot.partial_reasons == []
         # Verify the success values landed
         assert snapshot.rocm["version"] == "7.2.1"
-        assert snapshot.hipblaslt["commit"] == "abc1234"
+        assert snapshot.hipblaslt["rocm_release_tweak"] == "abc1234"
+        assert snapshot.rocblas["rocm_release_tweak"] == "dabb6df2b9"
+        assert snapshot.composable_kernel["system"]["version"] == "1.2.0"
+        assert snapshot.composable_kernel["pytorch_bundled"]["present"] is True
+        assert snapshot.fbgemm["pytorch_use_fbgemm"] is True
+        assert snapshot.fbgemm["pytorch_use_fbgemm_genai"] is True
         assert snapshot.system_health == {"rdhc_version": "1.4.0"}
         assert snapshot.hip["version"] == "7.2.5"
         assert snapshot.pytorch_version == "2.12.0"
@@ -707,14 +1014,16 @@ class TestCliIsThinWrapper:
     def test_total_file_size_is_bounded(self, cli_path: Path):
         # Total file budget (incl. docstring/imports/blank lines/error handling).
         # The spec target is ~30 lines of substantive code; the cushion
-        # accommodates the module docstring, Click decorators, and the
+        # accommodates the module docstring, Click decorators, the
         # try/except blocks that surface filesystem errors as
-        # ``click.ClickException`` (per Copilot review). The real
-        # "no-probing-in-CLI" guard is `test_cli_does_no_probing_imports`
-        # below -- this one is a soft canary against the file ballooning.
+        # ``click.ClickException`` (per Copilot review), the --verbose
+        # flag wiring, and the inline partial_reasons echo + closing
+        # status marker. The real "no-probing-in-CLI" guard is
+        # `test_cli_does_no_probing_imports` below -- this one is a
+        # soft canary against the file ballooning.
         line_count = sum(1 for _ in cli_path.read_text().splitlines())
-        assert line_count <= 80, (
-            f"cli/env.py is {line_count} lines; soft budget is 80. "
+        assert line_count <= 120, (
+            f"cli/env.py is {line_count} lines; soft budget is 120. "
             "If you need more, check that the new code is genuinely "
             "wiring/error-handling and not probing -- "
             "test_cli_does_no_probing_imports is the strict guard."
@@ -808,6 +1117,102 @@ class TestCliIsThinWrapper:
         assert result.exit_code != 0
         assert "Failed to write env probe" in result.output
         assert "Traceback" not in result.output
+
+    def test_cli_echoes_partial_reasons_inline(
+        self, all_disabled, tmp_path: Path
+    ):
+        """Operator running the probe should see WHY it's partial without
+        having to ``jq env.json``. partial_reasons is already in memory;
+        the CLI must print each one inline.
+        """
+        from click.testing import CliRunner
+
+        cli_path = Path(env_mod.__file__).parent.parent / "cli" / "env.py"
+        spec = importlib.util.spec_from_file_location("aorta.cli.env", cli_path)
+        cli_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cli_mod
+        spec.loader.exec_module(cli_mod)
+
+        runner = CliRunner()
+        out_path = tmp_path / "env.json"
+        result = runner.invoke(cli_mod.env, ["probe", "-o", str(out_path)])
+        assert result.exit_code == 0, result.output
+        assert "Partial reasons:" in result.output
+        # At least one rdhc-style reason will appear (rdhc not on PATH
+        # under all_disabled). Each reason rendered as a bullet line.
+        bullet_lines = [
+            line for line in result.output.splitlines()
+            if line.startswith("  - ")
+        ]
+        assert bullet_lines, (
+            f"no '  - <reason>' bullet lines in output: {result.output}"
+        )
+
+    def test_cli_closing_marker_partial(self, all_disabled, tmp_path: Path):
+        """Closing line repeats the [PARTIAL, N] state at end-of-output
+        so it's visible after a long --verbose dump or a long
+        partial_reasons list.
+        """
+        from click.testing import CliRunner
+
+        cli_path = Path(env_mod.__file__).parent.parent / "cli" / "env.py"
+        spec = importlib.util.spec_from_file_location("aorta.cli.env", cli_path)
+        cli_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cli_mod
+        spec.loader.exec_module(cli_mod)
+
+        runner = CliRunner()
+        out_path = tmp_path / "env.json"
+        result = runner.invoke(cli_mod.env, ["probe", "-o", str(out_path)])
+        assert result.exit_code == 0, result.output
+        # Last non-empty line is the closing marker.
+        last_line = next(
+            line for line in reversed(result.output.splitlines()) if line.strip()
+        )
+        assert last_line.startswith("[PARTIAL, ") and "reason(s)]" in last_line, (
+            f"closing marker missing or malformed: {last_line!r}"
+        )
+
+    def test_cli_verbose_flag_dumps_full_json(
+        self, all_disabled, tmp_path: Path
+    ):
+        """``aorta env probe -v`` should print the full JSON snapshot to
+        stdout in addition to the brief, so an operator on a remote box
+        can copy-paste without reading the JSON file.
+        """
+        from click.testing import CliRunner
+
+        cli_path = Path(env_mod.__file__).parent.parent / "cli" / "env.py"
+        spec = importlib.util.spec_from_file_location("aorta.cli.env", cli_path)
+        cli_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cli_mod
+        spec.loader.exec_module(cli_mod)
+
+        runner = CliRunner()
+        out_path = tmp_path / "env.json"
+
+        # Without -v: no full snapshot block in stdout
+        plain = runner.invoke(cli_mod.env, ["probe", "-o", str(out_path)])
+        assert plain.exit_code == 0
+        assert "--- Full snapshot ---" not in plain.output
+
+        # With -v: full snapshot block appears and parses back as JSON
+        verbose = runner.invoke(
+            cli_mod.env, ["probe", "-o", str(out_path), "-v"]
+        )
+        assert verbose.exit_code == 0
+        assert "--- Full snapshot ---" in verbose.output
+        # The block after the marker must be the same JSON we wrote to file.
+        marker = "--- Full snapshot ---"
+        json_block = verbose.output.split(marker, 1)[1]
+        # Trim everything after the closing marker.
+        if "[PARTIAL, " in json_block:
+            json_block = json_block.split("\n[PARTIAL, ", 1)[0]
+        elif "[OK]" in json_block:
+            json_block = json_block.split("\n[OK]", 1)[0]
+        # Must be parseable JSON, and its keys match REQUIRED_TOP_KEYS.
+        parsed = json.loads(json_block)
+        assert set(parsed.keys()) == REQUIRED_TOP_KEYS
 
     def test_cli_emits_json_native_output_no_default_str(
         self, all_disabled
@@ -1253,10 +1658,10 @@ class TestHipblasltBlockShape:
         reasons: list[str] = []
         block = env_mod._capture_hipblaslt(reasons)
         assert set(block.keys()) == {
-            "commit",
+            "rocm_release_tweak",
             "package_version",
             "lib_hash",
-            "tensile_yaml_revision",
+            "kernel_db_revision",
             "applied_prs",
         }
 
@@ -1269,8 +1674,10 @@ class TestHipblasltBlockShape:
         """Header file missing -> reason should say 'not readable'."""
         reasons: list[str] = []
         env_mod._capture_hipblaslt(reasons)
-        commit_reason = next(r for r in reasons if r.startswith("hipblaslt.commit"))
-        assert "not readable" in commit_reason
+        tweak_reason = next(
+            r for r in reasons if r.startswith("hipblaslt.rocm_release_tweak")
+        )
+        assert "not readable" in tweak_reason
 
     def test_reason_when_header_present_but_tweak_missing(
         self, isolated_env, tmp_path: Path, monkeypatch
@@ -1295,12 +1702,14 @@ class TestHipblasltBlockShape:
 
         reasons: list[str] = []
         block = env_mod._capture_hipblaslt(reasons)
-        # commit failed but package_version succeeded
-        assert block["commit"] is None
+        # rocm_release_tweak failed but package_version succeeded
+        assert block["rocm_release_tweak"] is None
         assert block["package_version"] == "1.2.0"
-        commit_reason = next(r for r in reasons if r.startswith("hipblaslt.commit"))
-        assert "not readable" not in commit_reason
-        assert "HIPBLASLT_VERSION_TWEAK" in commit_reason
+        tweak_reason = next(
+            r for r in reasons if r.startswith("hipblaslt.rocm_release_tweak")
+        )
+        assert "not readable" not in tweak_reason
+        assert "HIPBLASLT_VERSION_TWEAK" in tweak_reason
 
 
 # ---------------------------------------------------------------------------
@@ -1504,17 +1913,47 @@ class TestEnvVars:
         # Reasoned guard: changing this list is a schema change. If a future
         # PR adds a var, this test forces an explicit acknowledgement.
         assert set(CANONICAL_ENV_VARS) == {
+            # GPU scoping
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+            # HSA / runtime
             "HSA_XNACK",
             "HSA_KERNARG_POOL_SIZE",
             "HSA_NO_SCRATCH_RECLAIM",
+            "HSA_OVERRIDE_GFX_VERSION",
+            # GPU queue / codegen / build target
             "GPU_MAX_HW_QUEUES",
             "AMDGCN_USE_BUFFER_OPS",
             "DISABLE_TF32",
+            "PYTORCH_ROCM_ARCH",
+            "HIP_LAUNCH_BLOCKING",
+            # RCCL / NCCL
             "NCCL_MAX_NCHANNELS",
+            "NCCL_P2P_LEVEL",
+            "NCCL_IB_HCA",
+            "NCCL_SOCKET_IFNAME",
+            "RCCL_MSCCL_ENABLE",
+            # FBGEMM
             "FBGEMM_NO_JK",
             "FBGEMM_TBE_V2",
             "FBGEMM_TBE_ROCM_HIP_BACKWARD_KERNEL",
             "FBGEMM_BOUNDS_CHECK_INDICES_V2",
+            # MIOpen
+            "MIOPEN_SYSTEM_DB_PATH",
+            "MIOPEN_USER_DB_PATH",
+            "MIOPEN_DEBUG_DISABLE_FIND_DB",
+            "MIOPEN_FIND_MODE",
+            # SDPA / Flash Attention backend selection
+            # Note: USE_ROCM_CK_SDPA / USE_ROCM_CK_GEMM are NOT here --
+            # they're build-time cmake flags, captured under
+            # composable_kernel.{pytorch_use_ck_sdpa,pytorch_use_ck_gemm}
+            "TORCH_ROCM_FA_PREFER_CK",
+            "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL",
+            # GEMM backend preference + autotune pinning
+            "TORCH_BLAS_PREFER_HIPBLASLT",
+            "TORCH_HIPBLASLT_TUNING_FILE",
+            "TORCH_HIPBLASLT_TUNING_OVERRIDE_FILE",
+            # PyTorch / inductor
             "TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE",
             "PYTORCH_CUDA_ALLOC_CONF",
         }
@@ -1616,7 +2055,12 @@ class TestNoGpuCompute:
         for attr in (
             "ROCM_VERSION_FILE", "ROCM_VERSION_DEV_FILE", "KMD_VERSION_FILE",
             "HIPBLASLT_VERSION_HEADER", "HIPBLASLT_LIB_DIR",
-            "HIPBLASLT_TENSILE_DIR", "DOCKERENV_MARKER",
+            "HIPBLASLT_TENSILE_DIR",
+            "ROCBLAS_VERSION_HEADER", "ROCBLAS_LIB_DIR", "ROCBLAS_TENSILE_DIR",
+            "CK_VERSION_HEADER", "CK_TILE_CONFIG_HEADER",
+            "MIOPEN_VERSION_HEADER", "MIOPEN_LIB_DIR", "MIOPEN_KERNEL_DB_DIR",
+            "RCCL_VERSION_HEADER", "RCCL_LIB_DIR",
+            "DOCKERENV_MARKER",
             "PODMAN_CONTAINERENV_MARKER", "CGROUP_FILE", "SELF_CGROUP_FILE",
         ):
             monkeypatch.setattr(env_mod, attr, tmp_path / f"no_{attr.lower()}")
@@ -1630,3 +2074,1909 @@ class TestNoGpuCompute:
         # The actual guard
         fake_cuda.is_available.assert_not_called()
         fake_cuda.device_count.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# rocBLAS introspection -- mirrors the hipBLASLt block 1:1
+# ---------------------------------------------------------------------------
+
+
+class TestRocblasHeaderParsing:
+    def test_parse_full_header(self):
+        text = """
+        #ifndef _ROCBLAS_VERSION_H_
+        #define _ROCBLAS_VERSION_H_
+        #define ROCBLAS_VERSION_MAJOR     5
+        #define ROCBLAS_VERSION_MINOR     2
+        #define ROCBLAS_VERSION_PATCH     0
+        #define ROCBLAS_VERSION_TWEAK     dabb6df2b9
+        #endif
+        """
+        commit, version = env_mod._parse_version_header(
+            text, env_mod._ROCBLAS_TWEAK_RE, env_mod._ROCBLAS_VERSION_RE
+        )
+        assert commit == "dabb6df2b9"
+        assert version == "5.2.0"
+
+    def test_parse_missing_tweak_returns_none_commit(self):
+        text = """
+        #define ROCBLAS_VERSION_MAJOR 5
+        #define ROCBLAS_VERSION_MINOR 2
+        #define ROCBLAS_VERSION_PATCH 0
+        """
+        commit, version = env_mod._parse_version_header(
+            text, env_mod._ROCBLAS_TWEAK_RE, env_mod._ROCBLAS_VERSION_RE
+        )
+        assert commit is None
+        assert version == "5.2.0"
+
+    def test_parse_empty_returns_none_pair(self):
+        commit, version = env_mod._parse_version_header(
+            "", env_mod._ROCBLAS_TWEAK_RE, env_mod._ROCBLAS_VERSION_RE
+        )
+        assert (commit, version) == (None, None)
+
+
+class TestRocblasLibHash:
+    def test_hash_resolved_through_symlink(self, tmp_path: Path, monkeypatch):
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        real = lib_dir / "librocblas.so.5.2.70201"
+        real.write_bytes(b"hello rocblas")
+        symlink_a = lib_dir / "librocblas.so.5"
+        symlink_b = lib_dir / "librocblas.so"
+        symlink_a.symlink_to(real.name)
+        symlink_b.symlink_to(symlink_a.name)
+        monkeypatch.setattr(env_mod, "ROCBLAS_LIB_DIR", lib_dir)
+
+        digest = env_mod._hash_shared_library(env_mod.ROCBLAS_LIB_DIR, "librocblas.so")
+        expected = "sha256:" + hashlib.sha256(b"hello rocblas").hexdigest()
+        assert digest == expected
+
+    def test_no_library_returns_none(self, tmp_path: Path):
+        digest = env_mod._hash_shared_library(tmp_path / "empty", "librocblas.so")
+        assert digest is None
+
+    def test_stripped_image_falls_back_to_versioned_filename(
+        self, tmp_path: Path
+    ):
+        """Regression guard: stripped runtime images ship only the
+        versioned ``libfoo.so.MAJOR.MINOR.PATCH`` (the SONAME-versioned
+        ``.so.1`` symlink is created by ldconfig, the unversioned ``.so``
+        is ``-dev``-only). The probe must still hash the actual file.
+        """
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        # Only the versioned filename exists -- no unversioned `.so`,
+        # no SONAME `.so.1`. This is what `dpkg -L librocblas0` ships
+        # before ldconfig runs in a stripped image.
+        real = lib_dir / "librocblas.so.5.2.70201"
+        real.write_bytes(b"stripped-image bytes")
+
+        digest = env_mod._hash_shared_library(lib_dir, "librocblas.so")
+        expected = "sha256:" + hashlib.sha256(b"stripped-image bytes").hexdigest()
+        assert digest == expected, (
+            "stripped-image fallback failed: probe should hash "
+            "librocblas.so.5.2.70201 when the unversioned .so symlink is "
+            "missing (a -dev-only artifact)"
+        )
+
+    def test_picks_highest_versioned_when_multiple_present(
+        self, tmp_path: Path
+    ):
+        """When several versioned files exist (e.g. mid-upgrade state or
+        sideloaded debug build), pick the highest -- that's the file the
+        SONAME would normally point at after ldconfig runs.
+        """
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "librocblas.so.5.1.00000").write_bytes(b"old")
+        (lib_dir / "librocblas.so.5.2.70201").write_bytes(b"new")
+
+        digest = env_mod._hash_shared_library(lib_dir, "librocblas.so")
+        expected = "sha256:" + hashlib.sha256(b"new").hexdigest()
+        assert digest == expected
+
+
+class TestRocblasBlockShape:
+    def test_block_keys_stable(self, all_disabled):
+        reasons: list[str] = []
+        block = env_mod._capture_rocblas(reasons)
+        assert set(block.keys()) == {
+            "rocm_release_tweak",
+            "package_version",
+            "lib_hash",
+            "kernel_db_revision",
+            "applied_prs",
+        }
+        assert block["applied_prs"] == {}
+
+    def test_partial_reasons_use_rocblas_prefix(self, all_disabled):
+        reasons: list[str] = []
+        env_mod._capture_rocblas(reasons)
+        assert reasons, "expected reasons under all_disabled"
+        assert all(r.startswith("rocblas.") for r in reasons), reasons
+
+    def test_reason_distinguishes_unreadable_from_missing_define(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        header = tmp_path / "rocblas-version.h"
+        header.write_text(
+            "#define ROCBLAS_VERSION_MAJOR 5\n"
+            "#define ROCBLAS_VERSION_MINOR 2\n"
+            "#define ROCBLAS_VERSION_PATCH 0\n"
+            # No TWEAK on purpose
+        )
+        monkeypatch.setattr(env_mod, "ROCBLAS_VERSION_HEADER", header)
+        monkeypatch.setattr(env_mod, "ROCBLAS_LIB_DIR", tmp_path / "no_libs")
+        monkeypatch.setattr(env_mod, "ROCBLAS_TENSILE_DIR", tmp_path / "no_tensile")
+        reasons: list[str] = []
+        block = env_mod._capture_rocblas(reasons)
+        assert block["rocm_release_tweak"] is None
+        assert block["package_version"] == "5.2.0"
+        tweak_reason = next(
+            r for r in reasons if r.startswith("rocblas.rocm_release_tweak")
+        )
+        assert "not readable" not in tweak_reason
+        assert "ROCBLAS_VERSION_TWEAK" in tweak_reason
+
+
+# ---------------------------------------------------------------------------
+# Composable Kernel
+# ---------------------------------------------------------------------------
+
+
+class TestCKHeaderParsing:
+    def test_parse_full_header(self):
+        text = """
+        #define CK_VERSION 1.2.0
+        #define CK_VERSION_MAJOR 1
+        #define CK_VERSION_MINOR 2
+        #define CK_VERSION_PATCH 0
+        #define CK_COMMIT_ID 23d531c8ae9721ac990116751542ab63e11d27c8
+        """
+        version, commit = env_mod._parse_ck_header(text)
+        assert version == "1.2.0"
+        # Full 40-char SHA preserved (CK uses long form, unlike hipblaslt's 7-12 short)
+        assert commit == "23d531c8ae9721ac990116751542ab63e11d27c8"
+
+    def test_parse_short_commit_still_accepted(self):
+        text = "#define CK_COMMIT_ID abc1234\n"
+        version, commit = env_mod._parse_ck_header(text)
+        assert version is None
+        assert commit == "abc1234"
+
+    def test_parse_empty_returns_none_pair(self):
+        assert env_mod._parse_ck_header("") == (None, None)
+        assert env_mod._parse_ck_header(None) == (None, None)
+
+
+class TestCKBlockShape:
+    def test_block_has_two_subsections_plus_build_flags(self, all_disabled):
+        reasons: list[str] = []
+        block = env_mod._capture_composable_kernel(reasons)
+        assert set(block.keys()) == {
+            "system",
+            "pytorch_bundled",
+            "pytorch_use_ck_sdpa",
+            "pytorch_use_ck_gemm",
+        }
+        assert set(block["system"].keys()) == {"version", "commit", "ck_tile_present"}
+        assert set(block["pytorch_bundled"].keys()) == {"present", "symbol_count"}
+
+
+class TestCKPytorchBuildFlags:
+    """USE_ROCM_CK_SDPA / USE_ROCM_CK_GEMM are build-time cmake flags
+    consumed when the wheel is built -- NOT runtime env vars. The
+    composable_kernel block surfaces them via ``__config__.show()``
+    parsing, exactly like the FBGEMM flags. Setting them at runtime
+    in the workload's env does nothing.
+    """
+
+    def test_torch_absent_returns_null_pair_no_reason(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        sdpa, gemm = env_mod._read_pytorch_ck_flags(reasons)
+        assert sdpa is None
+        assert gemm is None
+        # No reason -- pytorch_version captures torch absence elsewhere.
+        assert reasons == []
+
+    def test_both_flags_on(self, isolated_env, monkeypatch):
+        import builtins
+        import types
+
+        config = types.SimpleNamespace(
+            show=lambda: "CXX_FLAGS=-DUSE_ROCM_CK_SDPA -DUSE_ROCM_CK_GEMM -O2"
+        )
+        fake_torch = types.SimpleNamespace(__config__=config)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        sdpa, gemm = env_mod._read_pytorch_ck_flags(reasons)
+        assert sdpa is True
+        assert gemm is True
+
+    def test_one_flag_off_distinguishes_from_null(
+        self, isolated_env, monkeypatch
+    ):
+        """``False`` must be a meaningful answer (a wheel built without
+        the CK SDPA path is dispatching to AOTriton -- a real and
+        important state to surface), distinct from ``None`` (couldn't
+        ask).
+        """
+        import builtins
+        import types
+
+        config = types.SimpleNamespace(
+            show=lambda: "CXX_FLAGS=-DUSE_ROCM_CK_GEMM -O2"  # no SDPA
+        )
+        fake_torch = types.SimpleNamespace(__config__=config)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        sdpa, gemm = env_mod._read_pytorch_ck_flags(reasons)
+        assert sdpa is False
+        assert gemm is True
+
+    def test_use_rocm_ck_sdpa_not_in_canonical_env_vars(self):
+        """Regression guard: schema 1.1 deliberately removed
+        USE_ROCM_CK_SDPA from CANONICAL_ENV_VARS because it's a
+        build-time cmake flag, not a runtime env var. If a future PR
+        re-adds it, this test catches the regression and forces a
+        deliberate review.
+        """
+        assert "USE_ROCM_CK_SDPA" not in CANONICAL_ENV_VARS
+        assert "USE_ROCM_CK_GEMM" not in CANONICAL_ENV_VARS
+
+    def test_partial_reasons_use_composable_kernel_prefix(self, all_disabled):
+        reasons: list[str] = []
+        env_mod._capture_composable_kernel(reasons)
+        # Only system.* should appear -- pytorch_bundled is silent when
+        # torch absence is already captured by pytorch_version.
+        prefixes = {r.split(":", 1)[0] for r in reasons}
+        assert prefixes <= {
+            "composable_kernel.system.version",
+            "composable_kernel.system.commit",
+        }, reasons
+
+    def test_ck_tile_present_when_header_exists(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        ck_tile_header = tmp_path / "ck_tile_config.hpp"
+        ck_tile_header.write_text("// header")
+        monkeypatch.setattr(env_mod, "CK_VERSION_HEADER", tmp_path / "no_ck.h")
+        monkeypatch.setattr(env_mod, "CK_TILE_CONFIG_HEADER", ck_tile_header)
+        reasons: list[str] = []
+        block = env_mod._capture_composable_kernel(reasons)
+        assert block["system"]["ck_tile_present"] is True
+
+
+class TestCKPytorchBundledProbe:
+    def test_torch_absent_returns_default_no_reason(
+        self, isolated_env, monkeypatch
+    ):
+        """Common case: torch not importable. We record no reason because
+        pytorch_version already captures the absence."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated absence")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._probe_pytorch_bundled_ck(reasons)
+        assert block == {"present": False, "symbol_count": None}
+        # Critical: no reason added (avoids duplicating pytorch_version's
+        # already-recorded absence)
+        assert reasons == []
+
+    def test_cpu_only_torch_does_not_flip_partial(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """A wheel with ``torch.version.hip is None`` is CPU-only by
+        design -- the absence of libtorch_hip.so is documented, not a
+        fallback. The probe should return the default block WITHOUT
+        appending a partial reason, mirroring the docker-on-baremetal
+        contract.
+        """
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        torch_dir.mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        # No lib/libtorch_hip.so on purpose -- this is CPU-only torch.
+        # Critically, version.hip is None.
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip=None, cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._probe_pytorch_bundled_ck(reasons)
+        assert block == {"present": False, "symbol_count": None}
+        # Documented absence -- NO reason appended (consumer can read
+        # the CPU-only state from torch.version.hip themselves).
+        assert reasons == [], (
+            f"CPU-only torch should not trigger partial; got reasons: {reasons}"
+        )
+
+    def test_hip_torch_with_missing_lib_does_flip_partial(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """Inverse case: torch.version.hip claims HIP support but
+        libtorch_hip.so is gone. That's a broken/incomplete install --
+        partial=True with a clear reason is correct.
+        """
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        torch_dir.mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip="7.2.0", cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._probe_pytorch_bundled_ck(reasons)
+        assert block == {"present": False, "symbol_count": None}
+        # This IS a partial -- claims HIP, lib gone. Reason should
+        # name the situation so an operator can act on it.
+        assert any("not found" in r and "claims HIP" in r for r in reasons), reasons
+
+    def test_nm_missing_records_reason(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """Stripped container (binutils not installed)."""
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        (torch_dir / "lib" / "libtorch_hip.so").write_bytes(b"x")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(__file__=str(torch_init))
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr(env_mod.shutil, "which", lambda name: None)
+        reasons: list[str] = []
+        block = env_mod._probe_pytorch_bundled_ck(reasons)
+        assert block == {"present": False, "symbol_count": None}
+        assert any("nm/c++filt" in r for r in reasons), reasons
+
+    def test_happy_path_counts_ck_symbols(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        (torch_dir / "lib" / "libtorch_hip.so").write_bytes(b"x")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(__file__=str(torch_init))
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr(env_mod.shutil, "which", lambda name: "/usr/bin/" + name)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0].endswith("nm"):
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="raw\n", stderr=""
+                )
+            if cmd[0].endswith("c++filt"):
+                # Three demangled lines, two contain ck:: namespace
+                stdout = (
+                    "ck::tensor_operation::Foo\n"
+                    "std::vector<int>\n"
+                    "ck::Block::Bar\n"
+                )
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=stdout, stderr=""
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        block = env_mod._probe_pytorch_bundled_ck(reasons)
+        assert block == {"present": True, "symbol_count": 2}
+        assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# Tensile
+# ---------------------------------------------------------------------------
+
+
+class TestCombinedKernelDbFingerprint:
+    def test_both_dirs_present_combines_filenames(self, tmp_path: Path):
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        (a / "Kernels.so-000-gfx942.hsaco").write_bytes(b"x")
+        (b / "TensileLibrary_gfx942.dat").write_bytes(b"y")
+        fp = env_mod._combined_kernel_db_fingerprint([a, b])
+        assert fp is not None and fp.startswith("filenames-sha256:")
+
+    def test_one_dir_missing_still_fingerprints(self, tmp_path: Path):
+        a = tmp_path / "a"
+        a.mkdir()
+        (a / "TensileLibrary_X.dat").write_bytes(b"x")
+        fp = env_mod._combined_kernel_db_fingerprint([a, tmp_path / "missing"])
+        assert fp is not None
+
+    def test_both_dirs_missing_returns_none(self, tmp_path: Path):
+        assert env_mod._combined_kernel_db_fingerprint(
+            [tmp_path / "a", tmp_path / "b"]
+        ) is None
+
+    def test_dir_basename_namespaces_collisions(self, tmp_path: Path):
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        # Same filename in both dirs -- the (dir, file) tagging should
+        # produce a different fingerprint than putting both in one dir.
+        (a / "Kernels.dat").write_bytes(b"x")
+        (b / "Kernels.dat").write_bytes(b"x")
+        fp_separated = env_mod._combined_kernel_db_fingerprint([a, b])
+
+        c = tmp_path / "c"
+        c.mkdir()
+        (c / "Kernels.dat").write_bytes(b"x")
+        fp_alone = env_mod._combined_kernel_db_fingerprint([c])
+        assert fp_separated != fp_alone
+
+    def test_real_world_library_basename_does_not_collapse(
+        self, tmp_path: Path
+    ):
+        """Regression guard for the production layout:
+        /opt/rocm/lib/{hipblaslt,rocblas}/library/.
+
+        Both directories' immediate basename is ``library`` -- using
+        ``d.name`` directly would key every entry as ``library/<file>``
+        and make hipblaslt's and rocblas's same-named kernel files
+        indistinguishable. The fingerprint must use the parent
+        directory's name (``hipblaslt`` vs ``rocblas``) for tagging.
+        """
+        # Mirror the real prod layout exactly.
+        hipblaslt_dir = tmp_path / "hipblaslt" / "library"
+        rocblas_dir = tmp_path / "rocblas" / "library"
+        hipblaslt_dir.mkdir(parents=True)
+        rocblas_dir.mkdir(parents=True)
+        # A same-named kernel file in BOTH directories.
+        (hipblaslt_dir / "Kernels.dat").write_bytes(b"x")
+        (rocblas_dir / "Kernels.dat").write_bytes(b"x")
+
+        fp_combined = env_mod._combined_kernel_db_fingerprint(
+            [hipblaslt_dir, rocblas_dir]
+        )
+        # Compare against a hypothetical "I only saw the rocblas dir"
+        # fingerprint -- if the namespacing collapsed, both would be
+        # equal since "library/Kernels.dat" + "library/Kernels.dat"
+        # dedupes after sort().
+        fp_rocblas_only = env_mod._combined_kernel_db_fingerprint(
+            [rocblas_dir]
+        )
+        assert fp_combined != fp_rocblas_only, (
+            "Combined fingerprint collapsed when both directories share "
+            "the basename 'library'. The probe must tag by the library "
+            "name (parent dir), not the immediate basename."
+        )
+
+
+class TestTensileBlock:
+    def test_block_keys_stable(self, all_disabled):
+        reasons: list[str] = []
+        block = env_mod._capture_tensile(reasons)
+        assert set(block.keys()) == {"package_version", "kernel_db_combined_hash"}
+
+    def test_tensile_pip_absence_does_not_record_reason(self, all_disabled):
+        """Tensile is rarely on production hosts; suppress the import-miss reason."""
+        reasons: list[str] = []
+        env_mod._capture_tensile(reasons)
+        assert all("Tensile not importable" not in r for r in reasons)
+
+    def test_kernel_db_absent_records_reason(self, all_disabled):
+        reasons: list[str] = []
+        env_mod._capture_tensile(reasons)
+        assert any(
+            r.startswith("tensile.kernel_db_combined_hash:") for r in reasons
+        )
+
+
+# ---------------------------------------------------------------------------
+# Triton
+# ---------------------------------------------------------------------------
+
+
+class TestTritonBlock:
+    def test_triton_unavailable_returns_none_with_reason(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "triton":
+                raise ImportError("simulated absence")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_triton(reasons)
+        assert block == {"package_version": None}
+        assert any("triton" in r for r in reasons)
+
+    def test_triton_with_version_returns_string(self, isolated_env, monkeypatch):
+        import builtins
+        import types
+
+        real_import = builtins.__import__
+        fake_triton = types.SimpleNamespace(__version__="3.5.1+rocm7.2.1.gita272dfa8")
+
+        def fake_import(name, *args, **kwargs):
+            if name == "triton":
+                return fake_triton
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_triton(reasons)
+        assert block == {"package_version": "3.5.1+rocm7.2.1.gita272dfa8"}
+        assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# FBGEMM
+# ---------------------------------------------------------------------------
+
+
+class TestFbgemmBlock:
+    def test_block_keys_stable(self, all_disabled):
+        reasons: list[str] = []
+        block = env_mod._capture_fbgemm(reasons)
+        assert set(block.keys()) == {
+            "package_version",
+            "pytorch_use_fbgemm",
+            "pytorch_use_fbgemm_genai",
+        }
+
+    def test_fbgemm_gpu_absence_does_not_record_reason(self, all_disabled):
+        reasons: list[str] = []
+        env_mod._capture_fbgemm(reasons)
+        assert all("fbgemm_gpu not importable" not in r for r in reasons)
+
+    def test_torch_absent_returns_null_flags_no_extra_reason(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name in ("torch", "fbgemm_gpu"):
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_fbgemm(reasons)
+        assert block["pytorch_use_fbgemm"] is None
+        assert block["pytorch_use_fbgemm_genai"] is None
+        # No reason added -- pytorch_version captures torch absence elsewhere
+        assert reasons == []
+
+    def test_pytorch_use_fbgemm_parsed_from_config(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+        import types
+
+        config = types.SimpleNamespace(
+            show=lambda: "BLAS_INFO=mkl, CXX_FLAGS=-DUSE_FBGEMM -DUSE_FBGEMM_GENAI -O2"
+        )
+        fake_torch = types.SimpleNamespace(__config__=config)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            if name == "fbgemm_gpu":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_fbgemm(reasons)
+        assert block["pytorch_use_fbgemm"] is True
+        assert block["pytorch_use_fbgemm_genai"] is True
+
+    def test_pytorch_use_fbgemm_off_when_not_in_flags(
+        self, isolated_env, monkeypatch
+    ):
+        """A ROCm wheel built without FBGEMM should yield False (not None)."""
+        import builtins
+        import types
+
+        config = types.SimpleNamespace(
+            show=lambda: "BLAS_INFO=mkl, CXX_FLAGS=-O2 -DOTHER_FLAG"
+        )
+        fake_torch = types.SimpleNamespace(__config__=config)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            if name == "fbgemm_gpu":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_fbgemm(reasons)
+        assert block["pytorch_use_fbgemm"] is False
+        assert block["pytorch_use_fbgemm_genai"] is False
+
+    def test_use_fbgemm_regex_does_not_match_genai_substring(self):
+        """Regression guard: -DUSE_FBGEMM (plain) must not false-positive on
+        -DUSE_FBGEMM_GENAI alone.
+        """
+        text = "CXX_FLAGS=-DUSE_FBGEMM_GENAI -O2"
+        assert env_mod._FBGEMM_DEFINE_RE.search(text) is None
+        assert env_mod._FBGEMM_GENAI_DEFINE_RE.search(text) is not None
+
+
+# ---------------------------------------------------------------------------
+# AITER
+# ---------------------------------------------------------------------------
+
+
+class TestAiterBlock:
+    def test_aiter_absence_does_not_record_reason(self, all_disabled):
+        """Most production hosts don't have aiter; suppress the noise."""
+        reasons: list[str] = []
+        block = env_mod._capture_aiter(reasons)
+        assert block == {"package_version": None}
+        assert all("aiter not importable" not in r for r in reasons)
+
+    def test_aiter_with_version_returns_string(self, isolated_env, monkeypatch):
+        import builtins
+        import types
+
+        real_import = builtins.__import__
+        fake_aiter = types.SimpleNamespace(__version__="0.1.4+rocm7.2.gitabc")
+
+        def fake_import(name, *args, **kwargs):
+            if name == "aiter":
+                return fake_aiter
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aiter(reasons)
+        assert block == {"package_version": "0.1.4+rocm7.2.gitabc"}
+        assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# Real-torch integration -- complements TestPytorchVersion's monkeypatched
+# unit tests by exercising _capture_pytorch_version against the actual
+# torch wheel installed in the venv. Skipped when torch isn't importable.
+# ---------------------------------------------------------------------------
+
+
+class TestPytorchVersionRealTorch:
+    """Integration test: real `import torch`, real ``__version__``.
+
+    The unit tests in ``TestPytorchVersion`` use ``SimpleNamespace`` fakes
+    -- they cover the contract but cannot catch the class of bug where
+    real torch's ``__version__`` is some unusual type or where the real
+    install path masks an attribute the fake doesn't model. This class
+    runs the probe against the actual installed torch.
+
+    Tagged ``@pytest.mark.rocm`` so it can be deselected on hosts that
+    aren't validating ROCm builds (``pytest -m 'not rocm'``); on hosts
+    without torch installed it self-skips via ``pytest.importorskip``.
+    """
+
+    @pytest.mark.rocm
+    def test_capture_matches_real_torch_version(self):
+        torch = pytest.importorskip(
+            "torch",
+            reason="real-torch integration test requires torch in the venv",
+        )
+        reasons: list[str] = []
+        captured = env_mod._capture_pytorch_version(reasons)
+        assert captured is not None, (
+            f"probe returned None against real torch; reasons: {reasons}"
+        )
+        # The probe stringifies, but it should still equal the source
+        # ``__version__`` exactly -- never the literal "None", never
+        # truncated, never a repr().
+        assert captured == str(torch.__version__)
+        assert captured != "None"
+        assert reasons == []
+
+    @pytest.mark.rocm
+    def test_pytorch_build_git_commit_matches_real_torch(self):
+        """``pytorch_build.git_commit`` must equal ``torch.version.git_version``.
+        That field is the linchpin -- it deterministically pins every
+        third_party submodule for GitHub-tree lookup.
+        """
+        torch = pytest.importorskip("torch")
+        snapshot = collect_env()
+        expected = getattr(torch.version, "git_version", None) or None
+        assert snapshot.pytorch_build["git_commit"] == expected
+
+    @pytest.mark.rocm
+    def test_full_collect_env_against_real_torch(self):
+        """End-to-end: real collect_env() returns a snapshot whose
+        pytorch_version matches torch.__version__ exactly. Catches any
+        wiring break between _capture_pytorch_version and the
+        EnvSnapshot constructor that the unit tests miss.
+        """
+        torch = pytest.importorskip(
+            "torch",
+            reason="real-torch integration test requires torch in the venv",
+        )
+        snapshot = collect_env()
+        assert snapshot.pytorch_version == str(torch.__version__)
+        assert "pytorch_version" not in " ".join(snapshot.partial_reasons), (
+            "pytorch_version probe recorded a partial reason against the "
+            f"real torch install: {snapshot.partial_reasons}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers extracted during the refactor
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Host system (kernel + glibc + machine arch)
+# ---------------------------------------------------------------------------
+
+
+class TestHostBlock:
+    def test_block_keys_stable(self, all_disabled):
+        snapshot = collect_env()
+        assert set(snapshot.host.keys()) == {
+            "kernel_release",
+            "kernel_version",
+            "machine",
+            "glibc_version",
+        }
+
+    def test_real_host_populates_fields(self, all_disabled):
+        """Smoke test against the real host -- on any Linux/macOS test
+        runner ``os.uname()`` and ``os.confstr`` work, so all four
+        fields should be non-null. The all_disabled fixture doesn't
+        sabotage stdlib syscalls.
+        """
+        snapshot = collect_env()
+        host = snapshot.host
+        assert host["kernel_release"] is not None
+        assert host["machine"] is not None
+        # glibc may legitimately be empty on non-glibc systems (musl,
+        # macOS) -- assert only the field is present, not its value.
+        assert "glibc_version" in host
+
+    def test_uname_failure_records_reason(self, all_disabled, monkeypatch):
+        def boom():
+            raise OSError("no uname for you")
+
+        monkeypatch.setattr(env_mod.os, "uname", boom)
+        reasons: list[str] = []
+        block = env_mod._capture_host(reasons)
+        assert block["kernel_release"] is None
+        assert any(r.startswith("host.kernel_release") for r in reasons)
+
+    def test_glibc_version_strips_redundant_prefix(
+        self, all_disabled, monkeypatch
+    ):
+        """``os.confstr`` returns ``"glibc 2.35"`` on Linux. The
+        ``glibc `` prefix duplicates the field name -- store the bare
+        version string so consumers comparing across hosts do
+        ``"2.35" == "2.35"`` rather than dealing with a stray prefix.
+        """
+        monkeypatch.setattr(env_mod.os, "confstr", lambda name: "glibc 2.35")
+        reasons: list[str] = []
+        block = env_mod._capture_host(reasons)
+        assert block["glibc_version"] == "2.35"
+
+    def test_glibc_version_unprefixed_value_passes_through(
+        self, all_disabled, monkeypatch
+    ):
+        """Defensive: if confstr ever returns a bare version string
+        (some libcs / future Python versions might), don't munge it.
+        """
+        monkeypatch.setattr(env_mod.os, "confstr", lambda name: "2.42")
+        reasons: list[str] = []
+        block = env_mod._capture_host(reasons)
+        assert block["glibc_version"] == "2.42"
+
+
+# ---------------------------------------------------------------------------
+# MIOpen (deep-learning primitives -- conv kernels)
+# ---------------------------------------------------------------------------
+
+
+class TestMiopen:
+    def test_block_keys_stable(self, all_disabled):
+        snapshot = collect_env()
+        assert set(snapshot.miopen.keys()) == {
+            "rocm_release_tweak",
+            "package_version",
+            "lib_hash",
+            "kernel_db_revision",
+        }
+
+    def test_partial_reasons_use_miopen_prefix(self, all_disabled):
+        reasons: list[str] = []
+        env_mod._capture_miopen(reasons)
+        assert reasons
+        assert all(r.startswith("miopen.") for r in reasons), reasons
+
+    def test_full_capture_against_real_files(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        header_dir = tmp_path / "include"
+        header_dir.mkdir()
+        (header_dir / "version.h").write_text(
+            "#define MIOPEN_VERSION_MAJOR 3\n"
+            "#define MIOPEN_VERSION_MINOR 5\n"
+            "#define MIOPEN_VERSION_PATCH 1\n"
+            "#define MIOPEN_VERSION_TWEAK dabb6df2b9\n"
+        )
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libMIOpen.so").write_bytes(b"miopen-bytes")
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        (db_dir / "gfx942_64.db.txt").write_text("k1")
+        (db_dir / "gfx942_64.HIP.fdb.txt").write_text("k2")
+
+        monkeypatch.setattr(env_mod, "MIOPEN_VERSION_HEADER", header_dir / "version.h")
+        monkeypatch.setattr(env_mod, "MIOPEN_LIB_DIR", lib_dir)
+        monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", db_dir)
+        reasons: list[str] = []
+        block = env_mod._capture_miopen(reasons)
+        assert block["rocm_release_tweak"] == "dabb6df2b9"
+        assert block["package_version"] == "3.5.1"
+        assert block["lib_hash"] is not None
+        assert block["kernel_db_revision"] is not None
+        assert block["kernel_db_revision"].startswith("filenames-sha256:")
+        assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# RCCL (collectives, NCCL-compatible API)
+# ---------------------------------------------------------------------------
+
+
+class TestRccl:
+    def test_block_keys_stable(self, all_disabled):
+        snapshot = collect_env()
+        assert set(snapshot.rccl.keys()) == {
+            "version_code",
+            "version",
+            "lib_hash",
+        }
+
+    def test_decode_modern_version_code(self):
+        # 22707 = 2*10000 + 27*100 + 7  (modern scheme; X=2, Y>=9)
+        code, version = env_mod._parse_rccl_header(
+            "#define NCCL_VERSION_CODE 22707\n"
+        )
+        assert code == 22707
+        assert version == "2.27.7"
+
+    def test_decode_legacy_version_code(self):
+        # 2807 = 2*1000 + 8*100 + 7  (legacy scheme; X<=2, Y<=8)
+        code, version = env_mod._parse_rccl_header(
+            "#define NCCL_VERSION_CODE 2807\n"
+        )
+        assert code == 2807
+        assert version == "2.8.7"
+
+    def test_empty_header_returns_none_pair(self):
+        assert env_mod._parse_rccl_header("") == (None, None)
+        assert env_mod._parse_rccl_header(None) == (None, None)
+
+    def test_full_capture(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        header_dir = tmp_path / "include"
+        header_dir.mkdir()
+        (header_dir / "rccl.h").write_text(
+            "// rccl header\n"
+            "#define NCCL_VERSION_CODE 22707\n"
+        )
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "librccl.so").write_bytes(b"rccl-bytes")
+
+        monkeypatch.setattr(env_mod, "RCCL_VERSION_HEADER", header_dir / "rccl.h")
+        monkeypatch.setattr(env_mod, "RCCL_LIB_DIR", lib_dir)
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["version_code"] == 22707
+        assert block["version"] == "2.27.7"
+        assert block["lib_hash"] is not None
+        assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# GPU architecture detection (rocm_agent_enumerator)
+# ---------------------------------------------------------------------------
+
+
+class TestGpuArch:
+    def test_block_keys_stable(self, all_disabled):
+        snapshot = collect_env()
+        assert set(snapshot.gpu_arch.keys()) == {
+            "agent_count",
+            "gfx_targets",
+            "agent_arch_counts",
+        }
+
+    def test_binary_missing_records_reason(self, isolated_env, monkeypatch):
+        monkeypatch.setattr(env_mod.shutil, "which", lambda name: None)
+        # Also stub the /opt/rocm/bin fallback by patching Path.exists
+        # to return False for the canonical path. Easiest: monkeypatch
+        # ROCM_AGENT_ENUMERATOR_BIN to a name that won't exist anywhere.
+        monkeypatch.setattr(
+            env_mod, "ROCM_AGENT_ENUMERATOR_BIN", "definitely_not_a_real_binary_xyz"
+        )
+        reasons: list[str] = []
+        block = env_mod._capture_gpu_arch(reasons)
+        assert block == {
+            "agent_count": None,
+            "gfx_targets": None,
+            "agent_arch_counts": None,
+        }
+        assert any("not on PATH" in r for r in reasons)
+
+    def test_happy_path_parses_one_per_line(
+        self, isolated_env, monkeypatch
+    ):
+        monkeypatch.setattr(
+            env_mod.shutil, "which",
+            lambda name: "/usr/bin/" + name,
+        )
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[0].endswith("rocm_agent_enumerator")
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="gfx942\ngfx942\ngfx942\ngfx942\n", stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        block = env_mod._capture_gpu_arch(reasons)
+        assert block["agent_count"] == 4
+        assert block["gfx_targets"] == ["gfx942"]
+        assert block["agent_arch_counts"] == {"gfx942": 4}
+        assert reasons == []
+
+    def test_filters_gfx000_placeholder(self, isolated_env, monkeypatch):
+        """Some hosts include a gfx000 placeholder for the host CPU
+        agent. It's not a GPU; drop it from the targets list.
+        """
+        monkeypatch.setattr(
+            env_mod.shutil, "which",
+            lambda name: "/usr/bin/" + name,
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="gfx000\ngfx942\ngfx942\n", stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        block = env_mod._capture_gpu_arch(reasons)
+        assert block["agent_count"] == 2  # gfx000 dropped
+        assert "gfx000" not in (block["agent_arch_counts"] or {})
+
+    def test_mixed_arch_host_captures_distribution(
+        self, isolated_env, monkeypatch
+    ):
+        """A host with mixed-arch GPUs (e.g. mi300x + rx7900) should
+        show both in `gfx_targets` AND the per-arch count in
+        `agent_arch_counts`. Catches the cross-environment confound
+        where two trials look identical except one ran on a different
+        second card.
+        """
+        monkeypatch.setattr(
+            env_mod.shutil, "which",
+            lambda name: "/usr/bin/" + name,
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="gfx1100\ngfx942\ngfx942\n", stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        block = env_mod._capture_gpu_arch(reasons)
+        assert block["gfx_targets"] == ["gfx1100", "gfx942"]
+        assert block["agent_arch_counts"] == {"gfx1100": 1, "gfx942": 2}
+
+    def test_no_kfd_access_records_stderr_tail(
+        self, isolated_env, monkeypatch
+    ):
+        """The most common failure: user not in render group, the
+        binary exits non-zero with a stderr message about /dev/kfd.
+        We surface that stderr so the operator knows what to fix.
+        """
+        monkeypatch.setattr(
+            env_mod.shutil, "which",
+            lambda name: "/usr/bin/" + name,
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1,
+                stdout="",
+                stderr="cannot open /dev/kfd: Permission denied\n",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        block = env_mod._capture_gpu_arch(reasons)
+        assert block["agent_count"] is None
+        assert any("Permission denied" in r for r in reasons), reasons
+
+
+# ---------------------------------------------------------------------------
+# AOTriton (default ROCm Flash Attention backend)
+# ---------------------------------------------------------------------------
+
+
+class TestAotritonBlockShape:
+    def test_block_keys_stable(self, all_disabled):
+        """Schema-shape guard. The aotriton block always has these keys
+        regardless of presence/absence of the bundled lib.
+        """
+        snapshot = collect_env()
+        assert set(snapshot.aotriton.keys()) == {
+            "bundled_present",
+            "bundled_version",
+            "bundled_lib_hash",
+            "bundled_images_dir_present",
+            "installed_prefix",
+        }
+
+
+class TestAotritonProbe:
+    def test_torch_absent_returns_default_no_reason(
+        self, isolated_env, monkeypatch
+    ):
+        """torch missing -> documented absence (already captured by
+        pytorch_version), aotriton probe stays silent.
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        assert block["bundled_present"] is False
+        assert block["bundled_version"] is None
+        assert reasons == []
+
+    def test_cpu_only_torch_skips_silently(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """torch.version.hip is None -> CPU-only wheel, no AOTriton by
+        design. Mirrors the bundled-CK probe's CPU-only handling.
+        """
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        torch_dir.mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip=None, cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        assert block["bundled_present"] is False
+        assert reasons == []
+
+    def test_happy_path_parses_version_and_hashes(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        (torch_dir / "lib" / "libaotriton_v2.so.0.11.1").write_bytes(b"aot")
+        (torch_dir / "lib" / "aotriton.images").mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip="7.2.5", cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        assert block["bundled_present"] is True
+        assert block["bundled_version"] == "0.11.1"
+        assert block["bundled_lib_hash"] is not None
+        assert block["bundled_lib_hash"].startswith("sha256:")
+        assert block["bundled_images_dir_present"] is True
+        assert block["installed_prefix"] is None
+        assert reasons == []
+
+    def test_picks_highest_version_when_multiple_present(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        (torch_dir / "lib" / "libaotriton_v2.so.0.10.0").write_bytes(b"old")
+        (torch_dir / "lib" / "libaotriton_v2.so.0.11.1").write_bytes(b"new")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip="7.2.5", cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        # Numeric-tuple sort: 0.11.1 > 0.10.0 even though string sort
+        # would say "0.11.1" < "0.10.0" (since '1' < '0' in second slot).
+        assert block["bundled_version"] == "0.11.1"
+
+    def test_version_and_hash_describe_the_same_file_under_minor_crossover(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """Regression guard for the round-4 bug:
+
+        bundled_version was version-tuple-sorted (correct), but
+        bundled_lib_hash was string-sort-sorted (wrong). For any pair
+        crossing a digit boundary, e.g. 0.9.0 vs 0.10.0:
+          - tuple sort picks 0.10.0
+          - string sort picks 0.9.0 (lexically '9' > '1')
+
+        That left bundled_version="0.10.0" while
+        bundled_lib_hash hashed the bytes of 0.9.0 -- the two fields
+        described different files for the same record. This test pins
+        the fix: both must point at 0.10.0.
+        """
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        (torch_dir / "lib" / "libaotriton_v2.so.0.9.0").write_bytes(b"NINE-zero")
+        (torch_dir / "lib" / "libaotriton_v2.so.0.10.0").write_bytes(b"TEN-zero")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip="7.2.5", cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        assert block["bundled_version"] == "0.10.0"
+        # The hash MUST be of the 0.10.0 bytes, NOT the 0.9.0 bytes
+        # that string-sort would have chosen.
+        expected_hash = "sha256:" + hashlib.sha256(b"TEN-zero").hexdigest()
+        wrong_hash = "sha256:" + hashlib.sha256(b"NINE-zero").hexdigest()
+        assert block["bundled_lib_hash"] == expected_hash, (
+            f"bundled_lib_hash describes the wrong file -- the "
+            f"version-tuple-sort vs string-sort regression has reappeared. "
+            f"Expected hash of '0.10.0' bytes ({expected_hash!r}), got "
+            f"{block['bundled_lib_hash']!r}. If this is the wrong-side "
+            f"hash {wrong_hash!r}, _capture_aotriton fell back to "
+            f"_hash_shared_library's glob+string-sort instead of using "
+            f"_hash_file_path(best_path)."
+        )
+
+    def test_no_aotriton_in_lib_dir_records_reason(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """HIP torch but no libaotriton_v2.so* -> custom build with
+        AOTriton disabled. Worth flagging.
+        """
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        # No aotriton lib on purpose.
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip="7.2.5", cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        assert block["bundled_present"] is False
+        assert any("no libaotriton_v2.so" in r for r in reasons)
+
+    def test_installed_prefix_env_var_recorded(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """AOTRITON_INSTALLED_PREFIX is the operator's override pointing
+        PyTorch at a system AOTriton install. Capturing it is critical
+        for cross-env diffs (a host with the override set behaves
+        differently from one without).
+        """
+        import builtins
+        import types
+
+        torch_dir = tmp_path / "torch"
+        (torch_dir / "lib").mkdir(parents=True)
+        (torch_dir / "lib" / "libaotriton_v2.so.0.11.1").write_bytes(b"x")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            version=types.SimpleNamespace(hip="7.2.5", cuda=None),
+        )
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setenv("AOTRITON_INSTALLED_PREFIX", "/opt/aotriton-0.12")
+        reasons: list[str] = []
+        block = env_mod._capture_aotriton(reasons)
+        assert block["installed_prefix"] == "/opt/aotriton-0.12"
+
+
+# ---------------------------------------------------------------------------
+# pytorch_build block (structured PyTorch identity + submodule SHAs)
+# ---------------------------------------------------------------------------
+
+
+class TestPytorchBuildBlockShape:
+    """Schema-shape and disaster-defaults guards."""
+
+    def test_block_keys_stable(self, all_disabled):
+        snapshot = collect_env()
+        assert set(snapshot.pytorch_build.keys()) == {
+            "git_commit",
+            "hip_version",
+            "cuda_version",
+            "debug",
+            "install_kind",
+            "source_path",
+            "submodule_commits",
+        }
+
+    def test_submodule_commits_keys_stable(self, all_disabled):
+        snapshot = collect_env()
+        subs = snapshot.pytorch_build["submodule_commits"]
+        # The canonical submodule list IS schema; bumping it is a
+        # deliberate change. Mirrors test_canonical_var_names_stable.
+        assert set(subs.keys()) == {
+            "_source",
+            "composable_kernel",
+            "aiter",
+            "fbgemm",
+        }
+
+    def test_canonical_submodules_constant_is_stable(self):
+        # If you add a third_party submodule to track, update both this
+        # set and TestPytorchBuildBlockShape.test_submodule_commits_keys_stable.
+        assert set(env_mod.CANONICAL_PYTORCH_SUBMODULES) == {
+            "composable_kernel",
+            "aiter",
+            "fbgemm",
+        }
+
+
+class TestDetectPytorchInstallKind:
+    def test_explicit_env_var_wins(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        src = tmp_path / "my_pytorch_src"
+        (src / "third_party").mkdir(parents=True)
+        monkeypatch.setenv("AORTA_PYTORCH_SRC", str(src))
+        kind, path = env_mod._detect_pytorch_install_kind()
+        assert kind == "source"
+        assert path == src.resolve()
+
+    def test_env_var_pointing_at_invalid_path_falls_through(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # AORTA_PYTORCH_SRC set, but the dir has no third_party/ -- we
+        # honour the operator's intent only when the structure is valid.
+        bogus = tmp_path / "not_a_pytorch_tree"
+        bogus.mkdir()
+        monkeypatch.setenv("AORTA_PYTORCH_SRC", str(bogus))
+        # No torch in this environment -> falls to "unknown"; the point
+        # is we don't return ("source", bogus).
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated absence")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        kind, path = env_mod._detect_pytorch_install_kind()
+        assert kind == "unknown"
+
+    def test_torch_absent_returns_unknown(self, isolated_env, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        kind, path = env_mod._detect_pytorch_install_kind()
+        assert kind == "unknown"
+        assert path is None
+
+    def test_walk_up_finds_source_tree(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """`import torch` from inside a source checkout: torch.__file__
+        sits under a directory that has .git + third_party siblings.
+        """
+        import builtins
+        import types
+
+        # Layout: <tmp>/.git, <tmp>/third_party/, <tmp>/torch/__init__.py
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "third_party").mkdir()
+        torch_dir = tmp_path / "torch"
+        torch_dir.mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            __version__="2.99.0",
+        )
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        kind, path = env_mod._detect_pytorch_install_kind()
+        assert kind == "source"
+        assert path == tmp_path.resolve()
+
+    def test_wheel_install_default(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """No env var, no .git, no third_party -- a stock wheel install."""
+        import builtins
+        import types
+
+        site = tmp_path / "site-packages"
+        site.mkdir()
+        torch_dir = site / "torch"
+        torch_dir.mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            __version__="2.99.0",
+        )
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        kind, path = env_mod._detect_pytorch_install_kind()
+        assert kind == "wheel"
+        assert path is None
+
+
+class TestGitRevParseHead:
+    def test_happy_path_returns_full_sha(self, tmp_path: Path, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="ff65f5bc672795c5e5033900ea0a0c4f8566c8cf\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        sha = env_mod._git_rev_parse_head(tmp_path)
+        assert sha == "ff65f5bc672795c5e5033900ea0a0c4f8566c8cf"
+
+    def test_non_hex_output_rejected(self, tmp_path: Path, monkeypatch):
+        """Defensive: a misconfigured git aliasing rev-parse to something
+        else (unlikely but possible) must not poison the snapshot.
+        """
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="not-a-sha\n", stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        assert env_mod._git_rev_parse_head(tmp_path) is None
+
+    def test_git_missing_returns_none(self, tmp_path: Path, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        assert env_mod._git_rev_parse_head(tmp_path) is None
+
+    def test_nonzero_exit_returns_none(self, tmp_path: Path, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=128, stdout="", stderr="not a git repo",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        assert env_mod._git_rev_parse_head(tmp_path) is None
+
+
+class TestCapturePytorchSubmodules:
+    def test_source_tree_populates_via_git(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        third_party = tmp_path / "third_party"
+        third_party.mkdir()
+        for name in env_mod.CANONICAL_PYTORCH_SUBMODULES:
+            (third_party / name).mkdir()
+
+        sha_map = {
+            "composable_kernel": "1" * 40,
+            "aiter": "2" * 40,
+            "fbgemm": "3" * 40,
+        }
+
+        def fake_run(cmd, **kwargs):
+            sub_name = Path(cmd[2]).name
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout=sha_map.get(sub_name, "") + "\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        result = env_mod._capture_pytorch_submodules(
+            "source", tmp_path, "abc1234", reasons
+        )
+        assert result["_source"] == "git"
+        assert result["composable_kernel"] == "1" * 40
+        assert result["aiter"] == "2" * 40
+        assert result["fbgemm"] == "3" * 40
+        assert reasons == []
+
+    def test_wheel_install_emits_url_template(self, isolated_env):
+        """No source tree -- partial reason must contain the GitHub URL
+        template with the captured commit substituted in. Operators
+        reading env.json get a copy-pasteable recovery URL.
+        """
+        reasons: list[str] = []
+        result = env_mod._capture_pytorch_submodules(
+            "wheel", None, "ff65f5bc672795c5e5033900ea0a0c4f8566c8cf", reasons
+        )
+        assert result["_source"] is None
+        for name in env_mod.CANONICAL_PYTORCH_SUBMODULES:
+            assert result[name] is None
+        assert len(reasons) == 1
+        reason = reasons[0]
+        assert "github.com/pytorch/pytorch/tree/" in reason
+        assert "ff65f5bc672795c5e5033900ea0a0c4f8566c8cf" in reason
+        assert "AORTA_PYTORCH_SRC" in reason
+
+    def test_wheel_install_unknown_commit_uses_placeholder(self, isolated_env):
+        """If git_commit is null too, the URL template still appears with
+        the literal `<git_commit>` placeholder so the operator at least
+        sees the recovery shape.
+        """
+        reasons: list[str] = []
+        env_mod._capture_pytorch_submodules("wheel", None, None, reasons)
+        assert any("<git_commit>" in r for r in reasons)
+
+    def test_unknown_install_kind_records_reason(self, isolated_env):
+        reasons: list[str] = []
+        env_mod._capture_pytorch_submodules("unknown", None, None, reasons)
+        assert any("torch import failed" in r for r in reasons)
+
+    def test_partial_submodule_set_records_missing(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """Source tree exists but only some submodules are checked out.
+        The missing ones land in a single-line reason, not N reasons.
+        """
+        third_party = tmp_path / "third_party"
+        third_party.mkdir()
+        # Only composable_kernel exists; aiter + fbgemm don't.
+        (third_party / "composable_kernel").mkdir()
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="a" * 40 + "\n", stderr="",
+            )
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        result = env_mod._capture_pytorch_submodules(
+            "source", tmp_path, "abc1234", reasons
+        )
+        assert result["composable_kernel"] == "a" * 40
+        assert result["aiter"] is None
+        assert result["fbgemm"] is None
+        assert result["_source"] == "git"
+        assert len(reasons) == 1
+        assert "aiter" in reasons[0]
+        assert "fbgemm" in reasons[0]
+
+
+class TestCapturePytorchBuildIntegration:
+    """The full block, exercised against fake torch."""
+
+    def test_torch_absent_returns_default_block(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_build(reasons)
+        assert block["git_commit"] is None
+        assert block["install_kind"] == "unknown"
+        # The block-level probe must NOT add a generic "torch import
+        # raised" reason -- pytorch_version already records the absence
+        # and double-counting would noise up partial_reasons. The single
+        # reason that DOES fire is the submodule-commits one (a
+        # consumer-facing affordance saying SHAs are unrecoverable),
+        # which is a separate field-level signal.
+        assert not any(
+            r.startswith("pytorch_build: torch import raised") for r in reasons
+        )
+        sub_reasons = [
+            r for r in reasons if r.startswith("pytorch_build.submodule_commits")
+        ]
+        assert len(sub_reasons) == 1
+        assert "torch import failed" in sub_reasons[0]
+
+    def test_real_torch_version_fields_captured(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        import builtins
+        import types
+
+        site = tmp_path / "site"
+        site.mkdir()
+        torch_dir = site / "torch"
+        torch_dir.mkdir()
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_init),
+            __version__="2.99.0",
+            version=types.SimpleNamespace(
+                git_version="ff65f5bc672795c5e5033900ea0a0c4f8566c8cf",
+                hip="7.2.5",
+                cuda=None,
+                debug=False,
+            ),
+        )
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_build(reasons)
+        assert block["git_commit"] == "ff65f5bc672795c5e5033900ea0a0c4f8566c8cf"
+        assert block["hip_version"] == "7.2.5"
+        assert block["cuda_version"] is None
+        assert block["debug"] is False
+        assert block["install_kind"] == "wheel"
+        # Wheel install -> single recovery-URL reason
+        assert any(
+            "github.com/pytorch/pytorch/tree/" in r for r in reasons
+        )
+
+
+class TestSafeImportTorch:
+    """Centralised torch-import helper used by every probe that needs
+    torch (composable_kernel, aotriton, fbgemm-flag scan, CK-flag scan,
+    pytorch_build).
+    """
+
+    def test_import_error_silent(self, isolated_env, monkeypatch):
+        """ImportError -> None, no reason added (pytorch_version probe
+        records the absence elsewhere, this helper must not double-count).
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        result = env_mod._safe_import_torch(reasons, "test_probe")
+        assert result is None
+        assert reasons == []
+
+    def test_unexpected_exception_records_with_probe_name(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise RuntimeError("C ext load failed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        result = env_mod._safe_import_torch(reasons, "composable_kernel.foo")
+        assert result is None
+        assert len(reasons) == 1
+        assert reasons[0].startswith("composable_kernel.foo: torch import raised")
+        assert "RuntimeError" in reasons[0]
+
+    def test_success_returns_module(self, isolated_env, monkeypatch):
+        import builtins
+        import types
+
+        fake_torch = types.SimpleNamespace(__version__="2.99.0")
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        result = env_mod._safe_import_torch(reasons, "test_probe")
+        assert result is fake_torch
+        assert reasons == []
+
+
+class TestHashFilePath:
+    """Helper that hashes a caller-supplied Path (vs
+    ``_hash_shared_library`` which globs and string-sorts internally).
+    """
+
+    def test_hash_specific_file(self, tmp_path: Path):
+        f = tmp_path / "libfoo.so.0.10.0"
+        f.write_bytes(b"specific bytes")
+        digest = env_mod._hash_file_path(f)
+        expected = "sha256:" + hashlib.sha256(b"specific bytes").hexdigest()
+        assert digest == expected
+
+    def test_resolves_symlink(self, tmp_path: Path):
+        real = tmp_path / "real.so"
+        real.write_bytes(b"real bytes")
+        link = tmp_path / "link.so"
+        link.symlink_to(real)
+        digest = env_mod._hash_file_path(link)
+        expected = "sha256:" + hashlib.sha256(b"real bytes").hexdigest()
+        assert digest == expected
+
+    def test_missing_returns_none(self, tmp_path: Path):
+        assert env_mod._hash_file_path(tmp_path / "nonexistent") is None
+
+    def test_directory_returns_none(self, tmp_path: Path):
+        d = tmp_path / "adir"
+        d.mkdir()
+        assert env_mod._hash_file_path(d) is None
+
+
+class TestPythonPackageVersionHelper:
+    def test_suppress_missing_skips_import_reason(self, isolated_env, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fakepkg":
+                raise ImportError("nope")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        result = env_mod._capture_python_package_version(
+            "fakepkg", reasons, suppress_missing=True
+        )
+        assert result is None
+        assert reasons == []
+
+    def test_suppress_missing_still_reports_other_failures(
+        self, isolated_env, monkeypatch
+    ):
+        """suppress_missing only swallows ImportError, not broken __version__."""
+        import builtins
+        import types
+
+        real_import = builtins.__import__
+        fake_mod = types.SimpleNamespace()  # no __version__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "brokenpkg":
+                return fake_mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        result = env_mod._capture_python_package_version(
+            "brokenpkg", reasons, suppress_missing=True
+        )
+        assert result is None
+        assert any("__version__" in r for r in reasons)
+
+    def test_custom_reason_prefix_used_in_output(
+        self, isolated_env, monkeypatch
+    ):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fakepkg":
+                raise ImportError("nope")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        env_mod._capture_python_package_version(
+            "fakepkg", reasons, reason_prefix="custom.thing"
+        )
+        assert any(r.startswith("custom.thing:") for r in reasons)
