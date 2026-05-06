@@ -77,11 +77,19 @@ SCHEMA_VERSION = "1.1"
 #   - Added top-level `host`, `miopen`, `rccl`, `gpu_arch`, `aotriton`,
 #     `pytorch_build`, `composable_kernel`, `tensile`, `triton`,
 #     `fbgemm`, `aiter`, `rocblas` blocks. All purely additive.
-#   - Added 7 new env vars to CANONICAL_ENV_VARS (HIP_VISIBLE_DEVICES,
-#     ROCR_VISIBLE_DEVICES, HSA_OVERRIDE_GFX_VERSION,
-#     HIP_LAUNCH_BLOCKING, MIOPEN_FIND_MODE, TORCH_HIPBLASLT_TUNING_FILE,
-#     TORCH_HIPBLASLT_TUNING_OVERRIDE_FILE) plus the SDPA/Tuning/MIOpen
-#     family from earlier.
+#   - Expanded CANONICAL_ENV_VARS across GPU scoping
+#     (HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
+#     HSA_OVERRIDE_GFX_VERSION), launch (HIP_LAUNCH_BLOCKING), build
+#     target (PYTORCH_ROCM_ARCH), MIOpen kernel-DB selection
+#     (MIOPEN_SYSTEM_DB_PATH / MIOPEN_USER_DB_PATH /
+#     MIOPEN_DEBUG_DISABLE_FIND_DB / MIOPEN_FIND_MODE), SDPA backend
+#     (TORCH_ROCM_FA_PREFER_CK / TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL),
+#     hipBLASLt autotune (TORCH_BLAS_PREFER_HIPBLASLT /
+#     TORCH_HIPBLASLT_TUNING_FILE / TORCH_HIPBLASLT_TUNING_OVERRIDE_FILE),
+#     and NCCL/RCCL extras (NCCL_P2P_LEVEL / NCCL_IB_HCA /
+#     NCCL_SOCKET_IFNAME / RCCL_MSCCL_ENABLE). Removed USE_ROCM_CK_SDPA
+#     (build-time cmake flag, see above). See CANONICAL_ENV_VARS for
+#     the full set.
 #   - host.glibc_version no longer carries the redundant "glibc "
 #     prefix; the value is the bare version string (e.g. "2.35").
 
@@ -1184,6 +1192,30 @@ def _hash_file_path(path: Path) -> str | None:
         return None
 
 
+def _parse_soname_version(filename: str, soname: str) -> tuple[int, ...] | None:
+    """Parse the dotted-decimal suffix of a versioned soname.
+
+    ``("libfoo.so.1.2.70201", "libfoo.so") -> (1, 2, 70201)``. Returns
+    ``None`` when the suffix isn't pure dotted-decimal (e.g. a debug
+    build with a trailing tag) so callers can fall back to lex sort.
+
+    Used to sort versioned-soname siblings by integer-tuple instead of
+    lexicographically -- otherwise ``libfoo.so.5.10.0`` ranks below
+    ``libfoo.so.5.9.0`` (because ``"1" < "9"`` as strings) and a
+    multi-version install would record the wrong file's hash.
+    """
+    prefix = soname + "."
+    if not filename.startswith(prefix):
+        return None
+    suffix = filename[len(prefix):]
+    if not suffix:
+        return None
+    try:
+        return tuple(int(p) for p in suffix.split("."))
+    except ValueError:
+        return None
+
+
 def _hash_shared_library(lib_dir: Path, soname: str) -> str | None:
     """SHA-256 a shared library, resolving symlinks first.
 
@@ -1200,19 +1232,30 @@ def _hash_shared_library(lib_dir: Path, soname: str) -> str | None:
     ``libfoo.so.1.2.3`` collapses to one hash regardless of which name
     the consumer linked against. Returns ``"sha256:<hex>"`` or ``None``.
     """
-    # Build candidate list: unversioned first, then any versioned
-    # filenames sorted descending so the highest-versioned wins. String
-    # sort works for the conventional ``soname.MAJOR.MINOR.PATCH``
-    # layout since each component is left-padded by the package version
-    # numbering (and where it does not, "good enough" still picks a
-    # real file deterministically).
+    # Build candidate list: unversioned first, then versioned files
+    # ranked highest-first by integer-tuple (NOT lexicographic) so a
+    # mid-upgrade pair like ``.so.5.10.0`` vs ``.so.5.9.0`` resolves to
+    # the actually-newer file. Any sibling whose suffix isn't pure
+    # dotted-decimal falls into a second tier and is lex-sorted -- it's
+    # an oddly-named file and we still want a deterministic pick.
     candidates: list[Path] = [lib_dir / soname]
     try:
-        versioned = sorted(lib_dir.glob(f"{soname}.*"), reverse=True)
+        siblings = list(lib_dir.glob(f"{soname}.*"))
     except OSError as exc:
         log.debug("glob failed for %s/%s.*: %s", lib_dir, soname, exc)
-        versioned = []
-    candidates.extend(versioned)
+        siblings = []
+    parsed: list[tuple[tuple[int, ...], Path]] = []
+    unparsed: list[Path] = []
+    for path in siblings:
+        version = _parse_soname_version(path.name, soname)
+        if version is None:
+            unparsed.append(path)
+        else:
+            parsed.append((version, path))
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    unparsed.sort(reverse=True)
+    candidates.extend(p for _, p in parsed)
+    candidates.extend(unparsed)
 
     seen_resolved: set[Path] = set()
     for candidate in candidates:

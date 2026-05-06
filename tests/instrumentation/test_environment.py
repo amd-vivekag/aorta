@@ -2177,6 +2177,30 @@ class TestRocblasLibHash:
         expected = "sha256:" + hashlib.sha256(b"new").hexdigest()
         assert digest == expected
 
+    def test_picks_numerically_highest_across_digit_boundary(
+        self, tmp_path: Path
+    ):
+        """Regression guard: the version-suffix sort must be by integer
+        tuple, not lexicographic. ``5.10.0`` is newer than ``5.9.0`` but
+        sorts *before* it as a string (``"1" < "9"``), so a lex-sorted
+        fallback would record the older file's hash on a multi-version
+        install.
+        """
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "librocblas.so.5.9.0").write_bytes(b"old-five-nine")
+        (lib_dir / "librocblas.so.5.10.0").write_bytes(b"new-five-ten")
+
+        digest = env_mod._hash_shared_library(lib_dir, "librocblas.so")
+        expected = "sha256:" + hashlib.sha256(b"new-five-ten").hexdigest()
+        wrong = "sha256:" + hashlib.sha256(b"old-five-nine").hexdigest()
+        assert digest == expected, (
+            "lib_hash describes the wrong file -- the integer-tuple vs "
+            f"string-sort regression has reappeared. Expected {expected!r}, "
+            f"got {digest!r}. If this is the wrong-side hash {wrong!r}, "
+            "_hash_shared_library has reverted to lex-sorting its glob."
+        )
+
 
 class TestRocblasBlockShape:
     def test_block_keys_stable(self, all_disabled):
