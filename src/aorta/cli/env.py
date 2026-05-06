@@ -33,7 +33,13 @@ def env() -> None:
     show_default=True,
     help="Path to write env.json.",
 )
-def probe(output: Path) -> None:
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="After the brief, also print the full snapshot JSON to stdout.",
+)
+def probe(output: Path, verbose: bool) -> None:
     """Capture trial-environment state to env.json (issue #147)."""
     from aorta.instrumentation.environment import collect_env
 
@@ -55,8 +61,9 @@ def probe(output: Path) -> None:
     # supposed to be JSON-native (str/int/bool/None/list/dict). If a
     # non-serializable type sneaks in (e.g. a Path or datetime), we want
     # the failure to be loud rather than silently stringified.
+    snapshot_dict = snapshot.to_dict()
     try:
-        output.write_text(json.dumps(snapshot.to_dict(), indent=2))
+        output.write_text(json.dumps(snapshot_dict, indent=2))
     except OSError as exc:
         raise click.ClickException(
             f"Failed to write env probe to {output}: {exc}"
@@ -68,3 +75,27 @@ def probe(output: Path) -> None:
         f"(schema_version={snapshot.schema_version}){partial}"
     )
     click.echo(snapshot.summary())
+
+    # Always inline the partial_reasons -- they are action items and
+    # forcing the operator to ``jq env.json`` to read them is friction.
+    # Costs nothing (the list is already in memory).
+    if snapshot.partial:
+        click.echo("\nPartial reasons:")
+        for reason in snapshot.partial_reasons:
+            click.echo(f"  - {reason}")
+
+    if verbose:
+        click.echo("\n--- Full snapshot ---")
+        click.echo(json.dumps(snapshot_dict, indent=2))
+
+    # Closing marker -- repeats the [PARTIAL] state at end-of-output so
+    # an operator scrolled to the bottom (especially after --verbose
+    # dumps the full JSON) immediately sees probe status without
+    # scrolling back up. Matches the marker shown next to the "Wrote
+    # env probe..." line.
+    if snapshot.partial:
+        click.echo(
+            f"\n[PARTIAL, {len(snapshot.partial_reasons)} reason(s)]"
+        )
+    else:
+        click.echo("\n[OK]")

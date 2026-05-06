@@ -8,7 +8,27 @@ will live here too.
 
 | Submodule | Purpose | Public API |
 | --- | --- | --- |
-| [`environment`](environment.py) | Snapshot the trial environment (rdhc + ROCm version files + hipconfig + hipBLASLt + container detection + canonical env vars + Python/PyTorch versions). | `collect_env() -> EnvSnapshot` |
+| [`environment`](environment.py) | ROCm + ML stack version snapshot + container/python env detection. See block list below. | `collect_env() -> EnvSnapshot` |
+
+**`environment` blocks** (every snapshot includes all of these; missing
+values become `None` plus a `partial_reasons` line):
+
+* System: `rdhc` health snapshot, ROCm version files, HIP toolchain,
+  container/python env detection, canonical env-var capture.
+* GEMM/kernel libraries: `hipBLASLt`, `rocBLAS`, `MIOpen` (conv
+  kernels), `RCCL` (collectives), `Composable Kernel` (with both
+  `system` and `pytorch_bundled` sub-blocks), `Tensile` (cross-library
+  kernel-DB fingerprint).
+* GPU + host: `gpu_arch` (gfx-target distribution via
+  `rocm_agent_enumerator`), `host` (kernel + glibc + machine arch).
+* PyTorch ecosystem: `Triton`, `FBGEMM` (pip + PyTorch build flags),
+  `AITER`, `AOTriton` (default ROCm Flash Attention backend; bundled
+  in `<torch>/lib/libaotriton_v2.so*` via cmake-fetched dep, not a
+  submodule), `pytorch_version`, `pytorch_build` (structured:
+  git_commit from `torch.version.git_version` + per-submodule SHAs
+  from `git -C <src>/third_party/<sub> rev-parse HEAD` when
+  `AORTA_PYTORCH_SRC` points at a source tree, otherwise GitHub URL
+  template for manual lookup).
 
 ## env probe quick reference
 
@@ -25,7 +45,8 @@ trial_result["env"] = snapshot.to_dict()
 # Reconstruct from a previously persisted env.json blob
 rebuilt = EnvSnapshot.from_dict(loaded_json["env"])
 
-# Quick human summary (six lines, no external dependencies)
+# Quick human summary (multi-line per-block brief, ~18 lines on a
+# populated host; no external dependencies)
 print(snapshot.summary())
 ```
 
@@ -47,8 +68,10 @@ aorta env probe -o runs/exp1/env.json
 ```
 
 After the run, `cat env.json` reveals the same dict that
-`snapshot.to_dict()` returns. The CLI also prints a six-line summary to
-stdout.
+`snapshot.to_dict()` returns. The CLI also prints a per-block summary
+brief to stdout (currently ~18 lines on a populated host -- one labelled
+cell per top-level block); see [`docs/env-probe.md#cli`](../../../docs/env-probe.md#cli)
+for the live example output.
 
 ### Installing RDHC for full `system_health` coverage
 
@@ -95,7 +118,7 @@ Documented absences DO NOT trigger `partial`:
 * `env_vars[X] == None` for an unset env var (the documented contract).
 * `runtime_context.venv_path == None` outside a venv.
 
-### env.json schema (v1.0)
+### env.json schema (v1.1)
 
 See `EnvSnapshot` in [`environment.py`](environment.py) for the
 authoritative shape and field-by-field docstrings. Top-level keys:
@@ -103,9 +126,17 @@ authoritative shape and field-by-field docstrings. Top-level keys:
 ```
 schema_version    captured_at       partial         partial_reasons
 system_health     rocm              hip             hipblaslt
+rocblas           miopen            rccl            composable_kernel
+tensile           triton            fbgemm          aiter
+aotriton          gpu_arch          host
 runtime_context   docker            env_vars
-python_version    pytorch_version
+python_version    pytorch_version   pytorch_build
 ```
+
+For the per-version field history (renames, env-var additions /
+removals), see the changelog comment next to `SCHEMA_VERSION` in
+`environment.py` or the "Schema changelog" section of
+[`docs/env-probe.md`](../../../docs/env-probe.md#schema-changelog).
 
 Schema is **stable + versioned**. Add fields freely; never rename or
 remove without bumping `schema_version`. Empty `applied_prs: {}` may
@@ -173,7 +204,9 @@ Roughly the same pattern as the existing blocks (`_run_rdhc`,
 
 ## Tests
 
-`tests/instrumentation/test_environment.py` has ~80 tests covering:
+`tests/instrumentation/test_environment.py` has ~150 tests (run
+`pytest --collect-only -q tests/instrumentation/test_environment.py | tail -1`
+for the live count) covering:
 
 * Schema completeness (every top-level key present in every snapshot)
 * Round-trip via `to_dict()` / `from_dict()` (incl. through JSON,
