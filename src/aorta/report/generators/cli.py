@@ -6,8 +6,9 @@ This module provides the 'generate' command group with subcommands:
   - plots: Generate visualization plots
 """
 
-import click
 from pathlib import Path
+
+import click
 
 
 @click.group()
@@ -17,9 +18,10 @@ def generate(ctx):
 
     \b
     Commands:
-      html   - Generate HTML report with embedded images
-      excel  - Generate comprehensive Excel report
-      plots  - Generate visualization plots
+      html          - Generate HTML report with embedded images
+      excel         - Generate comprehensive Excel report
+      plots         - Generate visualization plots
+      kernel-trace  - Correlate kernel events with NaN iterations
     """
     pass
 
@@ -288,3 +290,70 @@ def generate_plots_cmd(ctx, input_file, excel_input, gemm_csv, output, plot_type
         raise click.ClickException(str(e))
     except Exception as e:
         raise click.ClickException(f"Error generating plots: {e}")
+
+
+@generate.command("kernel-trace")
+@click.option(
+    "-i",
+    "--metrics-dir",
+    "metrics_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Directory containing rank_*_metrics.jsonl files",
+)
+@click.option(
+    "-o",
+    "--output-dir",
+    "output_dir",
+    required=True,
+    type=click.Path(),
+    help="Output directory for the kernel-trace report bundle",
+)
+@click.option(
+    "--lookback",
+    "lookback_iterations",
+    default=5,
+    type=int,
+    show_default=True,
+    help="Number of preceding iterations to attach to each NaN finding",
+)
+@click.option(
+    "--pattern",
+    default="rank_*_metrics.jsonl",
+    show_default=True,
+    help="Glob pattern for the per-rank metrics files",
+)
+@click.pass_context
+def generate_kernel_trace(ctx, metrics_dir, output_dir, lookback_iterations, pattern):
+    """Correlate kernel events from bpftrace with training NaN iterations.
+
+    Reads ``rank_*_metrics.jsonl`` written by the FSDP trainer (when
+    ``--enable-kernel-trace`` is on) and emits a JSON summary, a CSV of
+    findings, and a self-contained HTML report.
+
+    Example:
+
+    \b
+        aorta-report generate kernel-trace \\
+            -i artifacts/run_2026_04_27/ \\
+            -o artifacts/run_2026_04_27/kernel_report/
+    """
+    # Import the leaf module rather than the ``generators`` package: the
+    # package ``__init__`` eagerly imports ``excel_report`` / ``plot_generator``
+    # / ``html_generator`` (pandas / openpyxl / matplotlib), which would
+    # defeat this subcommand's "runnable on the base install with no
+    # report extras" promise. Caught by Copilot review on PR #162.
+    from .kernel_report import generate_kernel_report
+
+    quiet = ctx.obj.get("quiet", False)
+    artifacts = generate_kernel_report(
+        metrics_dir=Path(metrics_dir),
+        output_dir=Path(output_dir),
+        lookback_iterations=lookback_iterations,
+        pattern=pattern,
+    )
+
+    if not quiet:
+        click.echo("Kernel trace report artifacts:")
+        for name, path in artifacts.items():
+            click.echo(f"  {name}: {path}")
