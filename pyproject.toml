@@ -35,11 +35,15 @@ dependencies = [
 aorta = "aorta.cli:main"
 
 # Plugin discovery: workloads register here via aorta.workloads entry-point group.
-# Engineer task A2 adds the first one (fsdp). Private workloads
-# (meta_recom_repro, precision_swaitcnt_test) register from aorta-internal's
+# Public workloads (when they land) register here; private workloads
+# (recom_repro, precision_swaitcnt_test, etc.) register from aorta-internal's
 # pyproject.toml under the same group, separate package.
-[project.entry-points."aorta.workloads"]
-fsdp = "aorta.workloads.fsdp:FsdpWorkload"
+#
+# No public workloads are wired up yet -- the prior `fsdp` entry pointed at
+# `aorta.workloads.fsdp:FsdpWorkload`, which was never created, so `aorta run`
+# would log a noisy "Failed to load workload 'fsdp'" warning on every
+# invocation. Removed until a real public workload lands.
+# [project.entry-points."aorta.workloads"]
 
 [project.optional-dependencies]
 # For analysis/visualization scripts
