@@ -20,10 +20,48 @@ Validation that the library API needs to enforce regardless of caller
 this module still get checked.
 """
 
+import logging
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from aorta.run.results import TrialResult
+
+
+def configure_verbose_logging(verbose_count: int) -> None:
+    """Wire a stderr StreamHandler onto the ``aorta`` logger when -v is set.
+
+    Both ``aorta run`` and ``aorta triage run`` are silent by default --
+    the ``aorta.*`` loggers exist but have no handlers, so INFO-level
+    progress calls are dropped. Without this, a long matrix run prints
+    nothing until the final ``Wrote matrix to ...`` line, leaving
+    operators with no signal that anything is happening.
+
+    ``verbose_count`` follows Click's ``count=True`` convention:
+
+    * ``0``: no-op (default; preserves backwards-compatible silence).
+    * ``1`` (``-v``): INFO -- per-trial / per-cell progress.
+    * ``>=2`` (``-vv``): DEBUG -- also workload-internal logs.
+
+    Output goes to **stderr** so stdout stays clean for the existing
+    ``click.echo`` lines (final pass/fail summary, "to rerun" hint, etc.)
+    that callers may pipe into a parser.
+
+    Idempotent: invoking twice on the same process (tests use
+    ``CliRunner.invoke`` repeatedly) does not stack handlers.
+    """
+    if verbose_count <= 0:
+        return
+    level = logging.DEBUG if verbose_count >= 2 else logging.INFO
+    aorta_logger = logging.getLogger("aorta")
+    # Mark the handler so re-invocation under CliRunner doesn't pile up
+    # duplicates across tests / nested CLI invocations in the same process.
+    if not any(getattr(h, "_aorta_verbose", False) for h in aorta_logger.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+        handler._aorta_verbose = True  # type: ignore[attr-defined]
+        aorta_logger.addHandler(handler)
+    aorta_logger.setLevel(level)
 
 
 def parse_csv(value: str) -> tuple[str, ...]:

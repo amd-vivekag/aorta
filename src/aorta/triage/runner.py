@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -499,7 +500,17 @@ def run_recipe(
     # same errors). No need to re-check here.
 
     cell_stats: list[CellStats] = []
-    for cell in recipe.cells:
+    total_cells = len(recipe.cells)
+    log.info(
+        "matrix run started: workload=%s ticket=%s cells=%d trials/cell=%d steps/trial=%d output=%s",
+        recipe.workload,
+        recipe.ticket or "(none)",
+        total_cells,
+        recipe.trials,
+        recipe.steps,
+        run_dir,
+    )
+    for cell_idx, cell in enumerate(recipe.cells, start=1):
         if cell.environment not in seen_envs:
             env_json_path = env_dir / safe_slug(cell.environment) / "env.json"
             if _is_isolated_environment(
@@ -520,9 +531,43 @@ def run_recipe(
                 )
             seen_envs.add(cell.environment)
 
+        log.info(
+            "cell %d/%d: %s (mitigations=%s environment=%s) -- starting %d trial(s)",
+            cell_idx,
+            total_cells,
+            cell.name,
+            list(cell.mitigations) or ["(none)"],
+            cell.environment,
+            cell.effective_trials(recipe.trials),
+        )
+        cell_t0 = time.perf_counter()
         trials, error, resolved_env_vars, trial_paths = _run_one_cell(
             cell, recipe, run_dir, sidecar_files
         )
+        cell_elapsed = time.perf_counter() - cell_t0
+        if error is not None:
+            log.info(
+                "cell %d/%d: %s -- ERROR (%s) in %.1fs",
+                cell_idx,
+                total_cells,
+                cell.name,
+                error,
+                cell_elapsed,
+            )
+        else:
+            # ``TrialResult.result`` is the WorkloadResult-serialised-to-dict
+            # (see ``aorta/run/results.py`` schema); use ``.get`` so a future
+            # workload that omits the key from its dict still classifies cleanly.
+            passed = sum(1 for t in trials if t.result.get("passed"))
+            log.info(
+                "cell %d/%d: %s -- done in %.1fs [%d/%d trials passed]",
+                cell_idx,
+                total_cells,
+                cell.name,
+                cell_elapsed,
+                passed,
+                len(trials),
+            )
 
         stats = aggregate_cell(
             name=cell.name,
