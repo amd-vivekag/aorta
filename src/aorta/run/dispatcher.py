@@ -203,17 +203,23 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
         results_dir.mkdir(parents=True, exist_ok=True)
 
     # 10. Run trials
-    logger.info(
-        "run_trials: workload=%s environment=%s mitigations=%s trials=%d steps=%s",
-        request.workload,
-        request.environment,
-        list(request.mitigations) or ["(none)"],
-        request.trials,
-        request.steps if request.steps is not None else "(workload default)",
-    )
+    # Gate progress logs on rank 0 -- the same predicate that gates JSON
+    # writes -- so a torchrun-launched workload doesn't emit duplicate
+    # "trial K/N starting" lines from every rank under -v. Non-rank-0
+    # processes still execute the trial; they just don't narrate it.
+    if should_write:
+        logger.info(
+            "run_trials: workload=%s environment=%s mitigations=%s trials=%d steps=%s",
+            request.workload,
+            request.environment,
+            list(request.mitigations) or ["(none)"],
+            request.trials,
+            request.steps if request.steps is not None else "(workload default)",
+        )
     results: list[TrialResult] = []
     for trial_idx in range(request.trials):
-        logger.info("trial %d/%d: starting", trial_idx + 1, request.trials)
+        if should_write:
+            logger.info("trial %d/%d: starting", trial_idx + 1, request.trials)
         trial_t0 = time.perf_counter()
         result = _run_single_trial(
             trial_idx=trial_idx,
@@ -224,17 +230,18 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
             results_dir=results_dir,
             should_write=should_write,
         )
-        # ``TrialResult.result`` is the WorkloadResult-as-dict; .get() so
-        # workloads that omit ``passed`` still classify cleanly.
-        passed = bool(result.result.get("passed"))
-        logger.info(
-            "trial %d/%d: %s in %.1fs (exit_status=%s)",
-            trial_idx + 1,
-            request.trials,
-            "passed" if passed else "FAILED",
-            time.perf_counter() - trial_t0,
-            result.exit_status,
-        )
+        if should_write:
+            # ``TrialResult.result`` is the WorkloadResult-as-dict; .get() so
+            # workloads that omit ``passed`` still classify cleanly.
+            passed = bool(result.result.get("passed"))
+            logger.info(
+                "trial %d/%d: %s in %.1fs (exit_status=%s)",
+                trial_idx + 1,
+                request.trials,
+                "passed" if passed else "FAILED",
+                time.perf_counter() - trial_t0,
+                result.exit_status,
+            )
         results.append(result)
 
     return results

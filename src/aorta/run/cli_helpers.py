@@ -37,25 +37,42 @@ def configure_verbose_logging(verbose_count: int) -> None:
     nothing until the final ``Wrote matrix to ...`` line, leaving
     operators with no signal that anything is happening.
 
+    Scope: only the ``aorta.*`` logger hierarchy. Workloads registered
+    via the ``aorta.workloads`` entry-point group from sibling packages
+    (e.g. ``aorta_internal.workloads.recom_repro``) live OUTSIDE that
+    hierarchy, so their logging is unaffected -- a separate handler
+    on those packages' loggers (or the root logger) would be needed.
+
     ``verbose_count`` follows Click's ``count=True`` convention:
 
-    * ``0``: no-op (default; preserves backwards-compatible silence).
+    * ``0``: tear-down / no-op. If a prior call in the same process
+      installed verbosity, this removes it (handler + level reset);
+      otherwise nothing happens.
     * ``1`` (``-v``): INFO -- per-trial / per-cell progress.
-    * ``>=2`` (``-vv``): DEBUG -- also workload-internal logs.
+    * ``>=2`` (``-vv``): DEBUG -- aorta-internal debug logs.
 
     Output goes to **stderr** so stdout stays clean for the existing
     ``click.echo`` lines (final pass/fail summary, "to rerun" hint, etc.)
     that callers may pipe into a parser.
 
-    Idempotent: invoking twice on the same process (tests use
-    ``CliRunner.invoke`` repeatedly) does not stack handlers.
+    Symmetric and idempotent: ``configure_verbose_logging(N)`` followed
+    by ``configure_verbose_logging(0)`` returns the logger to its
+    original NOTSET state. CliRunner-based tests can invoke commands
+    with and without ``-v`` in any order without leaking state.
     """
-    if verbose_count <= 0:
-        return
-    level = logging.DEBUG if verbose_count >= 2 else logging.INFO
     aorta_logger = logging.getLogger("aorta")
-    # Mark the handler so re-invocation under CliRunner doesn't pile up
-    # duplicates across tests / nested CLI invocations in the same process.
+
+    if verbose_count <= 0:
+        # Tear down any handler we previously installed; reset level so
+        # subsequent invocations in the same process truly start silent.
+        for h in [h for h in aorta_logger.handlers if getattr(h, "_aorta_verbose", False)]:
+            aorta_logger.removeHandler(h)
+        aorta_logger.setLevel(logging.NOTSET)
+        return
+
+    level = logging.DEBUG if verbose_count >= 2 else logging.INFO
+    # Don't stack duplicate handlers under repeated invocation (CliRunner,
+    # programmatic callers calling the helper twice with -v).
     if not any(getattr(h, "_aorta_verbose", False) for h in aorta_logger.handlers):
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
@@ -149,6 +166,7 @@ def summarize_results(results: Iterable[TrialResult]) -> RunSummary:
 
 __all__ = [
     "RunSummary",
+    "configure_verbose_logging",
     "parse_csv",
     "parse_extra_env",
     "parse_mitigations",
