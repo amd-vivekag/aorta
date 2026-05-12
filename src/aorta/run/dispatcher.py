@@ -150,26 +150,40 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
             "[A-Za-z_][A-Za-z0-9_]* (POSIX env-var name shape)."
         )
 
-    # 4. Discover workload
+    # 4. Reject reserved ``_aorta_*`` keys in ``config_overrides``.
+    #    The dispatcher writes platform-supplied values (currently
+    #    ``_aorta_environment``) into ``config`` after merging
+    #    ``config_overrides``, so a caller-supplied ``_aorta_*`` key
+    #    would be silently clobbered.  Failing loudly here surfaces
+    #    typos and prevents callers from depending on a slot that
+    #    isn't actually theirs.
+    reserved_keys = sorted(k for k in request.config_overrides if k.startswith("_aorta_"))
+    if reserved_keys:
+        raise ValueError(
+            f"config_overrides keys {reserved_keys} use the reserved "
+            "'_aorta_' prefix (platform-supplied; not a user override)."
+        )
+
+    # 5. Discover workload
     workload_cls = get_workload_class(request.workload)
 
-    # 5. Validate launch mode BEFORE setup()
+    # 6. Validate launch mode BEFORE setup()
     validate_launch_mode(workload_cls)
 
-    # 6. Resolve environment.  Forward ``sidecar_files`` so any
+    # 7. Resolve environment.  Forward ``sidecar_files`` so any
     #    operator-supplied JSON sidecars (B3.1) are merged with
     #    built-ins and entry-point plugins.
     sidecar_files = list(request.sidecar_files) or None
     env_descriptor = get_environment(request.environment, extra_files=sidecar_files)
 
-    # 7. Resolve and union mitigations.  ``aorta.registry.get_mitigation``
+    # 8. Resolve and union mitigations.  ``aorta.registry.get_mitigation``
     #    returns a defensive ``dict[str, str]`` per-call, so later
     #    mitigations naturally win over earlier ones in the union.
     mitigation_env: dict[str, str] = {}
     for name in request.mitigations:
         mitigation_env.update(get_mitigation(name, extra_files=sidecar_files))
 
-    # 8. Determine if we should write (rank 0 only for distributed).
+    # 9. Determine if we should write (rank 0 only for distributed).
     #    Only rank 0 needs the output directory; creating it on every
     #    rank causes shared-FS contention and weakens the rank-0-only
     #    write guarantee.  Parse RANK defensively -- a misconfigured
@@ -188,7 +202,7 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
     if should_write:
         results_dir.mkdir(parents=True, exist_ok=True)
 
-    # 9. Run trials
+    # 10. Run trials
     results: list[TrialResult] = []
     for trial_idx in range(request.trials):
         result = _run_single_trial(
@@ -260,13 +274,10 @@ def _run_single_trial(
     #
     # The underscore prefix signals "platform-supplied; not a user
     # override" and matches the same convention ``TrialResult`` uses
-    # for ``execution_env``.
-    config["_aorta_environment"] = {
-        "name": env_descriptor.name,
-        "docker": env_descriptor.docker,
-        "venv": env_descriptor.venv,
-        "source_package": env_descriptor.source_package,
-    }
+    # for ``execution_env``.  ``run_trials`` rejects ``_aorta_*`` keys
+    # in ``config_overrides`` so this assignment can't silently clobber
+    # a caller-supplied value.
+    config["_aorta_environment"] = asdict(env_descriptor)
 
     # Snapshot the env BEFORE applying mitigation / extra_env so the
     # ``finally`` block can restore both the dispatcher's overlay and
@@ -357,13 +368,10 @@ def _run_single_trial(
     # ``aorta.registry.Environment`` shape (no ``kind`` / ``rocm`` --
     # those were stub-isms; ROCm version now lives inside
     # ``env_snapshot.rocm`` and the runtime kind in
-    # ``env_snapshot.runtime_context.type``).
-    execution_env = {
-        "name": env_descriptor.name,
-        "docker": env_descriptor.docker,
-        "venv": env_descriptor.venv,
-        "source_package": env_descriptor.source_package,
-    }
+    # ``env_snapshot.runtime_context.type``).  Same shape as
+    # ``config["_aorta_environment"]`` above; sharing ``asdict`` keeps
+    # the two in lockstep if ``Environment`` ever grows a field.
+    execution_env = asdict(env_descriptor)
 
     # Build TrialResult
     trial_result = TrialResult(

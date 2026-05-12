@@ -180,6 +180,22 @@ class TestRunTrials:
             with pytest.raises(ValueError, match="Invalid extra_env keys"):
                 run_trials(req)
 
+    def test_rejects_reserved_aorta_prefix_in_config_overrides(self, tmp_path):
+        """``_aorta_*`` keys are reserved for platform-supplied values
+        (currently ``_aorta_environment``).  A caller passing one in
+        ``config_overrides`` would be silently clobbered by the
+        dispatcher; failing loudly surfaces typos and prevents callers
+        from depending on a slot that isn't theirs.
+        """
+        req = RunRequest(
+            workload="anything",
+            trials=1,
+            config_overrides={"_aorta_environment": "hijack"},
+            results_dir=tmp_path,
+        )
+        with pytest.raises(ValueError, match=r"reserved '_aorta_' prefix"):
+            run_trials(req)
+
     def test_cleanup_error_is_logged_not_swallowed(self, tmp_path, caplog):
         """A failing ``cleanup()`` is logged so leaked resources are visible."""
         import logging
@@ -767,6 +783,67 @@ class TestConfigOverrides:
         assert env_block["docker"] is None
         assert env_block["venv"] is None
         assert env_block["source_package"] == "aorta"
+
+    def test_non_none_docker_env_round_trips_to_both_sites(self, tmp_path):
+        """Built-in ``local`` env has ``docker=venv=None``, so the other
+        env tests don't exercise the non-``None`` branch of the
+        ``asdict(env_descriptor)`` serialization at the two call sites
+        (``config["_aorta_environment"]`` and ``TrialResult.execution_env``).
+        A regression that drops a field from either dict would slip
+        through.  Pin all four fields at both sites with a docker-set env.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+
+        class EnvCapturingWorkload(Workload):
+            launch_mode = "single_process"
+            min_world_size = 1
+
+            def __init__(self, config):
+                super().__init__(config)
+                captured_config.update(config)
+
+            def setup(self):
+                pass
+
+            def run(self):
+                return WorkloadResult(passed=True)
+
+            def cleanup(self):
+                pass
+
+        env = Environment(
+            name="docker-test",
+            docker="img@sha256:deadbeef",
+            venv=None,
+            source_package="test",
+        )
+
+        mock_ep = MagicMock()
+        mock_ep.name = "envcapture"
+        mock_ep.load.return_value = EnvCapturingWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="docker-test",
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        expected = {
+            "name": "docker-test",
+            "docker": "img@sha256:deadbeef",
+            "venv": None,
+            "source_package": "test",
+        }
+        assert captured_config["_aorta_environment"] == expected
+        assert results[0].execution_env == expected
 
 
 class TestEnvironmentRestoration:
