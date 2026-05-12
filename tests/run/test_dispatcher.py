@@ -707,6 +707,67 @@ class TestConfigOverrides:
         assert captured_config.get("batch_size") == 32
         assert captured_config.get("lr") == 0.001
 
+    def test_resolved_environment_threaded_into_workload_config(self, tmp_path):
+        """The dispatcher threads the resolved ``Environment`` descriptor
+        into ``config["_aorta_environment"]`` so workloads that can
+        isolate themselves (e.g., a wrapper that invokes ``docker run``
+        instead of ``python``) know *which* environment was selected for
+        this cell.
+
+        ``aorta triage`` varies the environment axis across cells; the
+        in-process dispatcher API has no other way to communicate that
+        per-cell selection to the workload (the platform deliberately
+        does not pull or run docker images itself).
+        """
+        captured_config = {}
+
+        class EnvCapturingWorkload(Workload):
+            launch_mode = "single_process"
+            min_world_size = 1
+
+            def __init__(self, config):
+                super().__init__(config)
+                captured_config.update(config)
+
+            def setup(self):
+                pass
+
+            def run(self):
+                return WorkloadResult(passed=True)
+
+            def cleanup(self):
+                pass
+
+        mock_ep = MagicMock()
+        mock_ep.name = "envcapture"
+        mock_ep.load.return_value = EnvCapturingWorkload
+
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+
+        # Built-in ``local`` env has docker=None, venv=None -- pick that
+        # to keep the test free of registry / sidecar setup.
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            req = RunRequest(
+                workload="envcapture",
+                trials=1,
+                environment="local",
+                results_dir=tmp_path,
+            )
+            run_trials(req)
+
+        env_block = captured_config.get("_aorta_environment")
+        assert env_block is not None, (
+            "dispatcher must thread the resolved Environment descriptor into "
+            "config['_aorta_environment']; otherwise workloads cannot tell "
+            "which environment was selected for the cell."
+        )
+        assert env_block["name"] == "local"
+        # Built-in ``local`` has no docker / venv.
+        assert env_block["docker"] is None
+        assert env_block["venv"] is None
+        assert env_block["source_package"] == "aorta"
+
 
 class TestEnvironmentRestoration:
     """Tests for environment variable restoration after trials."""

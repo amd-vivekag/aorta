@@ -246,6 +246,28 @@ def _run_single_trial(
     if request.steps is not None:
         config["steps"] = request.steps
 
+    # Thread the resolved Environment descriptor into the workload's
+    # config under a reserved underscore-prefixed key.  Workloads that
+    # can isolate themselves (e.g., the recom_repro wrapper invoking
+    # ``docker run`` instead of ``python``) read this to pick the
+    # right image / venv; workloads that don't ignore the key.
+    #
+    # This is the dispatcher's way of telling the workload *which*
+    # environment was selected for this cell -- the ``--environment``
+    # flag and the ``environment:`` axis in a triage recipe both flow
+    # through here.  Triage runs vary this per-cell, so emitting it
+    # on every trial keeps cells independently runnable.
+    #
+    # The underscore prefix signals "platform-supplied; not a user
+    # override" and matches the same convention ``TrialResult`` uses
+    # for ``execution_env``.
+    config["_aorta_environment"] = {
+        "name": env_descriptor.name,
+        "docker": env_descriptor.docker,
+        "venv": env_descriptor.venv,
+        "source_package": env_descriptor.source_package,
+    }
+
     # Snapshot the env BEFORE applying mitigation / extra_env so the
     # ``finally`` block can restore both the dispatcher's overlay and
     # any workload-side mutations introduced by ``setup()`` / ``run()``.
