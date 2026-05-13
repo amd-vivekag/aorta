@@ -23,6 +23,7 @@ from aorta.registry import (
     load_environments,
     load_mitigations,
 )
+from aorta.run.cli_helpers import configure_verbose_logging
 from aorta.triage.recipe import (
     RecipeCellError,
     RecipeSchemaError,
@@ -142,6 +143,22 @@ def triage() -> None:
         "envs with the same name-collision rules (B3.1)."
     ),
 )
+@click.option(
+    "-v",
+    "--verbose",
+    count=True,
+    help=(
+        "Stream per-cell progress to stderr while the matrix runs. "
+        "-v = INFO (matrix preamble, per-cell start/finish, timings, "
+        "trials passed). -vv = DEBUG (aorta-internal debug logs). "
+        "Scope is the aorta.* logger hierarchy; workload code in "
+        "sibling packages (aorta_internal.workloads.*, etc.) is "
+        "unaffected. Default is silent: only the final 'Wrote matrix "
+        "to ...' line prints. Useful for long matrix runs (~6h for "
+        "SHAMPOO-NAN-2026-042-v2) where you'd otherwise have no "
+        "signal that anything is happening."
+    ),
+)
 def triage_run(
     recipe: Path | None,
     dry_run: bool,
@@ -156,8 +173,10 @@ def triage_run(
     confound_threshold: float | None,
     output_dir: Path,
     mitigation_files: tuple[Path, ...],
+    verbose: int,
 ) -> None:
     """Run the triage matrix: sweep mitigations x environments x trials, write matrix.md + matrix.json."""
+    configure_verbose_logging(verbose)
     # Defence-in-depth: Click's ``Choice(["matrix"])`` already enforces this,
     # but the CLI advertises ``--mode optimize`` as a future P1 addition (per
     # D11) and the dispatch site for that branch does not exist yet. Assert

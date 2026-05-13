@@ -20,10 +20,89 @@ Validation that the library API needs to enforce regardless of caller
 this module still get checked.
 """
 
+import logging
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from aorta.run.results import TrialResult
+
+
+def configure_verbose_logging(verbose_count: int) -> None:
+    """Wire a stderr StreamHandler onto the ``aorta`` logger when -v is set.
+
+    Both ``aorta run`` and ``aorta triage run`` are silent by default --
+    the ``aorta.*`` loggers exist but have no handlers, so INFO-level
+    progress calls are dropped. Without this, a long matrix run prints
+    nothing until the final ``Wrote matrix to ...`` line, leaving
+    operators with no signal that anything is happening.
+
+    Scope: only the ``aorta.*`` logger hierarchy. Workloads registered
+    via the ``aorta.workloads`` entry-point group from sibling packages
+    (e.g. ``aorta_internal.workloads.recom_repro``) live OUTSIDE that
+    hierarchy, so their logging is unaffected -- a separate handler
+    on those packages' loggers (or the root logger) would be needed.
+
+    ``verbose_count`` follows Click's ``count=True`` convention:
+
+    * ``0``: tear-down / no-op. If a prior call in the same process
+      installed verbosity, the marked handler is removed and the logger's
+      ``level`` and ``propagate`` are restored to the values observed at
+      install time (NOT unconditionally reset to NOTSET / True). An
+      embedding application that had configured ``aorta`` itself before
+      invoking the CLI gets its state back. If no prior install exists,
+      the call is a true no-op.
+    * ``1`` (``-v``): INFO -- per-trial / per-cell progress.
+    * ``>=2`` (``-vv``): DEBUG -- aorta-internal debug logs.
+
+    Output goes to **stderr** so stdout stays clean for the existing
+    ``click.echo`` lines (final pass/fail summary, "to rerun" hint, etc.)
+    that callers may pipe into a parser. ``aorta_logger.propagate`` is
+    set to ``False`` while verbose is active so a configured root logger
+    (e.g. via ``logging.basicConfig()`` in an embedding app) does not
+    also emit each record -- otherwise every progress line would print
+    twice. Restored on teardown.
+
+    Symmetric and idempotent: ``configure_verbose_logging(N)`` followed
+    by ``configure_verbose_logging(0)`` returns the logger to its exact
+    original state. CliRunner-based tests can invoke commands with and
+    without ``-v`` in any order without leaking state.
+    """
+    aorta_logger = logging.getLogger("aorta")
+
+    if verbose_count <= 0:
+        # Tear down any handler we previously installed and restore the
+        # exact (level, propagate) we observed at install time. Embedding
+        # applications that had configured the aorta logger themselves
+        # (e.g. ``logging.getLogger("aorta").setLevel(WARNING)``) get
+        # their state back instead of an unconditional NOTSET reset.
+        for h in [h for h in aorta_logger.handlers if getattr(h, "_aorta_verbose", False)]:
+            aorta_logger.setLevel(getattr(h, "_aorta_prior_level", logging.NOTSET))
+            aorta_logger.propagate = getattr(h, "_aorta_prior_propagate", True)
+            aorta_logger.removeHandler(h)
+        return
+
+    level = logging.DEBUG if verbose_count >= 2 else logging.INFO
+    existing = next(
+        (h for h in aorta_logger.handlers if getattr(h, "_aorta_verbose", False)),
+        None,
+    )
+    if existing is None:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+        # Snapshot prior (level, propagate) so teardown can restore exactly
+        # what the embedding app configured. Capture BEFORE we mutate, and
+        # store on the handler so the restore path is self-contained.
+        handler._aorta_verbose = True  # type: ignore[attr-defined]
+        handler._aorta_prior_level = aorta_logger.level  # type: ignore[attr-defined]
+        handler._aorta_prior_propagate = aorta_logger.propagate  # type: ignore[attr-defined]
+        aorta_logger.addHandler(handler)
+        # Disable propagation so a configured root logger (e.g. via
+        # ``logging.basicConfig()`` in an embedding app) does not also
+        # emit the same record -- otherwise -v would print every progress
+        # line twice. Restored on teardown.
+        aorta_logger.propagate = False
+    aorta_logger.setLevel(level)
 
 
 def parse_csv(value: str) -> tuple[str, ...]:
@@ -111,6 +190,7 @@ def summarize_results(results: Iterable[TrialResult]) -> RunSummary:
 
 __all__ = [
     "RunSummary",
+    "configure_verbose_logging",
     "parse_csv",
     "parse_extra_env",
     "parse_mitigations",

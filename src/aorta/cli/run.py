@@ -24,6 +24,7 @@ import click
 
 from aorta.registry import RegistryError
 from aorta.run.cli_helpers import (
+    configure_verbose_logging,
     parse_csv,
     parse_extra_env,
     parse_mitigations,
@@ -68,6 +69,19 @@ from aorta.run.dispatcher import RunRequest, run_trials
 @click.option(
     "--extra-env", default="", help="Comma-separated KEY=VAL pairs (applied after mitigations)."
 )
+@click.option(
+    "-v",
+    "--verbose",
+    count=True,
+    help=(
+        "Stream per-trial progress (rank 0 only) to stderr. -v = INFO "
+        "(trial start/finish, timings, exit_status); -vv = DEBUG "
+        "(aorta-internal debug logs). Scope is the aorta.* logger "
+        "hierarchy; workload code in sibling packages "
+        "(aorta_internal.workloads.*, etc.) is unaffected. Default is "
+        "silent: only the final pass/fail summary prints."
+    ),
+)
 def run(
     workload: str,
     trials: int,
@@ -78,6 +92,7 @@ def run(
     results_dir: Path,
     collect: str,
     extra_env: str,
+    verbose: int,
 ) -> None:
     """Run a workload across N trials with optional mitigations.
 
@@ -86,6 +101,7 @@ def run(
     orchestration logic lives here -- see ``aorta.run.dispatcher``
     and ``aorta.run.cli_helpers``.
     """
+    configure_verbose_logging(verbose)
     try:
         req = RunRequest(
             workload=workload,
