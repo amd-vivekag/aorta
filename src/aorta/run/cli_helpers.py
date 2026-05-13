@@ -46,38 +46,62 @@ def configure_verbose_logging(verbose_count: int) -> None:
     ``verbose_count`` follows Click's ``count=True`` convention:
 
     * ``0``: tear-down / no-op. If a prior call in the same process
-      installed verbosity, this removes it (handler + level reset);
-      otherwise nothing happens.
+      installed verbosity, the marked handler is removed and the logger's
+      ``level`` and ``propagate`` are restored to the values observed at
+      install time (NOT unconditionally reset to NOTSET / True). An
+      embedding application that had configured ``aorta`` itself before
+      invoking the CLI gets its state back. If no prior install exists,
+      the call is a true no-op.
     * ``1`` (``-v``): INFO -- per-trial / per-cell progress.
     * ``>=2`` (``-vv``): DEBUG -- aorta-internal debug logs.
 
     Output goes to **stderr** so stdout stays clean for the existing
     ``click.echo`` lines (final pass/fail summary, "to rerun" hint, etc.)
-    that callers may pipe into a parser.
+    that callers may pipe into a parser. ``aorta_logger.propagate`` is
+    set to ``False`` while verbose is active so a configured root logger
+    (e.g. via ``logging.basicConfig()`` in an embedding app) does not
+    also emit each record -- otherwise every progress line would print
+    twice. Restored on teardown.
 
     Symmetric and idempotent: ``configure_verbose_logging(N)`` followed
-    by ``configure_verbose_logging(0)`` returns the logger to its
-    original NOTSET state. CliRunner-based tests can invoke commands
-    with and without ``-v`` in any order without leaking state.
+    by ``configure_verbose_logging(0)`` returns the logger to its exact
+    original state. CliRunner-based tests can invoke commands with and
+    without ``-v`` in any order without leaking state.
     """
     aorta_logger = logging.getLogger("aorta")
 
     if verbose_count <= 0:
-        # Tear down any handler we previously installed; reset level so
-        # subsequent invocations in the same process truly start silent.
+        # Tear down any handler we previously installed and restore the
+        # exact (level, propagate) we observed at install time. Embedding
+        # applications that had configured the aorta logger themselves
+        # (e.g. ``logging.getLogger("aorta").setLevel(WARNING)``) get
+        # their state back instead of an unconditional NOTSET reset.
         for h in [h for h in aorta_logger.handlers if getattr(h, "_aorta_verbose", False)]:
+            aorta_logger.setLevel(getattr(h, "_aorta_prior_level", logging.NOTSET))
+            aorta_logger.propagate = getattr(h, "_aorta_prior_propagate", True)
             aorta_logger.removeHandler(h)
-        aorta_logger.setLevel(logging.NOTSET)
         return
 
     level = logging.DEBUG if verbose_count >= 2 else logging.INFO
-    # Don't stack duplicate handlers under repeated invocation (CliRunner,
-    # programmatic callers calling the helper twice with -v).
-    if not any(getattr(h, "_aorta_verbose", False) for h in aorta_logger.handlers):
+    existing = next(
+        (h for h in aorta_logger.handlers if getattr(h, "_aorta_verbose", False)),
+        None,
+    )
+    if existing is None:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+        # Snapshot prior (level, propagate) so teardown can restore exactly
+        # what the embedding app configured. Capture BEFORE we mutate, and
+        # store on the handler so the restore path is self-contained.
         handler._aorta_verbose = True  # type: ignore[attr-defined]
+        handler._aorta_prior_level = aorta_logger.level  # type: ignore[attr-defined]
+        handler._aorta_prior_propagate = aorta_logger.propagate  # type: ignore[attr-defined]
         aorta_logger.addHandler(handler)
+        # Disable propagation so a configured root logger (e.g. via
+        # ``logging.basicConfig()`` in an embedding app) does not also
+        # emit the same record -- otherwise -v would print every progress
+        # line twice. Restored on teardown.
+        aorta_logger.propagate = False
     aorta_logger.setLevel(level)
 
 
