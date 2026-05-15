@@ -159,6 +159,30 @@ def _format_confound(tag: ConfoundTag) -> str:
     return str(tag)
 
 
+def _render_failure_hints(cell_stats: list[CellStats]) -> list[str]:
+    """Build the ``## Failure hints`` section for matrix.md.
+
+    Returns an empty list when no cell carries a hint -- the caller
+    suppresses the section entirely in that case so the markdown does not
+    sprout an empty header for runs where every workload either passed or
+    failed without emitting an explanatory hint.
+
+    One bullet per ``(cell, hint)`` pair: a cell that emits two distinct
+    hints across its trials gets two bullets so each hint stays one line
+    and operators can scan-read. The ``(N/M trials)`` parenthetical reads
+    as "the hint fired in N of the cell's M trials" -- not the cell's
+    failure rate; trials can fail without emitting a hint.
+    """
+    if not any(cell.failure_hints for cell in cell_stats):
+        return []
+    lines = ["## Failure hints", ""]
+    for cell in cell_stats:
+        for hint, count in cell.failure_hints:
+            lines.append(f"- **{cell.name}** ({count}/{cell.trials} trials): {hint}")
+    lines.append("")
+    return lines
+
+
 def write_matrix_md(
     path: Path,
     recipe: Recipe,
@@ -234,6 +258,7 @@ def write_matrix_md(
         lines.append(_row(row))
 
     lines.append("")
+    lines.extend(_render_failure_hints(cell_stats))
     lines.append("## Notes")
     lines.append("")
     lines.append(

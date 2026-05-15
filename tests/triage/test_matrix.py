@@ -14,6 +14,7 @@ def _trial(
     total_iterations: int | None = None,
     elapsed_sec: float | None = None,
     wall_clock_sec: float = 1.0,
+    failure_details: list[dict] | None = None,
 ):
     """Build a TrialResult-shaped stand-in. aggregate_cell uses duck typing."""
     result: dict = {"passed": passed}
@@ -23,6 +24,8 @@ def _trial(
         result["total_iterations"] = total_iterations
     if elapsed_sec is not None:
         result["elapsed_sec"] = elapsed_sec
+    if failure_details is not None:
+        result["failure_details"] = failure_details
     return SimpleNamespace(
         exit_status=exit_status,
         wall_clock_sec=wall_clock_sec,
@@ -289,3 +292,104 @@ def test_step_time_source_for_error_cell_is_missing():
     rather than a stale default that implies real timing exists."""
     stats = _default_call(trials=[], error="docker pull failed")
     assert stats.step_time_source == "missing"
+
+
+# ---- failure_hints aggregation -------------------------------------------
+#
+# Workloads that can't run (image / config mismatch, missing dependency)
+# emit an explanatory `hint` string in `failure_details[*].hint`. The
+# aggregator surfaces those at the cell level so matrix.md can show them
+# without a reader having to open per-trial JSON.
+
+
+def test_failure_hints_default_empty_when_no_hints():
+    trials = [_trial(passed=True), _trial(passed=False)]
+    stats = _default_call(trials=trials)
+    assert stats.failure_hints == []
+
+
+def test_failure_hints_collects_and_counts_duplicates():
+    hint = "shampoo import failed: try shampoo_api='old'"
+    trials = [
+        _trial(passed=False, failure_details=[{"status": "crash", "hint": hint}]),
+        _trial(passed=False, failure_details=[{"status": "crash", "hint": hint}]),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.failure_hints == [(hint, 2)]
+
+
+def test_failure_hints_preserve_first_seen_order_with_distinct_hints():
+    h1 = "first hint"
+    h2 = "second hint"
+    trials = [
+        _trial(passed=False, failure_details=[{"hint": h1}]),
+        _trial(passed=False, failure_details=[{"hint": h2}]),
+        _trial(passed=False, failure_details=[{"hint": h1}]),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.failure_hints == [(h1, 2), (h2, 1)]
+
+
+def test_failure_hints_skips_entries_without_hint_key():
+    """A trial that crashed but didn't emit a hint contributes nothing.
+
+    Pin: the aggregator must NOT invent a hint from status / stderr.
+    """
+    trials = [
+        _trial(passed=False, failure_details=[{"status": "crash", "returncode": 1}]),
+        _trial(passed=False, failure_details=[{"hint": "real hint"}]),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.failure_hints == [("real hint", 1)]
+
+
+def test_failure_hints_skips_none_and_empty_hint_values():
+    trials = [
+        _trial(passed=False, failure_details=[{"hint": None}]),
+        _trial(passed=False, failure_details=[{"hint": ""}]),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.failure_hints == []
+
+
+def test_failure_hints_handles_multiple_details_per_trial():
+    trials = [
+        _trial(
+            passed=False,
+            failure_details=[{"hint": "h1"}, {"hint": "h2"}],
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.failure_hints == [("h1", 1), ("h2", 1)]
+
+
+def test_failure_hints_dedupes_within_trial_so_count_is_bounded_by_trials():
+    """A single trial that emits the same hint in two failure_details entries
+    must contribute 1 to the count, not 2.
+
+    The rendered ``({count}/{cell.trials} trials)`` would otherwise be
+    nonsense (e.g. ``2/1 trials``) once a workload emits multiple
+    ``failure_details`` per trial. Pin the per-trial-presence semantic
+    so the fraction stays interpretable.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            failure_details=[{"hint": "x"}, {"hint": "x"}],
+        ),
+        _trial(
+            passed=False,
+            failure_details=[{"hint": "x"}],
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    # Two trials emitted the hint, even though it appears 3 times across details.
+    assert stats.failure_hints == [("x", 2)]
+
+
+def test_failure_hints_for_error_cell_reflects_supplied_trials():
+    """Error cells short-circuit numeric aggregation but still expose hints
+    from any trials that did execute before the cell-level error fired."""
+    trials = [_trial(passed=False, failure_details=[{"hint": "boom"}])]
+    stats = _default_call(trials=trials, error="cell crashed")
+    assert stats.failure_hints == [("boom", 1)]

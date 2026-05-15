@@ -86,6 +86,14 @@ class CellStats:
     this field to refuse cell-vs-baseline ratios whose numerators and
     denominators were derived from incomparable signals (issue #160 /
     Sonbol's review on PR #160).
+
+    ``failure_hints`` is the deduplicated list of one-line ``hint`` strings
+    pulled from each trial's ``result["failure_details"][*]["hint"]``, paired
+    with how many trials in the cell emitted that exact hint. The aggregator
+    treats the hint as opaque text -- the workload owns the contract.
+    Trials with no ``failure_details`` or no ``hint`` key contribute nothing.
+    Order of appearance is preserved (first hint seen comes first) so the
+    matrix.md renderer is stable across runs with the same trial order.
     """
 
     name: str
@@ -109,6 +117,7 @@ class CellStats:
     trial_paths: list[str] = field(default_factory=list)
     error: str | None = None
     step_time_source: StepTimeSource = "missing"
+    failure_hints: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def failure_rate(self) -> float:
@@ -169,6 +178,61 @@ def _reduce_step_time_sources(sources: list[StepTimeSource]) -> StepTimeSource:
     if not contributing:
         return "missing"
     return max(contributing, key=lambda s: _SOURCE_RANK.get(s, 99))
+
+
+def _collect_trial_hints(trial: Any) -> list[str]:
+    """Return non-empty ``hint`` strings from a trial's ``failure_details``.
+
+    Only the explicit ``hint`` field is considered. Status / returncode /
+    stderr tails are deliberately ignored -- the renderer must not
+    paraphrase failure causes from logs, only surface the workload's own
+    one-line hint when it chose to provide one.
+    """
+    result = getattr(trial, "result", None)
+    if not isinstance(result, dict):
+        return []
+    details = result.get("failure_details")
+    if not isinstance(details, list):
+        return []
+    hints: list[str] = []
+    for entry in details:
+        if not isinstance(entry, dict):
+            continue
+        hint = entry.get("hint")
+        if isinstance(hint, str) and hint:
+            hints.append(hint)
+    return hints
+
+
+def _aggregate_failure_hints(trials: list[Any]) -> list[tuple[str, int]]:
+    """Deduplicate hints across a cell's trials, counting *trials that emitted*.
+
+    Each trial may produce zero or more hint strings (one per
+    ``failure_details`` entry that carries a ``hint``). The count is
+    the number of distinct *trials* that emitted a given hint, NOT the
+    number of total occurrences -- if a single trial emits the same
+    hint twice it counts as 1, not 2. This matches the matrix.md
+    rendering ``({count}/{cell.trials} trials)`` and keeps the count
+    bounded by ``len(trials)`` so the fraction is never impossible.
+
+    Order is the order each distinct hint string was first encountered
+    while walking trials in input order.
+    """
+    counts: Counter[str] = Counter()
+    order: list[str] = []
+    for trial in trials:
+        # Dedupe within the trial before counting -- one trial can
+        # legitimately have multiple ``failure_details`` entries (e.g.
+        # multi-phase workloads) and they may share a hint.
+        seen_in_trial: set[str] = set()
+        for hint in _collect_trial_hints(trial):
+            if hint in seen_in_trial:
+                continue
+            seen_in_trial.add(hint)
+            if hint not in counts:
+                order.append(hint)
+            counts[hint] += 1
+    return [(hint, counts[hint]) for hint in order]
 
 
 def _trial_passed(trial: Any) -> bool:
@@ -257,6 +321,7 @@ def aggregate_cell(
             trial_paths=list(trial_paths or []),
             error=error,
             step_time_source="missing",
+            failure_hints=_aggregate_failure_hints(trials),
         )
 
     trial_count = len(trials)
@@ -318,6 +383,7 @@ def aggregate_cell(
         trial_paths=list(trial_paths or []),
         error=None,
         step_time_source=cell_source,
+        failure_hints=_aggregate_failure_hints(trials),
     )
 
 
