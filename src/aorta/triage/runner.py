@@ -336,6 +336,25 @@ def _collect_trial_paths(results_dir: Path) -> list[str]:
     return [str(p) for p in found]
 
 
+def _trial_passed_for_log(trial: Any) -> bool:
+    """Mirror of ``aorta.triage.matrix._trial_passed`` for the per-cell
+    log line.
+
+    Kept local rather than imported from the matrix module's private
+    namespace so the runner doesn't depend on a leading-underscore
+    callable (Python convention: private to defining module). The
+    semantic is identical -- a trial passes iff ``exit_status == "ok"``
+    AND the wrapped ``WorkloadResult.passed`` is not False -- so the
+    log line and the matrix.md row agree on what counts as a pass.
+    """
+    if getattr(trial, "exit_status", None) != "ok":
+        return False
+    result = getattr(trial, "result", None)
+    if isinstance(result, dict) and result.get("passed") is False:
+        return False
+    return True
+
+
 _DID_NOT_RUN_CELL_SUFFIX = (
     " WARNING: workload never reached main work phase; matrix step-time/"
     "confound for this cell will be marked n/a"
@@ -361,11 +380,22 @@ def _format_cell_summary(trials: list[TrialResult], passed_count: int) -> tuple[
     # (which expects WorkloadResult-shaped objects vs. TrialResult here)
     # to avoid coupling the runner's log line to the matrix module's
     # internal helper signature.
+    #
+    # "New contract in use" is gated on ANY of the three new fields being
+    # present on ANY trial -- not just main_work_started. matrix.md shows
+    # the Iters column whenever configured_iterations is populated; the
+    # terminal log must follow the same predicate so the two renderers
+    # agree on which cells get the new bracket grammar (round-3 Copilot
+    # catch on #175).
     outcomes: list[str] = []
     populated = False
     for trial in trials:
         result = getattr(trial, "result", {})
-        if isinstance(result, dict) and result.get("main_work_started") is not None:
+        if isinstance(result, dict) and (
+            result.get("main_work_started") is not None
+            or result.get("configured_iterations") is not None
+            or result.get("executed_iterations") is not None
+        ):
             populated = True
         outcomes.append(_outcome_for_log(result if isinstance(result, dict) else {}))
 
@@ -671,10 +701,15 @@ def run_recipe(
                 cell_elapsed,
             )
         else:
-            # ``TrialResult.result`` is the WorkloadResult-serialised-to-dict
-            # (see ``aorta/run/results.py`` schema); use ``.get`` so a future
-            # workload that omits the key from its dict still classifies cleanly.
-            passed = sum(1 for t in trials if t.result.get("passed"))
+            # Use the canonical pass/fail predicate from
+            # ``aorta.triage.matrix._trial_passed`` so the per-cell log line
+            # agrees with the matrix-level passed_count: a trial is "passed"
+            # iff its exit_status is "ok" AND its WorkloadResult.passed is
+            # not False. Reading only ``result.get("passed")`` ignores
+            # infrastructure-level failures (exit_status="infrastructure_failed"
+            # with no result dict) and would over-count "passed" against the
+            # matrix.md row.
+            passed = sum(1 for t in trials if _trial_passed_for_log(t))
             summary, suffix = _format_cell_summary(trials, passed)
             log.info(
                 "cell %d/%d: %s -- done in %.1fs %s%s",
@@ -712,6 +747,14 @@ def run_recipe(
     # the mean lands at 0). Legacy workloads (no outcome_counts populated)
     # are unaffected -- ``is_did_not_run_cell`` returns False on empty
     # counts so old runs keep their existing classification.
+    #
+    # Note: matrix.json::baseline_cell still records the resolved name
+    # in this case (rather than null, as one reading of the issue's
+    # design block might suggest). Preserving the name keeps a record of
+    # which cell was attempted as the baseline -- useful for an operator
+    # diagnosing why every other row collapsed to n/a -- while the
+    # accompanying warning carries the "no usable comparison" signal.
+    # Setting baseline_cell to null would lose the "we tried X" info.
     if is_did_not_run_cell(baseline_stats):
         if recipe.confound.baseline_cell is not None:
             raise RecipeCellError(

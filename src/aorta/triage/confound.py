@@ -65,11 +65,20 @@ def is_did_not_run_cell(stats: CellStats) -> bool:
     that don't populate the new ``main_work_started`` field, in which
     case the function returns False -- we never disqualify a baseline
     on absence of data.
+
+    The count-vs-trials cross-check guards external callers that load
+    a ``CellStats``-shaped record from matrix.json or build one by hand:
+    in normal aggregation the histogram total is invariantly
+    ``stats.trials``, but a partial / truncated histogram constructed
+    elsewhere could otherwise misclassify a mixed cell as did-not-run
+    just because the only key present happens to be ``did_not_run``.
     """
     counts = stats.outcome_counts
     if not counts:
         return False
-    return set(counts) == {OUTCOME_DID_NOT_RUN}
+    if set(counts) != {OUTCOME_DID_NOT_RUN}:
+        return False
+    return counts.get(OUTCOME_DID_NOT_RUN, 0) == stats.trials
 
 
 def resolve_baseline(

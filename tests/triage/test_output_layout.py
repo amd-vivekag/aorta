@@ -1193,3 +1193,39 @@ def test_legacy_cell_summary_log_keeps_old_grammar(tmp_path, patched_env, patche
     for line in cell_lines:
         assert "trials passed" in line
         assert "outcome:" not in line
+
+
+def test_partial_contract_cell_summary_uses_new_grammar(tmp_path, patched_env, monkeypatch, caplog):
+    """Workload populates ``configured_iterations`` but NOT
+    ``main_work_started`` -> the matrix.md ``Iters`` column shows up,
+    so the terminal log must too. Pin the Copilot round-3 fix that the
+    "new contract in use" predicate is ANY of the three new fields, not
+    just main_work_started -- otherwise the same cell renders new-grammar
+    in the table and legacy-grammar in the log, confusing the operator.
+    """
+    import logging
+
+    def partial_contract(request):
+        return [
+            _FakeTrial(
+                exit_status="ok",
+                wall_clock_sec=1.0,
+                result={
+                    "passed": True,
+                    "step_times_ms": [100.0],
+                    "configured_iterations": 50,
+                    "executed_iterations": 50,
+                    # main_work_started intentionally absent
+                },
+            )
+            for _ in range(2)
+        ]
+
+    monkeypatch.setattr(runner, "run_trials", partial_contract)
+    r = _simple_recipe(ticket="T-1")
+    with caplog.at_level(logging.INFO, logger="aorta.triage.runner"):
+        runner.run_recipe(r, output_dir=tmp_path)
+    cell_lines = [rec.getMessage() for rec in caplog.records if "done in" in rec.getMessage()]
+    for line in cell_lines:
+        assert "outcome:" in line, f"new bracket grammar expected; got: {line}"
+        assert "iters: 50/50" in line

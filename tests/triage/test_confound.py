@@ -333,12 +333,25 @@ def test_classify_mixed_outcome_cell_is_not_did_not_run():
 
 
 def test_is_did_not_run_cell_true_for_uniform_did_not_run():
-    cell = _stats("c", outcome_counts={OUTCOME_DID_NOT_RUN: 2})
+    cell = _stats("c", trials=2, outcome_counts={OUTCOME_DID_NOT_RUN: 2})
     assert is_did_not_run_cell(cell) is True
 
 
 def test_is_did_not_run_cell_false_for_mixed_outcomes():
-    cell = _stats("c", outcome_counts={OUTCOME_DID_NOT_RUN: 1, OUTCOME_COMPLETED: 1})
+    cell = _stats("c", trials=2, outcome_counts={OUTCOME_DID_NOT_RUN: 1, OUTCOME_COMPLETED: 1})
+    assert is_did_not_run_cell(cell) is False
+
+
+def test_is_did_not_run_cell_false_when_count_does_not_cover_all_trials():
+    """Defensive guard against a partial / truncated histogram. Normal
+    aggregation invariantly produces a histogram totalling ``trials``,
+    but a CellStats loaded from external matrix.json or built by hand
+    could carry an inconsistent count -- e.g. ``{"did_not_run": 1}``
+    on a 2-trial cell -- and we must NOT flag that as did-not-run on
+    the strength of the only present key happening to be did_not_run.
+    Round-3 Copilot catch on PR #175.
+    """
+    cell = _stats("c", trials=2, outcome_counts={OUTCOME_DID_NOT_RUN: 1})
     assert is_did_not_run_cell(cell) is False
 
 
