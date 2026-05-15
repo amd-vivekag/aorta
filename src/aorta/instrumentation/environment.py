@@ -2255,16 +2255,27 @@ class _HipSymbolDumpCache:
         self._cached = False
         self._symbols: str | None = None
 
-    def get(self, reasons: list[str], reason_prefix: str) -> str | None:
+    def get(
+        self,
+        reasons: list[str],
+        reason_prefix: str,
+        *,
+        torch_mod: Any | None = None,
+    ) -> str | None:
         if self._cached:
             return self._symbols
-        self._symbols = _dump_pytorch_hip_demangled_symbols(reasons, reason_prefix)
+        self._symbols = _dump_pytorch_hip_demangled_symbols(
+            reasons, reason_prefix, torch_mod=torch_mod,
+        )
         self._cached = True
         return self._symbols
 
 
 def _dump_pytorch_hip_demangled_symbols(
-    reasons: list[str], reason_prefix: str
+    reasons: list[str],
+    reason_prefix: str,
+    *,
+    torch_mod: Any | None = None,
 ) -> str | None:
     """Run ``nm -D <libtorch_hip.so> | c++filt`` and return the output.
 
@@ -2293,8 +2304,18 @@ def _dump_pytorch_hip_demangled_symbols(
     The ``reason_prefix`` is the partial-reason prefix the calling
     probe uses (e.g. ``"composable_kernel.pytorch_bundled"``). Keep it
     grep-consistent with the rest of that probe's reasons.
+
+    ``torch_mod`` lets a caller supply an already-imported torch module
+    so the dump describes the SAME installation other parts of that
+    caller's snapshot describe. Without it, the helper re-imports
+    ambient torch via :func:`_safe_import_torch`, which on test paths
+    that pass a fake module would produce a snapshot where
+    ``torch_lib_bundled`` (uses passed module) and
+    ``libtorch_hip_symbol_counts`` (would use ambient) describe
+    different torch installations.
     """
-    torch_mod = _safe_import_torch(reasons, reason_prefix)
+    if torch_mod is None:
+        torch_mod = _safe_import_torch(reasons, reason_prefix)
     if torch_mod is None:
         return None
 
@@ -2852,8 +2873,15 @@ def _capture_pytorch_binary_introspection(
         return result
     if hip_symbol_cache is None:
         hip_symbol_cache = _HipSymbolDumpCache()
+    # Pass the already-imported torch_mod through so the dump describes
+    # the same installation `torch_lib_bundled` and
+    # `cxx_flags_use_defines` describe -- avoids the standalone-call
+    # path where the cache would re-import ambient torch and the two
+    # halves of `binary_introspection` would describe different torches.
     symbols = hip_symbol_cache.get(
-        reasons, "pytorch_build.binary_introspection"
+        reasons,
+        "pytorch_build.binary_introspection",
+        torch_mod=torch_mod,
     )
     if symbols is not None:
         counts: dict[str, int] = {marker: 0 for marker in _LIBTORCH_HIP_SYMBOL_MARKERS}

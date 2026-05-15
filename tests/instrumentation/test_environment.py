@@ -3983,7 +3983,7 @@ class TestHipSymbolDumpCache:
     def test_first_get_invokes_dump_subsequent_reuse(self, monkeypatch):
         calls: list[str] = []
 
-        def fake_dump(reasons, prefix):
+        def fake_dump(reasons, prefix, *, torch_mod=None):
             calls.append(prefix)
             return "ck::foo\nck::bar\n"
 
@@ -3996,7 +3996,7 @@ class TestHipSymbolDumpCache:
         assert calls == ["first"]
 
     def test_failed_dump_cached_no_duplicate_reasons(self, monkeypatch):
-        def fake_dump(reasons, prefix):
+        def fake_dump(reasons, prefix, *, torch_mod=None):
             reasons.append(f"{prefix}: nm/c++filt not on PATH")
             return None
 
@@ -4012,7 +4012,7 @@ class TestHipSymbolDumpCache:
     ):
         calls: list[str] = []
 
-        def fake_dump(reasons, prefix):
+        def fake_dump(reasons, prefix, *, torch_mod=None):
             calls.append(prefix)
             return None
 
@@ -4141,6 +4141,46 @@ class TestCapturePytorchBinaryIntrospection:
             for r in reasons
         )
 
+    def test_dump_uses_provided_torch_mod_not_ambient(
+        self, tmp_path, monkeypatch
+    ):
+        """Standalone-call path: when torch_mod is passed but no cache,
+        the freshly-created cache must use the passed torch_mod (not
+        re-import ambient torch). Otherwise `torch_lib_bundled` (uses
+        passed) and `libtorch_hip_symbol_counts` (would use ambient)
+        would describe different torch installations.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        # Set hip so the dump helper proceeds past the CPU-only guard,
+        # and create the lib so the early lib_path.exists() check passes.
+        torch_mod.version = type(torch_mod.version)(
+            git_version="abc1234", hip="7.2.5", cuda=None, debug=False,
+        )
+        lib_dir = Path(torch_mod.__file__).parent / "lib"
+        (lib_dir / "libtorch_hip.so").write_text("")
+
+        # Trip if _safe_import_torch is called for the dump's prefix --
+        # that would mean the helper re-imported ambient torch instead
+        # of using the passed module.
+        called: list[str] = []
+        real_safe = env_mod._safe_import_torch
+
+        def trip(reasons, prefix):
+            if prefix == "pytorch_build.binary_introspection":
+                called.append(prefix)
+            return real_safe(reasons, prefix)
+
+        monkeypatch.setattr(env_mod, "_safe_import_torch", trip)
+        # Stub the subprocess work (we're checking the import path,
+        # not the nm/c++filt dump itself).
+        monkeypatch.setattr(env_mod.shutil, "which", lambda _name: None)
+
+        env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert called == [], (
+            "binary_introspection re-imported ambient torch despite "
+            "being given an explicit torch_mod"
+        )
+
     def test_torch_none_skips_symbol_cache_lookup(self, monkeypatch):
         """Caller signal `torch_mod=None` -> skip the cache entirely;
         otherwise on a real-torch host the cache would still dump
@@ -4165,7 +4205,7 @@ class TestCapturePytorchBinaryIntrospection:
         torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
 
         class FixedCache:
-            def get(self, reasons, prefix):
+            def get(self, reasons, prefix, *, torch_mod=None):
                 return (
                     "void pytorch_flash::mha_fwd()\n"
                     "void pytorch_flash::mha_bwd()\n"
