@@ -4925,34 +4925,87 @@ class TestCapturePytorchNinjaHipcc:
         # offload_archs from the HIP rule is preserved.
         assert block["targets"]["torch_hip"]["offload_archs"] == ["gfx942"]
 
+    def test_conflicting_define_values_resolve_deterministically(self, tmp_path):
+        """Two HIP build statements in the same target set the same
+        macro to different values. The merge must produce a stable
+        result across runs (set iteration is hash-order; PYTHONHASHSEED
+        randomization would otherwise flip which value wins). Sorted
+        block iteration -> "lexicographically-largest block wins".
+        """
+        body = (
+            "build a.hip.o: HIP_COMPILER__torch_hip_unscanned src/a.hip\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DCK_TILE_FLAVOR=fast\n"
+            "  FLAGS = -O3\n"
+            "\n"
+            "build b.hip.o: HIP_COMPILER__torch_hip_unscanned src/b.hip\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DCK_TILE_FLAVOR=safe\n"
+            "  FLAGS = -O3\n"
+        )
+        self._make_ninja(tmp_path, body)
+        # Run twice; both runs must agree.
+        out_a = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        out_b = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert (
+            out_a["targets"]["torch_hip"]["defines"]["CK_TILE_FLAVOR"]
+            == out_b["targets"]["torch_hip"]["defines"]["CK_TILE_FLAVOR"]
+        )
+        # Sorted-block-wins: lexicographic order of the two whole
+        # DEFINES strings -- "...=fast" sorts before "...=safe", so
+        # the safe-flavor block wins on the merge.
+        assert (
+            out_a["targets"]["torch_hip"]["defines"]["CK_TILE_FLAVOR"] == "safe"
+        )
+
     def test_streaming_does_not_slurp_giant_files(self, tmp_path, monkeypatch):
         """Sanity: parser uses iterator-style read, not .read() / .readlines().
 
-        Asserts the open() call returns a file object whose .read() is
-        never called on the body -- catches a future "let's just slurp"
-        regression on a 350+ MB build.ninja.
+        Catches a future "let's just slurp" regression on a 350+ MB
+        build.ninja. Wraps the real file in a small proxy that
+        intercepts .read() / .readlines() (the slurp methods) while
+        delegating context-management and iteration. The proxy
+        approach avoids mutating attributes on the real
+        ``TextIOWrapper`` instance, which is portability-fragile
+        across CPython versions.
         """
         self._make_ninja(
             tmp_path,
-            "build x.o: HIP_COMPILER__torch_hip_unscanned\n  DEFINES = -Dtorch_hip_EXPORTS -DA\n  FLAGS = -O3\n",
+            "build x.o: HIP_COMPILER__torch_hip_unscanned\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DA\n  FLAGS = -O3\n",
         )
-        real_open = env_mod.Path.open
+
         slurp_calls: list[str] = []
 
+        class _NoSlurpFileProxy:
+            def __init__(self, real_fh, name):
+                self._fh = real_fh
+                self._name = name
+
+            def __enter__(self):
+                self._fh.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._fh.__exit__(*exc)
+
+            def __iter__(self):
+                return iter(self._fh)
+
+            def read(self, *a, **kw):
+                slurp_calls.append(self._name)
+                return self._fh.read(*a, **kw)
+
+            def readlines(self, *a, **kw):
+                slurp_calls.append(self._name)
+                return self._fh.readlines(*a, **kw)
+
+        real_open = env_mod.Path.open
+
         def tracking_open(self, *a, **kw):
-            fh = real_open(self, *a, **kw)
-            orig_read = fh.read
-
-            def tracked_read(*ra, **rk):
-                slurp_calls.append(self.name)
-                return orig_read(*ra, **rk)
-
-            fh.read = tracked_read
-            return fh
+            return _NoSlurpFileProxy(real_open(self, *a, **kw), self.name)
 
         monkeypatch.setattr(env_mod.Path, "open", tracking_open)
         env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
-        # iter(fh) doesn't invoke .read(); slurp would.
+        # iter(fh) doesn't invoke .read() / .readlines(); slurp would.
         assert slurp_calls == []
 
 

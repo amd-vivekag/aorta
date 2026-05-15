@@ -3659,8 +3659,18 @@ def _capture_pytorch_ninja_hipcc(
         # Collapse all unique DEFINES blocks for this target into one
         # sorted dict (target gets the union of every block's defines;
         # for sub-target variation the union captures everything).
+        # Iterate the deduplicated DEFINES blocks in lexicographic
+        # order. ``target_defines[tgt]`` is a set (used to dedup the
+        # thousands of identical DEFINES lines cmake emits per
+        # source file in a target); set iteration is hash-order,
+        # so without sorting two probes of the same wheel could
+        # yield different `defines` dicts whenever two blocks set
+        # the same macro to different values (rare but possible
+        # under per-source compile_definitions overrides). Sorted
+        # ordering -> "lexicographically-largest block wins on
+        # conflict", deterministic across runs.
         merged_defines: dict[str, str | None] = {}
-        for block in target_defines[tgt]:
+        for block in sorted(target_defines[tgt]):
             for m in _NINJA_DEFINE_TOKEN_RE.finditer(block):
                 merged_defines[m.group(1)] = m.group(2)
         defines_sorted = {k: merged_defines[k] for k in sorted(merged_defines)}
