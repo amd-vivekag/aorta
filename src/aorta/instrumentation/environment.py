@@ -2901,10 +2901,20 @@ def _hash_aiter_arch_dir(
     sorted by POSIX-style relpath before being fed into the outer
     sha256, and each file's bytes are hashed in chunks (no slurping
     .co files which can be tens of MB each).
+
+    Per-file read failures (OSError -- permission denied, IO error)
+    null out ``combined_sha256`` for the whole arch even though the
+    counts stay valid: a partial-tree hash silently compares-equal to
+    another partial-tree hash with the same readable subset, which
+    would lead consumers to conclude two trees match when they may
+    not. ``file_count`` / ``co_count`` reflect the directory listing
+    (which we DID see) so they remain useful as a coarse drift
+    signal even when the hash is unknown.
     """
     file_count = 0
     co_count = 0
     pairs: list[tuple[str, str]] = []
+    any_read_failed = False
     try:
         files = sorted(p for p in arch_dir.rglob("*") if p.is_file())
     except OSError as exc:
@@ -2925,20 +2935,25 @@ def _hash_aiter_arch_dir(
             reasons.append(
                 f"aiter.hsa_tree: read failed for {path} ({type(exc).__name__})"
             )
+            any_read_failed = True
             continue
         rel = path.relative_to(arch_dir).as_posix()
         pairs.append((rel, h.hexdigest()))
 
-    outer = hashlib.sha256()
-    for rel, digest in sorted(pairs):
-        outer.update(rel.encode("utf-8"))
-        outer.update(b"\0")
-        outer.update(digest.encode("ascii"))
-        outer.update(b"\n")
+    if any_read_failed:
+        combined: str | None = None
+    else:
+        outer = hashlib.sha256()
+        for rel, digest in sorted(pairs):
+            outer.update(rel.encode("utf-8"))
+            outer.update(b"\0")
+            outer.update(digest.encode("ascii"))
+            outer.update(b"\n")
+        combined = outer.hexdigest()
     return {
         "file_count": file_count,
         "co_count": co_count,
-        "combined_sha256": outer.hexdigest(),
+        "combined_sha256": combined,
     }
 
 

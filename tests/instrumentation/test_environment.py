@@ -5049,6 +5049,43 @@ class TestCaptureAiterHsaTree:
         sha_b = next(iter(out_b.values()))["gfx942"]["combined_sha256"]
         assert sha_a == sha_b
 
+    def test_per_file_read_failure_nulls_combined_sha256_keeps_counts(
+        self, tmp_path, monkeypatch
+    ):
+        """A partial-tree hash silently compares-equal to another
+        partial-tree hash with the same readable subset, leading
+        consumers to conclude two trees match when they may not.
+        On any read failure the whole arch's combined_sha256 must
+        be None; counts stay (the listing is still valid).
+        """
+        third_party = tmp_path / "third_party" / "aiter"
+        third_party.mkdir(parents=True)
+        self._make_hsa(third_party, {
+            "gfx942": {"a.co": b"abc", "b.co": b"def"},
+        })
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, str(tmp_path))
+        monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+
+        # Make `b.co` raise on read; `a.co` reads fine.
+        real_open = env_mod.Path.open
+
+        def selective_open(self, *a, **kw):
+            if self.name == "b.co":
+                raise PermissionError("denied")
+            return real_open(self, *a, **kw)
+
+        monkeypatch.setattr(env_mod.Path, "open", selective_open)
+        reasons: list[str] = []
+        out = env_mod._capture_aiter_hsa_tree(None, reasons)
+        per_arch = next(iter(out.values()))["gfx942"]
+        assert per_arch["combined_sha256"] is None
+        assert per_arch["file_count"] == 2
+        assert per_arch["co_count"] == 2
+        assert any(
+            r.startswith("aiter.hsa_tree: read failed") and "PermissionError" in r
+            for r in reasons
+        )
+
     def test_combined_sha256_changes_when_byte_changes(
         self, tmp_path, monkeypatch
     ):
