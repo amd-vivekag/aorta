@@ -363,6 +363,30 @@ def test_failure_hints_handles_multiple_details_per_trial():
     assert stats.failure_hints == [("h1", 1), ("h2", 1)]
 
 
+def test_failure_hints_dedupes_within_trial_so_count_is_bounded_by_trials():
+    """A single trial that emits the same hint in two failure_details entries
+    must contribute 1 to the count, not 2.
+
+    The rendered ``({count}/{cell.trials} trials)`` would otherwise be
+    nonsense (e.g. ``2/1 trials``) once a workload emits multiple
+    ``failure_details`` per trial. Pin the per-trial-presence semantic
+    so the fraction stays interpretable.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            failure_details=[{"hint": "x"}, {"hint": "x"}],
+        ),
+        _trial(
+            passed=False,
+            failure_details=[{"hint": "x"}],
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    # Two trials emitted the hint, even though it appears 3 times across details.
+    assert stats.failure_hints == [("x", 2)]
+
+
 def test_failure_hints_for_error_cell_reflects_supplied_trials():
     """Error cells short-circuit numeric aggregation but still expose hints
     from any trials that did execute before the cell-level error fired."""

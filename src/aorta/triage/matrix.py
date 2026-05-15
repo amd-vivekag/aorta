@@ -205,18 +205,30 @@ def _collect_trial_hints(trial: Any) -> list[str]:
 
 
 def _aggregate_failure_hints(trials: list[Any]) -> list[tuple[str, int]]:
-    """Deduplicate hints across a cell's trials, preserving first-seen order.
+    """Deduplicate hints across a cell's trials, counting *trials that emitted*.
 
-    Each trial may emit zero or more hints (one per ``failure_details``
-    entry that carries a ``hint``). A hint that appears N times across the
-    cell's trials shows up once with count N. Order is the order each
-    distinct hint string was first encountered while walking trials in
-    input order.
+    Each trial may produce zero or more hint strings (one per
+    ``failure_details`` entry that carries a ``hint``). The count is
+    the number of distinct *trials* that emitted a given hint, NOT the
+    number of total occurrences -- if a single trial emits the same
+    hint twice it counts as 1, not 2. This matches the matrix.md
+    rendering ``({count}/{cell.trials} trials)`` and keeps the count
+    bounded by ``len(trials)`` so the fraction is never impossible.
+
+    Order is the order each distinct hint string was first encountered
+    while walking trials in input order.
     """
     counts: Counter[str] = Counter()
     order: list[str] = []
     for trial in trials:
+        # Dedupe within the trial before counting -- one trial can
+        # legitimately have multiple ``failure_details`` entries (e.g.
+        # multi-phase workloads) and they may share a hint.
+        seen_in_trial: set[str] = set()
         for hint in _collect_trial_hints(trial):
+            if hint in seen_in_trial:
+                continue
+            seen_in_trial.add(hint)
             if hint not in counts:
                 order.append(hint)
             counts[hint] += 1
