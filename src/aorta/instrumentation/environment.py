@@ -557,10 +557,14 @@ class EnvSnapshot:
     pytorch_build: dict
     partial: bool
     partial_reasons: list[str] = field(default_factory=list)
-    # Defaulted so 1.2 snapshots loaded via `from_dict()` don't raise:
-    # the disaster shape is the right "we couldn't ask" reading.
-    # Definition follows partial_reasons (also defaulted) to satisfy
-    # the dataclass rule "fields with defaults follow fields without".
+    # Defaulted so 1.2 snapshots loaded via `from_dict()` don't raise.
+    # The default is an all-None ``backends_enabled`` map -- the same
+    # shape `_capture_pytorch_sdpa()` returns when torch is missing
+    # (every getter unobservable), which is the correct reading of a
+    # 1.2 snapshot from 1.3's POV: we have no SDPA data for that
+    # historical capture. Definition follows ``partial_reasons`` (also
+    # defaulted) to satisfy the dataclass rule "fields with defaults
+    # follow fields without".
     pytorch_sdpa: dict = field(
         default_factory=lambda: {
             "backends_enabled": {name: None for name in _PYTORCH_SDPA_GETTERS}

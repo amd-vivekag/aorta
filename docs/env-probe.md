@@ -87,7 +87,7 @@ Wrote env probe to /tmp/env.json (schema_version=1.3) [PARTIAL]
   aotriton:  bundled=0.11.1 present=True images_dir=True  [AOTRITON_INSTALLED_PREFIX=(unset)]
   rdhc:      unavailable (system_health=null)
   python:    3.12.13 | pytorch: 2.9.1+rocm7.2.1.gitff65f5bc
-  torch build: git_commit=ff65f5bc install=wheel [third_party SHAs: set AORTA_PYTORCH_SRC=<src> or look up github.com/pytorch/pytorch/tree/ff65f5bc/third_party/<name>]
+  torch build: git_commit=ff65f5bc install=source | submodules(git): composable_kernel=23d531c8 aiter=9a469a60 fbgemm=8c1f8d2b
   torch flags: gpu_archs=[gfx942]  USE_ROCM=ON USE_CUDA=OFF USE_NCCL=ON USE_MKL=OFF USE_MKLDNN=ON USE_FBGEMM=yes USE_FBGEMM_GENAI=no USE_FLASH_ATTENTION=yes USE_MEM_EFF_ATTENTION=yes USE_ROCM_CK_SDPA=yes USE_ROCM_CK_GEMM=no DISABLE_AOTRITON=no FLASH_NAMESPACE=pytorch_flash
   torch syms:  pytorch_flash::=142 mha_fwd_aot=4 mha_fwd_ck=4 _efficient_attention=18 aotriton::=72 ck_tile::FmhaFwd=1820 ck_tile::FmhaBwd=1240 ck_tile::BlockFmha=890 ck_tile::TileFmha=320 group_gemm_ck=12 aiter::=0  |  libaotriton_v2.so=yes  |  -DUSE_ROCM_CK_SDPA=yes -DUSE_ROCM_CK_GEMM=no
   flags:       FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on
@@ -99,10 +99,18 @@ Wrote env probe to /tmp/env.json (schema_version=1.3) [PARTIAL]
 Partial reasons:
   - system_health: rdhc exited 1 (stderr: sudo: a password is required)
   - rocm.version_dev: /opt/rocm/.info/version-dev missing, empty, or unreadable
-  - pytorch_build.submodule_commits: wheel install -- direct SHAs not recoverable; ...
 
-[PARTIAL, 3 reason(s)]
+[PARTIAL, 2 reason(s)]
 ```
+
+The sample shows a **source install** (`install=source`) so the new
+`cmake cache` / `ninja hipcc` lines have populated data. On a wheel
+install (`install=wheel`) those two lines render `(unavailable --
+wheel install or build/CMakeCache.txt missing)` /
+`(unavailable -- wheel install or build/build.ninja missing)`
+respectively, and `pytorch_build.submodule_commits` adds a
+`wheel install -- direct SHAs not recoverable; <github URL>` partial
+reason instead of the resolved per-submodule SHAs shown here.
 
 `[PARTIAL]` indicates at least one probe fell back to `None` -- the
 snapshot is still complete (every key present), it just records what
