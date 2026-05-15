@@ -69,7 +69,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.2) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.3) [PARTIAL]
   runtime:   baremetal / python=venv
   rocm:      7.2.1 (dev: None)
   hip:       7.2.53211-e1a6bc5663 (amd)
@@ -91,6 +91,10 @@ Wrote env probe to /tmp/env.json (schema_version=1.2) [PARTIAL]
   torch flags: gpu_archs=[gfx942]  USE_ROCM=ON USE_CUDA=OFF USE_NCCL=ON USE_MKL=OFF USE_MKLDNN=ON USE_FBGEMM=yes USE_FBGEMM_GENAI=no USE_FLASH_ATTENTION=yes USE_MEM_EFF_ATTENTION=yes USE_ROCM_CK_SDPA=yes USE_ROCM_CK_GEMM=no DISABLE_AOTRITON=no FLASH_NAMESPACE=pytorch_flash
   torch syms:  pytorch_flash::=142 mha_fwd_aot=4 mha_fwd_ck=4 _efficient_attention=18 aotriton::=72 ck_tile::FmhaFwd=1820 ck_tile::FmhaBwd=1240 ck_tile::BlockFmha=890 ck_tile::TileFmha=320 group_gemm_ck=12 aiter::=0  |  libaotriton_v2.so=yes  |  -DUSE_ROCM_CK_SDPA=yes -DUSE_ROCM_CK_GEMM=no
   flags:       FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on
+  cmake cache: 32 allowlisted entries from /work/pytorch/build/CMakeCache.txt
+  ninja hipcc: c10_hip=18D archs=[gfx942] torch_cpu=14D archs=[?] torch_hip=42D archs=[gfx942]
+  aiter hsa:   gfx942=1180.co/3a7b9e0f gfx950=420.co/c1d2e8a4
+  sdpa:        flash=on mem_eff=on math=on cudnn=off
 
 Partial reasons:
   - system_health: rdhc exited 1 (stderr: sudo: a password is required)
@@ -145,7 +149,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.2"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.3"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -162,14 +166,15 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `tensile` | `dict` | optional `import Tensile` + sorted-filenames hash over the union of hipBLASLt + rocBLAS kernel DBs | `package_version` (usually `null` outside builders), `kernel_db_combined_hash` |
 | `triton` | `dict` | `import triton; triton.__version__` | `package_version`. ROCm Triton fork bakes the source commit into `__version__`. |
 | `fbgemm` | `dict` | optional `import fbgemm_gpu` + parse of `torch.__config__.show()` for `-DUSE_FBGEMM*` defines | `package_version`, `pytorch_use_fbgemm`, `pytorch_use_fbgemm_genai`. The two booleans capture the build-time decision baked into the PyTorch wheel even when `fbgemm_gpu` isn't a separate pip package. |
-| `aiter` | `dict` | `import aiter; aiter.__version__` + `importlib.metadata.version("amd_aiter" \| "aiter")` | `package_version`, `package_dist_name` (which PyPI dist matched: `amd_aiter` is the canonical AMD-internal ROCm/PyTorch image dist; `aiter` is the upstream name), `commit` (parsed from the setuptools_scm `+g<sha>` local-version segment, matches the image tag's `aiter-<sha>` label). Most installs record `null` for everything; absence is silent. |
+| `aiter` | `dict` | `import aiter; aiter.__version__` + `importlib.metadata.version("amd_aiter" \| "aiter")` + scan of `aiter_meta/hsa/<gfx>/` (or `$AORTA_PYTORCH_SRC/third_party/aiter/hsa/`) | `package_version`, `package_dist_name` (which PyPI dist matched: `amd_aiter` is the canonical AMD-internal ROCm/PyTorch image dist; `aiter` is the upstream name), `commit` (parsed from the setuptools_scm `+g<sha>` local-version segment, matches the image tag's `aiter-<sha>` label), `hsa_tree` (issue #176 -- per-arch fingerprint of pre-built `.co` kernel binaries: file_count, co_count, deterministic combined_sha256). Most installs record `null` for everything; absence is silent. |
 | `aotriton` | `dict` | scan of `<torch>/lib/libaotriton_v2.so*` filenames + `sha256` of the resolved file + presence of `<torch>/lib/aotriton.images/` + `$AOTRITON_INSTALLED_PREFIX` | Default ROCm Flash Attention backend. Bundled in the wheel via `cmake/External/aotriton.cmake` (NOT a `third_party/` git submodule). Fields: `bundled_present`, `bundled_version`, `bundled_lib_hash`, `bundled_images_dir_present`, `installed_prefix`. CK is the alternative backend (toggled via `TORCH_ROCM_FA_PREFER_CK=1`). |
 | `runtime_context` | `dict` | `/.dockerenv`, `/run/.containerenv`, `$SINGULARITY_NAME`, `/proc/1/cgroup`, `sys.prefix`, `$CONDA_DEFAULT_ENV` | `type`, `python_env`, `venv_path`, `conda_env_name` |
 | `docker` | `dict \| null` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars + `/proc/self/cgroup` | `null` on baremetal; image+digest provided by the launcher (the only reliable way from inside a container) |
 | `env_vars` | `dict[str, str \| null]` | explicit canonical list (currently 31 names; see `CANONICAL_ENV_VARS` in `environment.py` for the live set) | GPU scoping + HSA / runtime + GPU queue / codegen + NCCL/RCCL + FBGEMM + MIOpen + SDPA backend selection + GEMM backend preference + hipBLASLt autotune + PyTorch / inductor. Build-time cmake flags (`USE_ROCM_CK_SDPA`, `USE_ROCM_CK_GEMM`, `USE_FBGEMM*`) are NOT in this list -- they're surfaced under their respective library blocks instead, parsed from `torch.__config__.show()`. |
 | `python_version` | `str` | `platform.python_version()` | always populated |
 | `pytorch_version` | `str \| null` | optional `import torch` (no CUDA/HIP context init) | `null` when torch absent |
-| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference). See "PyTorch source-tree submodule probing" below. |
+| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` + parse of `<source>/build/CMakeCache.txt` + stream of `<source>/build/build.ninja` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference), `cmake_cache` (issue #176, source/editable installs only -- allowlisted entries from CMakeCache.txt), `ninja_hipcc` (issue #176, source/editable installs only -- per-target HIPCC defines + codegen flags + offload archs from build.ninja). See "PyTorch source-tree submodule probing" below. |
+| `pytorch_sdpa` | `dict` | `torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()` | `backends_enabled` dict, one bool per SDPA backend + per-getter `null` when missing on older torch. Runtime state, NOT compile-time -- combine with `pytorch_build.binary_introspection.libtorch_hip_symbol_counts` for the full "compiled in AND enabled" picture. |
 
 `runtime_context.type` is one of `"docker" | "podman" | "singularity" | "baremetal"`. Adding values is a schema change.
 
@@ -332,7 +337,57 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.2` (current)
+### `1.3` (current)
+
+Adds source/editable-install build introspection (issue #176) plus a
+runtime SDPA backend probe. New fields are additive within existing
+top-level dicts plus one new top-level dict (`pytorch_sdpa`) which
+the 1.3 dataclass defaults to a "we couldn't ask" shape so loading
+older snapshots through `EnvSnapshot.from_dict(...)` does NOT raise.
+
+* `pytorch_build.cmake_cache` -- parsed `<source>/build/CMakeCache.txt`
+  for source / editable installs. `entries` is a sorted dict of
+  `<NAME>: {type, value}` filtered by an allowlist of name prefixes
+  (`USE_`, `CK_`, `AITER_`, `FLASH_`, `HIPBLAS`, `DISABLE_`,
+  `AOTRITON`, `ROCM_`, `HIP_PLATFORM`, `HIP_RUNTIME`, `HIP_COMPILER`,
+  `HIP_VERSION`, `PYTORCH_ROCM_ARCH`, `TORCH_BUILD_VERSION`,
+  `BUILD_TYPE`, `CMAKE_BUILD_TYPE`). Wheel installs render
+  `entries: null` and `_source_file: null` -- absence is the
+  documented common case, no partial reason.
+* `pytorch_build.ninja_hipcc` -- parsed `<source>/build/build.ninja`
+  per-target HIPCC defines, codegen flags, and `--offload-arch=`
+  list. Streamed line-by-line (build.ninja can be 350+ MB on a
+  fully-built tree). Targets reported: `torch_hip`, `torch_cpu`,
+  `c10_hip` (identified via the `-D<target>_EXPORTS` token cmake
+  appends per shared-lib target). Wheel installs render
+  `targets: null`.
+* `aiter.hsa_tree` -- per-arch fingerprint of aiter's pre-built HSA
+  `.co` kernel binaries. Per arch: `file_count`, `co_count`,
+  deterministic `combined_sha256` over sorted `(relpath, sha256)`
+  pairs. Three search roots: `importlib.util.find_spec("aiter_meta")`,
+  the sibling `aiter_meta` dir, and
+  `$AORTA_PYTORCH_SRC/third_party/aiter/hsa`. Returns `null` when no
+  tree is locatable -- silent absence (most installs lack it).
+* `pytorch_sdpa` (new top-level) -- `backends_enabled: {flash_sdp_enabled,
+  mem_efficient_sdp_enabled, math_sdp_enabled, cudnn_sdp_enabled}`.
+  Pure Python attribute lookups on `torch.backends.cuda` -- no GPU
+  work, no HIP context init. Per-getter `null` when the function is
+  missing on older torch (distinguishable from True/False).
+
+Backwards-compat notes:
+
+* 1.2 readers loading a 1.3 snapshot get the new top-level
+  `pytorch_sdpa` filtered out by `from_dict()`'s known-key gate --
+  no error, just silently dropped.
+* 1.3 readers loading a 1.2 snapshot get the dataclass-default
+  `pytorch_sdpa` (all-None backends) instead of an absent field --
+  the dataclass default kicks in.
+* Same nested-key caveat as 1.2: new nested keys (`cmake_cache`,
+  `ninja_hipcc`, `hsa_tree`) are NOT backfilled on 1.2 snapshots --
+  consumers indexing them get `KeyError`. Use `.get(key)` or guard
+  on `schema_version`.
+
+### `1.2`
 
 Top-level-key-additive -- every new field lives under existing
 top-level dicts (`pytorch_build`, `aiter`), so 1.1 readers loading

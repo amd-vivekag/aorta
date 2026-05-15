@@ -258,6 +258,7 @@ REQUIRED_TOP_KEYS = {
     "python_version",
     "pytorch_version",
     "pytorch_build",
+    "pytorch_sdpa",
 }
 
 
@@ -267,7 +268,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.2"
+        assert snapshot.schema_version == "1.3"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -314,7 +315,7 @@ class TestSchemaCompleteness:
 def _example_snapshot(**overrides) -> object:
     """Build a fully-populated EnvSnapshot for round-trip testing."""
     base = {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "captured_at": "2026-04-28T12:00:00Z",
         "system_health": {"rdhc_version": "1.4.0", "tests": {}},
         "rocm": {
@@ -363,7 +364,12 @@ def _example_snapshot(**overrides) -> object:
             "pytorch_use_fbgemm": True,
             "pytorch_use_fbgemm_genai": True,
         },
-        "aiter": {"package_version": None},
+        "aiter": {
+            "package_version": None,
+            "package_dist_name": None,
+            "commit": None,
+            "hsa_tree": None,
+        },
         "aotriton": {
             "bundled_present": True,
             "bundled_version": "0.11.1",
@@ -437,9 +443,16 @@ def _example_snapshot(**overrides) -> object:
             "build_flags": {
                 name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES
             },
+            "cmake_cache": {"_source_file": None, "entries": None},
+            "ninja_hipcc": {"_source_file": None, "targets": None},
         },
         "partial": False,
         "partial_reasons": [],
+        "pytorch_sdpa": {
+            "backends_enabled": {
+                name: None for name in env_mod._PYTORCH_SDPA_GETTERS
+            }
+        },
     }
     base.update(overrides)
     return EnvSnapshot(**base)
@@ -468,7 +481,7 @@ class TestEnvSnapshot:
         d = _example_snapshot().to_dict()
         d["future_field_not_yet_added"] = {"hello": "world"}
         rebuilt = EnvSnapshot.from_dict(d)
-        assert rebuilt.schema_version == "1.2"
+        assert rebuilt.schema_version == "1.3"
 
     def test_from_dict_defaults_partial_reasons_when_missing(self):
         """Older env.json without partial_reasons still loads (defaults to [])."""
@@ -2863,6 +2876,7 @@ class TestAiterBlock:
             "package_version": None,
             "package_dist_name": None,
             "commit": None,
+            "hsa_tree": None,
         }
         assert all("aiter not importable" not in r for r in reasons)
 
@@ -2888,6 +2902,7 @@ class TestAiterBlock:
             "package_version": "0.1.4+rocm7.2.gitabc",
             "package_dist_name": None,
             "commit": None,
+            "hsa_tree": None,
         }
         assert reasons == []
 
@@ -3607,6 +3622,8 @@ class TestPytorchBuildBlockShape:
             "flags",
             "build_flags",
             "binary_introspection",
+            "cmake_cache",
+            "ninja_hipcc",
         }
 
     def test_build_flags_keys_stable(self, all_disabled):
@@ -4702,6 +4719,322 @@ class TestSummaryStableBuildFlagsLine:
         assert flags_line is not None
         assert "FLASH_ATTN=on" in flags_line
         assert "CK_SDPA=on" in flags_line
+
+
+class TestCapturePytorchCmakeCache:
+    """Issue #176: parsed CMakeCache.txt for source/editable installs."""
+
+    @staticmethod
+    def _make_cache(tmp_path: Path, body: str) -> Path:
+        build = tmp_path / "build"
+        build.mkdir()
+        cache = build / "CMakeCache.txt"
+        cache.write_text(body, encoding="utf-8")
+        return cache
+
+    def test_wheel_install_returns_null_no_partial(self, tmp_path):
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_cmake_cache("wheel", tmp_path, reasons)
+        assert block == {"_source_file": None, "entries": None}
+        assert reasons == []
+
+    def test_no_build_dir_returns_null_no_partial(self, tmp_path):
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_cmake_cache("source", tmp_path, reasons)
+        assert block == {"_source_file": None, "entries": None}
+        assert reasons == []
+
+    def test_parses_filtered_entries_sorted(self, tmp_path):
+        cache_body = (
+            "// header comment\n"
+            "# unrelated comment\n"
+            "USE_FLASH_ATTENTION:BOOL=ON\n"
+            "USE_ROCM_CK_SDPA:BOOL=ON\n"
+            "BUILD_TYPE:STRING=Release\n"
+            "FLASH_NAMESPACE:STRING=pytorch_flash\n"
+            "BORING_VAR_NOT_ALLOWLISTED:STRING=keep-out\n"
+            "USE_NUMA:BOOL=OFF\n"
+        )
+        self._make_cache(tmp_path, cache_body)
+        block = env_mod._capture_pytorch_cmake_cache("source", tmp_path, [])
+        assert block["entries"] == {
+            "BUILD_TYPE": {"type": "STRING", "value": "Release"},
+            "FLASH_NAMESPACE": {"type": "STRING", "value": "pytorch_flash"},
+            "USE_FLASH_ATTENTION": {"type": "BOOL", "value": "ON"},
+            "USE_NUMA": {"type": "BOOL", "value": "OFF"},
+            "USE_ROCM_CK_SDPA": {"type": "BOOL", "value": "ON"},
+        }
+        assert "BORING_VAR_NOT_ALLOWLISTED" not in block["entries"]
+        assert block["_source_file"].endswith("CMakeCache.txt")
+
+    def test_unreadable_cache_records_partial_reason(self, tmp_path, monkeypatch):
+        self._make_cache(tmp_path, "USE_ROCM:BOOL=ON\n")
+
+        def boom(self, *args, **kwargs):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(env_mod.Path, "read_text", boom)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_cmake_cache("source", tmp_path, reasons)
+        assert block["entries"] is None
+        assert any(
+            r.startswith("pytorch_build.cmake_cache: read failed")
+            and "PermissionError" in r
+            for r in reasons
+        )
+
+
+class TestCapturePytorchNinjaHipcc:
+    """Issue #176: streamed build.ninja per-target HIPCC introspection."""
+
+    @staticmethod
+    def _make_ninja(tmp_path: Path, body: str) -> Path:
+        build = tmp_path / "build"
+        build.mkdir()
+        ninja = build / "build.ninja"
+        ninja.write_text(body, encoding="utf-8")
+        return ninja
+
+    def test_wheel_install_returns_null(self, tmp_path):
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_ninja_hipcc("wheel", tmp_path, reasons)
+        assert block == {"_source_file": None, "targets": None}
+        assert reasons == []
+
+    def test_targets_of_interest_captured(self, tmp_path):
+        # Two build statements: torch_hip (target of interest) + an
+        # unrelated target that must be filtered out.
+        body = (
+            "build foo.o: HIP_COMPILER__torch_hip_unscanned src/foo.hip\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DUSE_ROCM_CK_SDPA "
+            "-DCK_TILE_FMHA_FWD_FAST_EXP2 -DFLASH_NAMESPACE=pytorch_flash\n"
+            "  FLAGS = -fgpu-flush-denormals-to-zero --offload-arch=gfx942 "
+            "--offload-arch=gfx950 -O3\n"
+            "\n"
+            "build bar.o: HIP_COMPILER__unrelated_target src/bar.hip\n"
+            "  DEFINES = -Dunrelated_target_EXPORTS -DSHOULD_BE_IGNORED\n"
+            "  FLAGS = -O2\n"
+        )
+        self._make_ninja(tmp_path, body)
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert set(block["targets"]) == {"torch_hip"}
+        t = block["targets"]["torch_hip"]
+        assert t["defines"]["USE_ROCM_CK_SDPA"] is None
+        assert t["defines"]["FLASH_NAMESPACE"] == "pytorch_flash"
+        assert t["use_defines_present"]["USE_ROCM_CK_SDPA"] is True
+        assert t["use_defines_present"]["DISABLE_AOTRITON"] is False
+        assert t["codegen_flags_present"]["-fgpu-flush-denormals-to-zero"] is True
+        assert t["codegen_flags_present"]["-ffast-math"] is False
+        assert t["offload_archs"] == ["gfx942", "gfx950"]
+
+    def test_streaming_does_not_slurp_giant_files(self, tmp_path, monkeypatch):
+        """Sanity: parser uses iterator-style read, not .read() / .readlines().
+
+        Asserts the open() call returns a file object whose .read() is
+        never called on the body -- catches a future "let's just slurp"
+        regression on a 350+ MB build.ninja.
+        """
+        self._make_ninja(
+            tmp_path,
+            "build x.o: rule\n  DEFINES = -Dtorch_hip_EXPORTS -DA\n  FLAGS = -O3\n",
+        )
+        real_open = env_mod.Path.open
+        slurp_calls: list[str] = []
+
+        def tracking_open(self, *a, **kw):
+            fh = real_open(self, *a, **kw)
+            orig_read = fh.read
+
+            def tracked_read(*ra, **rk):
+                slurp_calls.append(self.name)
+                return orig_read(*ra, **rk)
+
+            fh.read = tracked_read
+            return fh
+
+        monkeypatch.setattr(env_mod.Path, "open", tracking_open)
+        env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        # iter(fh) doesn't invoke .read(); slurp would.
+        assert slurp_calls == []
+
+
+class TestCaptureAiterHsaTree:
+    """Issue #176: per-arch fingerprint of aiter's HSA code-object tree."""
+
+    @staticmethod
+    def _make_hsa(tmp_path: Path, layout: dict[str, dict[str, bytes]]) -> Path:
+        """Create hsa/<gfx>/ tree from {gfx: {relpath: bytes}} mapping."""
+        hsa = tmp_path / "hsa"
+        for gfx, files in layout.items():
+            arch_dir = hsa / gfx
+            arch_dir.mkdir(parents=True)
+            for relpath, data in files.items():
+                target = arch_dir / relpath
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        return hsa
+
+    def test_no_roots_returns_none(self, monkeypatch):
+        # No aiter_meta, no AORTA_PYTORCH_SRC, no aiter module passed.
+        monkeypatch.delenv(env_mod.AORTA_PYTORCH_SRC_ENV, raising=False)
+        monkeypatch.setattr(
+            "importlib.util.find_spec", lambda name: None,
+        )
+        assert env_mod._capture_aiter_hsa_tree(None, []) is None
+
+    def test_aorta_pytorch_src_root_picked_up(self, tmp_path, monkeypatch):
+        third_party = tmp_path / "third_party" / "aiter"
+        third_party.mkdir(parents=True)
+        self._make_hsa(third_party, {"gfx942": {"k.co": b"abc", "meta.json": b"{}"}})
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, str(tmp_path))
+        monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+        out = env_mod._capture_aiter_hsa_tree(None, [])
+        assert out is not None and len(out) == 1
+        per_arch = next(iter(out.values()))
+        assert per_arch["gfx942"]["file_count"] == 2
+        assert per_arch["gfx942"]["co_count"] == 1
+        assert isinstance(per_arch["gfx942"]["combined_sha256"], str)
+
+    def test_combined_sha256_deterministic_across_runs(self, tmp_path, monkeypatch):
+        """Two runs over identical bytes produce identical hashes
+        regardless of mtime / iteration order.
+        """
+        a_root = tmp_path / "tree_a" / "third_party" / "aiter"
+        b_root = tmp_path / "tree_b" / "third_party" / "aiter"
+        a_root.mkdir(parents=True)
+        b_root.mkdir(parents=True)
+        layout = {"gfx942": {"a.co": b"\x01\x02", "sub/b.co": b"\x03\x04"}}
+        self._make_hsa(a_root, layout)
+        self._make_hsa(b_root, layout)
+
+        monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, str(tmp_path / "tree_a"))
+        out_a = env_mod._capture_aiter_hsa_tree(None, [])
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, str(tmp_path / "tree_b"))
+        out_b = env_mod._capture_aiter_hsa_tree(None, [])
+
+        sha_a = next(iter(out_a.values()))["gfx942"]["combined_sha256"]
+        sha_b = next(iter(out_b.values()))["gfx942"]["combined_sha256"]
+        assert sha_a == sha_b
+
+    def test_combined_sha256_changes_when_byte_changes(
+        self, tmp_path, monkeypatch
+    ):
+        """Single-byte change in any .co produces a different hash --
+        guards against an accidental regression to e.g. counting only
+        file paths.
+        """
+        root_a = tmp_path / "a" / "third_party" / "aiter"
+        root_b = tmp_path / "b" / "third_party" / "aiter"
+        root_a.mkdir(parents=True)
+        root_b.mkdir(parents=True)
+        self._make_hsa(root_a, {"gfx942": {"k.co": b"\x00"}})
+        self._make_hsa(root_b, {"gfx942": {"k.co": b"\x01"}})
+        monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, str(tmp_path / "a"))
+        sha_a = next(iter(
+            env_mod._capture_aiter_hsa_tree(None, []).values()
+        ))["gfx942"]["combined_sha256"]
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, str(tmp_path / "b"))
+        sha_b = next(iter(
+            env_mod._capture_aiter_hsa_tree(None, []).values()
+        ))["gfx942"]["combined_sha256"]
+        assert sha_a != sha_b
+
+
+class TestCapturePytorchSdpa:
+    """Issue #176: runtime SDPA backend state."""
+
+    def test_torch_absent_yields_all_none(self, isolated_env, monkeypatch):
+        import builtins
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                (_ for _ in ()).throw(ImportError("simulated"))
+                if name == "torch"
+                else real_import(name, *a, **kw)
+            ),
+        )
+        block = env_mod._capture_pytorch_sdpa([])
+        assert block["backends_enabled"] == {
+            name: None for name in env_mod._PYTORCH_SDPA_GETTERS
+        }
+
+    def test_all_getters_present_returns_bools(self, isolated_env, monkeypatch):
+        import builtins
+        import types
+        cuda_ns = types.SimpleNamespace(
+            flash_sdp_enabled=lambda: True,
+            mem_efficient_sdp_enabled=lambda: True,
+            math_sdp_enabled=lambda: True,
+            cudnn_sdp_enabled=lambda: False,
+        )
+        fake_torch = types.SimpleNamespace(
+            backends=types.SimpleNamespace(cuda=cuda_ns),
+        )
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_torch if name == "torch" else real_import(name, *a, **kw)
+            ),
+        )
+        block = env_mod._capture_pytorch_sdpa([])
+        assert block["backends_enabled"] == {
+            "flash_sdp_enabled": True,
+            "mem_efficient_sdp_enabled": True,
+            "math_sdp_enabled": True,
+            "cudnn_sdp_enabled": False,
+        }
+
+    def test_missing_getter_renders_none_not_false(
+        self, isolated_env, monkeypatch
+    ):
+        """Older torch wheels lack one or more getters; that's
+        distinguishable from `False` (which means "we asked, the
+        backend is disabled").
+        """
+        import builtins
+        import types
+        cuda_ns = types.SimpleNamespace(
+            flash_sdp_enabled=lambda: True,
+            # mem_efficient_sdp_enabled / math_sdp_enabled / cudnn_sdp_enabled
+            # intentionally absent.
+        )
+        fake_torch = types.SimpleNamespace(
+            backends=types.SimpleNamespace(cuda=cuda_ns),
+        )
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_torch if name == "torch" else real_import(name, *a, **kw)
+            ),
+        )
+        block = env_mod._capture_pytorch_sdpa([])
+        assert block["backends_enabled"]["flash_sdp_enabled"] is True
+        assert block["backends_enabled"]["mem_efficient_sdp_enabled"] is None
+        assert block["backends_enabled"]["math_sdp_enabled"] is None
+        assert block["backends_enabled"]["cudnn_sdp_enabled"] is None
+
+
+class TestPytorchSdpaSnapshotRoundTrip:
+    """Schema regression: 1.2 snapshots without `pytorch_sdpa` must
+    round-trip through 1.3 `from_dict` and emerge with the dataclass-
+    default backends_enabled shape.
+    """
+
+    def test_legacy_snapshot_without_pytorch_sdpa_loads(self):
+        d = _example_snapshot().to_dict()
+        del d["pytorch_sdpa"]
+        rebuilt = EnvSnapshot.from_dict(d)
+        assert rebuilt.pytorch_sdpa == {
+            "backends_enabled": {
+                name: None for name in env_mod._PYTORCH_SDPA_GETTERS
+            }
+        }
 
 
 class TestSafeImportTorch:
