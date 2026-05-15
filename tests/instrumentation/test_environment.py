@@ -743,6 +743,18 @@ class TestCollectEnvContract:
                 cuda=None,
                 debug=False,
             ),
+            # backends.cuda surface required by _capture_pytorch_sdpa
+            # (issue #176). Without this, the SDPA probe reports
+            # "torch.backends.cuda unavailable" and the clean-probe
+            # contract (no partial reasons) fails.
+            backends=types.SimpleNamespace(
+                cuda=types.SimpleNamespace(
+                    flash_sdp_enabled=lambda: True,
+                    mem_efficient_sdp_enabled=lambda: True,
+                    math_sdp_enabled=lambda: True,
+                    cudnn_sdp_enabled=lambda: False,
+                ),
+            ),
         )
 
         # Stand up a fake source tree with .git + third_party so
