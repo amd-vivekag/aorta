@@ -414,9 +414,13 @@ def _iters_for_log(trials: list[TrialResult]) -> str:
     """Pre-render the ``iters: N/M`` fragment for the cell-summary log.
 
     Same rules as ``aorta.triage.matrix._aggregate_iter_counts`` but
-    operating on dicts. Returns ``"—"`` when the workload didn't track
-    iteration counts on at least one trial; ``"?/?"`` when trials
-    disagreed on the configured count.
+    operating on dicts. Returns ``"—"`` only for true legacy cells (no
+    trial populated ``configured_iterations``); ``"?/?"`` when trials
+    disagreed on the configured count; ``"—/<configured>"`` when the
+    budget is known but ``executed_iterations`` is missing for some
+    trial. The terminal log line and the matrix.md row should agree on
+    what each cell looked like, so this helper mirrors the matrix-side
+    rules byte-for-byte.
     """
     configured: list[int] = []
     executed: list[int | None] = []
@@ -438,7 +442,7 @@ def _iters_for_log(trials: list[TrialResult]) -> str:
     cfg_value = configured[0]
     populated = [e for e in executed if e is not None]
     if len(populated) != len(executed) or not populated:
-        return "—"
+        return f"—/{cfg_value}"
     lo, hi = min(populated), max(populated)
     return f"{lo}/{cfg_value}" if lo == hi else f"{lo}..{hi}/{cfg_value}"
 

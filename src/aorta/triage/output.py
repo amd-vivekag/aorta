@@ -305,7 +305,8 @@ def write_matrix_md(
             "primary code path began (e.g. setup-time crash). The cell is excluded "
             "from confound classification entirely; `Mean step (ms)` is `n/a` because "
             "any number derived from setup-only wall clock would misrepresent "
-            "iteration timing. Inspect `cells/<cell-name>/trial_*.json` for the cause."
+            "iteration timing. Inspect `cells/<cell-name>/<workload>/trial_*.json` "
+            "for the cause."
         )
     if show_iters:
         lines.append(

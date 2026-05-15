@@ -599,9 +599,17 @@ def test_iters_display_dash_when_no_trial_populates_iter_fields():
     assert stats.executed_iter_max is None
 
 
-def test_iters_display_dash_when_one_trial_missing_executed_field():
-    """Mixed populated/None executed_iterations -> "—" (don't render half a
-    cell). Configured is still recorded for the consumer that wants it."""
+def test_iters_display_renders_configured_when_executed_partial():
+    """Mixed populated/None ``executed_iterations`` across trials -> render
+    ``"—/<configured>"`` so the operator sees the budget that was set up
+    even when execution count is missing for some trials. Hiding the row
+    entirely (the previous behaviour) swallowed useful partial data --
+    Copilot's round-2 catch on PR #175.
+
+    The configured number is the load-bearing piece: it tells the reader
+    "the workload was asked to run N iterations". The em-dash on the
+    numerator says honestly "we don't know how far they got".
+    """
     trials = [
         _trial(
             main_work_started=True, executed_iterations=42, configured_iterations=50, passed=True
@@ -609,7 +617,7 @@ def test_iters_display_dash_when_one_trial_missing_executed_field():
         _trial(main_work_started=True, configured_iterations=50, passed=False),
     ]
     stats = _default_call(trials=trials)
-    assert stats.iters_display == "—"
+    assert stats.iters_display == "—/50"
     assert stats.configured_iters == 50
 
 

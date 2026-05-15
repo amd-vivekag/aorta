@@ -247,11 +247,13 @@ def _aggregate_iter_counts(
       ``configured_iterations``): all four return values are ``None`` /
       ``"—"``. The matrix.md renderer hides the column entirely if
       *every* cell ends up here.
-    * At least one trial has ``executed_iterations is None`` while another
-      has it populated: ``"—"``. We refuse to render half a cell.
     * Trials disagree on ``configured_iterations``: ``"?/?"``. Defensive
       -- shouldn't happen in practice (recipe pins steps per cell), but
       surfaces the contradiction instead of silently picking one value.
+    * Configured is known but at least one trial has
+      ``executed_iterations is None``: ``"—/<configured>"``. The budget
+      is real and worth surfacing; the missing executed count is the
+      honest part. Renders as a visible row instead of hiding the cell.
     * All trials executed the same count: ``"<N>/<configured>"``.
     * Trials executed different counts: ``"<min>..<max>/<configured>"``.
     """
@@ -278,7 +280,7 @@ def _aggregate_iter_counts(
 
     populated_executed = [e for e in executed_values if e is not None]
     if len(populated_executed) != len(executed_values) or not populated_executed:
-        return None, None, configured, "—"
+        return None, None, configured, f"—/{configured}"
 
     exec_min = min(populated_executed)
     exec_max = max(populated_executed)
