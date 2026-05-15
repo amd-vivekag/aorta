@@ -93,7 +93,7 @@ Wrote env probe to /tmp/env.json (schema_version=1.3) [PARTIAL]
   flags:       FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on
   cmake cache: 32 allowlisted entries from /work/pytorch/build/CMakeCache.txt
   ninja hipcc: c10_hip=18D archs=[gfx942] torch_cpu=14D archs=[?] torch_hip=42D archs=[gfx942]
-  aiter hsa:   gfx942=1180.co/3a7b9e0f gfx950=420.co/c1d2e8a4
+  aiter hsa:   aiter_meta/hsa:gfx942=1180.co/3a7b9e0f aiter_meta/hsa:gfx950=420.co/c1d2e8a4
   sdpa:        flash=on mem_eff=on math=on cudnn=off
 
 Partial reasons:

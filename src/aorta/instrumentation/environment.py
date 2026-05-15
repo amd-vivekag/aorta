@@ -55,9 +55,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -3478,6 +3478,19 @@ _NINJA_TARGET_EXPORTS_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)_EXPORTS\b")
 _NINJA_DEFINE_TOKEN_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?")
 _NINJA_OFFLOAD_ARCH_RE = re.compile(r"--offload-arch=(\S+)")
 
+# `build <outputs>: <rule_name> <inputs>...` -- captures the rule
+# name. cmake's ninja generator names rules per-language, e.g.
+# ``HIP_COMPILER__torch_hip_unscanned_<hash>`` for .hip files in the
+# torch_hip target and ``CXX_COMPILER__torch_hip_unscanned_<hash>``
+# for .cpp files in the same target. Both rules' DEFINES blocks
+# carry ``-Dtorch_hip_EXPORTS`` (cmake propagates target-level
+# defines to all sources), so without this filter the parser would
+# pollute torch_hip's reported defines/flags with the host-compiler
+# rule's data and report empty offload_archs (CXX rules carry no
+# --offload-arch).
+_NINJA_BUILD_LINE_RE = re.compile(r"^build [^:]*:\s+(\S+)")
+_NINJA_HIP_RULE_PREFIX = "HIP_COMPILER"
+
 
 def _iter_ninja_logical_lines(fh) -> Iterator[str]:
     """Stream Ninja logical lines, folding ``$``-continued physical lines.
@@ -3569,9 +3582,22 @@ def _capture_pytorch_ninja_hipcc(
     target_flags: dict[str, set[str]] = {}
     pending_target: str | None = None
     pending_lines_left = 0
+    in_hip_build = False
     try:
         with ninja_path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in _iter_ninja_logical_lines(fh):
+                build_match = _NINJA_BUILD_LINE_RE.match(line)
+                if build_match:
+                    rule_name = build_match.group(1)
+                    in_hip_build = rule_name.startswith(_NINJA_HIP_RULE_PREFIX)
+                    # Reset pending DEFINES->FLAGS state on rule
+                    # transitions so a HIP build's pending FLAGS slot
+                    # can't be filled by the next non-HIP build's FLAGS.
+                    pending_target = None
+                    pending_lines_left = 0
+                    continue
+                if not in_hip_build:
+                    continue
                 if line.startswith(_NINJA_DEFINES_PREFIX):
                     defines_str = line[len(_NINJA_DEFINES_PREFIX):]
                     tgt_match = _NINJA_TARGET_EXPORTS_RE.search(defines_str)

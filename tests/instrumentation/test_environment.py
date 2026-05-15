@@ -4862,7 +4862,7 @@ class TestCapturePytorchNinjaHipcc:
         whole DEFINES block would be misclassified.
         """
         body = (
-            "build x.o: rule\n"
+            "build x.o: HIP_COMPILER__torch_hip_unscanned\n"
             "  DEFINES = -DA -DB $\n"
             "    -Dtorch_hip_EXPORTS -DUSE_ROCM_CK_SDPA $\n"
             "    -DC\n"
@@ -4884,7 +4884,7 @@ class TestCapturePytorchNinjaHipcc:
         --offload-arch=... token on a continuation line is captured.
         """
         body = (
-            "build x.o: rule\n"
+            "build x.o: HIP_COMPILER__torch_hip_unscanned\n"
             "  DEFINES = -Dtorch_hip_EXPORTS\n"
             "  FLAGS = -O3 $\n"
             "    --offload-arch=gfx942 $\n"
@@ -4896,6 +4896,35 @@ class TestCapturePytorchNinjaHipcc:
             "gfx942", "gfx950",
         ]
 
+    def test_cxx_rule_with_same_target_exports_does_not_pollute_hip_data(
+        self, tmp_path
+    ):
+        """cmake propagates target-level defines to all sources, so a
+        CXX rule for .cpp files in the torch_hip target ALSO carries
+        `-Dtorch_hip_EXPORTS`. Without per-rule filtering the parser
+        would merge that CXX rule's data into ninja_hipcc.targets[
+        torch_hip] -- polluting the defines and producing empty
+        offload_archs (CXX rules don't carry --offload-arch).
+        """
+        body = (
+            "build foo.cpp.o: CXX_COMPILER__torch_hip_unscanned src/foo.cpp\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DCXX_ONLY_DEFINE\n"
+            "  FLAGS = -O3 -fPIC\n"
+            "\n"
+            "build bar.hip.o: HIP_COMPILER__torch_hip_unscanned src/bar.hip\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DUSE_ROCM_CK_SDPA\n"
+            "  FLAGS = -O3 --offload-arch=gfx942\n"
+        )
+        self._make_ninja(tmp_path, body)
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        defines = block["targets"]["torch_hip"]["defines"]
+        # HIP-rule defines made it through.
+        assert "USE_ROCM_CK_SDPA" in defines
+        # CXX-only defines must NOT appear in the HIP target's defines.
+        assert "CXX_ONLY_DEFINE" not in defines
+        # offload_archs from the HIP rule is preserved.
+        assert block["targets"]["torch_hip"]["offload_archs"] == ["gfx942"]
+
     def test_streaming_does_not_slurp_giant_files(self, tmp_path, monkeypatch):
         """Sanity: parser uses iterator-style read, not .read() / .readlines().
 
@@ -4905,7 +4934,7 @@ class TestCapturePytorchNinjaHipcc:
         """
         self._make_ninja(
             tmp_path,
-            "build x.o: rule\n  DEFINES = -Dtorch_hip_EXPORTS -DA\n  FLAGS = -O3\n",
+            "build x.o: HIP_COMPILER__torch_hip_unscanned\n  DEFINES = -Dtorch_hip_EXPORTS -DA\n  FLAGS = -O3\n",
         )
         real_open = env_mod.Path.open
         slurp_calls: list[str] = []
@@ -4950,6 +4979,40 @@ class TestCaptureAiterHsaTree:
             "importlib.util.find_spec", lambda name: None,
         )
         assert env_mod._capture_aiter_hsa_tree(None, []) is None
+
+    def test_aiter_meta_find_spec_root_picked_up(self, tmp_path, monkeypatch):
+        """Primary documented HSA discovery path: a pip-installed
+        `aiter_meta` whose ModuleSpec.submodule_search_locations
+        points at the dist's site-packages dir. The hsa/ tree lives
+        directly under that dir.
+        """
+        import importlib.util as _iutil
+        import types
+
+        site = tmp_path / "site-packages" / "aiter_meta"
+        site.mkdir(parents=True)
+        # Top-level marker file so the dir looks like a real pkg.
+        (site / "__init__.py").write_text("")
+        self._make_hsa(site, {"gfx942": {"k.co": b"abc", "meta.json": b"{}"}})
+
+        fake_spec = types.SimpleNamespace(
+            origin=str(site / "__init__.py"),
+            submodule_search_locations=[str(site)],
+        )
+        monkeypatch.setenv(env_mod.AORTA_PYTORCH_SRC_ENV, "")
+        monkeypatch.delenv(env_mod.AORTA_PYTORCH_SRC_ENV, raising=False)
+        monkeypatch.setattr(
+            _iutil, "find_spec",
+            lambda name: fake_spec if name == "aiter_meta" else None,
+        )
+        out = env_mod._capture_aiter_hsa_tree(None, [])
+        assert out is not None
+        # Root was the find_spec location -- not AORTA_PYTORCH_SRC.
+        roots = list(out.keys())
+        assert len(roots) == 1
+        assert "aiter_meta" in roots[0]
+        assert out[roots[0]]["gfx942"]["co_count"] == 1
+        assert out[roots[0]]["gfx942"]["file_count"] == 2
 
     def test_aorta_pytorch_src_root_picked_up(self, tmp_path, monkeypatch):
         third_party = tmp_path / "third_party" / "aiter"
