@@ -864,7 +864,8 @@ def test_matrix_json_records_failure_hints_per_cell(tmp_path, patched_env, monke
     run_dir = runner.run_recipe(r, output_dir=tmp_path)
     doc = json.loads((run_dir / "matrix.json").read_text())
     for cell in doc["cells"]:
-        # asdict turns tuples into lists; JSON consumers see [hint, count] pairs.
+        # asdict preserves the tuple shape; json.dumps then serializes
+        # tuples as JSON arrays, so consumers see [hint, count] pairs.
         assert cell["failure_hints"] == [[hint, 2]]
 
 
