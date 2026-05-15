@@ -1075,12 +1075,21 @@ def test_did_not_run_cell_renders_iters_zero_step_na_and_confound_tag(
     assert none_cell["mean_step_time_ms"] == 0.0
 
 
-def test_auto_baseline_disqualified_emits_top_of_file_warning(
+def test_auto_baseline_skips_did_not_run_cell_and_picks_survivor(
     tmp_path, patched_env, monkeypatch
 ):
-    """Auto-resolved baseline ended up did-not-run -> warning + every
-    non-baseline cell collapses to n/a (no usable baseline to compare
-    against)."""
+    """Auto-resolution must SKIP all-did_not_run cells and try other
+    candidates rather than collapsing the whole matrix to n/a on the
+    first dead baseline.
+
+    Setup: ``none-local`` (the natural auto-baseline via the
+    "mitigations==[none]" rule) is all-did_not_run, but
+    ``tf32_off-local`` ran fine. The runner must fall through to
+    tf32_off-local as the baseline -- no warning, normal classification
+    -- so the operator still gets a useful matrix. The dead cell still
+    renders its ``did_not_run`` tag because classify() short-circuits
+    on the cell itself.
+    """
 
     def baseline_did_not_run(request):
         if request.mitigations == ("none",):
@@ -1091,16 +1100,106 @@ def test_auto_baseline_disqualified_emits_top_of_file_warning(
     r = _simple_recipe(ticket="T-1")
     run_dir = runner.run_recipe(r, output_dir=tmp_path)
     md = (run_dir / "matrix.md").read_text()
+    # No "no usable baseline" warning -- a candidate survived.
+    assert "> [!WARNING]" not in md
+    assert "No usable baseline" not in md
+    # The dead cell still renders did_not_run.
+    none_row = next(line for line in md.splitlines() if "| none-local " in line)
+    assert "did_not_run" in none_row
+    # The survivor became the baseline.
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    assert doc["baseline_cell"] == "tf32_off-local"
+    tf32 = next(c for c in doc["cells"] if c["name"] == "tf32_off-local")
+    assert tf32["confound"] == "(baseline)"
+
+
+def test_auto_baseline_warns_when_every_candidate_is_did_not_run(
+    tmp_path, patched_env, monkeypatch
+):
+    """When skip-and-retry exhausts the candidate list (every cell is
+    all-did_not_run), the runner falls back to the soft warning + every
+    non-baseline cell collapses to n/a path. matrix.json still records
+    WHO would have been the baseline so the operator can find the
+    relevant trial logs.
+    """
+
+    def all_did_not_run(request):
+        return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
+
+    monkeypatch.setattr(runner, "run_trials", all_did_not_run)
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
     assert "> [!WARNING]" in md
     assert "Auto-baseline 'none-local'" in md
-    assert "did_not_run" in md
-    # Non-baseline cell can't ratio against the suppressed baseline.
-    tf32_row = next(line for line in md.splitlines() if "| tf32_off-local " in line)
-    assert "n/a" in tf32_row
-
+    assert "no other cell in the recipe survived" in md
     doc = json.loads((run_dir / "matrix.json").read_text())
-    tf32 = next(c for c in doc["cells"] if c["name"] == "tf32_off-local")
-    assert tf32["confound"] == "n/a"
+    # Name preserved despite collapse, per the design comment in runner.py.
+    assert doc["baseline_cell"] == "none-local"
+    # Every cell is itself did_not_run, so classify() short-circuits each
+    # one to that tag -- the n/a tag is reserved for non-did_not_run cells
+    # that can't ratio against a dead baseline. Here there are no such cells.
+    for cell in doc["cells"]:
+        assert cell["confound"] == "did_not_run"
+
+
+def test_auto_baseline_warning_collapses_other_cells_to_na(
+    tmp_path, patched_env, monkeypatch
+):
+    """When the only auto-baseline candidates are all did_not_run but
+    OTHER (non-candidate) cells ran fine, the runner falls back to the
+    soft warning + the surviving non-did_not_run cells render n/a (they
+    can't ratio against the suppressed baseline).
+
+    This recipe has two ``baseline-*`` cells (both did_not_run) and one
+    cell with a mitigation that doesn't match the auto-resolution rules
+    (so it can't BECOME the baseline) but did run successfully. The
+    survivor stays in the matrix as a row but with no usable comparison.
+    """
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe
+
+    def per_cell(request):
+        # Only the two baseline-* cells (mitigations==("none",)) die in
+        # setup; tf32-only and xnack-only both run cleanly. Without this
+        # split the survivors get disqualified too and rule 4 (single
+        # candidate) silently picks one -- never reaching the warn path.
+        if request.mitigations == ("none",):
+            return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
+        return [_fake_trial_completed(configured_iterations=50) for _ in range(2)]
+
+    monkeypatch.setattr(runner, "run_trials", per_cell)
+
+    # Two ``none``-mitigation cells (both did_not_run) plus two non-baseline
+    # mitigations that ran fine. After skipping the dead candidates, no cell
+    # matches auto-resolution rules 2-3, AND there's more than one candidate
+    # left so rule 4 (single candidate) doesn't apply -> RecipeCellError ->
+    # fallback path emits the warning. The two surviving cells render n/a
+    # because they can't ratio against the dead baseline.
+    r = Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=2,
+        steps=50,
+        cells=(
+            Cell(name="baseline-a", mitigations=("none",), environment="local"),
+            Cell(name="baseline-b", mitigations=("none",), environment="local"),
+            Cell(name="tf32-only", mitigations=("tf32_off",), environment="local"),
+            Cell(name="xnack-only", mitigations=("xnack",), environment="local"),
+        ),
+        ticket="T-1",
+        confound=ConfoundCfg(),
+        inline_environments=(),
+    )
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "> [!WARNING]" in md
+    assert "no other cell in the recipe survived" in md
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    by_name = {c["name"]: c for c in doc["cells"]}
+    assert by_name["baseline-a"]["confound"] == "did_not_run"
+    assert by_name["baseline-b"]["confound"] == "did_not_run"
+    assert by_name["tf32-only"]["confound"] == "n/a"
+    assert by_name["xnack-only"]["confound"] == "n/a"
 
 
 def test_explicit_baseline_pointing_to_did_not_run_raises(tmp_path, patched_env, monkeypatch):

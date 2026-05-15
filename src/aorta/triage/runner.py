@@ -46,7 +46,10 @@ from aorta.triage.confound import (
     resolve_baseline,
 )
 from aorta.triage.matrix import (
+    OUTCOME_COMPLETED,
+    OUTCOME_CRASHED_AFTER_ITERATIONS,
     OUTCOME_DID_NOT_RUN,
+    OUTCOME_UNKNOWN,
     CellStats,
     aggregate_cell,
 )
@@ -428,16 +431,16 @@ def _outcome_for_log(result: dict) -> str:
     if started is False:
         return OUTCOME_DID_NOT_RUN
     if started is not True:
-        return "unknown"
+        return OUTCOME_UNKNOWN
     executed = result.get("executed_iterations")
     configured = result.get("configured_iterations")
     if not isinstance(executed, int) or not isinstance(configured, int):
-        return "unknown"
+        return OUTCOME_UNKNOWN
     if executed >= configured:
-        return "completed"
+        return OUTCOME_COMPLETED
     if result.get("passed") is False:
-        return "crashed_after_iterations"
-    return "unknown"
+        return OUTCOME_CRASHED_AFTER_ITERATIONS
+    return OUTCOME_UNKNOWN
 
 
 def _iters_for_log(trials: list[TrialResult]) -> str:
@@ -734,29 +737,37 @@ def run_recipe(
         )
         cell_stats.append(stats)
 
-    baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
-    baseline_stats = next(c for c in cell_stats if c.name == baseline_cell.name)
-
-    # Did-not-run baseline disqualification (issue #173). Explicit
-    # baseline_cell named in the recipe -> hard error: the operator made
-    # a deliberate choice and a silent fallback would mask it. Auto-
-    # resolved baseline -> soft warning + every non-baseline cell falls
-    # through to CONFOUND_NA via the existing
-    # ``baseline.mean_step_time_ms <= 0`` branch in confound.classify
-    # (the suppressed wall_clock_total fallback in aggregate_cell ensures
-    # the mean lands at 0). Legacy workloads (no outcome_counts populated)
-    # are unaffected -- ``is_did_not_run_cell`` returns False on empty
-    # counts so old runs keep their existing classification.
+    # Did-not-run baseline disqualification (issue #173). Three cases:
+    #   1. Explicit ``confound.baseline_cell`` -> resolves first; if that
+    #      cell ended up all-did_not_run, hard error. The operator named
+    #      this cell deliberately and a silent fallback would mask their
+    #      choice.
+    #   2. Auto-resolution -> SKIP all-did_not_run cells when applying
+    #      the resolution rules. If a usable candidate remains, classify
+    #      against that one and emit no warning. This matches the issue's
+    #      "Baseline auto-selection: skip cells whose outcome_counts is
+    #      all-did_not_run" rule -- a recipe with one bad baseline-* cell
+    #      and one healthy `none`-mitigations cell should fall through to
+    #      the latter, not collapse the whole matrix to n/a.
+    #   3. Auto-resolution exhausted -> soft warning + every non-baseline
+    #      cell falls through to CONFOUND_NA via the existing
+    #      ``baseline.mean_step_time_ms <= 0`` branch in confound.classify
+    #      (the suppressed wall_clock_total fallback in aggregate_cell
+    #      ensures the mean lands at 0).
+    # Legacy workloads (empty outcome_counts) never enter the skip set,
+    # so old runs keep their existing classification path unchanged.
     #
-    # Note: matrix.json::baseline_cell still records the resolved name
-    # in this case (rather than null, as one reading of the issue's
-    # design block might suggest). Preserving the name keeps a record of
-    # which cell was attempted as the baseline -- useful for an operator
-    # diagnosing why every other row collapsed to n/a -- while the
-    # accompanying warning carries the "no usable comparison" signal.
-    # Setting baseline_cell to null would lose the "we tried X" info.
-    if is_did_not_run_cell(baseline_stats):
-        if recipe.confound.baseline_cell is not None:
+    # Note: matrix.json::baseline_cell records the resolved name in case
+    # 3 (rather than null, as one reading of the issue's design block
+    # might suggest). Preserving the name keeps a record of which cell
+    # was attempted as the baseline -- useful for an operator diagnosing
+    # why every other row collapsed to n/a -- while the accompanying
+    # warning carries the "no usable comparison" signal.
+    disqualified_names = {s.name for s in cell_stats if is_did_not_run_cell(s)}
+
+    if recipe.confound.baseline_cell is not None:
+        baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
+        if baseline_cell.name in disqualified_names:
             raise RecipeCellError(
                 f"explicit baseline_cell {baseline_cell.name!r} produced only "
                 f"did_not_run trials (workload never reached its main work "
@@ -764,15 +775,30 @@ def run_recipe(
                 f"the failure cause, or remove confound.baseline_cell from the "
                 "recipe to fall back to auto-resolution."
             )
-        warnings.append(
-            f"Auto-baseline {baseline_cell.name!r} had "
-            f"{baseline_stats.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
-            f"{baseline_stats.trials} trials in did_not_run "
-            "(workload never reached main work phase). No usable baseline -- "
-            "confound classification disabled. Inspect "
-            f"cells/{safe_slug(baseline_cell.name)}/ for the failure cause."
-        )
+    else:
+        try:
+            baseline_cell = resolve_baseline(
+                recipe.cells, None, skip_names=disqualified_names
+            )
+        except RecipeCellError:
+            # Every candidate was disqualified -- fall back to the original
+            # auto-resolution (without the skip set) so matrix.json still
+            # records WHO would have been the baseline, then warn loudly.
+            baseline_cell = resolve_baseline(recipe.cells, None)
+            baseline_stats_ref = next(
+                c for c in cell_stats if c.name == baseline_cell.name
+            )
+            warnings.append(
+                f"Auto-baseline {baseline_cell.name!r} had "
+                f"{baseline_stats_ref.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
+                f"{baseline_stats_ref.trials} trials in did_not_run, and no "
+                "other cell in the recipe survived auto-baseline resolution "
+                "either. No usable baseline -- confound classification "
+                "disabled. Inspect "
+                f"cells/{safe_slug(baseline_cell.name)}/ for the failure cause."
+            )
 
+    baseline_stats = next(c for c in cell_stats if c.name == baseline_cell.name)
     confound_tags = classify_all(cell_stats, baseline_cell.name, recipe.confound.threshold)
 
     if baseline_stats.error is not None:

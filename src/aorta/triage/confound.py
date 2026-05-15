@@ -84,6 +84,7 @@ def is_did_not_run_cell(stats: CellStats) -> bool:
 def resolve_baseline(
     cells: Iterable[Cell],
     explicit_name: str | None,
+    skip_names: Iterable[str] = (),
 ) -> Cell:
     """Resolve the baseline cell per the rules in the recipe schema.
 
@@ -95,6 +96,15 @@ def resolve_baseline(
     3. First cell whose mitigations == ``["none"]``.
     4. If the recipe has exactly one cell, use it.
     5. Otherwise raise :class:`RecipeCellError`.
+
+    ``skip_names`` is applied to rules 2-4 only -- explicit naming
+    always wins (the operator's deliberate choice), so the runner
+    handles a disqualified explicit baseline as a hard error
+    separately. The skip set is the runner's hook for the
+    "auto-selection skips all-did_not_run cells" rule from issue #173:
+    the runner builds the set after aggregation and re-resolves; if
+    nothing survives, the runner falls back to its soft warning +
+    every-cell-n/a path.
 
     Raises:
         RecipeCellError: None of the rules resolves and the recipe has more
@@ -115,16 +125,19 @@ def resolve_baseline(
             f"cell name; cells: {sorted(c.name for c in cells_list)}"
         )
 
-    for c in cells_list:
+    skip_set = set(skip_names)
+    candidates = [c for c in cells_list if c.name not in skip_set]
+
+    for c in candidates:
         if c.name.startswith("baseline-"):
             return c
 
-    for c in cells_list:
+    for c in candidates:
         if tuple(c.mitigations) == ("none",):
             return c
 
-    if len(cells_list) == 1:
-        return cells_list[0]
+    if len(candidates) == 1:
+        return candidates[0]
 
     raise RecipeCellError(
         "cannot resolve baseline cell: no cell named 'baseline-*' and no "

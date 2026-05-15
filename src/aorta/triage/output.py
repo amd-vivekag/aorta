@@ -42,7 +42,7 @@ from typing import Any
 import yaml
 
 from aorta.registry import get_environment
-from aorta.triage.confound import ConfoundTag
+from aorta.triage.confound import CONFOUND_DID_NOT_RUN, ConfoundTag
 from aorta.triage.matrix import CellStats
 from aorta.triage.recipe import Recipe
 
@@ -299,7 +299,14 @@ def write_matrix_md(
         "branch each row landed on."
     )
     lines.append("  - `error` -- the whole cell failed; row preserved so the matrix is complete.")
-    if any(c.outcome_counts for c in cell_stats):
+    # Gate the did_not_run legend on the tag actually appearing in the
+    # rendered Confound column. Gating on ``any(c.outcome_counts ...)``
+    # leaks the legend into matrices where every cell completed (the
+    # outcome histogram is non-empty for every new-contract run, but
+    # the tag itself only renders when ``is_did_not_run_cell`` returns
+    # True). Reading from ``confound_tags`` keeps the legend in lockstep
+    # with what the table actually shows.
+    if any(tag == CONFOUND_DID_NOT_RUN for tag, _ in confound_tags.values()):
         lines.append(
             "  - `did_not_run` -- every trial in the cell ended before the workload's "
             "primary code path began (e.g. setup-time crash). The cell is excluded "
