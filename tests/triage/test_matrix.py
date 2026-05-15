@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from aorta.triage.matrix import CellStats, aggregate_cell
+from aorta.triage.matrix import (
+    OUTCOME_COMPLETED,
+    OUTCOME_CRASHED_AFTER_ITERATIONS,
+    OUTCOME_DID_NOT_RUN,
+    OUTCOME_UNKNOWN,
+    CellStats,
+    aggregate_cell,
+)
 
 
 def _trial(
@@ -15,6 +22,9 @@ def _trial(
     elapsed_sec: float | None = None,
     wall_clock_sec: float = 1.0,
     failure_details: list[dict] | None = None,
+    main_work_started: bool | None = None,
+    executed_iterations: int | None = None,
+    configured_iterations: int | None = None,
 ):
     """Build a TrialResult-shaped stand-in. aggregate_cell uses duck typing."""
     result: dict = {"passed": passed}
@@ -26,6 +36,12 @@ def _trial(
         result["elapsed_sec"] = elapsed_sec
     if failure_details is not None:
         result["failure_details"] = failure_details
+    if main_work_started is not None:
+        result["main_work_started"] = main_work_started
+    if executed_iterations is not None:
+        result["executed_iterations"] = executed_iterations
+    if configured_iterations is not None:
+        result["configured_iterations"] = configured_iterations
     return SimpleNamespace(
         exit_status=exit_status,
         wall_clock_sec=wall_clock_sec,
@@ -393,3 +409,188 @@ def test_failure_hints_for_error_cell_reflects_supplied_trials():
     trials = [_trial(passed=False, failure_details=[{"hint": "boom"}])]
     stats = _default_call(trials=trials, error="cell crashed")
     assert stats.failure_hints == [("boom", 1)]
+
+
+# ---- did_not_run outcome aggregation (issue #173) ------------------------
+#
+# When a workload populates the new `main_work_started` /
+# `executed_iterations` / `configured_iterations` fields the aggregator
+# must (a) classify each trial against the platform-level outcome enum,
+# (b) suppress the wall_clock_total step-time fallback for did_not_run
+# trials so matrix.json never carries a fake iteration-time number, and
+# (c) pre-render the cell-level Iters column. Workloads that don't
+# populate the new fields must continue to behave exactly as today.
+
+
+def test_outcome_counts_did_not_run_when_main_work_did_not_start():
+    trials = [
+        _trial(
+            passed=False,
+            main_work_started=False,
+            executed_iterations=0,
+            configured_iterations=50,
+            wall_clock_sec=3.5,
+        )
+        for _ in range(2)
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_DID_NOT_RUN: 2}
+
+
+def test_outcome_counts_completed_when_executed_matches_configured():
+    trials = [
+        _trial(
+            passed=True,
+            main_work_started=True,
+            executed_iterations=50,
+            configured_iterations=50,
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_COMPLETED: 1}
+
+
+def test_outcome_counts_crashed_after_iterations():
+    trials = [
+        _trial(
+            passed=False,
+            main_work_started=True,
+            executed_iterations=12,
+            configured_iterations=50,
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_CRASHED_AFTER_ITERATIONS: 1}
+
+
+def test_outcome_counts_mixed_outcomes_in_one_cell():
+    trials = [
+        _trial(
+            main_work_started=True,
+            executed_iterations=50,
+            configured_iterations=50,
+            passed=True,
+        ),
+        _trial(
+            main_work_started=False,
+            executed_iterations=0,
+            configured_iterations=50,
+            passed=False,
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_COMPLETED: 1, OUTCOME_DID_NOT_RUN: 1}
+
+
+def test_outcome_counts_unknown_when_main_work_started_is_none():
+    """Workload that hasn't been updated to the new contract degrades to
+    OUTCOME_UNKNOWN for every trial -- never silently misclassified as
+    did_not_run or completed."""
+    trials = [_trial(passed=True), _trial(passed=False)]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 2}
+
+
+def test_did_not_run_trials_suppress_wall_clock_step_time_fallback():
+    """Symmetric refusal: a trial that died in setup must not contribute
+    a fake step-time number derived from setup-only wall clock.
+
+    Demo case: the import-error trial in the issue's MI350 SHAMPOO run
+    produced 3.5s wall clock and 50 configured steps; the old aggregator
+    surfaced 70 ms/step. With the suppression the cell reports no
+    timing -- matrix.md will render n/a, matrix.json carries no
+    misleading number.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            main_work_started=False,
+            executed_iterations=0,
+            configured_iterations=50,
+            wall_clock_sec=3.5,
+        )
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.mean_step_time_ms == 0.0
+    assert stats.step_time_source == "missing"
+
+
+def test_iters_display_uniform_when_all_trials_executed_same_count():
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=50, configured_iterations=50, passed=True
+        )
+        for _ in range(3)
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "50/50"
+    assert stats.executed_iter_min == 50
+    assert stats.executed_iter_max == 50
+    assert stats.configured_iters == 50
+
+
+def test_iters_display_min_max_when_executed_counts_differ():
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=10, configured_iterations=50, passed=False
+        ),
+        _trial(
+            main_work_started=True, executed_iterations=42, configured_iterations=50, passed=False
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "10..42/50"
+    assert stats.executed_iter_min == 10
+    assert stats.executed_iter_max == 42
+
+
+def test_iters_display_question_marks_when_configured_disagrees():
+    """Defensive: a recipe pins `steps` per cell, so trials in the same
+    cell shouldn't disagree on configured_iterations. If they do, surface
+    the contradiction instead of silently picking one value."""
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=10, configured_iterations=50, passed=True
+        ),
+        _trial(
+            main_work_started=True, executed_iterations=10, configured_iterations=100, passed=True
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "?/?"
+    assert stats.configured_iters is None
+
+
+def test_iters_display_dash_when_no_trial_populates_iter_fields():
+    """Legacy workload: configured_iters is None so the display is the
+    em-dash placeholder. The output renderer hides the column entirely
+    when every cell lands here."""
+    trials = [_trial(passed=True), _trial(passed=False)]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "—"
+    assert stats.configured_iters is None
+    assert stats.executed_iter_min is None
+    assert stats.executed_iter_max is None
+
+
+def test_iters_display_dash_when_one_trial_missing_executed_field():
+    """Mixed populated/None executed_iterations -> "—" (don't render half a
+    cell). Configured is still recorded for the consumer that wants it."""
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=42, configured_iterations=50, passed=True
+        ),
+        _trial(main_work_started=True, configured_iterations=50, passed=False),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "—"
+    assert stats.configured_iters == 50
+
+
+def test_error_cell_outcome_counts_empty_and_iters_display_dash():
+    """Error cells short-circuit aggregation: no outcome histogram, no
+    iters display."""
+    stats = _default_call(trials=[_trial()], error="docker pull failed")
+    assert stats.outcome_counts == {}
+    assert stats.iters_display == "—"
+    assert stats.configured_iters is None

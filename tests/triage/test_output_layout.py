@@ -33,6 +33,44 @@ def _fake_trial(passed: bool = True, step_times_ms: list[float] | None = None) -
     )
 
 
+def _fake_trial_did_not_run(configured_iterations: int = 50, wall_clock_sec: float = 3.5) -> _FakeTrial:
+    """A trial that died before the workload's main work phase began.
+
+    Mirrors the failure mode the issue (#173) is fighting: the workload
+    crashed during import / setup so it produced wall-clock time but no
+    iterations. The aggregator must refuse to surface a step-time number
+    derived from this; the matrix must mark the cell ``did_not_run``.
+    """
+    return _FakeTrial(
+        exit_status="workload_failed",
+        wall_clock_sec=wall_clock_sec,
+        result={
+            "passed": False,
+            "main_work_started": False,
+            "executed_iterations": 0,
+            "configured_iterations": configured_iterations,
+        },
+    )
+
+
+def _fake_trial_completed(
+    configured_iterations: int = 50,
+    step_times_ms: list[float] | None = None,
+) -> _FakeTrial:
+    """A trial that fully completed its configured iteration budget."""
+    return _FakeTrial(
+        exit_status="ok",
+        wall_clock_sec=1.0,
+        result={
+            "passed": True,
+            "step_times_ms": step_times_ms or [100.0],
+            "main_work_started": True,
+            "executed_iterations": configured_iterations,
+            "configured_iterations": configured_iterations,
+        },
+    )
+
+
 def _clean_snapshot() -> EnvSnapshot:
     """Minimal non-partial EnvSnapshot for test isolation.
 
@@ -921,3 +959,208 @@ def test_isolated_env_check_honors_sidecar_files(
     # The honest placeholder, NOT a misleading collect_env() snapshot.
     assert placeholder["snapshot_captured"] is False
     assert placeholder["descriptor"]["docker"] == "rocm/pytorch:nightly"
+
+
+# ---- did_not_run surfacing (issue #173) -----------------------------------
+#
+# Demo failure mode: nan-repro cells that crashed at import time were
+# rendered with fake step times derived from setup-only wall clock,
+# leading matrix.md readers to a coherent-looking but entirely false
+# story. These tests pin the new behaviour:
+#   * Iters column appears when at least one cell carries
+#     ``configured_iterations``; hidden otherwise (legacy workloads).
+#   * All-did_not_run cells render ``Iters: 0/<N>``,
+#     ``Mean step (ms): n/a``, ``Confound: did_not_run``.
+#   * Auto-baseline disqualified -> top-of-file `> [!WARNING]` block,
+#     non-baseline cells render ``n/a``.
+#   * Explicit ``baseline_cell:`` pointing to an all-did_not_run cell
+#     raises ``RecipeCellError`` (loud failure for an operator's
+#     deliberate choice).
+#   * Notes legend describes ``did_not_run`` and ``Iters`` only when
+#     they are actually displayed.
+
+
+def test_iters_column_hidden_for_legacy_workloads(tmp_path, patched_env, patched_run_trials):
+    """No cell populates configured_iterations -> column absent.
+
+    The default ``patched_run_trials`` fixture returns trials that don't
+    speak the new contract, exercising the backwards-compat path.
+    """
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "| Iters " not in md
+    # Legend entry suppressed too.
+    assert "`Iters` -- iterations actually executed" not in md
+
+
+def test_iters_column_appears_when_workload_populates_it(tmp_path, patched_env, monkeypatch):
+    """At least one cell carries configured_iters -> column rendered, with
+    the per-row pre-computed display string."""
+    monkeypatch.setattr(
+        runner,
+        "run_trials",
+        MagicMock(
+            return_value=[_fake_trial_completed(configured_iterations=50) for _ in range(2)]
+        ),
+    )
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "| Iters " in md
+    assert "50/50" in md
+    # Legend entry surfaces alongside the column.
+    assert "`Iters` -- iterations actually executed" in md
+
+
+def test_did_not_run_cell_renders_iters_zero_step_na_and_confound_tag(
+    tmp_path, patched_env, monkeypatch
+):
+    """The full demo case: every trial dies in setup. Matrix.md must mark
+    the cell honestly across all three columns."""
+
+    def all_did_not_run(request):
+        return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
+
+    monkeypatch.setattr(runner, "run_trials", all_did_not_run)
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "0/50" in md
+    # The cell row should NOT carry a fake step-time number.
+    # Find the row containing "none-local" and assert it has "n/a" for step.
+    none_row = next(line for line in md.splitlines() if "| none-local " in line)
+    assert "n/a" in none_row
+    assert "did_not_run" in none_row
+    # Legend entry for the new tag is included.
+    assert "`did_not_run`" in md
+    assert "primary code path began" in md
+
+    # matrix.json carries the new fields and the tag.
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    none_cell = next(c for c in doc["cells"] if c["name"] == "none-local")
+    assert none_cell["confound"] == "did_not_run"
+    assert none_cell["outcome_counts"] == {"did_not_run": 2}
+    assert none_cell["configured_iters"] == 50
+    assert none_cell["iters_display"] == "0/50"
+    assert none_cell["mean_step_time_ms"] == 0.0
+
+
+def test_auto_baseline_disqualified_emits_top_of_file_warning(
+    tmp_path, patched_env, monkeypatch
+):
+    """Auto-resolved baseline ended up did-not-run -> warning + every
+    non-baseline cell collapses to n/a (no usable baseline to compare
+    against)."""
+
+    def baseline_did_not_run(request):
+        if request.mitigations == ("none",):
+            return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
+        return [_fake_trial_completed(configured_iterations=50) for _ in range(2)]
+
+    monkeypatch.setattr(runner, "run_trials", baseline_did_not_run)
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "> [!WARNING]" in md
+    assert "Auto-baseline 'none-local'" in md
+    assert "did_not_run" in md
+    # Non-baseline cell can't ratio against the suppressed baseline.
+    tf32_row = next(line for line in md.splitlines() if "| tf32_off-local " in line)
+    assert "n/a" in tf32_row
+
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    tf32 = next(c for c in doc["cells"] if c["name"] == "tf32_off-local")
+    assert tf32["confound"] == "n/a"
+
+
+def test_explicit_baseline_pointing_to_did_not_run_raises(tmp_path, patched_env, monkeypatch):
+    """The operator named the baseline deliberately -> failure should be loud.
+
+    Asymmetric on purpose: auto-resolution warns + degrades, explicit
+    naming hard-errors. A silent fallback for an explicit choice would
+    let the recipe author believe the matrix means what they asked for
+    when it doesn't.
+    """
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe, RecipeCellError
+
+    def baseline_did_not_run(request):
+        if request.mitigations == ("none",):
+            return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
+        return [_fake_trial_completed(configured_iterations=50) for _ in range(2)]
+
+    monkeypatch.setattr(runner, "run_trials", baseline_did_not_run)
+
+    r = Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=2,
+        steps=50,
+        cells=(
+            Cell(name="none-local", mitigations=("none",), environment="local"),
+            Cell(name="tf32_off-local", mitigations=("tf32_off",), environment="local"),
+        ),
+        ticket="T-1",
+        confound=ConfoundCfg(baseline_cell="none-local"),
+        inline_environments=(),
+    )
+    with pytest.raises(RecipeCellError, match="explicit baseline_cell 'none-local'"):
+        runner.run_recipe(r, output_dir=tmp_path)
+
+
+def test_did_not_run_cell_summary_log_carries_warning_suffix(
+    tmp_path, patched_env, monkeypatch, caplog
+):
+    """Per-cell terminal log line for an all-did_not_run cell must include
+    the WARNING suffix so an operator watching stdout sees the same signal
+    as the matrix.md reader."""
+    import logging
+
+    def all_did_not_run(request):
+        return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
+
+    monkeypatch.setattr(runner, "run_trials", all_did_not_run)
+    r = _simple_recipe(ticket="T-1")
+    with caplog.at_level(logging.INFO, logger="aorta.triage.runner"):
+        runner.run_recipe(r, output_dir=tmp_path)
+    cell_lines = [rec.getMessage() for rec in caplog.records if "done in" in rec.getMessage()]
+    assert cell_lines, "expected per-cell summary lines in the runner log"
+    for line in cell_lines:
+        assert "outcome:" in line
+        assert "iters: 0/50" in line
+        assert "WARNING: workload never reached main work phase" in line
+
+
+def test_completed_cell_summary_log_omits_warning_suffix(
+    tmp_path, patched_env, monkeypatch, caplog
+):
+    """Healthy cells get the new bracket grammar but no WARNING tail."""
+    import logging
+
+    monkeypatch.setattr(
+        runner,
+        "run_trials",
+        MagicMock(return_value=[_fake_trial_completed(configured_iterations=50) for _ in range(2)]),
+    )
+    r = _simple_recipe(ticket="T-1")
+    with caplog.at_level(logging.INFO, logger="aorta.triage.runner"):
+        runner.run_recipe(r, output_dir=tmp_path)
+    cell_lines = [rec.getMessage() for rec in caplog.records if "done in" in rec.getMessage()]
+    for line in cell_lines:
+        assert "outcome: 2/2 completed" in line
+        assert "iters: 50/50" in line
+        assert "WARNING" not in line
+
+
+def test_legacy_cell_summary_log_keeps_old_grammar(tmp_path, patched_env, patched_run_trials, caplog):
+    """Legacy workloads (no main_work_started populated) keep their familiar
+    ``[N/M trials passed]`` summary so existing log scrapers don't break."""
+    import logging
+
+    r = _simple_recipe(ticket="T-1")
+    with caplog.at_level(logging.INFO, logger="aorta.triage.runner"):
+        runner.run_recipe(r, output_dir=tmp_path)
+    cell_lines = [rec.getMessage() for rec in caplog.records if "done in" in rec.getMessage()]
+    for line in cell_lines:
+        assert "trials passed" in line
+        assert "outcome:" not in line

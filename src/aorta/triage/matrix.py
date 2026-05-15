@@ -45,6 +45,14 @@ from typing import Any, Literal
 
 StepTimeSource = Literal["per_step", "elapsed_per_iter", "wall_clock_total", "missing"]
 
+# Per-trial outcome enum. Snake-case so the JSON key, the Confound tag, and
+# the matrix.md / terminal display string are all the same string -- avoids
+# a translation layer that drifts between renderers.
+OUTCOME_DID_NOT_RUN = "did_not_run"
+OUTCOME_CRASHED_AFTER_ITERATIONS = "crashed_after_iterations"
+OUTCOME_COMPLETED = "completed"
+OUTCOME_UNKNOWN = "unknown"
+
 # Lower index == higher fidelity. The cell-level ``step_time_source`` is the
 # WORST source any trial in the cell actually contributed samples from -- if
 # even one trial fell back to ``wall_clock_total``, the cell's mean folds
@@ -94,6 +102,21 @@ class CellStats:
     Trials with no ``failure_details`` or no ``hint`` key contribute nothing.
     Order of appearance is preserved (first hint seen comes first) so the
     matrix.md renderer is stable across runs with the same trial order.
+
+    ``outcome_counts`` is a histogram across the cell's trials over the
+    platform-level outcome enum (``did_not_run``,
+    ``crashed_after_iterations``, ``completed``, ``unknown``). Empty when
+    no trial in the cell populated the new ``main_work_started`` /
+    ``executed_iterations`` / ``configured_iterations`` fields on
+    ``WorkloadResult`` -- existing workloads degrade gracefully and the
+    matrix renders as today.
+
+    ``executed_iter_min`` / ``executed_iter_max`` summarise how far the
+    cell's trials actually got; ``configured_iters`` records the
+    workload-reported denominator. ``iters_display`` is the pre-rendered
+    cell value for matrix.md's "Iters" column (e.g. ``"0/50"``,
+    ``"199..200/200"``, ``"?/?"`` if trials disagreed on the configured
+    count, or ``"—"`` when the workload didn't track iterations).
     """
 
     name: str
@@ -118,6 +141,11 @@ class CellStats:
     error: str | None = None
     step_time_source: StepTimeSource = "missing"
     failure_hints: list[tuple[str, int]] = field(default_factory=list)
+    outcome_counts: dict[str, int] = field(default_factory=dict)
+    executed_iter_min: int | None = None
+    executed_iter_max: int | None = None
+    configured_iters: int | None = None
+    iters_display: str = "—"
 
     @property
     def failure_rate(self) -> float:
@@ -143,6 +171,14 @@ def _step_times_from_trial(trial: Any, effective_steps: int) -> tuple[list[float
     ``"missing"`` (the trial produced no usable timing). The aggregator
     uses ``source`` to compute the cell-level ``step_time_source`` so
     downstream confound detection can reject incomparable comparisons.
+
+    When the workload explicitly reports ``main_work_started=False`` the
+    wall-clock fallback is suppressed: dividing setup-only wall clock by
+    configured steps would produce a number that looks like iteration
+    timing but is actually import-time variance (issue #173). The
+    per-step / elapsed-per-iter branches are still consulted because a
+    workload that *did* surface those signals before deciding it didn't
+    really run is telling us something we should not throw away.
     """
     result = getattr(trial, "result", None)
     if isinstance(result, dict):
@@ -160,10 +196,97 @@ def _step_times_from_trial(trial: Any, effective_steps: int) -> tuple[list[float
             and elapsed > 0
         ):
             return [float(elapsed) / iters * 1000.0], "elapsed_per_iter"
+        if result.get("main_work_started") is False:
+            return [], "missing"
     wall = getattr(trial, "wall_clock_sec", 0.0) or 0.0
     if wall > 0 and effective_steps > 0:
         return [float(wall) / effective_steps * 1000.0], "wall_clock_total"
     return [], "missing"
+
+
+def _trial_outcome(trial: Any) -> str:
+    """Classify a trial against the platform-level outcome enum.
+
+    Reads the new optional ``main_work_started`` /
+    ``executed_iterations`` / ``configured_iterations`` fields from the
+    trial's ``WorkloadResult`` (surfaced via ``trial.result``). Returns
+    ``OUTCOME_UNKNOWN`` whenever ``main_work_started`` is missing /
+    ``None`` so workloads that haven't been updated to the new contract
+    degrade cleanly -- no false ``did_not_run`` flags, no false
+    ``completed`` flags.
+    """
+    result = getattr(trial, "result", None)
+    if not isinstance(result, dict):
+        return OUTCOME_UNKNOWN
+    started = result.get("main_work_started")
+    if started is False:
+        return OUTCOME_DID_NOT_RUN
+    if started is not True:
+        return OUTCOME_UNKNOWN
+    executed = result.get("executed_iterations")
+    configured = result.get("configured_iterations")
+    if not isinstance(executed, int) or not isinstance(configured, int):
+        return OUTCOME_UNKNOWN
+    if executed >= configured:
+        return OUTCOME_COMPLETED
+    if result.get("passed") is False:
+        return OUTCOME_CRASHED_AFTER_ITERATIONS
+    return OUTCOME_UNKNOWN
+
+
+def _aggregate_iter_counts(
+    trials: list[Any],
+) -> tuple[int | None, int | None, int | None, str]:
+    """Reduce per-trial iteration counts into the cell-level summary.
+
+    Returns ``(executed_min, executed_max, configured, display)``.
+
+    ``display`` rendering rules (matches issue #173 §"CellStats aggregation"):
+
+    * Workload doesn't populate iteration fields (no trial has
+      ``configured_iterations``): all four return values are ``None`` /
+      ``"—"``. The matrix.md renderer hides the column entirely if
+      *every* cell ends up here.
+    * At least one trial has ``executed_iterations is None`` while another
+      has it populated: ``"—"``. We refuse to render half a cell.
+    * Trials disagree on ``configured_iterations``: ``"?/?"``. Defensive
+      -- shouldn't happen in practice (recipe pins steps per cell), but
+      surfaces the contradiction instead of silently picking one value.
+    * All trials executed the same count: ``"<N>/<configured>"``.
+    * Trials executed different counts: ``"<min>..<max>/<configured>"``.
+    """
+    configured_values: list[int] = []
+    executed_values: list[int | None] = []
+    for trial in trials:
+        result = getattr(trial, "result", None)
+        if not isinstance(result, dict):
+            executed_values.append(None)
+            continue
+        cfg = result.get("configured_iterations")
+        if isinstance(cfg, int):
+            configured_values.append(cfg)
+        executed = result.get("executed_iterations")
+        executed_values.append(executed if isinstance(executed, int) else None)
+
+    if not configured_values:
+        return None, None, None, "—"
+
+    distinct_configured = set(configured_values)
+    configured = configured_values[0] if len(distinct_configured) == 1 else None
+    if configured is None:
+        return None, None, None, "?/?"
+
+    populated_executed = [e for e in executed_values if e is not None]
+    if len(populated_executed) != len(executed_values) or not populated_executed:
+        return None, None, configured, "—"
+
+    exec_min = min(populated_executed)
+    exec_max = max(populated_executed)
+    if exec_min == exec_max:
+        display = f"{exec_min}/{configured}"
+    else:
+        display = f"{exec_min}..{exec_max}/{configured}"
+    return exec_min, exec_max, configured, display
 
 
 def _reduce_step_time_sources(sources: list[StepTimeSource]) -> StepTimeSource:
@@ -322,6 +445,11 @@ def aggregate_cell(
             error=error,
             step_time_source="missing",
             failure_hints=_aggregate_failure_hints(trials),
+            outcome_counts={},
+            executed_iter_min=None,
+            executed_iter_max=None,
+            configured_iters=None,
+            iters_display="—",
         )
 
     trial_count = len(trials)
@@ -331,6 +459,7 @@ def aggregate_cell(
     all_step_times: list[float] = []
     wall_clocks: list[float] = []
     status_counter: Counter[str] = Counter()
+    outcome_counter: Counter[str] = Counter()
     trial_sources: list[StepTimeSource] = []
     for trial in trials:
         times, source = _step_times_from_trial(trial, effective_steps)
@@ -345,8 +474,10 @@ def aggregate_cell(
         # even for stand-in trial objects that omit the attribute.
         status = getattr(trial, "exit_status", None) or "unknown"
         status_counter[str(status)] += 1
+        outcome_counter[_trial_outcome(trial)] += 1
 
     cell_source = _reduce_step_time_sources(trial_sources)
+    exec_min, exec_max, configured_iters, iters_display = _aggregate_iter_counts(trials)
 
     if all_step_times:
         mean_step = float(statistics.fmean(all_step_times))
@@ -384,7 +515,20 @@ def aggregate_cell(
         error=None,
         step_time_source=cell_source,
         failure_hints=_aggregate_failure_hints(trials),
+        outcome_counts=dict(outcome_counter),
+        executed_iter_min=exec_min,
+        executed_iter_max=exec_max,
+        configured_iters=configured_iters,
+        iters_display=iters_display,
     )
 
 
-__all__ = ["CellStats", "StepTimeSource", "aggregate_cell"]
+__all__ = [
+    "CellStats",
+    "OUTCOME_COMPLETED",
+    "OUTCOME_CRASHED_AFTER_ITERATIONS",
+    "OUTCOME_DID_NOT_RUN",
+    "OUTCOME_UNKNOWN",
+    "StepTimeSource",
+    "aggregate_cell",
+]

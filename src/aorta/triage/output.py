@@ -224,29 +224,37 @@ def write_matrix_md(
     lines.append("## Reproduction Summary")
     lines.append("")
 
-    header = (
+    # Iters column appears only when at least one cell's workload populated
+    # ``configured_iterations`` (issue #173). Hiding the column keeps the
+    # matrix.md golden output stable for legacy workloads that haven't been
+    # updated to the new contract -- the regression test for old workloads
+    # asserts the column is absent.
+    show_iters = any(c.configured_iters is not None for c in cell_stats)
+    header_cells: list[str] = [
         "Cell",
         "Mitigations",
         "Environment",
         "Failure rate",
         "Failures",
-        "Mean step (ms)",
-        "Confound",
-    )
+    ]
+    if show_iters:
+        header_cells.append("Iters")
+    header_cells.extend(["Mean step (ms)", "Confound"])
+    header = tuple(header_cells)
     rows: list[tuple[str, ...]] = [header]
     for cell in cell_stats:
         tag, _ = confound_tags.get(cell.name, (cell.error and "error" or "-", None))
-        rows.append(
-            (
-                cell.name,
-                _format_mitigations(cell.mitigations),
-                cell.environment,
-                _format_failure_rate(cell),
-                _format_failures(cell),
-                _format_step_ms(cell),
-                _format_confound(tag),
-            )
-        )
+        row: list[str] = [
+            cell.name,
+            _format_mitigations(cell.mitigations),
+            cell.environment,
+            _format_failure_rate(cell),
+            _format_failures(cell),
+        ]
+        if show_iters:
+            row.append(cell.iters_display)
+        row.extend([_format_step_ms(cell), _format_confound(tag)])
+        rows.append(tuple(row))
     widths = [max(len(r[i]) for r in rows) for i in range(len(header))]
 
     def _row(cells: tuple[str, ...]) -> str:
@@ -288,6 +296,23 @@ def write_matrix_md(
         "branch each row landed on."
     )
     lines.append("  - `error` -- the whole cell failed; row preserved so the matrix is complete.")
+    if any(c.outcome_counts for c in cell_stats):
+        lines.append(
+            "  - `did_not_run` -- every trial in the cell ended before the workload's "
+            "primary code path began (e.g. setup-time crash). The cell is excluded "
+            "from confound classification entirely; `Mean step (ms)` is `n/a` because "
+            "any number derived from setup-only wall clock would misrepresent "
+            "iteration timing. Inspect `cells/<cell-name>/trial_*.json` for the cause."
+        )
+    if show_iters:
+        lines.append(
+            "- `Iters` -- iterations actually executed vs. configured. `0/<N>` = workload "
+            "never started its main work phase. `<min>..<max>/<N>` = trials in the cell "
+            "completed different counts (e.g. crashed mid-run). `?/?` = trials disagreed "
+            "on the configured count (defensive; should not happen under a single recipe). "
+            "`—` = workload didn't track iterations. The column is hidden entirely "
+            "when no cell in the matrix populates the new field."
+        )
     lines.append(
         "- `Failures` is `failed_count / trial_count` (e.g. `3 / 8` = three failed out "
         "of eight). `Failure rate` is the same data as a percentage and counts every "

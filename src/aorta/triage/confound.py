@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from aorta.triage.matrix import CellStats
+from aorta.triage.matrix import OUTCOME_DID_NOT_RUN, CellStats
 from aorta.triage.recipe import Cell, RecipeCellError
 
 # The em-dash is what matrix.md renders; keep it here as a single constant so
@@ -44,8 +44,32 @@ CONFOUND_ERROR = "error"
 # neutral tag would let "ratio could not be computed" cells render as
 # "mitigation works without a speed cost" in matrix.md.
 CONFOUND_NA = "n/a"
+# Cell whose every trial died before the workload's primary work phase
+# began. Refused from confound classification entirely (no ratio against
+# the baseline; no participation as the comparison target). Snake-case so
+# the JSON outcome key, the Confound tag, and the matrix.md / terminal
+# display string are the same string -- see issue #173 §"Design".
+CONFOUND_DID_NOT_RUN = OUTCOME_DID_NOT_RUN
 
-ConfoundTag = Literal["(baseline)", "-", "no effect", "error", "n/a"] | str
+ConfoundTag = Literal["(baseline)", "-", "no effect", "error", "n/a", "did_not_run"] | str
+
+
+def is_did_not_run_cell(stats: CellStats) -> bool:
+    """True iff every trial in the cell classified as ``did_not_run``.
+
+    Used by the runner to disqualify did-not-run baselines after
+    aggregation: an explicit ``baseline_cell`` that resolves to such a
+    cell is a hard error (the operator named it deliberately), an
+    auto-resolved one is a soft warning that downgrades every cell to
+    ``n/a``. ``stats.outcome_counts`` is empty for legacy workloads
+    that don't populate the new ``main_work_started`` field, in which
+    case the function returns False -- we never disqualify a baseline
+    on absence of data.
+    """
+    counts = stats.outcome_counts
+    if not counts:
+        return False
+    return set(counts) == {OUTCOME_DID_NOT_RUN}
 
 
 def resolve_baseline(
@@ -127,6 +151,16 @@ def classify(
     if cell.error is not None:
         return CONFOUND_ERROR, None
 
+    # Did-not-run cells are excluded from ratio classification entirely
+    # -- the cell's step-time was deliberately suppressed in
+    # ``aggregate_cell``, so any ratio would be zero / meaningless. The
+    # ``did_not_run`` tag makes it unambiguous to a matrix.md reader why
+    # the row carries no Confound verdict, distinct from ``n/a`` (which
+    # means "we tried to compare and couldn't") and ``error`` (which
+    # means the whole cell errored before producing trials).
+    if is_did_not_run_cell(cell):
+        return CONFOUND_DID_NOT_RUN, None
+
     if cell.name == baseline.name:
         return CONFOUND_BASELINE, None
 
@@ -195,6 +229,7 @@ def classify_all(
 
 __all__ = [
     "CONFOUND_BASELINE",
+    "CONFOUND_DID_NOT_RUN",
     "CONFOUND_ERROR",
     "CONFOUND_NA",
     "CONFOUND_NEUTRAL",
@@ -202,5 +237,6 @@ __all__ = [
     "ConfoundTag",
     "classify",
     "classify_all",
+    "is_did_not_run_cell",
     "resolve_baseline",
 ]

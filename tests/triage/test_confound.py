@@ -6,15 +6,21 @@ import pytest
 
 from aorta.triage.confound import (
     CONFOUND_BASELINE,
+    CONFOUND_DID_NOT_RUN,
     CONFOUND_ERROR,
     CONFOUND_NA,
     CONFOUND_NEUTRAL,
     CONFOUND_NO_EFFECT,
     classify,
     classify_all,
+    is_did_not_run_cell,
     resolve_baseline,
 )
-from aorta.triage.matrix import CellStats
+from aorta.triage.matrix import (
+    OUTCOME_COMPLETED,
+    OUTCOME_DID_NOT_RUN,
+    CellStats,
+)
 from aorta.triage.recipe import Cell, RecipeCellError
 
 
@@ -25,6 +31,7 @@ def _stats(
     trials: int = 8,
     error: str | None = None,
     step_time_source: str = "per_step",
+    outcome_counts: dict[str, int] | None = None,
 ) -> CellStats:
     """Build a synthetic CellStats for classify() unit tests.
 
@@ -55,6 +62,7 @@ def _stats(
         trial_paths=[],
         error=error,
         step_time_source=step_time_source,  # type: ignore[arg-type]
+        outcome_counts=dict(outcome_counts) if outcome_counts is not None else {},
     )
 
 
@@ -262,3 +270,98 @@ def test_classify_all_missing_baseline_raises():
     cell = _stats("c", mean_step_time_ms=100.0)
     with pytest.raises(RecipeCellError, match="baseline cell"):
         classify_all([cell], baseline_name="not_present", threshold=1.15)
+
+
+# ---- did_not_run handling (issue #173) -----------------------------------
+#
+# Cells whose every trial died before the workload's primary work phase
+# do not participate in confound classification at all. The classify()
+# function short-circuits to CONFOUND_DID_NOT_RUN; the runner uses
+# is_did_not_run_cell() to decide whether to disqualify the baseline
+# (hard error if explicitly named, soft warning if auto-resolved).
+
+
+def test_classify_did_not_run_cell_short_circuits():
+    """Even when the baseline measured cleanly, a did-not-run cell carries
+    its own tag instead of going through ratio classification."""
+    base = _stats("b", mean_step_time_ms=100.0)
+    cell = _stats(
+        "nan-repro",
+        mean_step_time_ms=0.0,
+        step_time_source="missing",
+        passed_count=0,
+        trials=2,
+        outcome_counts={OUTCOME_DID_NOT_RUN: 2},
+    )
+    tag, ratio = classify(cell, base, threshold=1.15)
+    assert tag == CONFOUND_DID_NOT_RUN
+    assert ratio is None
+
+
+def test_classify_did_not_run_takes_precedence_over_baseline_match():
+    """A baseline cell that itself ended up did-not-run renders as
+    did_not_run, not (baseline). The matrix.md reader sees an explicit
+    'this row produced no measurable work' tag rather than a misleading
+    '(baseline)' label on a row that didn't actually anchor anything."""
+    cell = _stats(
+        "baseline-nan-repro",
+        mean_step_time_ms=0.0,
+        step_time_source="missing",
+        trials=2,
+        outcome_counts={OUTCOME_DID_NOT_RUN: 2},
+    )
+    tag, ratio = classify(cell, cell, threshold=1.15)
+    assert tag == CONFOUND_DID_NOT_RUN
+    assert ratio is None
+
+
+def test_classify_mixed_outcome_cell_is_not_did_not_run():
+    """At least one trial reached main work -> the cell is NOT did_not_run.
+    Falls through to the normal ratio path against the baseline."""
+    base = _stats("b", mean_step_time_ms=100.0)
+    cell = _stats(
+        "c",
+        mean_step_time_ms=120.0,
+        passed_count=4,
+        trials=8,
+        outcome_counts={OUTCOME_DID_NOT_RUN: 4, OUTCOME_COMPLETED: 4},
+    )
+    tag, ratio = classify(cell, base, threshold=1.15)
+    assert tag != CONFOUND_DID_NOT_RUN
+    # Ratio path should fire: 1.20 < threshold 1.15? No, 1.20 > 1.15 -> speed.
+    assert tag == "speed (+20%)"
+
+
+def test_is_did_not_run_cell_true_for_uniform_did_not_run():
+    cell = _stats("c", outcome_counts={OUTCOME_DID_NOT_RUN: 2})
+    assert is_did_not_run_cell(cell) is True
+
+
+def test_is_did_not_run_cell_false_for_mixed_outcomes():
+    cell = _stats("c", outcome_counts={OUTCOME_DID_NOT_RUN: 1, OUTCOME_COMPLETED: 1})
+    assert is_did_not_run_cell(cell) is False
+
+
+def test_is_did_not_run_cell_false_for_legacy_workload_with_empty_counts():
+    """Workload that hasn't been updated to the new contract -> empty
+    outcome_counts. Must NOT be flagged as did_not_run; the runner relies
+    on this to keep legacy runs out of the disqualification path."""
+    cell = _stats("c")
+    assert cell.outcome_counts == {}
+    assert is_did_not_run_cell(cell) is False
+
+
+def test_confound_did_not_run_distinct_from_other_tags():
+    """Schema-level pin: the did_not_run tag must render to a string that
+    no other tag uses, so matrix.md / matrix.json consumers can switch on
+    it unambiguously."""
+    distinct_tags = {
+        CONFOUND_BASELINE,
+        CONFOUND_NEUTRAL,
+        CONFOUND_NO_EFFECT,
+        CONFOUND_ERROR,
+        CONFOUND_NA,
+        CONFOUND_DID_NOT_RUN,
+    }
+    assert len(distinct_tags) == 6
+    assert CONFOUND_DID_NOT_RUN == "did_not_run"

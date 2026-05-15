@@ -42,9 +42,14 @@ from aorta.registry.errors import RegistryError
 from aorta.run import RunRequest, TrialResult, run_trials
 from aorta.triage.confound import (
     classify_all,
+    is_did_not_run_cell,
     resolve_baseline,
 )
-from aorta.triage.matrix import CellStats, aggregate_cell
+from aorta.triage.matrix import (
+    OUTCOME_DID_NOT_RUN,
+    CellStats,
+    aggregate_cell,
+)
 from aorta.triage.output import (
     format_timestamp,
     resolve_run_dir,
@@ -53,7 +58,7 @@ from aorta.triage.output import (
     write_matrix_md,
     write_resolved_recipe,
 )
-from aorta.triage.recipe import InlineEnv, Recipe
+from aorta.triage.recipe import InlineEnv, Recipe, RecipeCellError
 
 log = logging.getLogger(__name__)
 
@@ -331,6 +336,113 @@ def _collect_trial_paths(results_dir: Path) -> list[str]:
     return [str(p) for p in found]
 
 
+_DID_NOT_RUN_CELL_SUFFIX = (
+    " WARNING: workload never reached main work phase; matrix step-time/"
+    "confound for this cell will be marked n/a"
+)
+
+
+def _format_cell_summary(trials: list[TrialResult], passed_count: int) -> tuple[str, str]:
+    """Format the bracketed cell-summary tail for the per-cell log line.
+
+    Returns ``(bracket, suffix)`` -- ``bracket`` is the
+    ``[outcome: ... | iters: ...]`` (or legacy ``[N/M trials passed]``)
+    chunk, ``suffix`` is either an empty string or the WARNING tail used
+    for did-not-run cells (issue #173).
+
+    Falls back to today's ``[N/M trials passed]`` shape when no trial in
+    the cell populated the new ``main_work_started`` /
+    ``executed_iterations`` / ``configured_iterations`` fields, so old
+    workloads keep their familiar terminal output exactly. The new shape
+    only kicks in once the workload speaks the new contract.
+    """
+    total = len(trials)
+    # Mirror aggregate_cell's outcome rules without importing the helper
+    # (which expects WorkloadResult-shaped objects vs. TrialResult here)
+    # to avoid coupling the runner's log line to the matrix module's
+    # internal helper signature.
+    outcomes: list[str] = []
+    populated = False
+    for trial in trials:
+        result = getattr(trial, "result", {})
+        if isinstance(result, dict) and result.get("main_work_started") is not None:
+            populated = True
+        outcomes.append(_outcome_for_log(result if isinstance(result, dict) else {}))
+
+    if not populated:
+        return f"[{passed_count}/{total} trials passed]", ""
+
+    counter: dict[str, int] = {}
+    for o in outcomes:
+        counter[o] = counter.get(o, 0) + 1
+    if len(counter) == 1:
+        only_outcome = next(iter(counter))
+        outcome_part = f"{counter[only_outcome]}/{total} {only_outcome}"
+    else:
+        outcome_part = "mixed"
+
+    iters_part = _iters_for_log(trials)
+    bracket = f"[outcome: {outcome_part} | iters: {iters_part}]"
+    suffix = _DID_NOT_RUN_CELL_SUFFIX if counter == {OUTCOME_DID_NOT_RUN: total} else ""
+    return bracket, suffix
+
+
+def _outcome_for_log(result: dict) -> str:
+    """Trial-outcome classifier mirroring aorta.triage.matrix._trial_outcome.
+
+    Duplicated rather than imported because the matrix helper takes a
+    trial object and reads ``trial.result``; here we already have the
+    dict and want a stable, testable function signature.
+    """
+    started = result.get("main_work_started")
+    if started is False:
+        return OUTCOME_DID_NOT_RUN
+    if started is not True:
+        return "unknown"
+    executed = result.get("executed_iterations")
+    configured = result.get("configured_iterations")
+    if not isinstance(executed, int) or not isinstance(configured, int):
+        return "unknown"
+    if executed >= configured:
+        return "completed"
+    if result.get("passed") is False:
+        return "crashed_after_iterations"
+    return "unknown"
+
+
+def _iters_for_log(trials: list[TrialResult]) -> str:
+    """Pre-render the ``iters: N/M`` fragment for the cell-summary log.
+
+    Same rules as ``aorta.triage.matrix._aggregate_iter_counts`` but
+    operating on dicts. Returns ``"—"`` when the workload didn't track
+    iteration counts on at least one trial; ``"?/?"`` when trials
+    disagreed on the configured count.
+    """
+    configured: list[int] = []
+    executed: list[int | None] = []
+    for trial in trials:
+        result = getattr(trial, "result", {})
+        if not isinstance(result, dict):
+            executed.append(None)
+            continue
+        cfg = result.get("configured_iterations")
+        if isinstance(cfg, int):
+            configured.append(cfg)
+        ex = result.get("executed_iterations")
+        executed.append(ex if isinstance(ex, int) else None)
+
+    if not configured:
+        return "—"
+    if len(set(configured)) > 1:
+        return "?/?"
+    cfg_value = configured[0]
+    populated = [e for e in executed if e is not None]
+    if len(populated) != len(executed) or not populated:
+        return "—"
+    lo, hi = min(populated), max(populated)
+    return f"{lo}/{cfg_value}" if lo == hi else f"{lo}..{hi}/{cfg_value}"
+
+
 def _run_one_cell(
     cell,
     recipe: Recipe,
@@ -559,14 +671,15 @@ def run_recipe(
             # (see ``aorta/run/results.py`` schema); use ``.get`` so a future
             # workload that omits the key from its dict still classifies cleanly.
             passed = sum(1 for t in trials if t.result.get("passed"))
+            summary, suffix = _format_cell_summary(trials, passed)
             log.info(
-                "cell %d/%d: %s -- done in %.1fs [%d/%d trials passed]",
+                "cell %d/%d: %s -- done in %.1fs %s%s",
                 cell_idx,
                 total_cells,
                 cell.name,
                 cell_elapsed,
-                passed,
-                len(trials),
+                summary,
+                suffix,
             )
 
         stats = aggregate_cell(
@@ -583,8 +696,37 @@ def run_recipe(
         cell_stats.append(stats)
 
     baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
-    confound_tags = classify_all(cell_stats, baseline_cell.name, recipe.confound.threshold)
     baseline_stats = next(c for c in cell_stats if c.name == baseline_cell.name)
+
+    # Did-not-run baseline disqualification (issue #173). Explicit
+    # baseline_cell named in the recipe -> hard error: the operator made
+    # a deliberate choice and a silent fallback would mask it. Auto-
+    # resolved baseline -> soft warning + every non-baseline cell falls
+    # through to CONFOUND_NA via the existing
+    # ``baseline.mean_step_time_ms <= 0`` branch in confound.classify
+    # (the suppressed wall_clock_total fallback in aggregate_cell ensures
+    # the mean lands at 0). Legacy workloads (no outcome_counts populated)
+    # are unaffected -- ``is_did_not_run_cell`` returns False on empty
+    # counts so old runs keep their existing classification.
+    if is_did_not_run_cell(baseline_stats):
+        if recipe.confound.baseline_cell is not None:
+            raise RecipeCellError(
+                f"explicit baseline_cell {baseline_cell.name!r} produced only "
+                f"did_not_run trials (workload never reached its main work "
+                f"phase). Inspect cells/{safe_slug(baseline_cell.name)}/ for "
+                f"the failure cause, or remove confound.baseline_cell from the "
+                "recipe to fall back to auto-resolution."
+            )
+        warnings.append(
+            f"Auto-baseline {baseline_cell.name!r} had "
+            f"{baseline_stats.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
+            f"{baseline_stats.trials} trials in did_not_run "
+            "(workload never reached main work phase). No usable baseline -- "
+            "confound classification disabled. Inspect "
+            f"cells/{safe_slug(baseline_cell.name)}/ for the failure cause."
+        )
+
+    confound_tags = classify_all(cell_stats, baseline_cell.name, recipe.confound.threshold)
 
     if baseline_stats.error is not None:
         warnings.append(
