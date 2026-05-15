@@ -851,11 +851,16 @@ def test_matrix_md_does_not_overpromise_reproducibility(tmp_path, patched_env, p
 
 
 def _fake_trial_with_hint(hint: str) -> _FakeTrial:
+    # step_times_ms populated so the platform did_not_run inference
+    # doesn't fire -- this fixture represents "ran some iterations,
+    # then failed with a hint", NOT "crashed before main work" (which
+    # is what the inference flags). The two failure modes coexist.
     return _FakeTrial(
         exit_status="workload_failed",
         wall_clock_sec=1.0,
         result={
             "passed": False,
+            "step_times_ms": [100.0],
             "failure_details": [{"status": "crash", "hint": hint}],
         },
     )
@@ -1046,14 +1051,20 @@ def test_did_not_run_cell_renders_iters_zero_step_na_and_confound_tag(
     tmp_path, patched_env, monkeypatch
 ):
     """The full demo case: every trial dies in setup. Matrix.md must mark
-    the cell honestly across all three columns."""
+    the cell honestly across all three columns. With every cell
+    did_not_run there's no usable baseline -> MatrixIncompleteError
+    raises after artifacts are written, but the artifacts ARE present
+    for the inspection assertions below."""
+    from aorta.triage.runner import MatrixIncompleteError
 
     def all_did_not_run(request):
         return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
 
     monkeypatch.setattr(runner, "run_trials", all_did_not_run)
     r = _simple_recipe(ticket="T-1")
-    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    with pytest.raises(MatrixIncompleteError) as ei:
+        runner.run_recipe(r, output_dir=tmp_path)
+    run_dir = ei.value.run_dir
     md = (run_dir / "matrix.md").read_text()
     assert "0/50" in md
     # The cell row should NOT carry a fake step-time number.
@@ -1117,18 +1128,21 @@ def test_auto_baseline_warns_when_every_candidate_is_did_not_run(
     tmp_path, patched_env, monkeypatch
 ):
     """When skip-and-retry exhausts the candidate list (every cell is
-    all-did_not_run), the runner falls back to the soft warning + every
-    non-baseline cell collapses to n/a path. matrix.json still records
-    WHO would have been the baseline so the operator can find the
-    relevant trial logs.
+    all-did_not_run), the runner emits the soft warning + writes
+    matrix.md/.json + raises ``MatrixIncompleteError`` so the CLI exits
+    non-zero. matrix.json still records WHO would have been the
+    baseline so the operator can find the relevant trial logs.
     """
+    from aorta.triage.runner import MatrixIncompleteError
 
     def all_did_not_run(request):
         return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
 
     monkeypatch.setattr(runner, "run_trials", all_did_not_run)
     r = _simple_recipe(ticket="T-1")
-    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    with pytest.raises(MatrixIncompleteError, match="No usable baseline") as ei:
+        runner.run_recipe(r, output_dir=tmp_path)
+    run_dir = ei.value.run_dir
     md = (run_dir / "matrix.md").read_text()
     assert "> [!WARNING]" in md
     assert "Auto-baseline 'none-local'" in md
@@ -1157,6 +1171,7 @@ def test_auto_baseline_warning_collapses_other_cells_to_na(
     survivor stays in the matrix as a row but with no usable comparison.
     """
     from aorta.triage.recipe import Cell, ConfoundCfg, Recipe
+    from aorta.triage.runner import MatrixIncompleteError
 
     def per_cell(request):
         # Only the two baseline-* cells (mitigations==("none",)) die in
@@ -1190,7 +1205,9 @@ def test_auto_baseline_warning_collapses_other_cells_to_na(
         confound=ConfoundCfg(),
         inline_environments=(),
     )
-    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    with pytest.raises(MatrixIncompleteError, match="No usable baseline") as ei:
+        runner.run_recipe(r, output_dir=tmp_path)
+    run_dir = ei.value.run_dir
     md = (run_dir / "matrix.md").read_text()
     assert "> [!WARNING]" in md
     assert "no other cell in the recipe survived" in md
@@ -1202,15 +1219,24 @@ def test_auto_baseline_warning_collapses_other_cells_to_na(
     assert by_name["xnack-only"]["confound"] == "n/a"
 
 
-def test_explicit_baseline_pointing_to_did_not_run_raises(tmp_path, patched_env, monkeypatch):
-    """The operator named the baseline deliberately -> failure should be loud.
+def test_explicit_baseline_pointing_to_did_not_run_raises_after_writing_matrix(
+    tmp_path, patched_env, monkeypatch
+):
+    """The operator named the baseline deliberately and it ended up
+    did_not_run. The runner emits the loud failure signal via
+    ``MatrixIncompleteError`` AFTER writing matrix.md / matrix.json so
+    the operator can still inspect what happened. The CLI catches the
+    exception and exits non-zero (verified separately via the CLI test
+    surface).
 
-    Asymmetric on purpose: auto-resolution warns + degrades, explicit
-    naming hard-errors. A silent fallback for an explicit choice would
-    let the recipe author believe the matrix means what they asked for
-    when it doesn't.
+    Asymmetric on purpose vs. the auto-baseline-survives path: auto-
+    resolution that finds a usable candidate proceeds silently;
+    explicit naming that hits a dead cell raises the
+    MatrixIncompleteError so CI scripts can detect it via exit code,
+    while still leaving inspection artifacts behind.
     """
-    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe, RecipeCellError
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe
+    from aorta.triage.runner import MatrixIncompleteError
 
     def baseline_did_not_run(request):
         if request.mitigations == ("none",):
@@ -1232,8 +1258,25 @@ def test_explicit_baseline_pointing_to_did_not_run_raises(tmp_path, patched_env,
         confound=ConfoundCfg(baseline_cell="none-local"),
         inline_environments=(),
     )
-    with pytest.raises(RecipeCellError, match="explicit baseline_cell 'none-local'"):
+    with pytest.raises(MatrixIncompleteError, match="explicit baseline_cell 'none-local'") as ei:
         runner.run_recipe(r, output_dir=tmp_path)
+
+    # Artifacts must be present for inspection.
+    run_dir = ei.value.run_dir
+    assert (run_dir / "matrix.md").exists()
+    assert (run_dir / "matrix.json").exists()
+
+    md = (run_dir / "matrix.md").read_text()
+    assert "> [!WARNING]" in md
+    assert "explicit baseline_cell 'none-local'" in md
+    # Baseline cell carries the did_not_run tag; non-baseline cell collapses to n/a.
+    none_row = next(line for line in md.splitlines() if "| none-local " in line)
+    assert "did_not_run" in none_row
+    tf32_row = next(line for line in md.splitlines() if "| tf32_off-local " in line)
+    assert "n/a" in tf32_row
+
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    assert doc["baseline_cell"] == "none-local"  # name preserved per design
 
 
 def test_did_not_run_cell_summary_log_carries_warning_suffix(
@@ -1241,8 +1284,12 @@ def test_did_not_run_cell_summary_log_carries_warning_suffix(
 ):
     """Per-cell terminal log line for an all-did_not_run cell must include
     the WARNING suffix so an operator watching stdout sees the same signal
-    as the matrix.md reader."""
+    as the matrix.md reader. Pinned regardless of the post-run
+    MatrixIncompleteError -- the per-cell logs are emitted before the
+    final raise, so caplog catches them."""
     import logging
+
+    from aorta.triage.runner import MatrixIncompleteError
 
     def all_did_not_run(request):
         return [_fake_trial_did_not_run(configured_iterations=50) for _ in range(2)]
@@ -1250,7 +1297,8 @@ def test_did_not_run_cell_summary_log_carries_warning_suffix(
     monkeypatch.setattr(runner, "run_trials", all_did_not_run)
     r = _simple_recipe(ticket="T-1")
     with caplog.at_level(logging.INFO, logger="aorta.triage.runner"):
-        runner.run_recipe(r, output_dir=tmp_path)
+        with pytest.raises(MatrixIncompleteError):
+            runner.run_recipe(r, output_dir=tmp_path)
     cell_lines = [rec.getMessage() for rec in caplog.records if "done in" in rec.getMessage()]
     assert cell_lines, "expected per-cell summary lines in the runner log"
     for line in cell_lines:

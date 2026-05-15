@@ -69,6 +69,23 @@ _INLINE_SIDECAR_NAME = "inline_environments.sidecar.json"
 _OPERATOR_SIDECAR_DIR = "sidecars"
 
 
+class MatrixIncompleteError(Exception):
+    """Raised AFTER ``run_recipe`` successfully writes matrix.md /
+    matrix.json when the run completed but classification could not
+    anchor -- e.g. the explicit ``baseline_cell`` produced only
+    did_not_run trials, or every auto-baseline candidate did. The
+    matrix artifacts ARE present for inspection (the exception carries
+    ``run_dir``); the exception itself signals the degradation to the
+    CLI so it can exit non-zero. This is distinct from
+    :class:`aorta.triage.recipe.RecipeCellError`, which is for
+    pre-execution validation failures (no artifacts written).
+    """
+
+    def __init__(self, message: str, run_dir: Path) -> None:
+        super().__init__(message)
+        self.run_dir = run_dir
+
+
 def _merge_sidecar_files(
     recipe_files: tuple[Path, ...],
     extra: tuple[Path, ...],
@@ -775,44 +792,58 @@ def run_recipe(
         )
         cell_stats.append(stats)
 
-    # Did-not-run baseline disqualification (issue #173). Three cases:
-    #   1. Explicit ``confound.baseline_cell`` -> resolves first; if that
-    #      cell ended up all-did_not_run, hard error. The operator named
-    #      this cell deliberately and a silent fallback would mask their
-    #      choice.
+    # Did-not-run baseline disqualification (issue #173). Three cases,
+    # all of them produce matrix.md / matrix.json so the operator can
+    # inspect the run; the runner raises ``MatrixIncompleteError`` at
+    # the very end (after artifacts are written) for the two degraded
+    # cases so the CLI can exit non-zero:
+    #   1. Explicit ``confound.baseline_cell`` -> resolves first; if
+    #      that cell ended up all-did_not_run, append a loud warning
+    #      and mark the run incomplete. The matrix is still rendered
+    #      (the explicit cell shows its did_not_run tag, others fall
+    #      through to n/a) so the operator can see WHAT went wrong
+    #      from artifacts alone.
     #   2. Auto-resolution -> SKIP all-did_not_run cells when applying
-    #      the resolution rules. If a usable candidate remains, classify
-    #      against that one and emit no warning. This matches the issue's
-    #      "Baseline auto-selection: skip cells whose outcome_counts is
-    #      all-did_not_run" rule -- a recipe with one bad baseline-* cell
-    #      and one healthy `none`-mitigations cell should fall through to
-    #      the latter, not collapse the whole matrix to n/a.
-    #   3. Auto-resolution exhausted -> soft warning + every non-baseline
-    #      cell falls through to CONFOUND_NA via the existing
-    #      ``baseline.mean_step_time_ms <= 0`` branch in confound.classify
-    #      (the suppressed wall_clock_total fallback in aggregate_cell
-    #      ensures the mean lands at 0).
+    #      the resolution rules. If a usable candidate remains,
+    #      classify against that one normally -- no warning, no
+    #      degradation flag. This matches the issue's "auto-selection
+    #      skips all-did_not_run cells" rule.
+    #   3. Auto-resolution exhausted -> soft warning + every non-
+    #      baseline cell falls through to CONFOUND_NA via the existing
+    #      ``baseline.mean_step_time_ms <= 0`` branch in
+    #      confound.classify (the suppressed wall_clock_total fallback
+    #      in aggregate_cell ensures the mean lands at 0). Run is
+    #      marked incomplete.
     # Legacy workloads (empty outcome_counts) never enter the skip set,
     # so old runs keep their existing classification path unchanged.
     #
-    # Note: matrix.json::baseline_cell records the resolved name in case
-    # 3 (rather than null, as one reading of the issue's design block
-    # might suggest). Preserving the name keeps a record of which cell
-    # was attempted as the baseline -- useful for an operator diagnosing
-    # why every other row collapsed to n/a -- while the accompanying
-    # warning carries the "no usable comparison" signal.
+    # matrix.json::baseline_cell records the resolved name in cases 1
+    # and 3 (rather than null). Preserving the name keeps a record of
+    # which cell was attempted as the baseline -- useful for an
+    # operator diagnosing why every other row collapsed to n/a -- while
+    # the accompanying warning carries the "no usable comparison" signal.
     disqualified_names = {s.name for s in cell_stats if is_did_not_run_cell(s)}
+    incomplete_reason: str | None = None
 
     if recipe.confound.baseline_cell is not None:
         baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
         if baseline_cell.name in disqualified_names:
-            raise RecipeCellError(
-                f"explicit baseline_cell {baseline_cell.name!r} produced only "
-                f"did_not_run trials (workload never reached its main work "
-                f"phase). Inspect cells/{safe_slug(baseline_cell.name)}/ for "
-                f"the failure cause, or remove confound.baseline_cell from the "
-                "recipe to fall back to auto-resolution."
+            baseline_stats_ref = next(
+                c for c in cell_stats if c.name == baseline_cell.name
             )
+            msg = (
+                f"explicit baseline_cell {baseline_cell.name!r} produced only "
+                f"did_not_run trials "
+                f"({baseline_stats_ref.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
+                f"{baseline_stats_ref.trials} trials, workload never reached "
+                "its main work phase). Confound classification disabled; "
+                f"non-baseline cells render n/a. Inspect "
+                f"cells/{safe_slug(baseline_cell.name)}/ for the failure "
+                "cause, or remove confound.baseline_cell from the recipe to "
+                "fall back to auto-resolution."
+            )
+            warnings.append(msg)
+            incomplete_reason = msg
     else:
         try:
             baseline_cell = resolve_baseline(
@@ -826,7 +857,7 @@ def run_recipe(
             baseline_stats_ref = next(
                 c for c in cell_stats if c.name == baseline_cell.name
             )
-            warnings.append(
+            msg = (
                 f"Auto-baseline {baseline_cell.name!r} had "
                 f"{baseline_stats_ref.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
                 f"{baseline_stats_ref.trials} trials in did_not_run, and no "
@@ -835,6 +866,8 @@ def run_recipe(
                 "disabled. Inspect "
                 f"cells/{safe_slug(baseline_cell.name)}/ for the failure cause."
             )
+            warnings.append(msg)
+            incomplete_reason = msg
 
     baseline_stats = next(c for c in cell_stats if c.name == baseline_cell.name)
     confound_tags = classify_all(cell_stats, baseline_cell.name, recipe.confound.threshold)
@@ -884,7 +917,13 @@ def run_recipe(
             f"to rerun: cd {run_dir} && aorta triage run --recipe recipe.resolved.yaml {flags}"
         )
 
+    if incomplete_reason is not None:
+        # Artifacts are written; raise so the CLI can print the failure
+        # message and exit non-zero. Tests / programmatic callers can
+        # ``except MatrixIncompleteError`` to inspect ``run_dir``.
+        raise MatrixIncompleteError(incomplete_reason, run_dir)
+
     return run_dir
 
 
-__all__ = ["run_recipe"]
+__all__ = ["MatrixIncompleteError", "run_recipe"]

@@ -318,6 +318,73 @@ cells:
     assert patched_run_trials.call_count == 2
 
 
+def test_cli_exits_nonzero_when_baseline_did_not_run_but_writes_matrix(
+    tmp_path, patched_env, monkeypatch
+):
+    """When the explicit baseline_cell collapses to did_not_run, the CLI
+    must exit non-zero (so CI/scripts catch it) AND still write the
+    matrix.md / matrix.json artifacts (so the operator can inspect what
+    happened). Round-2 of the user's smoke-test feedback on PR #175:
+    raising RecipeCellError before writing artifacts left the operator
+    with nothing to look at; the soft-fallback path keeps both signals.
+    """
+    from types import SimpleNamespace
+
+    def setup_crash(request):
+        # Mimics recom_repro nan-repro: workload_failed exit, no
+        # step_times_ms, zero elapsed_sec -> platform inference flags
+        # both trials as did_not_run.
+        return [
+            SimpleNamespace(
+                exit_status="workload_failed",
+                wall_clock_sec=3.5,
+                result={"passed": False, "step_times_ms": [], "elapsed_sec": 0.0},
+            )
+            for _ in range(2)
+        ]
+
+    import aorta.triage.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "run_trials", setup_crash)
+
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text(
+        """\
+schema_version: 1
+ticket: CLI-INC-1
+workload: fsdp
+trials: 2
+steps: 50
+confound:
+  baseline_cell: baseline-local
+cells:
+  - name: baseline-local
+    mitigations: [none]
+    environment: local
+  - name: tf32-local
+    mitigations: [tf32_off]
+    environment: local
+""",
+        encoding="utf-8",
+    )
+    cli = CliRunner()
+    out_dir = tmp_path / "out"
+    result = cli.invoke(
+        triage,
+        ["run", "--recipe", str(recipe), "--output-dir", str(out_dir)],
+    )
+    # Loud failure signal for CI / scripts.
+    assert result.exit_code != 0, result.output
+    assert "explicit baseline_cell 'baseline-local'" in result.output
+    # Artifacts present for the operator to inspect.
+    assert "Wrote matrix to" in result.output
+    matrix_files = list(out_dir.rglob("matrix.md"))
+    assert len(matrix_files) == 1
+    md = matrix_files[0].read_text()
+    assert "> [!WARNING]" in md
+    assert "did_not_run" in md
+
+
 def test_cli_recipe_mode_dry_run(tmp_path, patched_env, patched_run_trials):
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text(
