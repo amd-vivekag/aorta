@@ -3998,9 +3998,11 @@ class TestCapturePytorchBinaryIntrospection:
         assert block["torch_lib_bundled"] == {"libaotriton_v2.so": False}
 
     def test_cxx_define_presence_parsed_from_config_show(self, tmp_path):
-        cfg = "Build settings: CXX_FLAGS=-DUSE_ROCM_CK_SDPA -O3"
-        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=cfg)
-        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        flags = {"cxx_flags_raw": "-DUSE_ROCM_CK_SDPA -O3"}
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags=flags,
+        )
         assert block["cxx_flags_use_defines"] == {
             "USE_ROCM_CK_SDPA": True,
             "USE_ROCM_CK_GEMM": False,
@@ -4008,10 +4010,37 @@ class TestCapturePytorchBinaryIntrospection:
 
     def test_cxx_define_regex_does_not_false_match_substring(self, tmp_path):
         # `USE_ROCM_CK_SDPA_FOO` must not match `USE_ROCM_CK_SDPA`.
-        cfg = "Build settings: CXX_FLAGS=-DUSE_ROCM_CK_SDPA_FOO -O3"
-        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=cfg)
-        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        flags = {"cxx_flags_raw": "-DUSE_ROCM_CK_SDPA_FOO -O3"}
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags=flags,
+        )
         assert block["cxx_flags_use_defines"]["USE_ROCM_CK_SDPA"] is False
+
+    def test_cxx_define_in_cuda_flags_only_does_not_leak(self, tmp_path):
+        """A `-DUSE_ROCM_CK_SDPA` token that lives in CUDA_FLAGS must NOT
+        appear in cxx_flags_use_defines -- the field name is the
+        contract.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        flags = {
+            "cxx_flags_raw": "-O3 -fPIC",
+            "cuda_flags_raw": "-DUSE_ROCM_CK_SDPA -arch=gfx942",
+        }
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags=flags,
+        )
+        assert block["cxx_flags_use_defines"]["USE_ROCM_CK_SDPA"] is False
+
+    def test_cxx_flags_raw_none_yields_none_dict(self, tmp_path):
+        """No CXX_FLAGS source -> the whole cxx_flags_use_defines dict
+        stays None; we don't fabricate False entries.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags={"cxx_flags_raw": None},
+        )
+        assert block["cxx_flags_use_defines"] is None
 
     def test_torch_none_returns_full_default_shape(self):
         block = env_mod._capture_pytorch_binary_introspection([], torch_mod=None)
@@ -4299,6 +4328,40 @@ class TestProjectPytorchBuildFlags:
         }
         out = env_mod._project_pytorch_build_flags(flags)
         assert out["USE_MIOPEN"] is True
+
+    def test_both_sources_parsed_absent_bool_flag_renders_false(self):
+        """Issue #170 acceptance + matches existing _read_pytorch_ck_flags:
+        when BOTH config sources were successfully parsed and a bool
+        flag isn't in either, the cmake convention fires (absent define
+        = OFF), so render False -- not None.
+        """
+        flags = {
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},  # parsed, empty -- CXX_FLAGS had no -D defines
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_ROCM_CK_SDPA"] is False
+        assert out["USE_FLASH_ATTENTION"] is False
+        # Non-boolean flag (BUILD_TYPE) keeps None on absence -- its
+        # value is freeform, "absent define = OFF" doesn't apply.
+        assert out["BUILD_TYPE"] is None
+
+    def test_only_one_source_parsed_absent_bool_flag_stays_none(self):
+        """Conservative: when one source is None, we can't be sure the
+        flag isn't in the unread source -- stay None, don't claim False.
+        """
+        flags_settings_only = {
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": None,
+        }
+        flags_defines_only = {
+            "build_settings": None,
+            "cxx_defines": {},
+        }
+        for flags in (flags_settings_only, flags_defines_only):
+            out = env_mod._project_pytorch_build_flags(flags)
+            assert out["USE_ROCM_CK_SDPA"] is None
+            assert out["DISABLE_AOTRITON"] is None
 
     def test_none_flags_block_yields_all_none(self):
         """Torch import failed upstream -> patch returns None block;

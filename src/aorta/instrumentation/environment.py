@@ -348,6 +348,13 @@ _PYTORCH_BUILD_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "USE_MIOPEN": ("USE_MIOPEN", "CAFFE2_USE_MIOPEN"),
 }
 
+# Flags whose value is a string (e.g. ``BUILD_TYPE=Release``), not a
+# cmake boolean. The "absent define = OFF" cmake convention does NOT
+# apply to these -- their absence means "the build did not emit a
+# value", which is unknown rather than False. Used by the projection
+# helper to decide what to fill in when neither source has the flag.
+_PYTORCH_BUILD_FLAG_NON_BOOLEAN: frozenset[str] = frozenset({"BUILD_TYPE"})
+
 
 def _coerce_pytorch_build_flag_value(raw: str) -> bool | str:
     """ON/OFF/TRUE/FALSE/1/0 (any case) -> bool; anything else stays str.
@@ -381,29 +388,53 @@ def _project_pytorch_build_flags(
        ``USE_ROCM_CK_SDPA``). A bare ``-D<NAME>`` (no value) renders as
        ``True`` -- presence-as-define is the cmake convention for "this
        feature is compiled in".
-    3. Otherwise ``None`` -- distinguishable from ``False`` so callers
-       can tell "the build did not set this" apart from "the build set
-       it OFF".
+    3. Not found in either source. Two sub-cases:
+
+       a. **Both sources were parsed** (``build_settings`` AND
+          ``cxx_defines`` are non-None dicts -- the typical case for a
+          successful ``__config__.show()`` capture): the cmake
+          convention applies -- absent boolean flag means OFF, so
+          render ``False``. Non-boolean flags
+          (:data:`_PYTORCH_BUILD_FLAG_NON_BOOLEAN`, currently just
+          ``BUILD_TYPE``) keep ``None`` -- their value is freeform and
+          absence is unknown, not "off". This matches the existing
+          :func:`_read_pytorch_ck_flags` convention and the issue #170
+          acceptance bullet "USE_ROCM_CK_SDPA == false on builds
+          without CK SDPA".
+
+       b. **At least one source is None** (partial capture): render
+          ``None`` -- we can't be sure the flag isn't in the unread
+          source.
 
     No partial reasons are added here: if torch is importable but a
     particular flag is missing from ``__config__.show()``, that's the
     upstream build's choice, not a probe failure.
     """
-    settings = (flags or {}).get("build_settings") or {}
-    defines = (flags or {}).get("cxx_defines") or {}
+    settings_raw = (flags or {}).get("build_settings")
+    defines_raw = (flags or {}).get("cxx_defines")
+    settings = settings_raw or {}
+    defines = defines_raw or {}
+    both_sources_parsed = settings_raw is not None and defines_raw is not None
     out: dict[str, bool | str | None] = {}
     for name in PYTORCH_BUILD_FLAG_NAMES:
-        out[name] = None
+        found = False
         for alias in _PYTORCH_BUILD_FLAG_ALIASES.get(name, (name,)):
             if alias in settings:
                 out[name] = _coerce_pytorch_build_flag_value(settings[alias])
+                found = True
                 break
             if alias in defines:
                 value = defines[alias]
                 out[name] = (
                     True if value is None else _coerce_pytorch_build_flag_value(value)
                 )
+                found = True
                 break
+        if not found:
+            if both_sources_parsed and name not in _PYTORCH_BUILD_FLAG_NON_BOOLEAN:
+                out[name] = False
+            else:
+                out[name] = None
     return out
 
 # GitHub URL template printed in `partial_reasons` when the PyTorch
@@ -786,8 +817,12 @@ class EnvSnapshot:
         def fmt_count(v: int | None) -> str:
             return "?" if v is None else str(v)
 
+        # Markers are kept verbatim (including the trailing `::`
+        # namespace suffix) so the brief matches the JSON keys and stays
+        # readable as C++ -- `pytorch_flash::=142` is unambiguous;
+        # `pytorch_flash=142` would suggest a function/var name.
         sym_part = " ".join(
-            f"{marker.rstrip(':')}={fmt_count(sym_counts.get(marker))}"
+            f"{marker}={fmt_count(sym_counts.get(marker))}"
             for marker in _LIBTORCH_HIP_SYMBOL_MARKERS
         )
 
@@ -2641,7 +2676,10 @@ def _capture_pytorch_build(
 
     flags = _capture_pytorch_build_flags(reasons)
     binary_introspection = _capture_pytorch_binary_introspection(
-        reasons, torch_mod=torch_mod, hip_symbol_cache=hip_symbol_cache
+        reasons,
+        torch_mod=torch_mod,
+        flags=flags,
+        hip_symbol_cache=hip_symbol_cache,
     )
     build_flags = _project_pytorch_build_flags(flags)
 
@@ -2720,6 +2758,7 @@ def _capture_pytorch_binary_introspection(
     reasons: list[str],
     torch_mod: Any | None,
     *,
+    flags: dict[str, Any] | None = None,
     hip_symbol_cache: _HipSymbolDumpCache | None = None,
 ) -> dict[str, Any]:
     """Direct facts about the compiled PyTorch wheel -- no inference.
@@ -2785,22 +2824,20 @@ def _capture_pytorch_binary_introspection(
 
     # ----- CXX_FLAGS -DUSE_* presence (authoritative when True;
     # absence does NOT prove the cmake option was OFF -- many ROCm
-    # USE_* defines are only injected into HIPCC per-target flags) -----
+    # USE_* defines are only injected into HIPCC per-target flags). The
+    # field's contract is "presence of `-DNAME` in the host-side
+    # CXX_FLAGS string", so we scan ONLY cxx_flags_raw -- not the full
+    # `__config__.show()` text, which would also match `-DNAME` tokens
+    # that landed in CUDA_FLAGS or in unrelated lines and over-claim
+    # presence in CXX flags. -----
     cxx_define_names = ("USE_ROCM_CK_SDPA", "USE_ROCM_CK_GEMM")
-    if torch_mod is not None:
-        config = getattr(torch_mod, "__config__", None)
-        show = getattr(config, "show", None)
-        if show is not None:
-            try:
-                cfg_text = show()
-            except Exception:  # noqa: BLE001 -- other probes record this already
-                cfg_text = ""
-            if cfg_text:
-                cxx_pairs: dict[str, bool] = {}
-                for name in cxx_define_names:
-                    pattern = re.compile(rf"-D{re.escape(name)}(?![A-Za-z0-9_])")
-                    cxx_pairs[name] = bool(pattern.search(cfg_text))
-                result["cxx_flags_use_defines"] = cxx_pairs
+    cxx_flags_raw = (flags or {}).get("cxx_flags_raw")
+    if cxx_flags_raw is not None:
+        cxx_pairs: dict[str, bool] = {}
+        for name in cxx_define_names:
+            pattern = re.compile(rf"-D{re.escape(name)}(?![A-Za-z0-9_])")
+            cxx_pairs[name] = bool(pattern.search(cxx_flags_raw))
+        result["cxx_flags_use_defines"] = cxx_pairs
 
     # ----- libtorch_hip.so symbol counts (shared nm dump) -----
     # Caller signals torch unavailability with torch_mod=None; respect
