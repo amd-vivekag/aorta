@@ -721,10 +721,13 @@ class EnvSnapshot:
         report ``ON``/``OFF`` directly; CXX_FLAGS-only defines
         (USE_FBGEMM, USE_FLASH_ATTENTION, USE_ROCM_CK_SDPA, ...) report
         the captured value or ``yes`` for value-less defines. Absent
-        defines render as ``no`` when build_settings/cxx_defines were
-        captured, ``?`` when both are unavailable (so the operator can
-        tell "the build did not set this" apart from "we couldn't read
-        the build config").
+        defines render as ``no`` only when ``cxx_defines`` was actually
+        parsed (a real, possibly empty dict from a build whose
+        ``CXX_FLAGS`` we could read); when ``cxx_defines is None``
+        (CXX_FLAGS line missing from ``__config__.show()``) and the
+        flag isn't in ``build_settings`` either, we render ``?`` -- the
+        brief mustn't conflate "we couldn't read the define source"
+        with "the define is absent so the feature is off".
         """
         pb = self.pytorch_build or {}
         flags = pb.get("flags") or {}
@@ -734,15 +737,19 @@ class EnvSnapshot:
         archs = flags.get("gpu_arch_list")
         arch_part = ",".join(archs) if archs else "?"
 
-        # Treat both sources as separate signals: gpu_arch_list comes
-        # from torch.cuda.get_arch_list() while settings/defines come
-        # from torch.__config__.show(). One can populate when the other
-        # fails (e.g. CPU-only wheel, or __config__ raises). When both
-        # build sources are missing, render every cell as `?` so the
-        # brief doesn't falsely claim every flag is OFF.
+        # gpu_arch_list comes from torch.cuda.get_arch_list() and is
+        # independent of __config__.show(); settings/defines come from
+        # __config__.show() and can each be None even when the other
+        # populates (CPU-only wheel, missing CXX_FLAGS line, etc.).
+        # Two unknown signals to track:
+        # * `flags_unavailable`: BOTH config sources missing -> render
+        #   every cell `?` (no opinion at all).
+        # * `defines_unavailable`: CXX_FLAGS source missing -> a flag
+        #   that's also not in build_settings is unknown, NOT off.
         settings_raw = flags.get("build_settings")
         defines_raw = flags.get("cxx_defines")
         flags_unavailable = settings_raw is None and defines_raw is None
+        defines_unavailable = defines_raw is None
         settings = settings_raw or {}
         defines = defines_raw or {}
 
@@ -758,7 +765,7 @@ class EnvSnapshot:
                 value = defines[name]
                 cells.append(f"{name}={value}" if value is not None else f"{name}=yes")
                 continue
-            cells.append(f"{name}=no")
+            cells.append(f"{name}=?" if defines_unavailable else f"{name}=no")
         return f"gpu_archs=[{arch_part}]  " + " ".join(cells)
 
     def _summary_pytorch_binary_introspection_line(self) -> str:
@@ -810,6 +817,13 @@ class EnvSnapshot:
         ``on``/``off`` for booleans, ``?`` for absent (None). The full
         17-key parsed schema lives in env.json under
         ``pytorch_build.build_flags`` for callers that need the rest.
+
+        ``AOTRITON`` is a combined cell: ``DISABLE_AOTRITON`` is a
+        definitive kill-switch and ``USE_AOTRITON`` is the cmake enable.
+        Some builds report only one of the two, so the cell consults
+        both before falling back to ``?`` -- otherwise a build with
+        ``-DDISABLE_AOTRITON`` but no ``USE_AOTRITON=`` setting would
+        render ``?`` despite carrying a definitive disable signal.
         """
         pb = self.pytorch_build or {}
         flags = pb.get("build_flags") or {}
@@ -826,10 +840,22 @@ class EnvSnapshot:
                 return f"{label}=?"
             return f"{label}={value}"
 
+        def aotriton_cell() -> str:
+            use = flags.get("USE_AOTRITON")
+            disable = flags.get("DISABLE_AOTRITON")
+            # Disable is the explicit kill switch and wins on conflict;
+            # check it first so a contradictory build (use=True AND
+            # disable=True) renders the safer "off".
+            if disable is True or use is False:
+                return "AOTRITON=off"
+            if use is True or disable is False:
+                return "AOTRITON=on"
+            return "AOTRITON=?"
+
         return " ".join((
             cell("FLASH_ATTN", "USE_FLASH_ATTENTION"),
             cell("CK_SDPA", "USE_ROCM_CK_SDPA"),
-            cell("AOTRITON", "USE_AOTRITON"),
+            aotriton_cell(),
             cell("MEM_EFF", "USE_MEM_EFF_ATTENTION"),
         ))
 
@@ -2729,23 +2755,33 @@ def _capture_pytorch_binary_introspection(
     }
 
     # ----- bundled libs in torch/lib/ -----
+    # On OSError (missing dir, permission denied, ...) we leave
+    # ``torch_lib_bundled`` as None and add a partial reason -- a failed
+    # scan must NOT report False for every lib, since False is the
+    # definitive "we scanned, the lib isn't there" signal. One iterdir()
+    # per probe (not per lib name) keeps the cost bounded.
     if torch_mod is not None:
         torch_file = getattr(torch_mod, "__file__", None)
         if torch_file:
             torch_lib_dir = Path(torch_file).parent / "lib"
-            bundled: dict[str, bool] = {}
-            for name in _PYTORCH_LIB_BUNDLED_NAMES:
+            try:
+                entries = [p.name for p in torch_lib_dir.iterdir()]
+            except OSError as exc:
+                log.debug("torch/lib/ scan failed: %s", exc)
+                reasons.append(
+                    f"pytorch_build.binary_introspection.torch_lib_bundled: "
+                    f"{torch_lib_dir} scan failed ({type(exc).__name__})"
+                )
+            else:
                 # Match the bare name AND the SONAME-versioned variants
                 # (libaotriton_v2.so, libaotriton_v2.so.0.11.2, ...).
-                try:
-                    bundled[name] = any(
-                        p.name == name or p.name.startswith(f"{name}.")
-                        for p in torch_lib_dir.iterdir()
+                result["torch_lib_bundled"] = {
+                    name: any(
+                        entry == name or entry.startswith(f"{name}.")
+                        for entry in entries
                     )
-                except OSError as exc:
-                    log.debug("torch/lib/ scan failed: %s", exc)
-                    bundled[name] = False
-            result["torch_lib_bundled"] = bundled
+                    for name in _PYTORCH_LIB_BUNDLED_NAMES
+                }
 
     # ----- CXX_FLAGS -DUSE_* presence (authoritative when True;
     # absence does NOT prove the cmake option was OFF -- many ROCm

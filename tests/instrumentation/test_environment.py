@@ -4021,6 +4021,34 @@ class TestCapturePytorchBinaryIntrospection:
             v is None for v in block["libtorch_hip_symbol_counts"].values()
         )
 
+    def test_torch_lib_scan_oserror_yields_none_with_partial_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed torch/lib scan (missing dir, permission denied, ...)
+        must NOT report False per lib -- False is the definitive
+        "scanned, lib absent" signal. Whole dict stays None and a
+        partial reason is recorded so the operator knows the probe
+        failed rather than the libs being missing.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+
+        def boom(self):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(env_mod.Path, "iterdir", boom)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_binary_introspection(
+            reasons, torch_mod=torch_mod
+        )
+        assert block["torch_lib_bundled"] is None
+        assert any(
+            r.startswith(
+                "pytorch_build.binary_introspection.torch_lib_bundled:"
+            )
+            and "PermissionError" in r
+            for r in reasons
+        )
+
     def test_torch_none_skips_symbol_cache_lookup(self, monkeypatch):
         """Caller signal `torch_mod=None` -> skip the cache entirely;
         otherwise on a real-torch host the cache would still dump
@@ -4063,25 +4091,19 @@ class TestCapturePytorchBinaryIntrospection:
 
 
 class TestSummaryPytorchBuildFlagsLineUnavailable:
-    """Regression guard for Copilot review: gpu_arch_list captured but
-    build_settings/cxx_defines both None must NOT render every flag as
-    `=no` -- that conflates "couldn't read build config" with "all
-    flags off".
+    """Regression guards: distinguish "unavailable" from "all off" in the
+    `torch flags:` brief at two granularities -- whole-block and
+    per-cell.
     """
 
-    def test_archs_present_but_settings_defines_none_renders_question_marks(self):
-        snap = _example_snapshot(
+    @staticmethod
+    def _snap_with_flags(flags_block):
+        return _example_snapshot(
             pytorch_build={
                 "git_commit": None, "hip_version": None, "cuda_version": None,
                 "debug": None, "install_kind": "wheel", "source_path": None,
                 "submodule_commits": {"_source": None},
-                "flags": {
-                    "build_settings": None,
-                    "cxx_defines": None,
-                    "cxx_flags_raw": None,
-                    "cuda_flags_raw": None,
-                    "gpu_arch_list": ["gfx942"],
-                },
+                "flags": flags_block,
                 "binary_introspection": {
                     "libtorch_hip_symbol_counts": {
                         m: None for m in env_mod._LIBTORCH_HIP_SYMBOL_MARKERS
@@ -4094,11 +4116,93 @@ class TestSummaryPytorchBuildFlagsLineUnavailable:
                 },
             },
         )
+
+    def test_archs_present_but_settings_defines_none_renders_question_marks(self):
+        snap = self._snap_with_flags({
+            "build_settings": None, "cxx_defines": None,
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": ["gfx942"],
+        })
         line = snap._summary_pytorch_build_flags_line()
         assert "gpu_archs=[gfx942]" in line
         assert "USE_ROCM=?" in line
         assert "USE_ROCM=no" not in line
         assert "USE_FLASH_ATTENTION=?" in line
+
+    def test_settings_populated_but_cxx_defines_none_renders_cxx_only_flags_unknown(self):
+        """When CXX_FLAGS line is missing from __config__.show(),
+        cxx_defines is None. CXX-only flags (e.g. USE_ROCM_CK_SDPA)
+        must render `=?` not `=no` -- absence-of-source != absence-of-flag.
+        """
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON", "USE_CUDA": "OFF"},
+            "cxx_defines": None,
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": None,
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "USE_ROCM=ON" in line
+        assert "USE_CUDA=OFF" in line
+        # CXX-only flags couldn't be read -> unknown, NOT off.
+        assert "USE_ROCM_CK_SDPA=?" in line
+        assert "USE_FLASH_ATTENTION=?" in line
+        assert "USE_ROCM_CK_SDPA=no" not in line
+
+    def test_empty_cxx_defines_dict_renders_cxx_only_flags_no(self):
+        """An empty dict (we read CXX_FLAGS, no -D defines present) is
+        a definitive "feature off" signal, distinct from None.
+        """
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},
+            "cxx_flags_raw": "-O3 -fPIC",
+            "cuda_flags_raw": None,
+            "gpu_arch_list": None,
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "USE_ROCM_CK_SDPA=no" in line
+        assert "USE_FLASH_ATTENTION=no" in line
+
+
+class TestSummaryStableBuildFlagsLineAotritonCombined:
+    """Issue: brief AOTRITON cell must honor DISABLE_AOTRITON, otherwise
+    a build that reports only `-DDISABLE_AOTRITON` (no USE_AOTRITON
+    setting) renders `AOTRITON=?` despite a definitive disable signal.
+    """
+
+    @staticmethod
+    def _snap(use_aotriton, disable_aotriton):
+        bf = {name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES}
+        bf["USE_AOTRITON"] = use_aotriton
+        bf["DISABLE_AOTRITON"] = disable_aotriton
+        # Anchor: keep at least one other flag populated so the
+        # "all-None -> early unavailable return" guard doesn't fire
+        # when both AOTRITON inputs are None.
+        bf["USE_ROCM"] = True
+        base = _example_snapshot()
+        return _example_snapshot(
+            pytorch_build={**base.pytorch_build, "build_flags": bf}
+        )
+
+    def test_disable_only_true_renders_off(self):
+        line = self._snap(None, True)._summary_stable_build_flags_line()
+        assert "AOTRITON=off" in line
+
+    def test_use_only_true_renders_on(self):
+        line = self._snap(True, None)._summary_stable_build_flags_line()
+        assert "AOTRITON=on" in line
+
+    def test_disable_false_renders_on(self):
+        line = self._snap(None, False)._summary_stable_build_flags_line()
+        assert "AOTRITON=on" in line
+
+    def test_disable_wins_over_use_on_conflict(self):
+        line = self._snap(True, True)._summary_stable_build_flags_line()
+        assert "AOTRITON=off" in line
+
+    def test_both_none_renders_question_mark(self):
+        line = self._snap(None, None)._summary_stable_build_flags_line()
+        assert "AOTRITON=?" in line
 
 
 class TestProjectPytorchBuildFlags:
