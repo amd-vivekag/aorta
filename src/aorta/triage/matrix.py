@@ -539,8 +539,12 @@ def aggregate_cell(
         wall = getattr(trial, "wall_clock_sec", 0.0) or 0.0
         wall_clocks.append(float(wall))
         # Histogram by raw exit_status so callers can distinguish e.g.
-        # "workload_failed" (the workload returned a failed WorkloadResult)
-        # from "infrastructure_failed" (run_trials never got a result back).
+        # "workload_failed" (the workload's run() returned a failed
+        # WorkloadResult) from "infrastructure_failed" (B1's dispatcher
+        # caught an exception around setup/run/cleanup and synthesised a
+        # passed=False WorkloadResult so the cell still has a row).
+        # ``aorta.run.dispatcher`` populates a WorkloadResult in either
+        # case; the distinction is purely the exit_status value.
         # Falling back to "unknown" keeps the histogram total == trial_count
         # even for stand-in trial objects that omit the attribute.
         status = getattr(trial, "exit_status", None) or "unknown"

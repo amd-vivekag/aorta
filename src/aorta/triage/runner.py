@@ -745,10 +745,11 @@ def run_recipe(
             # ``aorta.triage.matrix._trial_passed`` so the per-cell log line
             # agrees with the matrix-level passed_count: a trial is "passed"
             # iff its exit_status is "ok" AND its WorkloadResult.passed is
-            # not False. Reading only ``result.get("passed")`` ignores
-            # infrastructure-level failures (exit_status="infrastructure_failed"
-            # with no result dict) and would over-count "passed" against the
-            # matrix.md row.
+            # not False. Reading only ``result.get("passed")`` ignores the
+            # exit_status side -- ``aorta.run.dispatcher`` always populates
+            # a WorkloadResult, but on infrastructure exceptions sets
+            # exit_status="infrastructure_failed" with passed=False, so
+            # both halves of the predicate are needed.
             passed = sum(1 for t in trials if _trial_passed_for_log(t))
             summary, suffix = _format_cell_summary(trials, passed)
             log.info(

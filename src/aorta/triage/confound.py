@@ -94,7 +94,9 @@ def resolve_baseline(
        load time).
     2. First cell whose name starts with ``baseline-``.
     3. First cell whose mitigations == ``["none"]``.
-    4. If the recipe has exactly one cell, use it.
+    4. If exactly one candidate remains, use it (i.e. a single-cell
+       recipe with no skip set, or a multi-cell recipe where every
+       other cell is in ``skip_names``).
     5. Otherwise raise :class:`RecipeCellError`.
 
     ``skip_names`` is applied to rules 2-4 only -- explicit naming
