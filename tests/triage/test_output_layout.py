@@ -804,6 +804,82 @@ def test_matrix_md_does_not_overpromise_reproducibility(tmp_path, patched_env, p
     assert "resolved_env_vars" in md
 
 
+# ---- Failure hints surfacing in matrix.md / matrix.json ------------------
+#
+# When a workload returns `failure_details[*].hint`, both outputs must
+# expose the hint at the cell level so a reader can tell "couldn't run"
+# apart from "ran and produced wrong numbers" without opening per-trial
+# JSON.
+
+
+def _fake_trial_with_hint(hint: str) -> _FakeTrial:
+    return _FakeTrial(
+        exit_status="workload_failed",
+        wall_clock_sec=1.0,
+        result={
+            "passed": False,
+            "failure_details": [{"status": "crash", "hint": hint}],
+        },
+    )
+
+
+def test_matrix_md_omits_failure_hints_section_when_no_hints(
+    tmp_path, patched_env, patched_run_trials
+):
+    """No cell carries a hint -> no header, not an empty `## Failure hints`."""
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "## Failure hints" not in md
+
+
+def test_matrix_md_renders_failure_hints_when_present(tmp_path, patched_env, monkeypatch):
+    """A cell whose trials emit a hint surfaces under `## Failure hints`."""
+    hint = "shampoo import failed: try shampoo_api='old'"
+    monkeypatch.setattr(
+        runner,
+        "run_trials",
+        MagicMock(return_value=[_fake_trial_with_hint(hint), _fake_trial_with_hint(hint)]),
+    )
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "## Failure hints" in md
+    # One bullet per (cell, hint); both cells share the stub so both fire.
+    assert f"**none-local** (2/2 trials): {hint}" in md
+    assert f"**tf32_off-local** (2/2 trials): {hint}" in md
+    # Section appears between the table and the Notes block.
+    assert md.index("## Failure hints") < md.index("## Notes")
+
+
+def test_matrix_json_records_failure_hints_per_cell(tmp_path, patched_env, monkeypatch):
+    """matrix.json::cells[*].failure_hints exposes the same data structurally."""
+    hint = "shampoo import failed"
+    monkeypatch.setattr(
+        runner,
+        "run_trials",
+        MagicMock(return_value=[_fake_trial_with_hint(hint), _fake_trial_with_hint(hint)]),
+    )
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    for cell in doc["cells"]:
+        # asdict turns tuples into lists; JSON consumers see [hint, count] pairs.
+        assert cell["failure_hints"] == [[hint, 2]]
+
+
+def test_matrix_json_failure_hints_empty_when_none_emitted(
+    tmp_path, patched_env, patched_run_trials
+):
+    """No hints -> field is present-and-empty, not omitted, so consumers
+    can rely on `cells[*].failure_hints` always being a list."""
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    for cell in doc["cells"]:
+        assert cell["failure_hints"] == []
+
+
 def test_isolated_env_check_honors_sidecar_files(
     tmp_path, patched_env, patched_run_trials, monkeypatch
 ):
