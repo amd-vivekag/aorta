@@ -57,6 +57,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -989,14 +990,21 @@ class EnvSnapshot:
         if not tree:
             return "(not present)"
         cells: list[str] = []
+        # Disambiguate roots so two trees sharing the same arch (e.g.
+        # an installed aiter_meta dist + a vendored source-tree fallback
+        # that both ship gfx942) don't render as duplicate `gfx942=...`
+        # cells. Prefix is the last 2 path components (`aiter_meta/hsa`,
+        # `aiter/hsa`) -- enough to tell them apart in the brief; the
+        # full root path lives in the JSON for callers who need it.
         for root in sorted(tree):
+            root_label = "/".join(Path(root).parts[-2:])
             arches = tree[root] or {}
             for arch in sorted(arches):
                 stats = arches[arch] or {}
                 co = stats.get("co_count")
                 sha = stats.get("combined_sha256")
                 short = sha[:8] if isinstance(sha, str) else "?"
-                cells.append(f"{arch}={co}.co/{short}")
+                cells.append(f"{root_label}:{arch}={co}.co/{short}")
         return " ".join(cells) if cells else "(empty trees)"
 
     def _summary_pytorch_sdpa_line(self) -> str:
@@ -3471,6 +3479,39 @@ _NINJA_DEFINE_TOKEN_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?")
 _NINJA_OFFLOAD_ARCH_RE = re.compile(r"--offload-arch=(\S+)")
 
 
+def _iter_ninja_logical_lines(fh) -> Iterator[str]:
+    """Stream Ninja logical lines, folding ``$``-continued physical lines.
+
+    Ninja allows long variable assignments to wrap by ending a line with
+    ``$`` (the next line continues the value). cmake's ninja generator
+    routinely emits multi-hundred-character DEFINES / FLAGS values that
+    wrap several times. Without folding, the second-and-later physical
+    lines look like indented continuations and the parser drops every
+    define / arch / flag past the first line -- including any
+    ``-D<target>_EXPORTS`` marker landing on a continuation, which
+    silently misclassifies the whole build statement.
+
+    Strips the trailing ``$`` and concatenates with a single space (the
+    ninja convention -- the unfolded value is whitespace-tokenised
+    anyway). Newline at end-of-line is dropped.
+    """
+    pending: list[str] = []
+    for raw in fh:
+        stripped = raw.rstrip("\n")
+        if stripped.endswith("$"):
+            pending.append(stripped[:-1])
+            continue
+        if pending:
+            pending.append(stripped)
+            yield " ".join(pending)
+            pending = []
+        else:
+            yield stripped
+    if pending:
+        # Trailing $ at EOF -- emit what we have.
+        yield " ".join(pending)
+
+
 def _capture_pytorch_ninja_hipcc(
     install_kind: str,
     source_path: Path | None,
@@ -3504,8 +3545,18 @@ def _capture_pytorch_ninja_hipcc(
       observed in the target's FLAGS line.
 
     Returns ``targets: None`` for wheel installs (build.ninja absent).
+    When build.ninja exists but no targets-of-interest matched (parser
+    miss, file scanned successfully but the build configured a
+    different set of shared-lib targets), returns ``_source_file``
+    populated and ``targets: {}`` -- distinguishable from the
+    wheel/no-file case so consumers know we DID scan.
+
     Streams the file line-by-line: build.ninja can be 350+ MB on a
-    fully-built tree so we must not slurp.
+    fully-built tree so we must not slurp. Long Ninja variable
+    assignments use ``$\\n`` continuation; the inner generator folds
+    those before the regex pass so a DEFINES that wraps onto follow-on
+    lines isn't silently truncated (the per-target ``_EXPORTS`` marker
+    or any -D define can land anywhere in the wrapped value).
     """
     result: dict[str, Any] = {"_source_file": None, "targets": None}
     if install_kind not in ("source", "editable") or source_path is None:
@@ -3520,8 +3571,7 @@ def _capture_pytorch_ninja_hipcc(
     pending_lines_left = 0
     try:
         with ninja_path.open("r", encoding="utf-8", errors="replace") as fh:
-            for raw_line in fh:
-                line = raw_line.rstrip("\n")
+            for line in _iter_ninja_logical_lines(fh):
                 if line.startswith(_NINJA_DEFINES_PREFIX):
                     defines_str = line[len(_NINJA_DEFINES_PREFIX):]
                     tgt_match = _NINJA_TARGET_EXPORTS_RE.search(defines_str)
@@ -3529,10 +3579,11 @@ def _capture_pytorch_ninja_hipcc(
                     if tgt and tgt in _NINJA_HIPCC_TARGETS_OF_INTEREST:
                         target_defines.setdefault(tgt, set()).add(defines_str)
                         pending_target = tgt
-                        # cmake emits FLAGS within ~5 lines of DEFINES;
-                        # 10-line window leaves slack for unrelated
-                        # variables (DEPFILE, RSP_FILE, ...) without
-                        # wandering into the next build statement.
+                        # cmake emits FLAGS within ~5 logical lines of
+                        # DEFINES; 10-line window leaves slack for
+                        # unrelated variables (DEPFILE, RSP_FILE, ...)
+                        # without wandering into the next build
+                        # statement.
                         pending_lines_left = 10
                     else:
                         pending_target = None
@@ -3554,7 +3605,12 @@ def _capture_pytorch_ninja_hipcc(
         )
         return result
 
+    # File was readable. Even if no targets-of-interest matched, set
+    # _source_file so consumers can tell "scanned, no matches" apart
+    # from "wheel install / file absent".
+    result["_source_file"] = str(ninja_path)
     if not target_defines:
+        result["targets"] = {}
         return result
 
     targets_out: dict[str, Any] = {}

@@ -4827,6 +4827,63 @@ class TestCapturePytorchNinjaHipcc:
         assert t["codegen_flags_present"]["-ffast-math"] is False
         assert t["offload_archs"] == ["gfx942", "gfx950"]
 
+    def test_scanned_no_matches_returns_source_file_and_empty_targets(
+        self, tmp_path
+    ):
+        """Distinguishable from `targets: None` (wheel / no file): file
+        existed, parser ran, just nothing matched _NINJA_HIPCC_TARGETS_OF_INTEREST.
+        """
+        body = (
+            "build foo.o: HIP_COMPILER__unknown src/foo.hip\n"
+            "  DEFINES = -Dunknown_target_EXPORTS\n"
+            "  FLAGS = -O3\n"
+        )
+        self._make_ninja(tmp_path, body)
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert block["targets"] == {}
+        assert block["_source_file"] is not None
+        assert block["_source_file"].endswith("build.ninja")
+
+    def test_dollar_continuation_folded_for_target_marker(self, tmp_path):
+        """Ninja `$\\n` line continuation: the `-D<target>_EXPORTS`
+        token can land on a continuation line. Without folding the
+        whole DEFINES block would be misclassified.
+        """
+        body = (
+            "build x.o: rule\n"
+            "  DEFINES = -DA -DB $\n"
+            "    -Dtorch_hip_EXPORTS -DUSE_ROCM_CK_SDPA $\n"
+            "    -DC\n"
+            "  FLAGS = -O3 --offload-arch=gfx942\n"
+        )
+        self._make_ninja(tmp_path, body)
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert "torch_hip" in block["targets"]
+        defines = block["targets"]["torch_hip"]["defines"]
+        # Tokens from every physical line must be captured.
+        assert "A" in defines
+        assert "USE_ROCM_CK_SDPA" in defines
+        assert "C" in defines
+
+    def test_dollar_continuation_in_flags_captures_offload_arch(
+        self, tmp_path
+    ):
+        """The same continuation handling must apply to FLAGS so an
+        --offload-arch=... token on a continuation line is captured.
+        """
+        body = (
+            "build x.o: rule\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS\n"
+            "  FLAGS = -O3 $\n"
+            "    --offload-arch=gfx942 $\n"
+            "    --offload-arch=gfx950\n"
+        )
+        self._make_ninja(tmp_path, body)
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert block["targets"]["torch_hip"]["offload_archs"] == [
+            "gfx942", "gfx950",
+        ]
+
     def test_streaming_does_not_slurp_giant_files(self, tmp_path, monkeypatch):
         """Sanity: parser uses iterator-style read, not .read() / .readlines().
 
@@ -5035,6 +5092,148 @@ class TestPytorchSdpaSnapshotRoundTrip:
                 name: None for name in env_mod._PYTORCH_SDPA_GETTERS
             }
         }
+
+
+class TestSummaryNewBriefLines:
+    """Issue #176 brief one-liners: cmake cache, ninja hipcc,
+    aiter HSA tree, SDPA. Each tests both the available and
+    unavailable rendering so wording / shape regressions surface.
+    """
+
+    @staticmethod
+    def _snap_with_pytorch_build(pytorch_build_overrides):
+        base = _example_snapshot()
+        return _example_snapshot(
+            pytorch_build={**base.pytorch_build, **pytorch_build_overrides}
+        )
+
+    def _line(self, snap, prefix):
+        for ln in snap.summary().splitlines():
+            if ln.lstrip().startswith(prefix):
+                return ln
+        raise AssertionError(f"no `{prefix}` line in summary")
+
+    # ---- cmake cache ----
+    def test_cmake_cache_unavailable_renders_explicit_message(self):
+        snap = self._snap_with_pytorch_build({
+            "cmake_cache": {"_source_file": None, "entries": None},
+        })
+        line = self._line(snap, "cmake cache:")
+        assert "unavailable" in line
+
+    def test_cmake_cache_available_renders_count_and_path(self):
+        snap = self._snap_with_pytorch_build({
+            "cmake_cache": {
+                "_source_file": "/work/build/CMakeCache.txt",
+                "entries": {
+                    "USE_ROCM": {"type": "BOOL", "value": "ON"},
+                    "BUILD_TYPE": {"type": "STRING", "value": "Release"},
+                },
+            },
+        })
+        line = self._line(snap, "cmake cache:")
+        assert "2 allowlisted entries" in line
+        assert "/work/build/CMakeCache.txt" in line
+
+    # ---- ninja hipcc ----
+    def test_ninja_hipcc_unavailable_renders_explicit_message(self):
+        snap = self._snap_with_pytorch_build({
+            "ninja_hipcc": {"_source_file": None, "targets": None},
+        })
+        line = self._line(snap, "ninja hipcc:")
+        assert "unavailable" in line
+
+    def test_ninja_hipcc_available_renders_per_target_define_count(self):
+        snap = self._snap_with_pytorch_build({
+            "ninja_hipcc": {
+                "_source_file": "/work/build/build.ninja",
+                "targets": {
+                    "torch_hip": {
+                        "defines": {"A": None, "B": "1", "C": None},
+                        "use_defines_present": {},
+                        "codegen_flags_present": {},
+                        "offload_archs": ["gfx942"],
+                    },
+                },
+            },
+        })
+        line = self._line(snap, "ninja hipcc:")
+        assert "torch_hip=3D" in line
+        assert "archs=[gfx942]" in line
+
+    def test_ninja_hipcc_scanned_no_matches_renders_no_targets(self):
+        snap = self._snap_with_pytorch_build({
+            "ninja_hipcc": {
+                "_source_file": "/work/build/build.ninja",
+                "targets": {},
+            },
+        })
+        line = self._line(snap, "ninja hipcc:")
+        assert "no targets of interest matched" in line
+
+    # ---- aiter HSA tree ----
+    def test_aiter_hsa_tree_absent_renders_not_present(self):
+        snap = _example_snapshot(
+            aiter={**_example_snapshot().aiter, "hsa_tree": None}
+        )
+        line = self._line(snap, "aiter hsa:")
+        assert line.endswith("(not present)")
+
+    def test_aiter_hsa_tree_brief_disambiguates_roots(self):
+        """Two roots both shipping gfx942 must NOT collapse to two
+        unlabelled `gfx942=...` cells.
+        """
+        snap = _example_snapshot(
+            aiter={
+                **_example_snapshot().aiter,
+                "hsa_tree": {
+                    "/usr/lib/python/site-packages/aiter_meta/hsa": {
+                        "gfx942": {
+                            "file_count": 100, "co_count": 90,
+                            "combined_sha256": "aaaaaaaa" + "0" * 56,
+                        },
+                    },
+                    "/work/pytorch/third_party/aiter/hsa": {
+                        "gfx942": {
+                            "file_count": 99, "co_count": 89,
+                            "combined_sha256": "bbbbbbbb" + "0" * 56,
+                        },
+                    },
+                },
+            },
+        )
+        line = self._line(snap, "aiter hsa:")
+        # Each root identified by its last 2 path components -> distinct.
+        assert "aiter_meta/hsa:gfx942=" in line
+        assert "aiter/hsa:gfx942=" in line
+        # Distinct hashes also surface so a diff is visible.
+        assert "aaaaaaaa" in line
+        assert "bbbbbbbb" in line
+
+    # ---- SDPA ----
+    def test_sdpa_unavailable_renders_explicit_message(self):
+        snap = _example_snapshot(
+            pytorch_sdpa={"backends_enabled": {
+                name: None for name in env_mod._PYTORCH_SDPA_GETTERS
+            }}
+        )
+        line = self._line(snap, "sdpa:")
+        assert "unavailable" in line
+
+    def test_sdpa_mixed_state_renders_compact_form(self):
+        snap = _example_snapshot(
+            pytorch_sdpa={"backends_enabled": {
+                "flash_sdp_enabled": True,
+                "mem_efficient_sdp_enabled": False,
+                "math_sdp_enabled": True,
+                "cudnn_sdp_enabled": None,
+            }}
+        )
+        line = self._line(snap, "sdpa:")
+        assert "flash=on" in line
+        assert "mem_eff=off" in line
+        assert "math=on" in line
+        assert "cudnn=?" in line
 
 
 class TestSafeImportTorch:
