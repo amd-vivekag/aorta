@@ -384,25 +384,32 @@ def _format_cell_summary(trials: list[TrialResult], passed_count: int) -> tuple[
     # to avoid coupling the runner's log line to the matrix module's
     # internal helper signature.
     #
-    # "New contract in use" is gated on ANY of the three new fields being
-    # present on ANY trial -- not just main_work_started. matrix.md shows
-    # the Iters column whenever configured_iterations is populated; the
-    # terminal log must follow the same predicate so the two renderers
-    # agree on which cells get the new bracket grammar (round-3 Copilot
-    # catch on #175).
+    # Switch to the new bracket grammar whenever the cell carries any
+    # signal the new grammar surfaces:
+    #   (a) any trial explicitly populates one of the new contract
+    #       fields (so matrix.md will show the Iters column for this
+    #       cell -- terminal log must agree), OR
+    #   (b) platform inference classifies any trial as non-UNKNOWN
+    #       (e.g. a legacy workload that crashed in setup -> inferred
+    #       did_not_run -> the matrix.md row will carry the
+    #       did_not_run tag).
+    # Otherwise stay in legacy ``[N/M trials passed]`` so plain-vanilla
+    # success runs keep their familiar terminal output exactly.
     outcomes: list[str] = []
-    populated = False
     for trial in trials:
         result = getattr(trial, "result", {})
-        if isinstance(result, dict) and (
-            result.get("main_work_started") is not None
-            or result.get("configured_iterations") is not None
-            or result.get("executed_iterations") is not None
-        ):
-            populated = True
-        outcomes.append(_outcome_for_log(result if isinstance(result, dict) else {}))
+        outcomes.append(_outcome_for_log(trial, result if isinstance(result, dict) else {}))
 
-    if not populated:
+    explicit_contract = any(
+        isinstance(getattr(t, "result", None), dict)
+        and (
+            t.result.get("main_work_started") is not None
+            or t.result.get("configured_iterations") is not None
+            or t.result.get("executed_iterations") is not None
+        )
+        for t in trials
+    )
+    if not explicit_contract and all(o == OUTCOME_UNKNOWN for o in outcomes):
         return f"[{passed_count}/{total} trials passed]", ""
 
     counter: dict[str, int] = {}
@@ -420,27 +427,57 @@ def _format_cell_summary(trials: list[TrialResult], passed_count: int) -> tuple[
     return bracket, suffix
 
 
-def _outcome_for_log(result: dict) -> str:
+def _outcome_for_log(trial: Any, result: dict) -> str:
     """Trial-outcome classifier mirroring aorta.triage.matrix._trial_outcome.
 
-    Duplicated rather than imported because the matrix helper takes a
-    trial object and reads ``trial.result``; here we already have the
-    dict and want a stable, testable function signature.
+    Two signal sources, in priority order:
+    1. Explicit contract via ``main_work_started`` /
+       ``executed_iterations`` / ``configured_iterations``.
+    2. Platform inference for legacy workloads (``main_work_started``
+       is None) -- non-ok exit_status with no per-step times and no
+       elapsed time => ``did_not_run``. Mirrors
+       ``aorta.triage.matrix._looks_like_did_not_run``; the two helpers
+       are kept in lockstep so the terminal log and matrix.json agree
+       on which trials get the inferred tag.
     """
     started = result.get("main_work_started")
     if started is False:
         return OUTCOME_DID_NOT_RUN
-    if started is not True:
+    if started is True:
+        executed = result.get("executed_iterations")
+        configured = result.get("configured_iterations")
+        if not isinstance(executed, int) or not isinstance(configured, int):
+            return OUTCOME_UNKNOWN
+        if executed >= configured:
+            return OUTCOME_COMPLETED
+        if result.get("passed") is False:
+            return OUTCOME_CRASHED_AFTER_ITERATIONS
         return OUTCOME_UNKNOWN
-    executed = result.get("executed_iterations")
-    configured = result.get("configured_iterations")
-    if not isinstance(executed, int) or not isinstance(configured, int):
-        return OUTCOME_UNKNOWN
-    if executed >= configured:
-        return OUTCOME_COMPLETED
-    if result.get("passed") is False:
-        return OUTCOME_CRASHED_AFTER_ITERATIONS
+    # main_work_started is None -- platform inference branch.
+    if _looks_like_did_not_run_for_log(trial, result):
+        return OUTCOME_DID_NOT_RUN
     return OUTCOME_UNKNOWN
+
+
+def _looks_like_did_not_run_for_log(trial: Any, result: dict) -> bool:
+    """Mirror of ``aorta.triage.matrix._looks_like_did_not_run`` for the
+    runner's per-cell log line. Three signals must agree: non-ok
+    exit_status, no measured per-step times, and zero elapsed_sec.
+    Kept here (rather than imported) so the runner doesn't depend on a
+    matrix-private helper.
+    """
+    exit_status = getattr(trial, "exit_status", None)
+    if exit_status is None or exit_status == "ok":
+        return False
+    step_times = result.get("step_times_ms")
+    if isinstance(step_times, list) and any(
+        isinstance(t, (int, float)) and t > 0 for t in step_times
+    ):
+        return False
+    elapsed = result.get("elapsed_sec")
+    if isinstance(elapsed, (int, float)) and elapsed > 0:
+        return False
+    return True
 
 
 def _iters_for_log(trials: list[TrialResult]) -> str:

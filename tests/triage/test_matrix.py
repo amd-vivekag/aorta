@@ -422,6 +422,81 @@ def test_failure_hints_for_error_cell_reflects_supplied_trials():
 # populate the new fields must continue to behave exactly as today.
 
 
+def test_platform_inference_did_not_run_for_legacy_setup_crash():
+    """Legacy workload that died in setup -- main_work_started absent,
+    but the observable signature (exit_status="workload_failed",
+    step_times_ms=[], elapsed_sec=0.0) is unmistakably "didn't run".
+
+    The platform must classify the trial as did_not_run from these
+    signals alone, without requiring the workload to be updated to the
+    new contract. This is the recom_repro nan-repro demo case from the
+    issue: trials died on ImportError at 3.5s, produced no per-step
+    times, no elapsed time, but did report passed=False.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            exit_status="workload_failed",
+            wall_clock_sec=3.5,
+            # main_work_started intentionally absent -- legacy workload
+        )
+        for _ in range(2)
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_DID_NOT_RUN: 2}
+    # The wall_clock_total fallback is suppressed for inferred
+    # did_not_run trials, same as for explicit main_work_started=False.
+    assert stats.mean_step_time_ms == 0.0
+    assert stats.step_time_source == "missing"
+
+
+def test_platform_inference_does_not_fire_when_step_times_present():
+    """Even with non-ok exit_status, a trial that produced ANY per-step
+    timing data is NOT inferred as did_not_run. That signature means the
+    workload reached its measurement loop and crashed mid-run -- the
+    wall_clock fallback path / explicit crashed_after_iterations
+    classification handles it correctly. Pin the predicate's strictness.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            exit_status="workload_failed",
+            step_times_ms=[100.0, 110.0, 95.0],
+            wall_clock_sec=3.5,
+        )
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 1}
+    assert stats.mean_step_time_ms > 0  # per-step timing preserved
+
+
+def test_platform_inference_does_not_fire_on_passing_trials():
+    """A trial with exit_status="ok" never triggers inference, even if
+    it has no step_times / elapsed (e.g. a workload that doesn't track
+    timing). Inference is strictly for failure paths."""
+    trials = [_trial(passed=True, exit_status="ok", wall_clock_sec=1.0)]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 1}
+
+
+def test_platform_inference_does_not_fire_when_elapsed_sec_present():
+    """A workload that measured *something* (elapsed_sec > 0) is not
+    inferred as did_not_run, even if it failed and produced no per-step
+    times. That signature is a workload that finished some measurable
+    work then crashed -- classification falls to the existing wall-clock
+    fallback path."""
+    trials = [
+        _trial(
+            passed=False,
+            exit_status="workload_failed",
+            elapsed_sec=2.0,
+            wall_clock_sec=2.5,
+        )
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 1}
+
+
 def test_outcome_counts_did_not_run_when_main_work_did_not_start():
     trials = [
         _trial(
@@ -482,20 +557,21 @@ def test_outcome_counts_mixed_outcomes_in_one_cell():
     assert stats.outcome_counts == {OUTCOME_COMPLETED: 1, OUTCOME_DID_NOT_RUN: 1}
 
 
-def test_outcome_counts_empty_when_no_trial_speaks_new_contract():
-    """Workload that hasn't been updated to the new contract -> empty
-    histogram, NOT ``{"unknown": N}``.
+def test_outcome_counts_unknown_for_legacy_passing_trials():
+    """Legacy passing trials -> ``{"unknown": N}`` (always populated for
+    non-error cells now that platform inference is live).
 
-    The empty-vs-unknown distinction is load-bearing: ``output.py``
-    gates the ``did_not_run`` legend entry on ``any(c.outcome_counts ...)``,
-    and ``is_did_not_run_cell`` documents itself as "False for legacy
-    workloads with empty counts". Filling in ``{"unknown": N}`` for
-    every legacy run would leak the new-contract legend into matrix.md
-    for every workload that doesn't yet speak it. Pin the contract.
+    The matrix.md ``did_not_run`` legend gate moved to "actual rendered
+    confound tag" rather than "outcome_counts presence", so an
+    all-unknown legacy cell can no longer leak the legend even though
+    its outcome_counts is non-empty. ``is_did_not_run_cell`` likewise
+    requires ``set(counts) == {DID_NOT_RUN}``, so an all-unknown cell
+    is never false-flagged.
     """
-    trials = [_trial(passed=True), _trial(passed=False)]
+    trials = [_trial(passed=True), _trial(passed=True)]
     stats = _default_call(trials=trials)
-    assert stats.outcome_counts == {}
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 2}
+    assert sum(stats.outcome_counts.values()) == stats.trials
 
 
 def test_outcome_counts_built_when_only_iter_fields_populated():
