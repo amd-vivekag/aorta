@@ -62,8 +62,35 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "1.1"
-# 1.0 -> 1.1 (this commit):
+SCHEMA_VERSION = "1.2"
+# 1.1 -> 1.2 (this commit):
+#   - Added `pytorch_build.flags` (build_settings, cxx_defines,
+#     cxx_flags_raw, cuda_flags_raw, gpu_arch_list) -- structured raw
+#     introspection from `torch.__config__.show()`.
+#   - Added `pytorch_build.build_flags` (issue #170) -- stable 17-key
+#     parsed bool/str/None subset projected from the structured flags
+#     block; CAFFE2_USE_MIOPEN is treated as an alias for USE_MIOPEN.
+#   - Added `pytorch_build.binary_introspection`
+#     (libtorch_hip_symbol_counts, torch_lib_bundled,
+#     cxx_flags_use_defines) -- pure-fact symbol counts and bundled-lib
+#     presence from libtorch_hip.so via `nm | c++filt`.
+#   - Extended `aiter` block: added `package_dist_name` (PyPI dist
+#     identity, `amd_aiter` vs `aiter`) and `commit` (parsed from the
+#     setuptools_scm `+g<sha>` local-version segment, matches the image
+#     tag's `aiter-<sha>` label).
+#   All additions are top-level-key-additive (every new field lives
+#   under existing top-level dicts -- `pytorch_build`, `aiter` --
+#   not as new top-level dataclass fields), so 1.1 readers running
+#   `EnvSnapshot.from_dict(...)` against a 1.2 snapshot do NOT raise
+#   and existing top-level access (`.pytorch_build`, `.aiter`) still
+#   works. The new nested keys (`pytorch_build.flags`,
+#   `pytorch_build.build_flags`, `pytorch_build.binary_introspection`,
+#   `aiter.package_dist_name`, `aiter.commit`) are present on 1.2
+#   snapshots and absent on 1.1 snapshots -- consumers indexing them
+#   on a 1.1 snapshot get a KeyError, NOT None. Use `.get(key)` or
+#   guard on `schema_version` if you read these.
+#
+# 1.0 -> 1.1:
 #   - Renamed hipblaslt/rocblas/miopen.commit -> .rocm_release_tweak
 #     (the field's value is the ROCm-release-shared identifier, not a
 #     per-library upstream commit -- the old name misled consumers).
@@ -291,6 +318,119 @@ CANONICAL_PYTORCH_SUBMODULES: tuple[str, ...] = (
     "fbgemm",
 )
 
+# Stable subset of compile-time PyTorch flags surfaced as parsed
+# bool/str/None values under ``pytorch_build.build_flags``. Pre-declared
+# so the schema is fixed across PyTorch versions: a flag absent from
+# ``torch.__config__.show()`` renders as ``None`` (distinguishable from
+# ``False``), and the key set never changes from the operator's POV.
+# Order is the issue's priority order -- stable for diff-readability.
+PYTORCH_BUILD_FLAG_NAMES: tuple[str, ...] = (
+    "USE_FLASH_ATTENTION",
+    "USE_ROCM_CK_SDPA",
+    "USE_AOTRITON",
+    "USE_MEM_EFF_ATTENTION",
+    "DISABLE_AOTRITON",
+    "USE_ROCM",
+    "USE_CUDA",
+    "USE_CUDNN",
+    "USE_MIOPEN",
+    "USE_FBGEMM",
+    "USE_FBGEMM_GENAI",
+    "USE_NCCL",
+    "USE_MKL",
+    "USE_MKLDNN",
+    "USE_OPENMP",
+    "USE_KINETO",
+    "BUILD_TYPE",
+)
+
+_PYTORCH_BUILD_FLAG_TRUE = frozenset({"ON", "TRUE", "1"})
+_PYTORCH_BUILD_FLAG_FALSE = frozenset({"OFF", "FALSE", "0"})
+
+# Aliases under which a PyTorch build may report a flag in
+# `torch.__config__.show()`. Some flags have a Caffe2-era spelling that
+# upstream still emits on certain ROCm builds (CAFFE2_USE_MIOPEN being
+# the canonical example -- per issue #170). Lookup tries the aliases in
+# order; first hit wins. Canonical name (the key) is what surfaces in
+# `pytorch_build.build_flags`.
+_PYTORCH_BUILD_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
+    "USE_MIOPEN": ("USE_MIOPEN", "CAFFE2_USE_MIOPEN"),
+}
+
+def _coerce_pytorch_build_flag_value(raw: str) -> bool | str:
+    """ON/OFF/TRUE/FALSE/1/0 (any case) -> bool; anything else stays str.
+
+    Preserves original casing for non-boolean values so ``BUILD_TYPE``
+    surfaces as ``"Release"``, not ``"RELEASE"``.
+    """
+    upper = raw.upper().strip().rstrip(",")
+    if upper in _PYTORCH_BUILD_FLAG_TRUE:
+        return True
+    if upper in _PYTORCH_BUILD_FLAG_FALSE:
+        return False
+    return raw
+
+
+def _project_pytorch_build_flags(
+    flags: dict[str, Any] | None,
+) -> dict[str, bool | str | None]:
+    """Project the stable :data:`PYTORCH_BUILD_FLAG_NAMES` subset out of
+    the structured ``pytorch_build.flags`` block.
+
+    Returns a dict with every name in ``PYTORCH_BUILD_FLAG_NAMES``
+    present. Lookup is two-pass to honour "build_settings beats
+    CXX_FLAGS define injection" precedence even when aliases are in
+    play:
+
+    1. **Settings pass** -- check every alias of the canonical name in
+       ``Build settings:`` KEY=VALUE pairs first. A hit anywhere in the
+       alias tuple wins: this is cmake-canonical state (USE_ROCM=ON,
+       USE_CUDA=OFF, BUILD_TYPE=Release).
+    2. **Defines pass** -- only if the settings pass found nothing,
+       check every alias in ``CXX_FLAGS`` ``-D<NAME>[=<value>]``
+       defines. A bare ``-D<NAME>`` (no value) renders as ``True``
+       (presence-as-define is the cmake convention for "feature
+       compiled in"); ``-D<NAME>=<value>`` is coerced.
+    3. **Otherwise None** -- distinguishable from ``False`` so callers
+       can tell "the build did not set this anywhere we could see"
+       apart from "the build set it to OFF". This matches the issue
+       #170 mock JSON (e.g. ``DISABLE_AOTRITON: null`` on a build with
+       ``USE_AOTRITON: true``). Operators wanting cmake-style "absent
+       define = OFF" semantics for a specific flag should read
+       ``pytorch_build.flags.cxx_defines`` directly -- the dict's
+       presence vs absence is the definitive signal there.
+
+    No partial reasons are added here: if torch is importable but a
+    particular flag is missing from ``__config__.show()``, that's the
+    upstream build's choice, not a probe failure.
+    """
+    settings = (flags or {}).get("build_settings") or {}
+    defines = (flags or {}).get("cxx_defines") or {}
+    out: dict[str, bool | str | None] = {}
+    for name in PYTORCH_BUILD_FLAG_NAMES:
+        aliases = _PYTORCH_BUILD_FLAG_ALIASES.get(name, (name,))
+        # Pass 1: settings (cmake-canonical) wins for any alias.
+        value: bool | str | None = None
+        hit = False
+        for alias in aliases:
+            if alias in settings:
+                value = _coerce_pytorch_build_flag_value(settings[alias])
+                hit = True
+                break
+        # Pass 2: only fall to defines when no alias hit settings.
+        if not hit:
+            for alias in aliases:
+                if alias in defines:
+                    raw = defines[alias]
+                    value = (
+                        True
+                        if raw is None
+                        else _coerce_pytorch_build_flag_value(raw)
+                    )
+                    break
+        out[name] = value
+    return out
+
 # GitHub URL template printed in `partial_reasons` when the PyTorch
 # source tree is not on disk. The operator reading the partial entry
 # can substitute the captured `git_commit` and resolve the bound
@@ -514,10 +654,12 @@ class EnvSnapshot:
                 f"separate from torch's vendored copy]",
                 # AITER (AMD's CK-based inference kernel lib) is
                 # optional -- some inference stacks pull it in, training
-                # / stock inference don't. Annotate to avoid alarming
+                # / stock inference don't. PyPI dist name is `amd_aiter`;
+                # the `+g<sha>` local-version segment of setuptools_scm
+                # versions encodes the build commit (matches the image
+                # tag's `aiter-<sha>` label). Annotate to avoid alarming
                 # readers who see "not installed".
-                f"  aiter:     {pkg_state(aiter.get('package_version'))} "
-                f"[aiter pip pkg; optional ROCm inference lib]",
+                f"  aiter:     {self._summary_aiter_cell(aiter)}",
                 # AOTriton: default ROCm Flash Attention backend.
                 # Bundled in the wheel; system override possible via
                 # AOTRITON_INSTALLED_PREFIX (rare).
@@ -528,8 +670,26 @@ class EnvSnapshot:
                 f"  rdhc:      {sysh}",
                 f"  python:    {self.python_version} | pytorch: {self.pytorch_version}",
                 f"  torch build: {self._summary_pytorch_build_line()}",
+                f"  torch flags: {self._summary_pytorch_build_flags_line()}",
+                f"  torch syms:  {self._summary_pytorch_binary_introspection_line()}",
+                f"  flags:       {self._summary_stable_build_flags_line()}",
             )
         )
+
+    @staticmethod
+    def _summary_aiter_cell(aiter: dict) -> str:
+        """Render the aiter brief cell with dist + commit when available."""
+        version = aiter.get("package_version")
+        dist = aiter.get("package_dist_name")
+        commit = aiter.get("commit")
+        if not version:
+            return "(not installed) [aiter pip pkg; optional ROCm inference lib]"
+        bits = [version]
+        if commit:
+            bits.append(f"commit={commit[:8]}")
+        if dist:
+            bits.append(f"pip dist={dist}")
+        return " ".join(bits)
 
     def _summary_pytorch_build_line(self) -> str:
         """Single-line summary of the structured pytorch_build block."""
@@ -555,6 +715,186 @@ class EnvSnapshot:
             f"[third_party SHAs: set AORTA_PYTORCH_SRC=<src> or look up "
             f"github.com/pytorch/pytorch/tree/{commit_short}/third_party/<name>]"
         )
+
+    # Subset of build flags worth surfacing in the brief. Tuned to the
+    # SDPA / Flash-Attention / GEMM-backend questions operators actually
+    # ask of `aorta env probe`. The full define dict is in env.json
+    # under pytorch_build.flags.cxx_defines.
+    _SUMMARY_FLAG_NAMES = (
+        "USE_ROCM",
+        "USE_CUDA",
+        "USE_NCCL",
+        "USE_MKL",
+        "USE_MKLDNN",
+        "USE_FBGEMM",
+        "USE_FBGEMM_GENAI",
+        "USE_FLASH_ATTENTION",
+        "USE_MEM_EFF_ATTENTION",
+        "USE_ROCM_CK_SDPA",
+        "USE_ROCM_CK_GEMM",
+        "DISABLE_AOTRITON",
+        "FLASH_NAMESPACE",
+    )
+
+    def _summary_pytorch_build_flags_line(self) -> str:
+        """Single-line summary of pytorch_build.flags (gpu archs + key defines).
+
+        Two segments: the wheel's compiled gpu_arch list (from
+        ``torch.cuda.get_arch_list()``), then a compact yes/no/value
+        rendering of well-known build flags. Defines that came from
+        ``Build settings`` (USE_ROCM, USE_CUDA, USE_NCCL, USE_MKLDNN)
+        report ``ON``/``OFF`` directly; CXX_FLAGS-only defines
+        (USE_FBGEMM, USE_FLASH_ATTENTION, USE_ROCM_CK_SDPA, ...) report
+        the captured value or ``yes`` for value-less defines. Absent
+        defines render as ``no`` only when ``cxx_defines`` was actually
+        parsed (a real, possibly empty dict from a build whose
+        ``CXX_FLAGS`` we could read); when ``cxx_defines is None``
+        (CXX_FLAGS line missing from ``__config__.show()``) and the
+        flag isn't in ``build_settings`` either, we render ``?`` -- the
+        brief mustn't conflate "we couldn't read the define source"
+        with "the define is absent so the feature is off".
+        """
+        pb = self.pytorch_build or {}
+        flags = pb.get("flags") or {}
+        if not flags or all(flags.get(k) is None for k in flags):
+            return "(unavailable -- torch import failed or no __config__)"
+
+        # Distinguish CPU-only-wheel ([] from a successful
+        # torch.cuda.get_arch_list() call) from probe failure (None).
+        # Truthiness would conflate the two as `?`.
+        archs = flags.get("gpu_arch_list")
+        if archs is None:
+            arch_part = "?"
+        elif not archs:
+            arch_part = "(none)"
+        else:
+            arch_part = ",".join(archs)
+
+        # gpu_arch_list comes from torch.cuda.get_arch_list() and is
+        # independent of __config__.show(); settings/defines come from
+        # __config__.show() and can each be None even when the other
+        # populates (CPU-only wheel, missing CXX_FLAGS line, etc.).
+        # Two unknown signals to track:
+        # * `flags_unavailable`: BOTH config sources missing -> render
+        #   every cell `?` (no opinion at all).
+        # * `defines_unavailable`: CXX_FLAGS source missing -> a flag
+        #   that's also not in build_settings is unknown, NOT off.
+        settings_raw = flags.get("build_settings")
+        defines_raw = flags.get("cxx_defines")
+        flags_unavailable = settings_raw is None and defines_raw is None
+        defines_unavailable = defines_raw is None
+        settings = settings_raw or {}
+        defines = defines_raw or {}
+
+        cells: list[str] = []
+        for name in self._SUMMARY_FLAG_NAMES:
+            if flags_unavailable:
+                cells.append(f"{name}=?")
+                continue
+            if name in settings:
+                cells.append(f"{name}={settings[name]}")
+                continue
+            if name in defines:
+                value = defines[name]
+                cells.append(f"{name}={value}" if value is not None else f"{name}=yes")
+                continue
+            cells.append(f"{name}=?" if defines_unavailable else f"{name}=no")
+        return f"gpu_archs=[{arch_part}]  " + " ".join(cells)
+
+    def _summary_pytorch_binary_introspection_line(self) -> str:
+        """Fact-only single-line summary of libtorch_hip.so introspection.
+
+        Three segments, each rendered with the raw observed values
+        (counts, presence booleans). No verdicts -- the operator maps
+        symbol counts to cmake options. Marker counts of ``?`` mean the
+        symbol dump was unavailable (binutils stripped, lib missing,
+        torch broken); ``0`` means we scanned and found none.
+        """
+        pb = self.pytorch_build or {}
+        bi = pb.get("binary_introspection") or {}
+        sym_counts = bi.get("libtorch_hip_symbol_counts") or {}
+        bundled = bi.get("torch_lib_bundled")
+        cxx_defs = bi.get("cxx_flags_use_defines")
+
+        def fmt_count(v: int | None) -> str:
+            return "?" if v is None else str(v)
+
+        # Markers are kept verbatim (including the trailing `::`
+        # namespace suffix) so the brief matches the JSON keys and stays
+        # readable as C++ -- `pytorch_flash::=142` is unambiguous;
+        # `pytorch_flash=142` would suggest a function/var name.
+        sym_part = " ".join(
+            f"{marker}={fmt_count(sym_counts.get(marker))}"
+            for marker in _LIBTORCH_HIP_SYMBOL_MARKERS
+        )
+
+        if bundled is None:
+            bundled_part = "torch_lib=?"
+        else:
+            bundled_part = " ".join(
+                f"{name}={'yes' if present else 'no'}"
+                for name, present in bundled.items()
+            )
+
+        if cxx_defs is None:
+            cxx_part = "cxx_defs=?"
+        else:
+            cxx_part = " ".join(
+                f"-D{name}={'yes' if present else 'no'}"
+                for name, present in cxx_defs.items()
+            )
+
+        return f"{sym_part}  |  {bundled_part}  |  {cxx_part}"
+
+    def _summary_stable_build_flags_line(self) -> str:
+        """Compact attention-focused brief for ``pytorch_build.build_flags``.
+
+        Renders the four flags an attention-NaN triage operator scans
+        first: ``flags: FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on``.
+        ``on``/``off`` for booleans, ``?`` for absent (None). The full
+        17-key parsed schema lives in env.json under
+        ``pytorch_build.build_flags`` for callers that need the rest.
+
+        ``AOTRITON`` is a combined cell: ``DISABLE_AOTRITON`` is a
+        definitive kill-switch and ``USE_AOTRITON`` is the cmake enable.
+        Some builds report only one of the two, so the cell consults
+        both before falling back to ``?`` -- otherwise a build with
+        ``-DDISABLE_AOTRITON`` but no ``USE_AOTRITON=`` setting would
+        render ``?`` despite carrying a definitive disable signal.
+        """
+        pb = self.pytorch_build or {}
+        flags = pb.get("build_flags") or {}
+        if not flags or all(v is None for v in flags.values()):
+            return "(unavailable -- torch import failed or no __config__)"
+
+        def cell(label: str, key: str) -> str:
+            value = flags.get(key)
+            if value is True:
+                return f"{label}=on"
+            if value is False:
+                return f"{label}=off"
+            if value is None:
+                return f"{label}=?"
+            return f"{label}={value}"
+
+        def aotriton_cell() -> str:
+            use = flags.get("USE_AOTRITON")
+            disable = flags.get("DISABLE_AOTRITON")
+            # Disable is the explicit kill switch and wins on conflict;
+            # check it first so a contradictory build (use=True AND
+            # disable=True) renders the safer "off".
+            if disable is True or use is False:
+                return "AOTRITON=off"
+            if use is True or disable is False:
+                return "AOTRITON=on"
+            return "AOTRITON=?"
+
+        return " ".join((
+            cell("FLASH_ATTN", "USE_FLASH_ATTENTION"),
+            cell("CK_SDPA", "USE_ROCM_CK_SDPA"),
+            aotriton_cell(),
+            cell("MEM_EFF", "USE_MEM_EFF_ATTENTION"),
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +928,17 @@ def collect_env() -> EnvSnapshot:
         hip = _capture_hip_toolchain(reasons)
         hipblaslt = _capture_hipblaslt(reasons)
         rocblas = _capture_rocblas(reasons)
-        composable_kernel = _capture_composable_kernel(reasons)
+        # Shared once per collect_env() call: both _capture_composable_kernel
+        # and _capture_pytorch_build's binary_introspection probe grep the
+        # demangled libtorch_hip.so symbol table. Without this, the
+        # ~1-2 s (cold: up to 30 s) `nm | c++filt` subprocess runs twice
+        # AND duplicates its failure reason on stripped/missing-binutils
+        # hosts. Cache lives only inside this collect_env() invocation
+        # so test isolation across consecutive calls is preserved.
+        hip_symbol_cache = _HipSymbolDumpCache()
+        composable_kernel = _capture_composable_kernel(
+            reasons, hip_symbol_cache=hip_symbol_cache
+        )
         tensile = _capture_tensile(reasons)
         triton = _capture_triton(reasons)
         fbgemm = _capture_fbgemm(reasons)
@@ -601,7 +951,9 @@ def collect_env() -> EnvSnapshot:
         docker = _capture_docker_metadata(runtime_context, reasons)
         env_vars = _capture_env_vars()  # individual nulls are documented, not partial
         pytorch_version = _capture_pytorch_version(reasons)
-        pytorch_build = _capture_pytorch_build(reasons)
+        pytorch_build = _capture_pytorch_build(
+            reasons, hip_symbol_cache=hip_symbol_cache
+        )
 
         return EnvSnapshot(
             schema_version=SCHEMA_VERSION,
@@ -707,7 +1059,7 @@ def _disaster_snapshot(
             "pytorch_use_fbgemm": None,
             "pytorch_use_fbgemm_genai": None,
         },
-        aiter={"package_version": None},
+        aiter={"package_version": None, "package_dist_name": None, "commit": None},
         aotriton={
             "bundled_present": False,
             "bundled_version": None,
@@ -758,6 +1110,21 @@ def _disaster_snapshot(
                 **{name: None for name in CANONICAL_PYTORCH_SUBMODULES},
                 "_source": None,
             },
+            "flags": {
+                "build_settings": None,
+                "cxx_defines": None,
+                "cxx_flags_raw": None,
+                "cuda_flags_raw": None,
+                "gpu_arch_list": None,
+            },
+            "binary_introspection": {
+                "libtorch_hip_symbol_counts": {
+                    m: None for m in _LIBTORCH_HIP_SYMBOL_MARKERS
+                },
+                "torch_lib_bundled": None,
+                "cxx_flags_use_defines": None,
+            },
+            "build_flags": {name: None for name in PYTORCH_BUILD_FLAG_NAMES},
         },
         partial=True,
         partial_reasons=[*preceding_reasons, unexpected_reason],
@@ -1048,6 +1415,22 @@ _FBGEMM_GENAI_DEFINE_RE = re.compile(r"-DUSE_FBGEMM_GENAI(?![A-Za-z0-9_])")
 # torch.__config__.show() text the FBGEMM probe scans.
 _CK_SDPA_DEFINE_RE = re.compile(r"-DUSE_ROCM_CK_SDPA(?![A-Za-z0-9_])")
 _CK_GEMM_DEFINE_RE = re.compile(r"-DUSE_ROCM_CK_GEMM(?![A-Za-z0-9_])")
+
+# `Build settings:` block in `torch.__config__.show()` is a comma-
+# separated KEY=VALUE list. KEYs are uppercase identifiers; VALUEs may
+# contain spaces, '=' (e.g. CXX_FLAGS), and end at the next ", KEY=" or
+# end-of-string. The lookahead lets us capture multi-word values like
+# CXX_FLAGS without splitting on internal commas.
+_BUILD_SETTINGS_RE = re.compile(r"Build settings:\s*(.+)", re.DOTALL)
+_BUILD_SETTING_PAIR_RE = re.compile(
+    r"([A-Z_][A-Z0-9_]*)=(.*?)(?=,\s+[A-Z_][A-Z0-9_]*=|\s*$)",
+    re.DOTALL,
+)
+
+# Every `-D<NAME>` and `-D<NAME>=<value>` token in a flags string. Used
+# to extract the actionable subset of CXX_FLAGS for build-flag verification
+# (USE_FLASH_ATTENTION, USE_MKL, USE_ROCM_CK_SDPA, FLASH_NAMESPACE=...).
+_CXX_DEFINE_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)(?:=([^\s,]+))?")
 
 # Match libaotriton_v2.so.<MAJOR>.<MINOR>.<PATCH>. Anchored so a stray
 # debug-suffixed variant (e.g. .so.0.11.1.dbg) would NOT match -- we
@@ -1680,7 +2063,11 @@ def _capture_rocblas(reasons: list[str]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _capture_composable_kernel(reasons: list[str]) -> dict[str, Any]:
+def _capture_composable_kernel(
+    reasons: list[str],
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
     """Capture Composable Kernel identity at both layers.
 
     CK ships in two places that can drift independently:
@@ -1735,7 +2122,9 @@ def _capture_composable_kernel(reasons: list[str]) -> dict[str, Any]:
             )
 
     # ------- pytorch_bundled sub-block -------
-    bundled_block = _probe_pytorch_bundled_ck(reasons)
+    bundled_block = _probe_pytorch_bundled_ck(
+        reasons, hip_symbol_cache=hip_symbol_cache
+    )
 
     # ------- build-time PyTorch CK dispatch flags -------
     # These are -DUSE_ROCM_CK_{SDPA,GEMM} cmake flags baked into the
@@ -1808,72 +2197,153 @@ def _parse_ck_header(text: str | None) -> tuple[str | None, str | None]:
     return (version, commit)
 
 
-def _probe_pytorch_bundled_ck(reasons: list[str]) -> dict[str, Any]:
+def _probe_pytorch_bundled_ck(
+    reasons: list[str],
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
     """Look for ``ck::`` symbols inside ``libtorch_hip.so``.
 
-    Strategy: locate the lib via ``torch.__file__`` (no HIP context init),
-    then run ``nm -D <lib>`` piped through ``c++filt`` and count
-    occurrences of the ``ck::`` namespace prefix. Falls back to
-    ``present=False, symbol_count=None`` plus a partial reason whenever
-    any step is unavailable (torch broken, binutils stripped from the
-    container, subprocess timeout).
+    Strategy: dump the lib's demangled dynamic symbols once via the
+    shared :class:`_HipSymbolDumpCache`, then count occurrences of the
+    ``ck::`` namespace prefix. Falls back to
+    ``present=False, symbol_count=None`` whenever the symbol dump is
+    unavailable (the helper records the partial reason on its own).
+
+    ``hip_symbol_cache`` is optional so tests / direct callers can
+    invoke this probe standalone without manufacturing a cache; in that
+    case a fresh single-shot cache is used and no cross-probe
+    deduplication happens (which is the right behaviour when only one
+    probe runs).
+
+    Demangled symbols routinely look like
+    ``ck::tensor_operation::...``; any line containing ``ck::`` is a CK
+    symbol. Other namespaces whose template parameters contain ``ck::``
+    are themselves CK-related by construction (they reference CK types),
+    so they count.
+    """
+    if hip_symbol_cache is None:
+        hip_symbol_cache = _HipSymbolDumpCache()
+    default = {"present": False, "symbol_count": None}
+    symbol_text = hip_symbol_cache.get(
+        reasons, "composable_kernel.pytorch_bundled"
+    )
+    if symbol_text is None:
+        return default
+    symbol_count = sum(1 for line in symbol_text.splitlines() if "ck::" in line)
+    return {"present": symbol_count > 0, "symbol_count": symbol_count}
+
+
+class _HipSymbolDumpCache:
+    """Per-``collect_env()``-call cache for the demangled
+    ``libtorch_hip.so`` symbol dump.
+
+    Both the CK pytorch-bundled probe and the binary-introspection
+    probe grep the same symbol table; without this cache
+    ``collect_env()`` shells out to ``nm | c++filt`` twice per run
+    (each call ~1-2 s warm, up to 30 s cold) AND records the same
+    failure reason twice. The cache lives only for the duration of one
+    ``collect_env()`` invocation -- not module-level, so test isolation
+    between consecutive calls is preserved (the original concern that
+    blocked using ``functools.lru_cache`` here).
+
+    The first ``get()`` call owns the partial-reason prefix it provides;
+    subsequent calls reuse the same dump and append no extra reason.
+    """
+
+    def __init__(self) -> None:
+        self._cached = False
+        self._symbols: str | None = None
+
+    def get(
+        self,
+        reasons: list[str],
+        reason_prefix: str,
+        *,
+        torch_mod: Any | None = None,
+    ) -> str | None:
+        if self._cached:
+            return self._symbols
+        self._symbols = _dump_pytorch_hip_demangled_symbols(
+            reasons, reason_prefix, torch_mod=torch_mod,
+        )
+        self._cached = True
+        return self._symbols
+
+
+def _dump_pytorch_hip_demangled_symbols(
+    reasons: list[str],
+    reason_prefix: str,
+    *,
+    torch_mod: Any | None = None,
+) -> str | None:
+    """Run ``nm -D <libtorch_hip.so> | c++filt`` and return the output.
+
+    Shared by the CK symbol-count probe and the SDPA backend
+    inference probe so we pay the ``nm`` cost (1-2 s on a warm cache,
+    up to 30 s cold) only once per ``collect_env()`` call -- without
+    introducing a module-level cache that would survive across processes
+    and break test isolation.
+
+    Locates the lib via ``torch.__file__`` (no HIP context init).
+    Returns ``None`` for the documented absences listed below; appends
+    a partial reason for genuine failures (torch broken, binutils
+    stripped, subprocess timeout, non-zero exit).
 
     Documented absences that **do not** trigger ``partial=True``:
 
     * ``import torch`` raises ImportError (already captured by the
       ``pytorch_version`` probe -- no need to duplicate the reason).
-    * ``torch.version.hip is None`` (this is a CPU-only PyTorch wheel,
-      so ``libtorch_hip.so`` is legitimately absent by design).
+    * ``torch.version.hip is None`` (CPU-only PyTorch wheel; the lib is
+      legitimately absent by design).
 
-    ``-D`` (dynamic symbols only) is much faster than the full symbol
-    table on a multi-hundred-MB lib while still covering every CK kernel
-    that's actually exposed for dispatch.
+    ``-D --defined-only`` (dynamic, defined symbols) is much faster
+    than the full symbol table on a multi-hundred-MB lib while still
+    covering every dispatch entry-point we care about.
+
+    The ``reason_prefix`` is the partial-reason prefix the calling
+    probe uses (e.g. ``"composable_kernel.pytorch_bundled"``). Keep it
+    grep-consistent with the rest of that probe's reasons.
+
+    ``torch_mod`` lets a caller supply an already-imported torch module
+    so the dump describes the SAME installation other parts of that
+    caller's snapshot describe. Without it, the helper re-imports
+    ambient torch via :func:`_safe_import_torch`, which on test paths
+    that pass a fake module would produce a snapshot where
+    ``torch_lib_bundled`` (uses passed module) and
+    ``libtorch_hip_symbol_counts`` (would use ambient) describe
+    different torch installations.
     """
-    default = {"present": False, "symbol_count": None}
-
-    # Locate libtorch_hip.so via torch.__file__. The helper shares the
-    # same no-HIP-context guarantee as _capture_python_package_version
-    # (only does __import__, never touches torch.cuda).
-    torch_mod = _safe_import_torch(reasons, "composable_kernel.pytorch_bundled")
     if torch_mod is None:
-        return default
+        torch_mod = _safe_import_torch(reasons, reason_prefix)
+    if torch_mod is None:
+        return None
 
-    # CPU-only PyTorch wheel -- there is no HIP code to fingerprint.
-    # ``torch.version.hip`` is the canonical "was this wheel built with
-    # HIP?" signal (None when not). Treat as a documented absence so a
-    # CPU-only wheel doesn't flip ``partial=True`` for the bundled-CK
-    # probe -- but the consumer can still see it from the
-    # ``pytorch_bundled.present=False`` field.
     torch_version = getattr(torch_mod, "version", None)
     if torch_version is not None and getattr(torch_version, "hip", None) is None:
-        return default
+        return None
 
     torch_file = getattr(torch_mod, "__file__", None)
     if not torch_file:
-        reasons.append(
-            "composable_kernel.pytorch_bundled: torch.__file__ unavailable"
-        )
-        return default
+        reasons.append(f"{reason_prefix}: torch.__file__ unavailable")
+        return None
 
     lib_path = Path(torch_file).parent / "lib" / PYTORCH_HIP_LIB_NAME
     if not lib_path.exists():
-        # torch.version.hip claimed HIP support but the lib is missing.
-        # That's not a CPU-only wheel (we caught those above) -- it's a
-        # broken / incomplete install worth flagging.
         reasons.append(
-            f"composable_kernel.pytorch_bundled: {lib_path} not found "
+            f"{reason_prefix}: {lib_path} not found "
             "(torch.version.hip claims HIP but the runtime lib is missing)"
         )
-        return default
+        return None
 
     nm = shutil.which("nm")
     cxxfilt = shutil.which("c++filt")
     if nm is None or cxxfilt is None:
         reasons.append(
-            "composable_kernel.pytorch_bundled: nm/c++filt not on PATH "
-            "(install binutils for symbol-count detection)"
+            f"{reason_prefix}: nm/c++filt not on PATH "
+            "(install binutils for symbol-based detection)"
         )
-        return default
+        return None
 
     try:
         nm_proc = subprocess.run(
@@ -1884,16 +2354,13 @@ def _probe_pytorch_bundled_ck(reasons: list[str]) -> dict[str, Any]:
             check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        reasons.append(
-            f"composable_kernel.pytorch_bundled: nm invocation failed ({exc})"
-        )
-        return default
+        reasons.append(f"{reason_prefix}: nm invocation failed ({exc})")
+        return None
     if nm_proc.returncode != 0:
         reasons.append(
-            f"composable_kernel.pytorch_bundled: nm exited "
-            f"{nm_proc.returncode} on {lib_path}"
+            f"{reason_prefix}: nm exited {nm_proc.returncode} on {lib_path}"
         )
-        return default
+        return None
 
     try:
         cxxfilt_proc = subprocess.run(
@@ -1905,30 +2372,13 @@ def _probe_pytorch_bundled_ck(reasons: list[str]) -> dict[str, Any]:
             check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        reasons.append(
-            f"composable_kernel.pytorch_bundled: c++filt invocation failed ({exc})"
-        )
-        return default
+        reasons.append(f"{reason_prefix}: c++filt invocation failed ({exc})")
+        return None
     if cxxfilt_proc.returncode != 0:
-        reasons.append(
-            f"composable_kernel.pytorch_bundled: c++filt exited "
-            f"{cxxfilt_proc.returncode}"
-        )
-        return default
+        reasons.append(f"{reason_prefix}: c++filt exited {cxxfilt_proc.returncode}")
+        return None
 
-    # Count exported symbols in the `ck::` namespace. We use a substring
-    # check (not a regex) for speed; demangled symbols routinely look
-    # like "ck::tensor_operation::..." so any line containing "ck::" is a
-    # CK symbol. This will also include symbols from other namespaces
-    # whose template parameters contain "ck::", but those are themselves
-    # CK-related by construction (they reference CK types), so they count.
-    symbol_count = sum(
-        1 for line in cxxfilt_proc.stdout.splitlines() if "ck::" in line
-    )
-    return {
-        "present": symbol_count > 0,
-        "symbol_count": symbol_count,
-    }
+    return cxxfilt_proc.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -2095,24 +2545,93 @@ def _read_pytorch_fbgemm_flags(
 
 
 def _capture_aiter(reasons: list[str]) -> dict[str, str | None]:
-    """Capture AITER (AMD Iterative kernel library) version.
+    """Capture AITER (AMD Iterative kernel library) identity.
 
-    AITER is a PyPI-distributed ROCm inference kernel library built on
-    top of CK. Most environments don't have it installed; absence is
-    suppressed from partial_reasons.
+    AITER is a ROCm inference kernel library built on top of CK. In the
+    AMD-internal ROCm/PyTorch images it is shipped as a separately
+    pip-installed distribution named ``amd_aiter`` whose import name is
+    ``aiter``. The image tag often encodes the aiter commit (e.g.
+    ``...aiter-9a469a6``); the same SHA appears as the
+    setuptools_scm ``+g<sha>`` local-version segment of
+    ``amd_aiter``'s version (e.g. ``0.1.11.dev32+g9a469a608``).
 
-    Note: upstream PyTorch now vendors AITER as a third_party/ submodule
-    too -- see :func:`_capture_pytorch_build` for the bundled-commit
-    probe. This block only covers the standalone pip distribution.
+    Three layered version sources, first hit wins:
+
+    1. ``aiter.__version__`` (most packages set this).
+    2. ``aiter._version.__version__`` (where ``setuptools_scm`` writes
+       it -- aiter does not re-export from ``aiter/__init__.py``).
+    3. ``importlib.metadata.version("amd_aiter")`` (PyPI dist metadata,
+       works even when import-time C-extension JIT fails).
+
+    Records the dist name we matched and, when the version carries a
+    ``+g<sha>`` suffix, the parsed commit, so consumers can verify the
+    image-tag claim from ``env.json`` alone.
+
+    Note: upstream PyTorch also vendors AITER as a third_party/
+    submodule -- see :func:`_capture_pytorch_build` for the
+    bundled-commit probe. The two paths are independent: an image can
+    have ``amd_aiter`` pip-installed *and* a different aiter SHA pinned
+    inside the torch wheel.
     """
-    return {
-        "package_version": _capture_python_package_version(
-            "aiter",
-            reasons,
-            reason_prefix="aiter.package_version",
-            suppress_missing=True,
-        ),
+    from importlib import metadata as _md
+
+    result: dict[str, str | None] = {
+        "package_version": None,
+        "package_dist_name": None,
+        "commit": None,
     }
+
+    imported = False
+    mod: Any | None = None
+    try:
+        mod = __import__("aiter")
+        imported = True
+    except ImportError:
+        pass
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        log.debug("aiter import for version probe failed: %s", exc)
+        reasons.append(
+            f"aiter.package_version: aiter import raised ({type(exc).__name__})"
+        )
+
+    version: str | None = None
+    if mod is not None:
+        version = getattr(mod, "__version__", None)
+        if version is None:
+            try:
+                from aiter import _version as _aiter_version  # type: ignore[import-not-found]
+
+                version = getattr(_aiter_version, "__version__", None) or None
+            except Exception:  # noqa: BLE001 -- best-effort fallback
+                version = None
+
+    dist_name: str | None = None
+    for candidate in ("amd_aiter", "aiter"):
+        try:
+            dist_version = _md.version(candidate)
+        except _md.PackageNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001 -- defensive
+            continue
+        dist_name = candidate
+        if version is None:
+            version = dist_version
+        break
+
+    if imported and version is None:
+        reasons.append(
+            "aiter.package_version: aiter imported but no __version__, no "
+            "aiter._version.__version__, and no amd_aiter dist metadata"
+        )
+
+    if version:
+        m = re.search(r"\+g([0-9a-f]{7,40})", version)
+        if m:
+            result["commit"] = m.group(1)
+
+    result["package_version"] = version
+    result["package_dist_name"] = dist_name
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2120,7 +2639,11 @@ def _capture_aiter(reasons: list[str]) -> dict[str, str | None]:
 # ---------------------------------------------------------------------------
 
 
-def _capture_pytorch_build(reasons: list[str]) -> dict[str, Any]:
+def _capture_pytorch_build(
+    reasons: list[str],
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
     """Capture structured PyTorch build identity.
 
     Complements the flat ``pytorch_version`` field with the build
@@ -2174,6 +2697,15 @@ def _capture_pytorch_build(reasons: list[str]) -> dict[str, Any]:
         install_kind, source_path, git_commit, reasons
     )
 
+    flags = _capture_pytorch_build_flags(reasons)
+    binary_introspection = _capture_pytorch_binary_introspection(
+        reasons,
+        torch_mod=torch_mod,
+        flags=flags,
+        hip_symbol_cache=hip_symbol_cache,
+    )
+    build_flags = _project_pytorch_build_flags(flags)
+
     return {
         "git_commit": git_commit,
         "hip_version": hip_version,
@@ -2182,6 +2714,294 @@ def _capture_pytorch_build(reasons: list[str]) -> dict[str, Any]:
         "install_kind": install_kind,
         "source_path": str(source_path) if source_path else None,
         "submodule_commits": submodule_commits,
+        "flags": flags,
+        "build_flags": build_flags,
+        "binary_introspection": binary_introspection,
+    }
+
+
+# Substring markers grep'd against the demangled dynamic symbol table
+# of ``libtorch_hip.so``. Pure facts: each entry is a substring whose
+# count we report. We do NOT map these to ON/OFF verdicts for cmake
+# options like USE_FLASH_ATTENTION -- that mapping is the operator's
+# call (a non-zero count proves "this code path is compiled into the
+# wheel", but a zero count does NOT prove the option was OFF -- the
+# linker may have stripped unreferenced symbols, the code may live in
+# a different .so, or our marker may be wrong for a future rename).
+_LIBTORCH_HIP_SYMBOL_MARKERS: tuple[str, ...] = (
+    # ---- FLASH_NAMESPACE-defaulted FA wrappers ----
+    # Substring matches every pytorch_flash::* variant
+    # (mha_fwd, mha_bwd, mha_varlen_{fwd,bwd}, plus their _aot and _ck
+    # backend specialisations). Reported as one count.
+    "pytorch_flash::",
+    # The two backend-specialised FA wrappers, reported individually so
+    # the operator can tell which backend(s) are actually compiled in:
+    # _aot = AOTriton-driven path, _ck = CK-driven path. Names verified
+    # against pytorch/aten/src/ATen/native/transformers/hip/flash_attn/.
+    "mha_fwd_aot",
+    "mha_fwd_ck",
+    # ---- mem-eff attention ----
+    # at::_efficient_attention_{forward,backward} + at::cuda:: variants.
+    # Substring is unique to this op family.
+    "_efficient_attention",
+    # ---- AOTriton ----
+    # aotriton::TensorView / aotriton::* runtime adapter symbols
+    # (sdp::aotriton_adapter::mk_aotensor uses these types).
+    "aotriton::",
+    # ---- CK Tile FMHA kernel zoo ----
+    # The CK SDPA path lives under `ck_tile::` with templated kernel /
+    # pipeline / shape types. Substrings are case-sensitive and match
+    # the actual demangled names in libtorch_hip.so (verified against
+    # the cksdpa image -- 5500+ symbols). Each marker is reported
+    # individually so a renamed family only loses one row.
+    "ck_tile::FmhaFwd",
+    "ck_tile::FmhaBwd",
+    "ck_tile::BlockFmha",
+    "ck_tile::TileFmha",
+    # ---- CK GEMM (separate from CK SDPA) ----
+    # at::hip::detail::group_gemm_ck and friends.
+    "group_gemm_ck",
+    # ---- Vendored aiter inside libtorch_hip.so ----
+    # When PyTorch is built with its third_party/aiter submodule wired
+    # in (USE_AITER-style flag), aiter:: symbols (e.g.
+    # `aiter::mha_bwd`) appear directly in libtorch_hip. This is
+    # SEPARATE from the standalone `amd_aiter` pip dist captured under
+    # the top-level `aiter` block.
+    "aiter::",
+)
+
+# Bundled shared libs in ``torch/lib/`` worth surfacing. Presence-only,
+# no inference. ``libaotriton_v2.so`` is the AOTriton runtime; its
+# bundling is decided at PyTorch build time by USE_AOTRITON +
+# AOTRITON_INSTALL_FROM_SOURCE / cmake/External/aotriton.cmake.
+_PYTORCH_LIB_BUNDLED_NAMES: tuple[str, ...] = ("libaotriton_v2.so",)
+
+
+def _capture_pytorch_binary_introspection(
+    reasons: list[str],
+    torch_mod: Any | None,
+    *,
+    flags: dict[str, Any] | None = None,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
+    """Direct facts about the compiled PyTorch wheel -- no inference.
+
+    Three fact buckets, each independently None when the source isn't
+    available:
+
+    * ``libtorch_hip_symbol_counts`` -- count of demangled dynamic
+      symbols in ``libtorch_hip.so`` matching each substring in
+      :data:`_LIBTORCH_HIP_SYMBOL_MARKERS`. ``None`` for every marker
+      when binutils is unavailable, the lib is missing, or the wheel
+      is CPU-only (``torch.version.hip is None``).
+    * ``torch_lib_bundled`` -- ``{lib_name: bool}`` for each entry in
+      :data:`_PYTORCH_LIB_BUNDLED_NAMES`. ``None`` (whole dict) when
+      ``torch.__file__`` is unreadable.
+    * ``cxx_flags_use_defines`` -- presence of specific ``-DUSE_*``
+      defines in the host-side ``CXX_FLAGS`` reported by
+      ``torch.__config__.show()``. ``None`` (whole dict) when
+      ``__config__.show()`` is unavailable.
+
+    Why no verdicts: PyTorch's CMake options (USE_FLASH_ATTENTION,
+    USE_MEM_EFF_ATTENTION, USE_AOTRITON, USE_ROCM_CK_SDPA, ...) are
+    not stored in the wheel; CMakeCache.txt isn't shipped. Symbol
+    presence proves the option was ON at build time, but symbol
+    *absence* does not prove OFF (linker stripping, namespace renames,
+    code in a different .so). The operator reads the counts and draws
+    the conclusion.
+    """
+    result: dict[str, Any] = {
+        "libtorch_hip_symbol_counts": {m: None for m in _LIBTORCH_HIP_SYMBOL_MARKERS},
+        "torch_lib_bundled": None,
+        "cxx_flags_use_defines": None,
+    }
+
+    # ----- bundled libs in torch/lib/ -----
+    # On OSError (missing dir, permission denied, ...) we leave
+    # ``torch_lib_bundled`` as None and add a partial reason -- a failed
+    # scan must NOT report False for every lib, since False is the
+    # definitive "we scanned, the lib isn't there" signal. One iterdir()
+    # per probe (not per lib name) keeps the cost bounded.
+    if torch_mod is not None:
+        torch_file = getattr(torch_mod, "__file__", None)
+        if torch_file:
+            torch_lib_dir = Path(torch_file).parent / "lib"
+            try:
+                entries = [p.name for p in torch_lib_dir.iterdir()]
+            except OSError as exc:
+                log.debug("torch/lib/ scan failed: %s", exc)
+                reasons.append(
+                    f"pytorch_build.binary_introspection.torch_lib_bundled: "
+                    f"{torch_lib_dir} scan failed ({type(exc).__name__})"
+                )
+            else:
+                # Match the bare name AND the SONAME-versioned variants
+                # (libaotriton_v2.so, libaotriton_v2.so.0.11.2, ...).
+                result["torch_lib_bundled"] = {
+                    name: any(
+                        entry == name or entry.startswith(f"{name}.")
+                        for entry in entries
+                    )
+                    for name in _PYTORCH_LIB_BUNDLED_NAMES
+                }
+
+    # ----- CXX_FLAGS -DUSE_* presence (authoritative when True;
+    # absence does NOT prove the cmake option was OFF -- many ROCm
+    # USE_* defines are only injected into HIPCC per-target flags). The
+    # field's contract is "presence of `-DNAME` in the host-side
+    # CXX_FLAGS string", so we scan ONLY cxx_flags_raw -- not the full
+    # `__config__.show()` text, which would also match `-DNAME` tokens
+    # that landed in CUDA_FLAGS or in unrelated lines and over-claim
+    # presence in CXX flags. -----
+    cxx_define_names = ("USE_ROCM_CK_SDPA", "USE_ROCM_CK_GEMM")
+    cxx_flags_raw = (flags or {}).get("cxx_flags_raw")
+    if cxx_flags_raw is not None:
+        cxx_pairs: dict[str, bool] = {}
+        for name in cxx_define_names:
+            pattern = re.compile(rf"-D{re.escape(name)}(?![A-Za-z0-9_])")
+            cxx_pairs[name] = bool(pattern.search(cxx_flags_raw))
+        result["cxx_flags_use_defines"] = cxx_pairs
+
+    # ----- libtorch_hip.so symbol counts (shared nm dump) -----
+    # Caller signals torch unavailability with torch_mod=None; respect
+    # that and skip the symbol dump entirely. Otherwise the cache would
+    # still attempt its own torch import, which on a host with torch
+    # actually installed would populate symbol_counts despite the
+    # caller's "no torch" intent and contradict the default-shape
+    # contract documented in the docstring.
+    if torch_mod is None:
+        return result
+    if hip_symbol_cache is None:
+        hip_symbol_cache = _HipSymbolDumpCache()
+    # Pass the already-imported torch_mod through so the dump describes
+    # the same installation `torch_lib_bundled` and
+    # `cxx_flags_use_defines` describe -- avoids the standalone-call
+    # path where the cache would re-import ambient torch and the two
+    # halves of `binary_introspection` would describe different torches.
+    symbols = hip_symbol_cache.get(
+        reasons,
+        "pytorch_build.binary_introspection",
+        torch_mod=torch_mod,
+    )
+    if symbols is not None:
+        counts: dict[str, int] = {marker: 0 for marker in _LIBTORCH_HIP_SYMBOL_MARKERS}
+        for line in symbols.splitlines():
+            for marker in _LIBTORCH_HIP_SYMBOL_MARKERS:
+                if marker in line:
+                    counts[marker] += 1
+        result["libtorch_hip_symbol_counts"] = counts
+
+    return result
+
+
+def _capture_pytorch_build_flags(reasons: list[str]) -> dict[str, Any]:
+    """Capture compile-time flags baked into the PyTorch wheel.
+
+    Two introspection paths -- both work for wheel installs (no build
+    artifacts on disk required):
+
+    * ``torch.__config__.show()`` -- the host-side build config string.
+      Yields a structured ``Build settings`` KEY=VALUE block plus the
+      verbatim ``CXX_FLAGS`` / ``CUDA_FLAGS`` from cmake. We parse all
+      ``-D<NAME>[=<value>]`` defines out of CXX_FLAGS into a dict so
+      consumers can verify presence cheaply
+      (``"USE_FLASH_ATTENTION" in flags["cxx_defines"]``).
+    * ``torch.cuda.get_arch_list()`` -- the authoritative list of GPU
+      architectures the wheel was compiled for (e.g. ``["gfx942",
+      "gfx950"]``). Reads compiled-in metadata, no HIP context init.
+
+    Captured fields (``None`` when torch is absent or __config__ raises):
+
+    * ``build_settings`` -- dict of KEY=VALUE from the ``Build settings:``
+      block (USE_CUDA, USE_ROCM, USE_NCCL, USE_MKLDNN, BUILD_TYPE,
+      COMMIT_SHA, BLAS_INFO, ...). Values kept as captured strings
+      ("ON"/"OFF" or non-boolean for BUILD_TYPE etc.); no coercion.
+    * ``cxx_defines`` -- dict mapping each ``-D`` define name from
+      ``CXX_FLAGS`` to its value (or ``None`` for value-less defines).
+      The actionable subset of ``cxx_flags_raw``.
+    * ``cxx_flags_raw`` / ``cuda_flags_raw`` -- the verbatim flag
+      strings, preserved for grep over non-define args
+      (``-fgpu-flush-denormals-to-zero``, ``-Wno-...``, ``-I`` paths).
+    * ``gpu_arch_list`` -- ``torch.cuda.get_arch_list()`` output.
+
+    Limitation: ``torch.__config__.show()`` reports only host-side C++
+    flags. PyTorch's ATen-hip target applies many additional defines
+    *only* when invoking HIPCC on .hip files (CK_TILE_FMHA_FWD_FAST_EXP2,
+    AITER_ASM_DIR, HIPBLASLT_HAS_GETINDEXFROMALGO, HIPBLAS_V2,
+    USE_FLASH_ATTENTION on some builds, the various warning
+    suppressions, ...). Those are NOT recoverable from a wheel install
+    -- they live in the build's ``compile_commands.json`` which is not
+    shipped. For source/editable installs they could be read via the
+    cmake-generated commands DB, but that path is out of scope for this
+    probe (the env-probe runtime budget is ~5 s and parsing
+    compile_commands.json alone costs more than that).
+    """
+    default: dict[str, Any] = {
+        "build_settings": None,
+        "cxx_defines": None,
+        "cxx_flags_raw": None,
+        "cuda_flags_raw": None,
+        "gpu_arch_list": None,
+    }
+
+    torch_mod = _safe_import_torch(reasons, "pytorch_build.flags")
+    if torch_mod is None:
+        return default
+
+    arch_list: list[str] | None = None
+    try:
+        cuda_mod = getattr(torch_mod, "cuda", None)
+        getter = getattr(cuda_mod, "get_arch_list", None) if cuda_mod else None
+        if getter is not None:
+            arch_list = list(getter())
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        log.debug("torch.cuda.get_arch_list() raised: %s", exc)
+        reasons.append(
+            f"pytorch_build.flags.gpu_arch_list: torch.cuda.get_arch_list() "
+            f"raised ({type(exc).__name__})"
+        )
+
+    config = getattr(torch_mod, "__config__", None)
+    show = getattr(config, "show", None)
+    if show is None:
+        reasons.append("pytorch_build.flags: torch.__config__.show unavailable")
+        result = dict(default)
+        result["gpu_arch_list"] = arch_list
+        return result
+    try:
+        config_text = show()
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        log.debug("torch.__config__.show() for build flags raised: %s", exc)
+        reasons.append(
+            f"pytorch_build.flags: torch.__config__.show() raised "
+            f"({type(exc).__name__})"
+        )
+        result = dict(default)
+        result["gpu_arch_list"] = arch_list
+        return result
+
+    settings: dict[str, str] = {}
+    m = _BUILD_SETTINGS_RE.search(config_text)
+    if m:
+        for pair in _BUILD_SETTING_PAIR_RE.finditer(m.group(1)):
+            settings[pair.group(1)] = pair.group(2).strip().rstrip(",").strip()
+
+    cxx_flags_raw = settings.get("CXX_FLAGS")
+    cuda_flags_raw = settings.get("CUDA_FLAGS")
+    cxx_defines: dict[str, str | None] | None = None
+    if cxx_flags_raw is not None:
+        defines: dict[str, str | None] = {}
+        for d in _CXX_DEFINE_RE.finditer(cxx_flags_raw):
+            defines[d.group(1)] = d.group(2)
+        # JSON-stable ordering for diff-friendly output.
+        cxx_defines = {k: defines[k] for k in sorted(defines)}
+
+    return {
+        "build_settings": settings or None,
+        "cxx_defines": cxx_defines,
+        "cxx_flags_raw": cxx_flags_raw,
+        "cuda_flags_raw": cuda_flags_raw,
+        "gpu_arch_list": arch_list,
     }
 
 

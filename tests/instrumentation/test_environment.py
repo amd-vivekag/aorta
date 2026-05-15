@@ -267,7 +267,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.1"
+        assert snapshot.schema_version == "1.2"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -314,7 +314,7 @@ class TestSchemaCompleteness:
 def _example_snapshot(**overrides) -> object:
     """Build a fully-populated EnvSnapshot for round-trip testing."""
     base = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "captured_at": "2026-04-28T12:00:00Z",
         "system_health": {"rdhc_version": "1.4.0", "tests": {}},
         "rocm": {
@@ -420,6 +420,23 @@ def _example_snapshot(**overrides) -> object:
                 "aiter": None,
                 "fbgemm": None,
             },
+            "flags": {
+                "build_settings": None,
+                "cxx_defines": None,
+                "cxx_flags_raw": None,
+                "cuda_flags_raw": None,
+                "gpu_arch_list": None,
+            },
+            "binary_introspection": {
+                "libtorch_hip_symbol_counts": {
+                    m: None for m in env_mod._LIBTORCH_HIP_SYMBOL_MARKERS
+                },
+                "torch_lib_bundled": None,
+                "cxx_flags_use_defines": None,
+            },
+            "build_flags": {
+                name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES
+            },
         },
         "partial": False,
         "partial_reasons": [],
@@ -451,7 +468,7 @@ class TestEnvSnapshot:
         d = _example_snapshot().to_dict()
         d["future_field_not_yet_added"] = {"hello": "world"}
         rebuilt = EnvSnapshot.from_dict(d)
-        assert rebuilt.schema_version == "1.1"
+        assert rebuilt.schema_version == "1.2"
 
     def test_from_dict_defaults_partial_reasons_when_missing(self):
         """Older env.json without partial_reasons still loads (defaults to [])."""
@@ -2821,17 +2838,39 @@ class TestFbgemmBlock:
 
 
 class TestAiterBlock:
+    @staticmethod
+    def _force_no_aiter_dist(monkeypatch):
+        """Make `importlib.metadata.version("amd_aiter" | "aiter")` raise
+        PackageNotFoundError so tests are deterministic regardless of
+        whether a developer / CI host happens to have the dist installed.
+        """
+        import importlib.metadata as _md
+        real_version = _md.version
+
+        def fake_version(name):
+            if name in ("amd_aiter", "aiter"):
+                raise _md.PackageNotFoundError(name)
+            return real_version(name)
+
+        monkeypatch.setattr(_md, "version", fake_version)
+
     def test_aiter_absence_does_not_record_reason(self, all_disabled):
         """Most production hosts don't have aiter; suppress the noise."""
+        self._force_no_aiter_dist(all_disabled)
         reasons: list[str] = []
         block = env_mod._capture_aiter(reasons)
-        assert block == {"package_version": None}
+        assert block == {
+            "package_version": None,
+            "package_dist_name": None,
+            "commit": None,
+        }
         assert all("aiter not importable" not in r for r in reasons)
 
     def test_aiter_with_version_returns_string(self, isolated_env, monkeypatch):
         import builtins
         import types
 
+        self._force_no_aiter_dist(monkeypatch)
         real_import = builtins.__import__
         fake_aiter = types.SimpleNamespace(__version__="0.1.4+rocm7.2.gitabc")
 
@@ -2843,8 +2882,77 @@ class TestAiterBlock:
         monkeypatch.setattr(builtins, "__import__", fake_import)
         reasons: list[str] = []
         block = env_mod._capture_aiter(reasons)
-        assert block == {"package_version": "0.1.4+rocm7.2.gitabc"}
+        # +rocm... local segment carries no `+g<sha>` -> commit stays None.
+        # No amd_aiter dist (forced) -> dist_name None.
+        assert block == {
+            "package_version": "0.1.4+rocm7.2.gitabc",
+            "package_dist_name": None,
+            "commit": None,
+        }
         assert reasons == []
+
+    def test_aiter_setuptools_scm_commit_extracted(
+        self, isolated_env, monkeypatch
+    ):
+        """`+g<sha>` setuptools_scm local-version segment -> commit field.
+
+        Matches the AMD-internal ROCm/PyTorch image-tag convention where
+        `aiter-9a469a6` in the tag mirrors the `+g9a469a608` segment in
+        amd_aiter's version.
+        """
+        import builtins
+        import types
+
+        self._force_no_aiter_dist(monkeypatch)
+        fake_aiter = types.SimpleNamespace(
+            __version__="0.1.11.dev32+g9a469a608"
+        )
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_aiter if name == "aiter" else real_import(name, *a, **kw)
+            ),
+        )
+        block = env_mod._capture_aiter([])
+        assert block["package_version"] == "0.1.11.dev32+g9a469a608"
+        assert block["commit"] == "9a469a608"
+
+    def test_aiter_dist_metadata_fallback_populates_dist_name(
+        self, isolated_env, monkeypatch
+    ):
+        """Path 3: aiter import succeeds but lacks __version__ AND
+        aiter._version; importlib.metadata.version("amd_aiter") provides
+        both the version string and the dist_name signal.
+        """
+        import builtins
+        import importlib.metadata as _md
+        import types
+
+        # aiter module without __version__ and no _version submodule.
+        fake_aiter = types.SimpleNamespace()
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_aiter if name == "aiter" else real_import(name, *a, **kw)
+            ),
+        )
+        # amd_aiter dist resolves; aiter dist does not.
+        real_version = _md.version
+
+        def fake_version(name):
+            if name == "amd_aiter":
+                return "0.1.11.dev32+g9a469a608"
+            if name == "aiter":
+                raise _md.PackageNotFoundError(name)
+            return real_version(name)
+
+        monkeypatch.setattr(_md, "version", fake_version)
+        block = env_mod._capture_aiter([])
+        assert block["package_version"] == "0.1.11.dev32+g9a469a608"
+        assert block["package_dist_name"] == "amd_aiter"
+        assert block["commit"] == "9a469a608"
 
 
 # ---------------------------------------------------------------------------
@@ -3496,7 +3604,24 @@ class TestPytorchBuildBlockShape:
             "install_kind",
             "source_path",
             "submodule_commits",
+            "flags",
+            "build_flags",
+            "binary_introspection",
         }
+
+    def test_build_flags_keys_stable(self, all_disabled):
+        """The 17-key parsed build_flags subset is the schema contract.
+
+        Bumping it is a deliberate change -- mirrors test_canonical_var_names_stable.
+        Order intentionally not asserted (dict iteration order is the
+        insertion order from PYTORCH_BUILD_FLAG_NAMES, but consumers
+        should treat the dict as a set-of-keys mapping).
+        """
+        snapshot = collect_env()
+        bf = snapshot.pytorch_build["build_flags"]
+        assert set(bf.keys()) == set(env_mod.PYTORCH_BUILD_FLAG_NAMES)
+        # all_disabled fakes torch import absence -> every flag is None.
+        assert all(v is None for v in bf.values())
 
     def test_submodule_commits_keys_stable(self, all_disabled):
         snapshot = collect_env()
@@ -3848,6 +3973,735 @@ class TestCapturePytorchBuildIntegration:
         assert any(
             "github.com/pytorch/pytorch/tree/" in r for r in reasons
         )
+
+
+class TestHipSymbolDumpCache:
+    """Per-collect_env() cache that dedupes the nm|c++filt subprocess
+    across the CK probe and the binary-introspection probe.
+    """
+
+    def test_first_get_invokes_dump_subsequent_reuse(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_dump(reasons, prefix, *, torch_mod=None):
+            calls.append(prefix)
+            return "ck::foo\nck::bar\n"
+
+        monkeypatch.setattr(env_mod, "_dump_pytorch_hip_demangled_symbols", fake_dump)
+        cache = env_mod._HipSymbolDumpCache()
+        reasons: list[str] = []
+        a = cache.get(reasons, "first")
+        b = cache.get(reasons, "second")
+        assert a == b == "ck::foo\nck::bar\n"
+        assert calls == ["first"]
+
+    def test_failed_dump_cached_no_duplicate_reasons(self, monkeypatch):
+        def fake_dump(reasons, prefix, *, torch_mod=None):
+            reasons.append(f"{prefix}: nm/c++filt not on PATH")
+            return None
+
+        monkeypatch.setattr(env_mod, "_dump_pytorch_hip_demangled_symbols", fake_dump)
+        cache = env_mod._HipSymbolDumpCache()
+        reasons: list[str] = []
+        assert cache.get(reasons, "first") is None
+        assert cache.get(reasons, "second") is None
+        assert reasons == ["first: nm/c++filt not on PATH"]
+
+    def test_cache_shared_across_probes_in_collect_env(
+        self, all_disabled, monkeypatch
+    ):
+        calls: list[str] = []
+
+        def fake_dump(reasons, prefix, *, torch_mod=None):
+            calls.append(prefix)
+            return None
+
+        monkeypatch.setattr(env_mod, "_dump_pytorch_hip_demangled_symbols", fake_dump)
+        collect_env()
+        # CK probe and binary_introspection probe both use the cache;
+        # only the first prefix actually invokes the dump.
+        assert len(calls) <= 1
+
+
+class TestCapturePytorchBinaryIntrospection:
+    """Direct facts about the compiled PyTorch wheel -- no inference."""
+
+    @staticmethod
+    def _fake_torch(tmp_path: Path, *, with_aotriton: bool, cfg_text: str | None):
+        import types
+        torch_dir = tmp_path / "site" / "torch"
+        lib_dir = torch_dir / "lib"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        if with_aotriton:
+            (lib_dir / "libaotriton_v2.so.0.11.2").write_text("")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        config_obj = (
+            types.SimpleNamespace(show=lambda: cfg_text)
+            if cfg_text is not None
+            else None
+        )
+        return types.SimpleNamespace(
+            __file__=str(torch_init),
+            __version__="2.99.0",
+            __config__=config_obj,
+            version=types.SimpleNamespace(
+                git_version="abc1234", hip="7.2.5", cuda=None, debug=False,
+            ),
+        )
+
+    def test_torch_lib_bundled_detects_versioned_soname(self, tmp_path):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=True, cfg_text=None)
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert block["torch_lib_bundled"] == {"libaotriton_v2.so": True}
+
+    def test_torch_lib_bundled_absent_renders_false(self, tmp_path):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert block["torch_lib_bundled"] == {"libaotriton_v2.so": False}
+
+    def test_cxx_define_presence_parsed_from_config_show(self, tmp_path):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        flags = {"cxx_flags_raw": "-DUSE_ROCM_CK_SDPA -O3"}
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags=flags,
+        )
+        assert block["cxx_flags_use_defines"] == {
+            "USE_ROCM_CK_SDPA": True,
+            "USE_ROCM_CK_GEMM": False,
+        }
+
+    def test_cxx_define_regex_does_not_false_match_substring(self, tmp_path):
+        # `USE_ROCM_CK_SDPA_FOO` must not match `USE_ROCM_CK_SDPA`.
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        flags = {"cxx_flags_raw": "-DUSE_ROCM_CK_SDPA_FOO -O3"}
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags=flags,
+        )
+        assert block["cxx_flags_use_defines"]["USE_ROCM_CK_SDPA"] is False
+
+    def test_cxx_define_in_cuda_flags_only_does_not_leak(self, tmp_path):
+        """A `-DUSE_ROCM_CK_SDPA` token that lives in CUDA_FLAGS must NOT
+        appear in cxx_flags_use_defines -- the field name is the
+        contract.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        flags = {
+            "cxx_flags_raw": "-O3 -fPIC",
+            "cuda_flags_raw": "-DUSE_ROCM_CK_SDPA -arch=gfx942",
+        }
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags=flags,
+        )
+        assert block["cxx_flags_use_defines"]["USE_ROCM_CK_SDPA"] is False
+
+    def test_cxx_flags_raw_none_yields_none_dict(self, tmp_path):
+        """No CXX_FLAGS source -> the whole cxx_flags_use_defines dict
+        stays None; we don't fabricate False entries.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, flags={"cxx_flags_raw": None},
+        )
+        assert block["cxx_flags_use_defines"] is None
+
+    def test_torch_none_returns_full_default_shape(self):
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=None)
+        assert block["torch_lib_bundled"] is None
+        assert block["cxx_flags_use_defines"] is None
+        assert all(
+            v is None for v in block["libtorch_hip_symbol_counts"].values()
+        )
+
+    def test_torch_lib_scan_oserror_yields_none_with_partial_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed torch/lib scan (missing dir, permission denied, ...)
+        must NOT report False per lib -- False is the definitive
+        "scanned, lib absent" signal. Whole dict stays None and a
+        partial reason is recorded so the operator knows the probe
+        failed rather than the libs being missing.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+
+        def boom(self):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(env_mod.Path, "iterdir", boom)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_binary_introspection(
+            reasons, torch_mod=torch_mod
+        )
+        assert block["torch_lib_bundled"] is None
+        assert any(
+            r.startswith(
+                "pytorch_build.binary_introspection.torch_lib_bundled:"
+            )
+            and "PermissionError" in r
+            for r in reasons
+        )
+
+    def test_dump_uses_provided_torch_mod_not_ambient(
+        self, tmp_path, monkeypatch
+    ):
+        """Standalone-call path: when torch_mod is passed but no cache,
+        the freshly-created cache must use the passed torch_mod (not
+        re-import ambient torch). Otherwise `torch_lib_bundled` (uses
+        passed) and `libtorch_hip_symbol_counts` (would use ambient)
+        would describe different torch installations.
+        """
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        # Set hip so the dump helper proceeds past the CPU-only guard,
+        # and create the lib so the early lib_path.exists() check passes.
+        torch_mod.version = type(torch_mod.version)(
+            git_version="abc1234", hip="7.2.5", cuda=None, debug=False,
+        )
+        lib_dir = Path(torch_mod.__file__).parent / "lib"
+        (lib_dir / "libtorch_hip.so").write_text("")
+
+        # Trip if _safe_import_torch is called for the dump's prefix --
+        # that would mean the helper re-imported ambient torch instead
+        # of using the passed module.
+        called: list[str] = []
+        real_safe = env_mod._safe_import_torch
+
+        def trip(reasons, prefix):
+            if prefix == "pytorch_build.binary_introspection":
+                called.append(prefix)
+            return real_safe(reasons, prefix)
+
+        monkeypatch.setattr(env_mod, "_safe_import_torch", trip)
+        # Stub the subprocess work (we're checking the import path,
+        # not the nm/c++filt dump itself).
+        monkeypatch.setattr(env_mod.shutil, "which", lambda _name: None)
+
+        env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert called == [], (
+            "binary_introspection re-imported ambient torch despite "
+            "being given an explicit torch_mod"
+        )
+
+    def test_torch_none_skips_symbol_cache_lookup(self, monkeypatch):
+        """Caller signal `torch_mod=None` -> skip the cache entirely;
+        otherwise on a real-torch host the cache would still dump
+        symbols and contradict the default-shape contract.
+        """
+        called: list[str] = []
+
+        class TripwireCache:
+            def get(self, reasons, prefix):
+                called.append(prefix)
+                return "pytorch_flash::mha_fwd\n"
+
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=None, hip_symbol_cache=TripwireCache(),
+        )
+        assert called == []
+        assert all(
+            v is None for v in block["libtorch_hip_symbol_counts"].values()
+        )
+
+    def test_symbol_counts_use_provided_cache(self, tmp_path, monkeypatch):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+
+        class FixedCache:
+            def get(self, reasons, prefix, *, torch_mod=None):
+                return (
+                    "void pytorch_flash::mha_fwd()\n"
+                    "void pytorch_flash::mha_bwd()\n"
+                    "void aotriton::TensorView()\n"
+                    "void unrelated::symbol()\n"
+                )
+
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, hip_symbol_cache=FixedCache()
+        )
+        counts = block["libtorch_hip_symbol_counts"]
+        assert counts["pytorch_flash::"] == 2
+        assert counts["aotriton::"] == 1
+        assert counts["ck_tile::FmhaFwd"] == 0
+
+
+class TestSummaryPytorchBuildFlagsLineUnavailable:
+    """Regression guards: distinguish "unavailable" from "all off" in the
+    `torch flags:` brief at two granularities -- whole-block and
+    per-cell.
+    """
+
+    @staticmethod
+    def _snap_with_flags(flags_block):
+        return _example_snapshot(
+            pytorch_build={
+                "git_commit": None, "hip_version": None, "cuda_version": None,
+                "debug": None, "install_kind": "wheel", "source_path": None,
+                "submodule_commits": {"_source": None},
+                "flags": flags_block,
+                "binary_introspection": {
+                    "libtorch_hip_symbol_counts": {
+                        m: None for m in env_mod._LIBTORCH_HIP_SYMBOL_MARKERS
+                    },
+                    "torch_lib_bundled": None,
+                    "cxx_flags_use_defines": None,
+                },
+                "build_flags": {
+                    name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES
+                },
+            },
+        )
+
+    def test_archs_present_but_settings_defines_none_renders_question_marks(self):
+        snap = self._snap_with_flags({
+            "build_settings": None, "cxx_defines": None,
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": ["gfx942"],
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "gpu_archs=[gfx942]" in line
+        assert "USE_ROCM=?" in line
+        assert "USE_ROCM=no" not in line
+        assert "USE_FLASH_ATTENTION=?" in line
+
+    def test_settings_populated_but_cxx_defines_none_renders_cxx_only_flags_unknown(self):
+        """When CXX_FLAGS line is missing from __config__.show(),
+        cxx_defines is None. CXX-only flags (e.g. USE_ROCM_CK_SDPA)
+        must render `=?` not `=no` -- absence-of-source != absence-of-flag.
+        """
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON", "USE_CUDA": "OFF"},
+            "cxx_defines": None,
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": None,
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "USE_ROCM=ON" in line
+        assert "USE_CUDA=OFF" in line
+        # CXX-only flags couldn't be read -> unknown, NOT off.
+        assert "USE_ROCM_CK_SDPA=?" in line
+        assert "USE_FLASH_ATTENTION=?" in line
+        assert "USE_ROCM_CK_SDPA=no" not in line
+
+    def test_empty_cxx_defines_dict_renders_cxx_only_flags_no(self):
+        """An empty dict (we read CXX_FLAGS, no -D defines present) is
+        a definitive "feature off" signal, distinct from None.
+        """
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},
+            "cxx_flags_raw": "-O3 -fPIC",
+            "cuda_flags_raw": None,
+            "gpu_arch_list": None,
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "USE_ROCM_CK_SDPA=no" in line
+        assert "USE_FLASH_ATTENTION=no" in line
+
+    def test_gpu_arch_list_empty_renders_none_not_question_mark(self):
+        """CPU-only wheel: torch.cuda.get_arch_list() returns []. That's
+        a successful, definitive result -- distinct from None
+        (probe failed). Render `(none)` not `?`.
+        """
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": [],
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "gpu_archs=[(none)]" in line
+        assert "gpu_archs=[?]" not in line
+
+    def test_gpu_arch_list_none_renders_question_mark(self):
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": None,
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "gpu_archs=[?]" in line
+
+
+class TestSummaryStableBuildFlagsLineAotritonCombined:
+    """Issue: brief AOTRITON cell must honor DISABLE_AOTRITON, otherwise
+    a build that reports only `-DDISABLE_AOTRITON` (no USE_AOTRITON
+    setting) renders `AOTRITON=?` despite a definitive disable signal.
+    """
+
+    @staticmethod
+    def _snap(use_aotriton, disable_aotriton):
+        bf = {name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES}
+        bf["USE_AOTRITON"] = use_aotriton
+        bf["DISABLE_AOTRITON"] = disable_aotriton
+        # Anchor: keep at least one other flag populated so the
+        # "all-None -> early unavailable return" guard doesn't fire
+        # when both AOTRITON inputs are None.
+        bf["USE_ROCM"] = True
+        base = _example_snapshot()
+        return _example_snapshot(
+            pytorch_build={**base.pytorch_build, "build_flags": bf}
+        )
+
+    def test_disable_only_true_renders_off(self):
+        line = self._snap(None, True)._summary_stable_build_flags_line()
+        assert "AOTRITON=off" in line
+
+    def test_use_only_true_renders_on(self):
+        line = self._snap(True, None)._summary_stable_build_flags_line()
+        assert "AOTRITON=on" in line
+
+    def test_disable_false_renders_on(self):
+        line = self._snap(None, False)._summary_stable_build_flags_line()
+        assert "AOTRITON=on" in line
+
+    def test_disable_wins_over_use_on_conflict(self):
+        line = self._snap(True, True)._summary_stable_build_flags_line()
+        assert "AOTRITON=off" in line
+
+    def test_both_none_renders_question_mark(self):
+        line = self._snap(None, None)._summary_stable_build_flags_line()
+        assert "AOTRITON=?" in line
+
+
+class TestProjectPytorchBuildFlags:
+    """Issue #170: stable parsed subset of compile-time PyTorch flags."""
+
+    def test_boolean_on_off_coerced(self):
+        flags = {
+            "build_settings": {"USE_ROCM": "ON", "USE_CUDA": "OFF"},
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_ROCM"] is True
+        assert out["USE_CUDA"] is False
+
+    def test_boolean_true_false_one_zero_coerced(self):
+        flags = {
+            "build_settings": {
+                "USE_NCCL": "TRUE",
+                "USE_MKL": "FALSE",
+                "USE_OPENMP": "1",
+                "USE_KINETO": "0",
+            },
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_NCCL"] is True
+        assert out["USE_MKL"] is False
+        assert out["USE_OPENMP"] is True
+        assert out["USE_KINETO"] is False
+
+    def test_non_boolean_value_kept_as_string(self):
+        """BUILD_TYPE=Release is not boolean -- preserve the original casing."""
+        flags = {
+            "build_settings": {"BUILD_TYPE": "Release"},
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["BUILD_TYPE"] == "Release"
+
+    def test_missing_keys_present_as_none(self):
+        """Every key in PYTORCH_BUILD_FLAG_NAMES must be in the output;
+        missing ones are None (distinguishable from False).
+        """
+        out = env_mod._project_pytorch_build_flags(
+            {"build_settings": {"USE_ROCM": "ON"}, "cxx_defines": None}
+        )
+        assert set(out.keys()) == set(env_mod.PYTORCH_BUILD_FLAG_NAMES)
+        assert out["DISABLE_AOTRITON"] is None
+        assert out["USE_FLASH_ATTENTION"] is None
+
+    def test_cxx_define_without_value_is_true(self):
+        """Bare ``-DUSE_FLASH_ATTENTION`` (no =value) means "on" by cmake convention."""
+        flags = {
+            "build_settings": None,
+            "cxx_defines": {"USE_FLASH_ATTENTION": None, "USE_ROCM_CK_SDPA": None},
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_FLASH_ATTENTION"] is True
+        assert out["USE_ROCM_CK_SDPA"] is True
+
+    def test_cxx_define_with_value_coerced(self):
+        flags = {
+            "build_settings": None,
+            "cxx_defines": {"USE_AOTRITON": "ON"},
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_AOTRITON"] is True
+
+    def test_build_settings_wins_over_cxx_defines(self):
+        """Cmake-canonical settings beat per-target define injection."""
+        flags = {
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {"USE_ROCM": "OFF"},
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_ROCM"] is True
+
+    def test_caffe2_use_miopen_alias_maps_to_use_miopen(self):
+        """Issue #170: CAFFE2_USE_MIOPEN is an alias for USE_MIOPEN."""
+        flags = {
+            "build_settings": {"CAFFE2_USE_MIOPEN": "ON"},
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_MIOPEN"] is True
+
+    def test_canonical_use_miopen_wins_over_caffe2_alias(self):
+        """When both spellings appear, the canonical name takes precedence
+        (alias tuple is ordered USE_MIOPEN first).
+        """
+        flags = {
+            "build_settings": {"USE_MIOPEN": "ON", "CAFFE2_USE_MIOPEN": "OFF"},
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_MIOPEN"] is True
+
+    def test_absent_flag_stays_none_even_when_both_sources_parsed(self):
+        """Issue #170 mock: keys not present in __config__.show() are
+        null, not False (DISABLE_AOTRITON: null on a build with
+        USE_AOTRITON: true). The brief line in `pytorch_build.flags`
+        carries the cmake-convention "no" rendering for operators who
+        want it; `pytorch_build.build_flags` preserves the
+        "set vs unset" distinction.
+        """
+        flags = {
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},  # parsed, empty
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_ROCM_CK_SDPA"] is None
+        assert out["DISABLE_AOTRITON"] is None
+        assert out["BUILD_TYPE"] is None
+
+    def test_settings_alias_wins_even_when_canonical_in_defines(self):
+        """Documented precedence: every alias in build_settings beats
+        every alias in cxx_defines. A `-DUSE_MIOPEN` in defines must
+        not override `CAFFE2_USE_MIOPEN=ON` in settings just because
+        USE_MIOPEN comes earlier in the alias tuple.
+        """
+        flags = {
+            "build_settings": {"CAFFE2_USE_MIOPEN": "OFF"},
+            "cxx_defines": {"USE_MIOPEN": None},  # bare -DUSE_MIOPEN
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        # Settings says OFF -> False wins, not the True from -D define.
+        assert out["USE_MIOPEN"] is False
+
+    def test_none_flags_block_yields_all_none(self):
+        """Torch import failed upstream -> patch returns None block;
+        projection still produces the full schema, all None.
+        """
+        out = env_mod._project_pytorch_build_flags(None)
+        assert set(out.keys()) == set(env_mod.PYTORCH_BUILD_FLAG_NAMES)
+        assert all(v is None for v in out.values())
+
+
+class TestCapturePytorchBuildFlagsRawSchema:
+    """Direct coverage for `_capture_pytorch_build_flags()` raw output.
+
+    The other tests cover `build_flags` (the projected stable subset)
+    and the brief lines, but the raw structured block (cxx_defines,
+    cxx_flags_raw, cuda_flags_raw, gpu_arch_list) feeds env.json and
+    callers reading the raw schema would silently regress without
+    direct coverage.
+    """
+
+    def _patch_torch(self, monkeypatch, fake_torch):
+        import builtins
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_torch if name == "torch" else real_import(name, *a, **kw)
+            ),
+        )
+
+    def test_raw_fields_populated_from_full_config_show(self, monkeypatch):
+        import types
+        cfg = (
+            "Build settings: BUILD_TYPE=Release, USE_ROCM=ON, "
+            "CXX_FLAGS=-DUSE_ROCM_CK_SDPA -DFLASH_NAMESPACE=pytorch_flash -O3, "
+            "CUDA_FLAGS=-arch=gfx942 -DCUDA_ONLY"
+        )
+        fake_torch = types.SimpleNamespace(
+            __config__=types.SimpleNamespace(show=lambda: cfg),
+            cuda=types.SimpleNamespace(get_arch_list=lambda: ["gfx942", "gfx950"]),
+        )
+        self._patch_torch(monkeypatch, fake_torch)
+        out = env_mod._capture_pytorch_build_flags([])
+        assert out["build_settings"]["USE_ROCM"] == "ON"
+        assert out["build_settings"]["BUILD_TYPE"] == "Release"
+        assert out["cxx_defines"] == {
+            "FLASH_NAMESPACE": "pytorch_flash",
+            "USE_ROCM_CK_SDPA": None,
+        }
+        assert out["cxx_flags_raw"].startswith("-DUSE_ROCM_CK_SDPA")
+        assert out["cuda_flags_raw"].startswith("-arch=gfx942")
+        assert out["gpu_arch_list"] == ["gfx942", "gfx950"]
+
+    def test_arch_list_captured_when_config_show_unavailable(self, monkeypatch):
+        """gpu_arch_list source is independent of __config__.show()."""
+        import types
+        fake_torch = types.SimpleNamespace(
+            __config__=None,
+            cuda=types.SimpleNamespace(get_arch_list=lambda: ["gfx942"]),
+        )
+        self._patch_torch(monkeypatch, fake_torch)
+        reasons: list[str] = []
+        out = env_mod._capture_pytorch_build_flags(reasons)
+        assert out["gpu_arch_list"] == ["gfx942"]
+        assert out["build_settings"] is None
+        assert out["cxx_defines"] is None
+        # __config__.show unavailable adds a partial reason
+        assert any(r.startswith("pytorch_build.flags") for r in reasons)
+
+
+class TestCapturePytorchBuildFlagsFromConfigShow:
+    """End-to-end: torch.__config__.show() text -> build_flags dict."""
+
+    @staticmethod
+    def _fake_torch(tmp_path: Path, config_show_text: str):
+        import types
+        torch_dir = tmp_path / "site" / "torch"
+        torch_dir.mkdir(parents=True, exist_ok=True)
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        return types.SimpleNamespace(
+            __file__=str(torch_init),
+            __version__="2.99.0",
+            version=types.SimpleNamespace(
+                git_version="abc1234", hip=None, cuda=None, debug=False,
+            ),
+            __config__=types.SimpleNamespace(show=lambda: config_show_text),
+            cuda=types.SimpleNamespace(get_arch_list=lambda: ["gfx942"]),
+        )
+
+    def _patch_torch(self, monkeypatch, fake_torch):
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                return fake_torch
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    def test_ck_sdpa_build_yields_true_for_attention_flags(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        cfg = (
+            "PyTorch built with:\n"
+            "  - GCC 11.4\n"
+            "Build settings: BUILD_TYPE=Release, USE_ROCM=ON, USE_CUDA=OFF, "
+            "USE_NCCL=ON, USE_MKLDNN=ON, USE_FLASH_ATTENTION=ON, "
+            "USE_MEM_EFF_ATTENTION=ON, USE_FBGEMM=ON, USE_FBGEMM_GENAI=OFF, "
+            "USE_AOTRITON=ON, "
+            "CXX_FLAGS=-DUSE_ROCM_CK_SDPA -DUSE_FLASH_ATTENTION -O3"
+        )
+        self._patch_torch(monkeypatch, self._fake_torch(tmp_path, cfg))
+        block = env_mod._capture_pytorch_build([])
+        bf = block["build_flags"]
+        assert bf["USE_ROCM_CK_SDPA"] is True
+        assert bf["USE_FLASH_ATTENTION"] is True
+        assert bf["USE_AOTRITON"] is True
+        assert bf["USE_MEM_EFF_ATTENTION"] is True
+        assert bf["USE_CUDA"] is False
+        assert bf["BUILD_TYPE"] == "Release"
+
+    def test_absent_keys_render_as_none_not_omitted(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        """Per issue acceptance: DISABLE_AOTRITON on a stock upstream
+        build is not in __config__.show() -- must render as null, not
+        be absent from the dict.
+        """
+        cfg = "Build settings: USE_ROCM=ON, BUILD_TYPE=Release"
+        self._patch_torch(monkeypatch, self._fake_torch(tmp_path, cfg))
+        block = env_mod._capture_pytorch_build([])
+        bf = block["build_flags"]
+        assert "DISABLE_AOTRITON" in bf
+        assert bf["DISABLE_AOTRITON"] is None
+        assert "USE_FLASH_ATTENTION" in bf
+        assert bf["USE_FLASH_ATTENTION"] is None
+
+    def test_torch_import_fails_yields_all_none_no_extra_reason(
+        self, isolated_env, monkeypatch
+    ):
+        """Torch import failure: pytorch_version probe records it
+        elsewhere; build_flags must NOT add a duplicate reason and the
+        full schema must still appear (all None).
+        """
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise ImportError("simulated")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_build(reasons)
+        bf = block["build_flags"]
+        assert set(bf.keys()) == set(env_mod.PYTORCH_BUILD_FLAG_NAMES)
+        assert all(v is None for v in bf.values())
+        assert not any(r.startswith("pytorch_build.build_flags") for r in reasons)
+
+
+class TestSummaryStableBuildFlagsLine:
+    """Issue #170: brief one-liner format."""
+
+    def _snap(self, build_flags):
+        base = _example_snapshot()
+        return _example_snapshot(
+            pytorch_build={**base.pytorch_build, "build_flags": build_flags}
+        )
+
+    def test_all_on_renders_compact_form(self):
+        bf = {name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES}
+        bf.update({
+            "USE_FLASH_ATTENTION": True,
+            "USE_ROCM_CK_SDPA": True,
+            "USE_AOTRITON": True,
+            "USE_MEM_EFF_ATTENTION": True,
+        })
+        snap = self._snap(bf)
+        line = snap._summary_stable_build_flags_line()
+        assert line == "FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on"
+
+    def test_off_and_unknown_render_distinctly(self):
+        bf = {name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES}
+        bf.update({
+            "USE_FLASH_ATTENTION": False,
+            "USE_ROCM_CK_SDPA": True,
+            # USE_AOTRITON intentionally absent (None)
+            "USE_MEM_EFF_ATTENTION": False,
+        })
+        snap = self._snap(bf)
+        line = snap._summary_stable_build_flags_line()
+        assert line == "FLASH_ATTN=off CK_SDPA=on AOTRITON=? MEM_EFF=off"
+
+    def test_all_none_renders_unavailable(self):
+        bf = {name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES}
+        snap = self._snap(bf)
+        line = snap._summary_stable_build_flags_line()
+        assert "unavailable" in line
+
+    def test_summary_includes_flags_line(self):
+        """Brief output must include the issue's `flags:` one-liner."""
+        bf = {name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES}
+        bf.update({"USE_FLASH_ATTENTION": True, "USE_ROCM_CK_SDPA": True})
+        snap = self._snap(bf)
+        body = snap.summary()
+        flags_line = next(
+            (ln for ln in body.splitlines() if ln.lstrip().startswith("flags:")),
+            None,
+        )
+        assert flags_line is not None
+        assert "FLASH_ATTN=on" in flags_line
+        assert "CK_SDPA=on" in flags_line
 
 
 class TestSafeImportTorch:

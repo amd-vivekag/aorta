@@ -69,7 +69,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.1) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.2) [PARTIAL]
   runtime:   baremetal / python=venv
   rocm:      7.2.1 (dev: None)
   hip:       7.2.53211-e1a6bc5663 (amd)
@@ -88,6 +88,9 @@ Wrote env probe to /tmp/env.json (schema_version=1.1) [PARTIAL]
   rdhc:      unavailable (system_health=null)
   python:    3.12.13 | pytorch: 2.9.1+rocm7.2.1.gitff65f5bc
   torch build: git_commit=ff65f5bc install=wheel [third_party SHAs: set AORTA_PYTORCH_SRC=<src> or look up github.com/pytorch/pytorch/tree/ff65f5bc/third_party/<name>]
+  torch flags: gpu_archs=[gfx942]  USE_ROCM=ON USE_CUDA=OFF USE_NCCL=ON USE_MKL=OFF USE_MKLDNN=ON USE_FBGEMM=yes USE_FBGEMM_GENAI=no USE_FLASH_ATTENTION=yes USE_MEM_EFF_ATTENTION=yes USE_ROCM_CK_SDPA=yes USE_ROCM_CK_GEMM=no DISABLE_AOTRITON=no FLASH_NAMESPACE=pytorch_flash
+  torch syms:  pytorch_flash::=142 mha_fwd_aot=4 mha_fwd_ck=4 _efficient_attention=18 aotriton::=72 ck_tile::FmhaFwd=1820 ck_tile::FmhaBwd=1240 ck_tile::BlockFmha=890 ck_tile::TileFmha=320 group_gemm_ck=12 aiter::=0  |  libaotriton_v2.so=yes  |  -DUSE_ROCM_CK_SDPA=yes -DUSE_ROCM_CK_GEMM=no
+  flags:       FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on
 
 Partial reasons:
   - system_health: rdhc exited 1 (stderr: sudo: a password is required)
@@ -142,7 +145,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.1"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.2"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -159,14 +162,14 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `tensile` | `dict` | optional `import Tensile` + sorted-filenames hash over the union of hipBLASLt + rocBLAS kernel DBs | `package_version` (usually `null` outside builders), `kernel_db_combined_hash` |
 | `triton` | `dict` | `import triton; triton.__version__` | `package_version`. ROCm Triton fork bakes the source commit into `__version__`. |
 | `fbgemm` | `dict` | optional `import fbgemm_gpu` + parse of `torch.__config__.show()` for `-DUSE_FBGEMM*` defines | `package_version`, `pytorch_use_fbgemm`, `pytorch_use_fbgemm_genai`. The two booleans capture the build-time decision baked into the PyTorch wheel even when `fbgemm_gpu` isn't a separate pip package. |
-| `aiter` | `dict` | `import aiter; aiter.__version__` | `package_version`. Most installs record `null`; absence is silent. |
+| `aiter` | `dict` | `import aiter; aiter.__version__` + `importlib.metadata.version("amd_aiter" \| "aiter")` | `package_version`, `package_dist_name` (which PyPI dist matched: `amd_aiter` is the canonical AMD-internal ROCm/PyTorch image dist; `aiter` is the upstream name), `commit` (parsed from the setuptools_scm `+g<sha>` local-version segment, matches the image tag's `aiter-<sha>` label). Most installs record `null` for everything; absence is silent. |
 | `aotriton` | `dict` | scan of `<torch>/lib/libaotriton_v2.so*` filenames + `sha256` of the resolved file + presence of `<torch>/lib/aotriton.images/` + `$AOTRITON_INSTALLED_PREFIX` | Default ROCm Flash Attention backend. Bundled in the wheel via `cmake/External/aotriton.cmake` (NOT a `third_party/` git submodule). Fields: `bundled_present`, `bundled_version`, `bundled_lib_hash`, `bundled_images_dir_present`, `installed_prefix`. CK is the alternative backend (toggled via `TORCH_ROCM_FA_PREFER_CK=1`). |
 | `runtime_context` | `dict` | `/.dockerenv`, `/run/.containerenv`, `$SINGULARITY_NAME`, `/proc/1/cgroup`, `sys.prefix`, `$CONDA_DEFAULT_ENV` | `type`, `python_env`, `venv_path`, `conda_env_name` |
 | `docker` | `dict \| null` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars + `/proc/self/cgroup` | `null` on baremetal; image+digest provided by the launcher (the only reliable way from inside a container) |
 | `env_vars` | `dict[str, str \| null]` | explicit canonical list (currently 31 names; see `CANONICAL_ENV_VARS` in `environment.py` for the live set) | GPU scoping + HSA / runtime + GPU queue / codegen + NCCL/RCCL + FBGEMM + MIOpen + SDPA backend selection + GEMM backend preference + hipBLASLt autotune + PyTorch / inductor. Build-time cmake flags (`USE_ROCM_CK_SDPA`, `USE_ROCM_CK_GEMM`, `USE_FBGEMM*`) are NOT in this list -- they're surfaced under their respective library blocks instead, parsed from `torch.__config__.show()`. |
 | `python_version` | `str` | `platform.python_version()` | always populated |
 | `pytorch_version` | `str \| null` | optional `import torch` (no CUDA/HIP context init) | `null` when torch absent |
-| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. See "PyTorch source-tree submodule probing" below. |
+| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference). See "PyTorch source-tree submodule probing" below. |
 
 `runtime_context.type` is one of `"docker" | "podman" | "singularity" | "baremetal"`. Adding values is a schema change.
 
@@ -329,7 +332,49 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.1` (current)
+### `1.2` (current)
+
+Top-level-key-additive -- every new field lives under existing
+top-level dicts (`pytorch_build`, `aiter`), so 1.1 readers loading
+a 1.2 snapshot via `EnvSnapshot.from_dict(...)` do NOT raise and
+existing top-level access still works. Note however that the new
+**nested** keys (`pytorch_build.flags`, `pytorch_build.build_flags`,
+`pytorch_build.binary_introspection`, `aiter.package_dist_name`,
+`aiter.commit`) are NOT backfilled on 1.1 snapshots -- a consumer
+indexing them on a 1.1 snapshot gets a `KeyError`, not `None`. Use
+`.get(key)` or guard on `schema_version` if you read these from
+historical snapshots.
+
+* `pytorch_build.flags` -- structured raw introspection from
+  `torch.__config__.show()`: `build_settings` (KEY=VALUE dict from the
+  `Build settings:` block), `cxx_defines` (`-D<NAME>[=<value>]` tokens
+  parsed out of `CXX_FLAGS`), verbatim `cxx_flags_raw` /
+  `cuda_flags_raw`, and `gpu_arch_list` from
+  `torch.cuda.get_arch_list()`.
+* `pytorch_build.build_flags` (issue #170) -- stable 17-key parsed
+  subset projected from `flags`. Boolean-like values (ON/OFF/TRUE/
+  FALSE/1/0, any case) become bools; non-boolean values like
+  `BUILD_TYPE=Release` stay strings; flags absent from
+  `__config__.show()` render as `null`. `CAFFE2_USE_MIOPEN` is treated
+  as an alias for `USE_MIOPEN` (the Caffe2-era spelling some ROCm
+  builds still emit). The brief gains a compact one-liner:
+  `flags: FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on`.
+* `pytorch_build.binary_introspection` -- `nm | c++filt` substring
+  counts on `libtorch_hip.so` (`pytorch_flash::`, `ck_tile::FmhaFwd`,
+  `aotriton::`, `aiter::`, ...), bundled-lib presence in
+  `<torch>/lib/` (`libaotriton_v2.so`), and presence of specific
+  `-DUSE_*` defines in `CXX_FLAGS`. Pure facts -- a non-zero count
+  proves a code path is compiled in, but a zero count does NOT prove
+  the cmake option was OFF (linker stripping). The CK pytorch-bundled
+  probe and binary_introspection share one `nm` dump per
+  `collect_env()` call via `_HipSymbolDumpCache`.
+* `aiter` -- gained `package_dist_name` (which PyPI dist matched:
+  `amd_aiter` is the AMD-internal ROCm/PyTorch image dist; `aiter` is
+  the upstream name) and `commit` (parsed from the setuptools_scm
+  `+g<sha>` local-version segment, matches the image tag's
+  `aiter-<sha>` label).
+
+### `1.1`
 
 Renames (non-additive -- bumped from `1.0`):
 
