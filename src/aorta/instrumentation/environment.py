@@ -348,14 +348,6 @@ _PYTORCH_BUILD_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "USE_MIOPEN": ("USE_MIOPEN", "CAFFE2_USE_MIOPEN"),
 }
 
-# Flags whose value is a string (e.g. ``BUILD_TYPE=Release``), not a
-# cmake boolean. The "absent define = OFF" cmake convention does NOT
-# apply to these -- their absence means "the build did not emit a
-# value", which is unknown rather than False. Used by the projection
-# helper to decide what to fill in when neither source has the flag.
-_PYTORCH_BUILD_FLAG_NON_BOOLEAN: frozenset[str] = frozenset({"BUILD_TYPE"})
-
-
 def _coerce_pytorch_build_flag_value(raw: str) -> bool | str:
     """ON/OFF/TRUE/FALSE/1/0 (any case) -> bool; anything else stays str.
 
@@ -377,64 +369,57 @@ def _project_pytorch_build_flags(
     the structured ``pytorch_build.flags`` block.
 
     Returns a dict with every name in ``PYTORCH_BUILD_FLAG_NAMES``
-    present. The lookup order is:
+    present. Lookup is two-pass to honour "build_settings beats
+    CXX_FLAGS define injection" precedence even when aliases are in
+    play:
 
-    1. ``Build settings:`` KEY=VALUE pairs (the cmake-canonical state
-       reported by ``torch.__config__.show()`` -- the authoritative
-       source for things like ``USE_ROCM=ON``, ``USE_CUDA=OFF``,
-       ``BUILD_TYPE=Release``).
-    2. ``CXX_FLAGS`` ``-D<NAME>[=<value>]`` defines (per-target define
-       injection -- the only place some flags appear, e.g.
-       ``USE_ROCM_CK_SDPA``). A bare ``-D<NAME>`` (no value) renders as
-       ``True`` -- presence-as-define is the cmake convention for "this
-       feature is compiled in".
-    3. Not found in either source. Two sub-cases:
-
-       a. **Both sources were parsed** (``build_settings`` AND
-          ``cxx_defines`` are non-None dicts -- the typical case for a
-          successful ``__config__.show()`` capture): the cmake
-          convention applies -- absent boolean flag means OFF, so
-          render ``False``. Non-boolean flags
-          (:data:`_PYTORCH_BUILD_FLAG_NON_BOOLEAN`, currently just
-          ``BUILD_TYPE``) keep ``None`` -- their value is freeform and
-          absence is unknown, not "off". This matches the existing
-          :func:`_read_pytorch_ck_flags` convention and the issue #170
-          acceptance bullet "USE_ROCM_CK_SDPA == false on builds
-          without CK SDPA".
-
-       b. **At least one source is None** (partial capture): render
-          ``None`` -- we can't be sure the flag isn't in the unread
-          source.
+    1. **Settings pass** -- check every alias of the canonical name in
+       ``Build settings:`` KEY=VALUE pairs first. A hit anywhere in the
+       alias tuple wins: this is cmake-canonical state (USE_ROCM=ON,
+       USE_CUDA=OFF, BUILD_TYPE=Release).
+    2. **Defines pass** -- only if the settings pass found nothing,
+       check every alias in ``CXX_FLAGS`` ``-D<NAME>[=<value>]``
+       defines. A bare ``-D<NAME>`` (no value) renders as ``True``
+       (presence-as-define is the cmake convention for "feature
+       compiled in"); ``-D<NAME>=<value>`` is coerced.
+    3. **Otherwise None** -- distinguishable from ``False`` so callers
+       can tell "the build did not set this anywhere we could see"
+       apart from "the build set it to OFF". This matches the issue
+       #170 mock JSON (e.g. ``DISABLE_AOTRITON: null`` on a build with
+       ``USE_AOTRITON: true``). Operators wanting cmake-style "absent
+       define = OFF" semantics for a specific flag should read
+       ``pytorch_build.flags.cxx_defines`` directly -- the dict's
+       presence vs absence is the definitive signal there.
 
     No partial reasons are added here: if torch is importable but a
     particular flag is missing from ``__config__.show()``, that's the
     upstream build's choice, not a probe failure.
     """
-    settings_raw = (flags or {}).get("build_settings")
-    defines_raw = (flags or {}).get("cxx_defines")
-    settings = settings_raw or {}
-    defines = defines_raw or {}
-    both_sources_parsed = settings_raw is not None and defines_raw is not None
+    settings = (flags or {}).get("build_settings") or {}
+    defines = (flags or {}).get("cxx_defines") or {}
     out: dict[str, bool | str | None] = {}
     for name in PYTORCH_BUILD_FLAG_NAMES:
-        found = False
-        for alias in _PYTORCH_BUILD_FLAG_ALIASES.get(name, (name,)):
+        aliases = _PYTORCH_BUILD_FLAG_ALIASES.get(name, (name,))
+        # Pass 1: settings (cmake-canonical) wins for any alias.
+        value: bool | str | None = None
+        hit = False
+        for alias in aliases:
             if alias in settings:
-                out[name] = _coerce_pytorch_build_flag_value(settings[alias])
-                found = True
+                value = _coerce_pytorch_build_flag_value(settings[alias])
+                hit = True
                 break
-            if alias in defines:
-                value = defines[alias]
-                out[name] = (
-                    True if value is None else _coerce_pytorch_build_flag_value(value)
-                )
-                found = True
-                break
-        if not found:
-            if both_sources_parsed and name not in _PYTORCH_BUILD_FLAG_NON_BOOLEAN:
-                out[name] = False
-            else:
-                out[name] = None
+        # Pass 2: only fall to defines when no alias hit settings.
+        if not hit:
+            for alias in aliases:
+                if alias in defines:
+                    raw = defines[alias]
+                    value = (
+                        True
+                        if raw is None
+                        else _coerce_pytorch_build_flag_value(raw)
+                    )
+                    break
+        out[name] = value
     return out
 
 # GitHub URL template printed in `partial_reasons` when the PyTorch
@@ -765,8 +750,16 @@ class EnvSnapshot:
         if not flags or all(flags.get(k) is None for k in flags):
             return "(unavailable -- torch import failed or no __config__)"
 
+        # Distinguish CPU-only-wheel ([] from a successful
+        # torch.cuda.get_arch_list() call) from probe failure (None).
+        # Truthiness would conflate the two as `?`.
         archs = flags.get("gpu_arch_list")
-        arch_part = ",".join(archs) if archs else "?"
+        if archs is None:
+            arch_part = "?"
+        elif not archs:
+            arch_part = "(none)"
+        else:
+            arch_part = ",".join(archs)
 
         # gpu_arch_list comes from torch.cuda.get_arch_list() and is
         # independent of __config__.show(); settings/defines come from

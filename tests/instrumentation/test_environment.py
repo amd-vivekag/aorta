@@ -4192,6 +4192,31 @@ class TestSummaryPytorchBuildFlagsLineUnavailable:
         assert "USE_ROCM_CK_SDPA=no" in line
         assert "USE_FLASH_ATTENTION=no" in line
 
+    def test_gpu_arch_list_empty_renders_none_not_question_mark(self):
+        """CPU-only wheel: torch.cuda.get_arch_list() returns []. That's
+        a successful, definitive result -- distinct from None
+        (probe failed). Render `(none)` not `?`.
+        """
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": [],
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "gpu_archs=[(none)]" in line
+        assert "gpu_archs=[?]" not in line
+
+    def test_gpu_arch_list_none_renders_question_mark(self):
+        snap = self._snap_with_flags({
+            "build_settings": {"USE_ROCM": "ON"},
+            "cxx_defines": {},
+            "cxx_flags_raw": None, "cuda_flags_raw": None,
+            "gpu_arch_list": None,
+        })
+        line = snap._summary_pytorch_build_flags_line()
+        assert "gpu_archs=[?]" in line
+
 
 class TestSummaryStableBuildFlagsLineAotritonCombined:
     """Issue: brief AOTRITON cell must honor DISABLE_AOTRITON, otherwise
@@ -4329,39 +4354,36 @@ class TestProjectPytorchBuildFlags:
         out = env_mod._project_pytorch_build_flags(flags)
         assert out["USE_MIOPEN"] is True
 
-    def test_both_sources_parsed_absent_bool_flag_renders_false(self):
-        """Issue #170 acceptance + matches existing _read_pytorch_ck_flags:
-        when BOTH config sources were successfully parsed and a bool
-        flag isn't in either, the cmake convention fires (absent define
-        = OFF), so render False -- not None.
+    def test_absent_flag_stays_none_even_when_both_sources_parsed(self):
+        """Issue #170 mock: keys not present in __config__.show() are
+        null, not False (DISABLE_AOTRITON: null on a build with
+        USE_AOTRITON: true). The brief line in `pytorch_build.flags`
+        carries the cmake-convention "no" rendering for operators who
+        want it; `pytorch_build.build_flags` preserves the
+        "set vs unset" distinction.
         """
         flags = {
             "build_settings": {"USE_ROCM": "ON"},
-            "cxx_defines": {},  # parsed, empty -- CXX_FLAGS had no -D defines
+            "cxx_defines": {},  # parsed, empty
         }
         out = env_mod._project_pytorch_build_flags(flags)
-        assert out["USE_ROCM_CK_SDPA"] is False
-        assert out["USE_FLASH_ATTENTION"] is False
-        # Non-boolean flag (BUILD_TYPE) keeps None on absence -- its
-        # value is freeform, "absent define = OFF" doesn't apply.
+        assert out["USE_ROCM_CK_SDPA"] is None
+        assert out["DISABLE_AOTRITON"] is None
         assert out["BUILD_TYPE"] is None
 
-    def test_only_one_source_parsed_absent_bool_flag_stays_none(self):
-        """Conservative: when one source is None, we can't be sure the
-        flag isn't in the unread source -- stay None, don't claim False.
+    def test_settings_alias_wins_even_when_canonical_in_defines(self):
+        """Documented precedence: every alias in build_settings beats
+        every alias in cxx_defines. A `-DUSE_MIOPEN` in defines must
+        not override `CAFFE2_USE_MIOPEN=ON` in settings just because
+        USE_MIOPEN comes earlier in the alias tuple.
         """
-        flags_settings_only = {
-            "build_settings": {"USE_ROCM": "ON"},
-            "cxx_defines": None,
+        flags = {
+            "build_settings": {"CAFFE2_USE_MIOPEN": "OFF"},
+            "cxx_defines": {"USE_MIOPEN": None},  # bare -DUSE_MIOPEN
         }
-        flags_defines_only = {
-            "build_settings": None,
-            "cxx_defines": {},
-        }
-        for flags in (flags_settings_only, flags_defines_only):
-            out = env_mod._project_pytorch_build_flags(flags)
-            assert out["USE_ROCM_CK_SDPA"] is None
-            assert out["DISABLE_AOTRITON"] is None
+        out = env_mod._project_pytorch_build_flags(flags)
+        # Settings says OFF -> False wins, not the True from -D define.
+        assert out["USE_MIOPEN"] is False
 
     def test_none_flags_block_yields_all_none(self):
         """Torch import failed upstream -> patch returns None block;
