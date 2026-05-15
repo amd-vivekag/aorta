@@ -267,7 +267,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.1"
+        assert snapshot.schema_version == "1.2"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -314,7 +314,7 @@ class TestSchemaCompleteness:
 def _example_snapshot(**overrides) -> object:
     """Build a fully-populated EnvSnapshot for round-trip testing."""
     base = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "captured_at": "2026-04-28T12:00:00Z",
         "system_health": {"rdhc_version": "1.4.0", "tests": {}},
         "rocm": {
@@ -468,7 +468,7 @@ class TestEnvSnapshot:
         d = _example_snapshot().to_dict()
         d["future_field_not_yet_added"] = {"hello": "world"}
         rebuilt = EnvSnapshot.from_dict(d)
-        assert rebuilt.schema_version == "1.1"
+        assert rebuilt.schema_version == "1.2"
 
     def test_from_dict_defaults_partial_reasons_when_missing(self):
         """Older env.json without partial_reasons still loads (defaults to [])."""
@@ -2838,8 +2838,25 @@ class TestFbgemmBlock:
 
 
 class TestAiterBlock:
+    @staticmethod
+    def _force_no_aiter_dist(monkeypatch):
+        """Make `importlib.metadata.version("amd_aiter" | "aiter")` raise
+        PackageNotFoundError so tests are deterministic regardless of
+        whether a developer / CI host happens to have the dist installed.
+        """
+        import importlib.metadata as _md
+        real_version = _md.version
+
+        def fake_version(name):
+            if name in ("amd_aiter", "aiter"):
+                raise _md.PackageNotFoundError(name)
+            return real_version(name)
+
+        monkeypatch.setattr(_md, "version", fake_version)
+
     def test_aiter_absence_does_not_record_reason(self, all_disabled):
         """Most production hosts don't have aiter; suppress the noise."""
+        self._force_no_aiter_dist(all_disabled)
         reasons: list[str] = []
         block = env_mod._capture_aiter(reasons)
         assert block == {
@@ -2853,6 +2870,7 @@ class TestAiterBlock:
         import builtins
         import types
 
+        self._force_no_aiter_dist(monkeypatch)
         real_import = builtins.__import__
         fake_aiter = types.SimpleNamespace(__version__="0.1.4+rocm7.2.gitabc")
 
@@ -2865,7 +2883,7 @@ class TestAiterBlock:
         reasons: list[str] = []
         block = env_mod._capture_aiter(reasons)
         # +rocm... local segment carries no `+g<sha>` -> commit stays None.
-        # No amd_aiter dist installed in test env -> dist_name None.
+        # No amd_aiter dist (forced) -> dist_name None.
         assert block == {
             "package_version": "0.1.4+rocm7.2.gitabc",
             "package_dist_name": None,
@@ -4003,6 +4021,26 @@ class TestCapturePytorchBinaryIntrospection:
             v is None for v in block["libtorch_hip_symbol_counts"].values()
         )
 
+    def test_torch_none_skips_symbol_cache_lookup(self, monkeypatch):
+        """Caller signal `torch_mod=None` -> skip the cache entirely;
+        otherwise on a real-torch host the cache would still dump
+        symbols and contradict the default-shape contract.
+        """
+        called: list[str] = []
+
+        class TripwireCache:
+            def get(self, reasons, prefix):
+                called.append(prefix)
+                return "pytorch_flash::mha_fwd\n"
+
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=None, hip_symbol_cache=TripwireCache(),
+        )
+        assert called == []
+        assert all(
+            v is None for v in block["libtorch_hip_symbol_counts"].values()
+        )
+
     def test_symbol_counts_use_provided_cache(self, tmp_path, monkeypatch):
         torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
 
@@ -4137,6 +4175,26 @@ class TestProjectPytorchBuildFlags:
         }
         out = env_mod._project_pytorch_build_flags(flags)
         assert out["USE_ROCM"] is True
+
+    def test_caffe2_use_miopen_alias_maps_to_use_miopen(self):
+        """Issue #170: CAFFE2_USE_MIOPEN is an alias for USE_MIOPEN."""
+        flags = {
+            "build_settings": {"CAFFE2_USE_MIOPEN": "ON"},
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_MIOPEN"] is True
+
+    def test_canonical_use_miopen_wins_over_caffe2_alias(self):
+        """When both spellings appear, the canonical name takes precedence
+        (alias tuple is ordered USE_MIOPEN first).
+        """
+        flags = {
+            "build_settings": {"USE_MIOPEN": "ON", "CAFFE2_USE_MIOPEN": "OFF"},
+            "cxx_defines": None,
+        }
+        out = env_mod._project_pytorch_build_flags(flags)
+        assert out["USE_MIOPEN"] is True
 
     def test_none_flags_block_yields_all_none(self):
         """Torch import failed upstream -> patch returns None block;

@@ -62,8 +62,26 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "1.1"
-# 1.0 -> 1.1 (this commit):
+SCHEMA_VERSION = "1.2"
+# 1.1 -> 1.2 (this commit):
+#   - Added `pytorch_build.flags` (build_settings, cxx_defines,
+#     cxx_flags_raw, cuda_flags_raw, gpu_arch_list) -- structured raw
+#     introspection from `torch.__config__.show()`.
+#   - Added `pytorch_build.build_flags` (issue #170) -- stable 17-key
+#     parsed bool/str/None subset projected from the structured flags
+#     block; CAFFE2_USE_MIOPEN is treated as an alias for USE_MIOPEN.
+#   - Added `pytorch_build.binary_introspection`
+#     (libtorch_hip_symbol_counts, torch_lib_bundled,
+#     cxx_flags_use_defines) -- pure-fact symbol counts and bundled-lib
+#     presence from libtorch_hip.so via `nm | c++filt`.
+#   - Extended `aiter` block: added `package_dist_name` (PyPI dist
+#     identity, `amd_aiter` vs `aiter`) and `commit` (parsed from the
+#     setuptools_scm `+g<sha>` local-version segment, matches the image
+#     tag's `aiter-<sha>` label).
+#   All purely additive -- 1.1 consumers reading the new fields off a
+#   1.2 snapshot get None where they used to get nothing.
+#
+# 1.0 -> 1.1:
 #   - Renamed hipblaslt/rocblas/miopen.commit -> .rocm_release_tweak
 #     (the field's value is the ROCm-release-shared identifier, not a
 #     per-library upstream commit -- the old name misled consumers).
@@ -320,6 +338,16 @@ PYTORCH_BUILD_FLAG_NAMES: tuple[str, ...] = (
 _PYTORCH_BUILD_FLAG_TRUE = frozenset({"ON", "TRUE", "1"})
 _PYTORCH_BUILD_FLAG_FALSE = frozenset({"OFF", "FALSE", "0"})
 
+# Aliases under which a PyTorch build may report a flag in
+# `torch.__config__.show()`. Some flags have a Caffe2-era spelling that
+# upstream still emits on certain ROCm builds (CAFFE2_USE_MIOPEN being
+# the canonical example -- per issue #170). Lookup tries the aliases in
+# order; first hit wins. Canonical name (the key) is what surfaces in
+# `pytorch_build.build_flags`.
+_PYTORCH_BUILD_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
+    "USE_MIOPEN": ("USE_MIOPEN", "CAFFE2_USE_MIOPEN"),
+}
+
 
 def _coerce_pytorch_build_flag_value(raw: str) -> bool | str:
     """ON/OFF/TRUE/FALSE/1/0 (any case) -> bool; anything else stays str.
@@ -365,15 +393,17 @@ def _project_pytorch_build_flags(
     defines = (flags or {}).get("cxx_defines") or {}
     out: dict[str, bool | str | None] = {}
     for name in PYTORCH_BUILD_FLAG_NAMES:
-        if name in settings:
-            out[name] = _coerce_pytorch_build_flag_value(settings[name])
-        elif name in defines:
-            value = defines[name]
-            out[name] = (
-                True if value is None else _coerce_pytorch_build_flag_value(value)
-            )
-        else:
-            out[name] = None
+        out[name] = None
+        for alias in _PYTORCH_BUILD_FLAG_ALIASES.get(name, (name,)):
+            if alias in settings:
+                out[name] = _coerce_pytorch_build_flag_value(settings[alias])
+                break
+            if alias in defines:
+                value = defines[alias]
+                out[name] = (
+                    True if value is None else _coerce_pytorch_build_flag_value(value)
+                )
+                break
     return out
 
 # GitHub URL template printed in `partial_reasons` when the PyTorch
@@ -1336,7 +1366,7 @@ _BUILD_SETTING_PAIR_RE = re.compile(
 
 # Every `-D<NAME>` and `-D<NAME>=<value>` token in a flags string. Used
 # to extract the actionable subset of CXX_FLAGS for build-flag verification
-# (USE_FLASH_ATTENTION, USE_MSLK, USE_ROCM_CK_SDPA, FLASH_NAMESPACE=...).
+# (USE_FLASH_ATTENTION, USE_MKL, USE_ROCM_CK_SDPA, FLASH_NAMESPACE=...).
 _CXX_DEFINE_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)(?:=([^\s,]+))?")
 
 # Match libaotriton_v2.so.<MAJOR>.<MINOR>.<PATCH>. Anchored so a stray
@@ -2737,6 +2767,14 @@ def _capture_pytorch_binary_introspection(
                 result["cxx_flags_use_defines"] = cxx_pairs
 
     # ----- libtorch_hip.so symbol counts (shared nm dump) -----
+    # Caller signals torch unavailability with torch_mod=None; respect
+    # that and skip the symbol dump entirely. Otherwise the cache would
+    # still attempt its own torch import, which on a host with torch
+    # actually installed would populate symbol_counts despite the
+    # caller's "no torch" intent and contradict the default-shape
+    # contract documented in the docstring.
+    if torch_mod is None:
+        return result
     if hip_symbol_cache is None:
         hip_symbol_cache = _HipSymbolDumpCache()
     symbols = hip_symbol_cache.get(
