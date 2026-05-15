@@ -3894,6 +3894,175 @@ class TestCapturePytorchBuildIntegration:
         )
 
 
+class TestHipSymbolDumpCache:
+    """Per-collect_env() cache that dedupes the nm|c++filt subprocess
+    across the CK probe and the binary-introspection probe.
+    """
+
+    def test_first_get_invokes_dump_subsequent_reuse(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_dump(reasons, prefix):
+            calls.append(prefix)
+            return "ck::foo\nck::bar\n"
+
+        monkeypatch.setattr(env_mod, "_dump_pytorch_hip_demangled_symbols", fake_dump)
+        cache = env_mod._HipSymbolDumpCache()
+        reasons: list[str] = []
+        a = cache.get(reasons, "first")
+        b = cache.get(reasons, "second")
+        assert a == b == "ck::foo\nck::bar\n"
+        assert calls == ["first"]
+
+    def test_failed_dump_cached_no_duplicate_reasons(self, monkeypatch):
+        def fake_dump(reasons, prefix):
+            reasons.append(f"{prefix}: nm/c++filt not on PATH")
+            return None
+
+        monkeypatch.setattr(env_mod, "_dump_pytorch_hip_demangled_symbols", fake_dump)
+        cache = env_mod._HipSymbolDumpCache()
+        reasons: list[str] = []
+        assert cache.get(reasons, "first") is None
+        assert cache.get(reasons, "second") is None
+        assert reasons == ["first: nm/c++filt not on PATH"]
+
+    def test_cache_shared_across_probes_in_collect_env(
+        self, all_disabled, monkeypatch
+    ):
+        calls: list[str] = []
+
+        def fake_dump(reasons, prefix):
+            calls.append(prefix)
+            return None
+
+        monkeypatch.setattr(env_mod, "_dump_pytorch_hip_demangled_symbols", fake_dump)
+        collect_env()
+        # CK probe and binary_introspection probe both use the cache;
+        # only the first prefix actually invokes the dump.
+        assert len(calls) <= 1
+
+
+class TestCapturePytorchBinaryIntrospection:
+    """Direct facts about the compiled PyTorch wheel -- no inference."""
+
+    @staticmethod
+    def _fake_torch(tmp_path: Path, *, with_aotriton: bool, cfg_text: str | None):
+        import types
+        torch_dir = tmp_path / "site" / "torch"
+        lib_dir = torch_dir / "lib"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        if with_aotriton:
+            (lib_dir / "libaotriton_v2.so.0.11.2").write_text("")
+        torch_init = torch_dir / "__init__.py"
+        torch_init.write_text("")
+        config_obj = (
+            types.SimpleNamespace(show=lambda: cfg_text)
+            if cfg_text is not None
+            else None
+        )
+        return types.SimpleNamespace(
+            __file__=str(torch_init),
+            __version__="2.99.0",
+            __config__=config_obj,
+            version=types.SimpleNamespace(
+                git_version="abc1234", hip="7.2.5", cuda=None, debug=False,
+            ),
+        )
+
+    def test_torch_lib_bundled_detects_versioned_soname(self, tmp_path):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=True, cfg_text=None)
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert block["torch_lib_bundled"] == {"libaotriton_v2.so": True}
+
+    def test_torch_lib_bundled_absent_renders_false(self, tmp_path):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert block["torch_lib_bundled"] == {"libaotriton_v2.so": False}
+
+    def test_cxx_define_presence_parsed_from_config_show(self, tmp_path):
+        cfg = "Build settings: CXX_FLAGS=-DUSE_ROCM_CK_SDPA -O3"
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=cfg)
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert block["cxx_flags_use_defines"] == {
+            "USE_ROCM_CK_SDPA": True,
+            "USE_ROCM_CK_GEMM": False,
+        }
+
+    def test_cxx_define_regex_does_not_false_match_substring(self, tmp_path):
+        # `USE_ROCM_CK_SDPA_FOO` must not match `USE_ROCM_CK_SDPA`.
+        cfg = "Build settings: CXX_FLAGS=-DUSE_ROCM_CK_SDPA_FOO -O3"
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=cfg)
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=torch_mod)
+        assert block["cxx_flags_use_defines"]["USE_ROCM_CK_SDPA"] is False
+
+    def test_torch_none_returns_full_default_shape(self):
+        block = env_mod._capture_pytorch_binary_introspection([], torch_mod=None)
+        assert block["torch_lib_bundled"] is None
+        assert block["cxx_flags_use_defines"] is None
+        assert all(
+            v is None for v in block["libtorch_hip_symbol_counts"].values()
+        )
+
+    def test_symbol_counts_use_provided_cache(self, tmp_path, monkeypatch):
+        torch_mod = self._fake_torch(tmp_path, with_aotriton=False, cfg_text=None)
+
+        class FixedCache:
+            def get(self, reasons, prefix):
+                return (
+                    "void pytorch_flash::mha_fwd()\n"
+                    "void pytorch_flash::mha_bwd()\n"
+                    "void aotriton::TensorView()\n"
+                    "void unrelated::symbol()\n"
+                )
+
+        block = env_mod._capture_pytorch_binary_introspection(
+            [], torch_mod=torch_mod, hip_symbol_cache=FixedCache()
+        )
+        counts = block["libtorch_hip_symbol_counts"]
+        assert counts["pytorch_flash::"] == 2
+        assert counts["aotriton::"] == 1
+        assert counts["ck_tile::FmhaFwd"] == 0
+
+
+class TestSummaryPytorchBuildFlagsLineUnavailable:
+    """Regression guard for Copilot review: gpu_arch_list captured but
+    build_settings/cxx_defines both None must NOT render every flag as
+    `=no` -- that conflates "couldn't read build config" with "all
+    flags off".
+    """
+
+    def test_archs_present_but_settings_defines_none_renders_question_marks(self):
+        snap = _example_snapshot(
+            pytorch_build={
+                "git_commit": None, "hip_version": None, "cuda_version": None,
+                "debug": None, "install_kind": "wheel", "source_path": None,
+                "submodule_commits": {"_source": None},
+                "flags": {
+                    "build_settings": None,
+                    "cxx_defines": None,
+                    "cxx_flags_raw": None,
+                    "cuda_flags_raw": None,
+                    "gpu_arch_list": ["gfx942"],
+                },
+                "binary_introspection": {
+                    "libtorch_hip_symbol_counts": {
+                        m: None for m in env_mod._LIBTORCH_HIP_SYMBOL_MARKERS
+                    },
+                    "torch_lib_bundled": None,
+                    "cxx_flags_use_defines": None,
+                },
+                "build_flags": {
+                    name: None for name in env_mod.PYTORCH_BUILD_FLAG_NAMES
+                },
+            },
+        )
+        line = snap._summary_pytorch_build_flags_line()
+        assert "gpu_archs=[gfx942]" in line
+        assert "USE_ROCM=?" in line
+        assert "USE_ROCM=no" not in line
+        assert "USE_FLASH_ATTENTION=?" in line
+
+
 class TestProjectPytorchBuildFlags:
     """Issue #170: stable parsed subset of compile-time PyTorch flags."""
 

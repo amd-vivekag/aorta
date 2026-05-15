@@ -669,10 +669,10 @@ class EnvSnapshot:
         "USE_ROCM",
         "USE_CUDA",
         "USE_NCCL",
+        "USE_MKL",
         "USE_MKLDNN",
         "USE_FBGEMM",
         "USE_FBGEMM_GENAI",
-        "USE_MSLK",
         "USE_FLASH_ATTENTION",
         "USE_MEM_EFF_ATTENTION",
         "USE_ROCM_CK_SDPA",
@@ -689,10 +689,12 @@ class EnvSnapshot:
         rendering of well-known build flags. Defines that came from
         ``Build settings`` (USE_ROCM, USE_CUDA, USE_NCCL, USE_MKLDNN)
         report ``ON``/``OFF`` directly; CXX_FLAGS-only defines
-        (USE_MSLK, USE_FBGEMM, USE_FLASH_ATTENTION, USE_ROCM_CK_SDPA,
-        ...) report the captured value or ``yes`` for value-less defines.
-        Absent defines render as ``no`` so an operator can scan for
-        missing features at a glance.
+        (USE_FBGEMM, USE_FLASH_ATTENTION, USE_ROCM_CK_SDPA, ...) report
+        the captured value or ``yes`` for value-less defines. Absent
+        defines render as ``no`` when build_settings/cxx_defines were
+        captured, ``?`` when both are unavailable (so the operator can
+        tell "the build did not set this" apart from "we couldn't read
+        the build config").
         """
         pb = self.pytorch_build or {}
         flags = pb.get("flags") or {}
@@ -702,11 +704,23 @@ class EnvSnapshot:
         archs = flags.get("gpu_arch_list")
         arch_part = ",".join(archs) if archs else "?"
 
-        settings = flags.get("build_settings") or {}
-        defines = flags.get("cxx_defines") or {}
+        # Treat both sources as separate signals: gpu_arch_list comes
+        # from torch.cuda.get_arch_list() while settings/defines come
+        # from torch.__config__.show(). One can populate when the other
+        # fails (e.g. CPU-only wheel, or __config__ raises). When both
+        # build sources are missing, render every cell as `?` so the
+        # brief doesn't falsely claim every flag is OFF.
+        settings_raw = flags.get("build_settings")
+        defines_raw = flags.get("cxx_defines")
+        flags_unavailable = settings_raw is None and defines_raw is None
+        settings = settings_raw or {}
+        defines = defines_raw or {}
 
         cells: list[str] = []
         for name in self._SUMMARY_FLAG_NAMES:
+            if flags_unavailable:
+                cells.append(f"{name}=?")
+                continue
             if name in settings:
                 cells.append(f"{name}={settings[name]}")
                 continue
@@ -821,7 +835,17 @@ def collect_env() -> EnvSnapshot:
         hip = _capture_hip_toolchain(reasons)
         hipblaslt = _capture_hipblaslt(reasons)
         rocblas = _capture_rocblas(reasons)
-        composable_kernel = _capture_composable_kernel(reasons)
+        # Shared once per collect_env() call: both _capture_composable_kernel
+        # and _capture_pytorch_build's binary_introspection probe grep the
+        # demangled libtorch_hip.so symbol table. Without this, the
+        # ~1-2 s (cold: up to 30 s) `nm | c++filt` subprocess runs twice
+        # AND duplicates its failure reason on stripped/missing-binutils
+        # hosts. Cache lives only inside this collect_env() invocation
+        # so test isolation across consecutive calls is preserved.
+        hip_symbol_cache = _HipSymbolDumpCache()
+        composable_kernel = _capture_composable_kernel(
+            reasons, hip_symbol_cache=hip_symbol_cache
+        )
         tensile = _capture_tensile(reasons)
         triton = _capture_triton(reasons)
         fbgemm = _capture_fbgemm(reasons)
@@ -834,7 +858,9 @@ def collect_env() -> EnvSnapshot:
         docker = _capture_docker_metadata(runtime_context, reasons)
         env_vars = _capture_env_vars()  # individual nulls are documented, not partial
         pytorch_version = _capture_pytorch_version(reasons)
-        pytorch_build = _capture_pytorch_build(reasons)
+        pytorch_build = _capture_pytorch_build(
+            reasons, hip_symbol_cache=hip_symbol_cache
+        )
 
         return EnvSnapshot(
             schema_version=SCHEMA_VERSION,
@@ -1944,7 +1970,11 @@ def _capture_rocblas(reasons: list[str]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _capture_composable_kernel(reasons: list[str]) -> dict[str, Any]:
+def _capture_composable_kernel(
+    reasons: list[str],
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
     """Capture Composable Kernel identity at both layers.
 
     CK ships in two places that can drift independently:
@@ -1999,7 +2029,9 @@ def _capture_composable_kernel(reasons: list[str]) -> dict[str, Any]:
             )
 
     # ------- pytorch_bundled sub-block -------
-    bundled_block = _probe_pytorch_bundled_ck(reasons)
+    bundled_block = _probe_pytorch_bundled_ck(
+        reasons, hip_symbol_cache=hip_symbol_cache
+    )
 
     # ------- build-time PyTorch CK dispatch flags -------
     # These are -DUSE_ROCM_CK_{SDPA,GEMM} cmake flags baked into the
@@ -2072,14 +2104,24 @@ def _parse_ck_header(text: str | None) -> tuple[str | None, str | None]:
     return (version, commit)
 
 
-def _probe_pytorch_bundled_ck(reasons: list[str]) -> dict[str, Any]:
+def _probe_pytorch_bundled_ck(
+    reasons: list[str],
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
     """Look for ``ck::`` symbols inside ``libtorch_hip.so``.
 
     Strategy: dump the lib's demangled dynamic symbols once via the
-    shared :func:`_dump_pytorch_hip_demangled_symbols` helper, then count
-    occurrences of the ``ck::`` namespace prefix. Falls back to
+    shared :class:`_HipSymbolDumpCache`, then count occurrences of the
+    ``ck::`` namespace prefix. Falls back to
     ``present=False, symbol_count=None`` whenever the symbol dump is
     unavailable (the helper records the partial reason on its own).
+
+    ``hip_symbol_cache`` is optional so tests / direct callers can
+    invoke this probe standalone without manufacturing a cache; in that
+    case a fresh single-shot cache is used and no cross-probe
+    deduplication happens (which is the right behaviour when only one
+    probe runs).
 
     Demangled symbols routinely look like
     ``ck::tensor_operation::...``; any line containing ``ck::`` is a CK
@@ -2087,14 +2129,45 @@ def _probe_pytorch_bundled_ck(reasons: list[str]) -> dict[str, Any]:
     are themselves CK-related by construction (they reference CK types),
     so they count.
     """
+    if hip_symbol_cache is None:
+        hip_symbol_cache = _HipSymbolDumpCache()
     default = {"present": False, "symbol_count": None}
-    symbol_text = _dump_pytorch_hip_demangled_symbols(
+    symbol_text = hip_symbol_cache.get(
         reasons, "composable_kernel.pytorch_bundled"
     )
     if symbol_text is None:
         return default
     symbol_count = sum(1 for line in symbol_text.splitlines() if "ck::" in line)
     return {"present": symbol_count > 0, "symbol_count": symbol_count}
+
+
+class _HipSymbolDumpCache:
+    """Per-``collect_env()``-call cache for the demangled
+    ``libtorch_hip.so`` symbol dump.
+
+    Both the CK pytorch-bundled probe and the binary-introspection
+    probe grep the same symbol table; without this cache
+    ``collect_env()`` shells out to ``nm | c++filt`` twice per run
+    (each call ~1-2 s warm, up to 30 s cold) AND records the same
+    failure reason twice. The cache lives only for the duration of one
+    ``collect_env()`` invocation -- not module-level, so test isolation
+    between consecutive calls is preserved (the original concern that
+    blocked using ``functools.lru_cache`` here).
+
+    The first ``get()`` call owns the partial-reason prefix it provides;
+    subsequent calls reuse the same dump and append no extra reason.
+    """
+
+    def __init__(self) -> None:
+        self._cached = False
+        self._symbols: str | None = None
+
+    def get(self, reasons: list[str], reason_prefix: str) -> str | None:
+        if self._cached:
+            return self._symbols
+        self._symbols = _dump_pytorch_hip_demangled_symbols(reasons, reason_prefix)
+        self._cached = True
+        return self._symbols
 
 
 def _dump_pytorch_hip_demangled_symbols(
@@ -2452,7 +2525,11 @@ def _capture_aiter(reasons: list[str]) -> dict[str, str | None]:
 # ---------------------------------------------------------------------------
 
 
-def _capture_pytorch_build(reasons: list[str]) -> dict[str, Any]:
+def _capture_pytorch_build(
+    reasons: list[str],
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
+) -> dict[str, Any]:
     """Capture structured PyTorch build identity.
 
     Complements the flat ``pytorch_version`` field with the build
@@ -2508,7 +2585,7 @@ def _capture_pytorch_build(reasons: list[str]) -> dict[str, Any]:
 
     flags = _capture_pytorch_build_flags(reasons)
     binary_introspection = _capture_pytorch_binary_introspection(
-        reasons, torch_mod=torch_mod
+        reasons, torch_mod=torch_mod, hip_symbol_cache=hip_symbol_cache
     )
     build_flags = _project_pytorch_build_flags(flags)
 
@@ -2586,6 +2663,8 @@ _PYTORCH_LIB_BUNDLED_NAMES: tuple[str, ...] = ("libaotriton_v2.so",)
 def _capture_pytorch_binary_introspection(
     reasons: list[str],
     torch_mod: Any | None,
+    *,
+    hip_symbol_cache: _HipSymbolDumpCache | None = None,
 ) -> dict[str, Any]:
     """Direct facts about the compiled PyTorch wheel -- no inference.
 
@@ -2658,7 +2737,9 @@ def _capture_pytorch_binary_introspection(
                 result["cxx_flags_use_defines"] = cxx_pairs
 
     # ----- libtorch_hip.so symbol counts (shared nm dump) -----
-    symbols = _dump_pytorch_hip_demangled_symbols(
+    if hip_symbol_cache is None:
+        hip_symbol_cache = _HipSymbolDumpCache()
+    symbols = hip_symbol_cache.get(
         reasons, "pytorch_build.binary_introspection"
     )
     if symbols is not None:
