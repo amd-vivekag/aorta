@@ -482,13 +482,39 @@ def test_outcome_counts_mixed_outcomes_in_one_cell():
     assert stats.outcome_counts == {OUTCOME_COMPLETED: 1, OUTCOME_DID_NOT_RUN: 1}
 
 
-def test_outcome_counts_unknown_when_main_work_started_is_none():
-    """Workload that hasn't been updated to the new contract degrades to
-    OUTCOME_UNKNOWN for every trial -- never silently misclassified as
-    did_not_run or completed."""
+def test_outcome_counts_empty_when_no_trial_speaks_new_contract():
+    """Workload that hasn't been updated to the new contract -> empty
+    histogram, NOT ``{"unknown": N}``.
+
+    The empty-vs-unknown distinction is load-bearing: ``output.py``
+    gates the ``did_not_run`` legend entry on ``any(c.outcome_counts ...)``,
+    and ``is_did_not_run_cell`` documents itself as "False for legacy
+    workloads with empty counts". Filling in ``{"unknown": N}`` for
+    every legacy run would leak the new-contract legend into matrix.md
+    for every workload that doesn't yet speak it. Pin the contract.
+    """
     trials = [_trial(passed=True), _trial(passed=False)]
     stats = _default_call(trials=trials)
-    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 2}
+    assert stats.outcome_counts == {}
+
+
+def test_outcome_counts_includes_unknown_for_silent_trials_in_mixed_cell():
+    """As soon as ONE trial speaks the new contract, all trials are
+    counted -- silent ones legitimately classify as ``unknown`` so the
+    histogram total matches ``trial_count``. This is the "mixed cell"
+    case where some trials use the new contract and others don't."""
+    trials = [
+        _trial(
+            main_work_started=True,
+            executed_iterations=50,
+            configured_iterations=50,
+            passed=True,
+        ),
+        _trial(passed=False),  # silent -- no main_work_started
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_COMPLETED: 1, OUTCOME_UNKNOWN: 1}
+    assert sum(stats.outcome_counts.values()) == stats.trials
 
 
 def test_did_not_run_trials_suppress_wall_clock_step_time_fallback():

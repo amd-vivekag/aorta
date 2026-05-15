@@ -224,12 +224,15 @@ def write_matrix_md(
     lines.append("## Reproduction Summary")
     lines.append("")
 
-    # Iters column appears only when at least one cell's workload populated
-    # ``configured_iterations`` (issue #173). Hiding the column keeps the
-    # matrix.md golden output stable for legacy workloads that haven't been
-    # updated to the new contract -- the regression test for old workloads
-    # asserts the column is absent.
-    show_iters = any(c.configured_iters is not None for c in cell_stats)
+    # Iters column appears whenever any cell has iteration data worth
+    # surfacing -- hidden only when *every* cell rendered as the em-dash
+    # placeholder (legacy workloads that don't speak the new contract).
+    # Gating on ``iters_display != "—"`` (rather than ``configured_iters
+    # is not None``) is deliberate: the defensive "?/?" case sets
+    # ``configured_iters=None`` to flag the contradiction, but the
+    # contradiction itself is exactly what an operator needs to see --
+    # hiding the column would silently swallow it.
+    show_iters = any(c.iters_display != "—" for c in cell_stats)
     header_cells: list[str] = [
         "Cell",
         "Mitigations",

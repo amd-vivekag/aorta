@@ -459,8 +459,21 @@ def aggregate_cell(
     all_step_times: list[float] = []
     wall_clocks: list[float] = []
     status_counter: Counter[str] = Counter()
-    outcome_counter: Counter[str] = Counter()
     trial_sources: list[StepTimeSource] = []
+    # Whether any trial in the cell populates the new outcome contract --
+    # gates whether ``outcome_counts`` is built at all. A cell where every
+    # trial is silent (legacy workload) reports ``outcome_counts={}`` so
+    # downstream "is the new contract in use?" checks (matrix.md legend
+    # gating, ``is_did_not_run_cell``) don't false-fire on absence of data.
+    # As soon as ONE trial speaks the contract, all trials are counted --
+    # silent ones legitimately classify as ``unknown`` in a mixed cell so
+    # the histogram total matches ``trial_count``.
+    new_contract_seen = any(
+        isinstance(getattr(t, "result", None), dict)
+        and t.result.get("main_work_started") is not None
+        for t in trials
+    )
+    outcome_counter: Counter[str] = Counter()
     for trial in trials:
         times, source = _step_times_from_trial(trial, effective_steps)
         all_step_times.extend(times)
@@ -474,7 +487,8 @@ def aggregate_cell(
         # even for stand-in trial objects that omit the attribute.
         status = getattr(trial, "exit_status", None) or "unknown"
         status_counter[str(status)] += 1
-        outcome_counter[_trial_outcome(trial)] += 1
+        if new_contract_seen:
+            outcome_counter[_trial_outcome(trial)] += 1
 
     cell_source = _reduce_step_time_sources(trial_sources)
     exec_min, exec_max, configured_iters, iters_display = _aggregate_iter_counts(trials)

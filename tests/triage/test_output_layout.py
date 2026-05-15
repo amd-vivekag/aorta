@@ -984,14 +984,43 @@ def test_iters_column_hidden_for_legacy_workloads(tmp_path, patched_env, patched
     """No cell populates configured_iterations -> column absent.
 
     The default ``patched_run_trials`` fixture returns trials that don't
-    speak the new contract, exercising the backwards-compat path.
+    speak the new contract, exercising the backwards-compat path. Legacy
+    runs must render exactly as today: no Iters column AND no
+    did_not_run legend leakage (gated on outcome_counts being non-empty,
+    which is itself gated on the new contract being in use).
     """
     r = _simple_recipe(ticket="T-1")
     run_dir = runner.run_recipe(r, output_dir=tmp_path)
     md = (run_dir / "matrix.md").read_text()
     assert "| Iters " not in md
-    # Legend entry suppressed too.
     assert "`Iters` -- iterations actually executed" not in md
+    # New-contract legend entries must NOT leak into a legacy matrix.
+    assert "`did_not_run`" not in md
+    assert "primary code path began" not in md
+
+
+def test_iters_column_shown_when_configured_disagrees(tmp_path, patched_env, monkeypatch):
+    """Defensive ``?/?`` case: trials in one cell disagreed on the
+    configured iteration count. ``configured_iters`` lands at None, but
+    the contradiction itself is exactly what an operator needs to see --
+    the column must remain visible so the ``?/?`` row surfaces.
+
+    Pin the gating predicate (``iters_display != "—"``) by exercising
+    the case it's specifically designed to keep visible.
+    """
+
+    def disagreeing(request):
+        return [
+            _fake_trial_completed(configured_iterations=50),
+            _fake_trial_completed(configured_iterations=100),
+        ]
+
+    monkeypatch.setattr(runner, "run_trials", disagreeing)
+    r = _simple_recipe(ticket="T-1")
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    md = (run_dir / "matrix.md").read_text()
+    assert "| Iters " in md
+    assert "?/?" in md
 
 
 def test_iters_column_appears_when_workload_populates_it(tmp_path, patched_env, monkeypatch):
