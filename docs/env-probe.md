@@ -334,8 +334,16 @@ tracking schema evolution don't have to read source.
 
 ### `1.2` (current)
 
-Additive only -- 1.1 consumers reading `pytorch_build` get `None` for
-the new fields rather than a missing key.
+Top-level-key-additive -- every new field lives under existing
+top-level dicts (`pytorch_build`, `aiter`), so 1.1 readers loading
+a 1.2 snapshot via `EnvSnapshot.from_dict(...)` do NOT raise and
+existing top-level access still works. Note however that the new
+**nested** keys (`pytorch_build.flags`, `pytorch_build.build_flags`,
+`pytorch_build.binary_introspection`, `aiter.package_dist_name`,
+`aiter.commit`) are NOT backfilled on 1.1 snapshots -- a consumer
+indexing them on a 1.1 snapshot gets a `KeyError`, not `None`. Use
+`.get(key)` or guard on `schema_version` if you read these from
+historical snapshots.
 
 * `pytorch_build.flags` -- structured raw introspection from
   `torch.__config__.show()`: `build_settings` (KEY=VALUE dict from the

@@ -78,8 +78,17 @@ SCHEMA_VERSION = "1.2"
 #     identity, `amd_aiter` vs `aiter`) and `commit` (parsed from the
 #     setuptools_scm `+g<sha>` local-version segment, matches the image
 #     tag's `aiter-<sha>` label).
-#   All purely additive -- 1.1 consumers reading the new fields off a
-#   1.2 snapshot get None where they used to get nothing.
+#   All additions are top-level-key-additive (every new field lives
+#   under existing top-level dicts -- `pytorch_build`, `aiter` --
+#   not as new top-level dataclass fields), so 1.1 readers running
+#   `EnvSnapshot.from_dict(...)` against a 1.2 snapshot do NOT raise
+#   and existing top-level access (`.pytorch_build`, `.aiter`) still
+#   works. The new nested keys (`pytorch_build.flags`,
+#   `pytorch_build.build_flags`, `pytorch_build.binary_introspection`,
+#   `aiter.package_dist_name`, `aiter.commit`) are present on 1.2
+#   snapshots and absent on 1.1 snapshots -- consumers indexing them
+#   on a 1.1 snapshot get a KeyError, NOT None. Use `.get(key)` or
+#   guard on `schema_version` if you read these.
 #
 # 1.0 -> 1.1:
 #   - Renamed hipblaslt/rocblas/miopen.commit -> .rocm_release_tweak

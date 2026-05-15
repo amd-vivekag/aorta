@@ -2891,6 +2891,69 @@ class TestAiterBlock:
         }
         assert reasons == []
 
+    def test_aiter_setuptools_scm_commit_extracted(
+        self, isolated_env, monkeypatch
+    ):
+        """`+g<sha>` setuptools_scm local-version segment -> commit field.
+
+        Matches the AMD-internal ROCm/PyTorch image-tag convention where
+        `aiter-9a469a6` in the tag mirrors the `+g9a469a608` segment in
+        amd_aiter's version.
+        """
+        import builtins
+        import types
+
+        self._force_no_aiter_dist(monkeypatch)
+        fake_aiter = types.SimpleNamespace(
+            __version__="0.1.11.dev32+g9a469a608"
+        )
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_aiter if name == "aiter" else real_import(name, *a, **kw)
+            ),
+        )
+        block = env_mod._capture_aiter([])
+        assert block["package_version"] == "0.1.11.dev32+g9a469a608"
+        assert block["commit"] == "9a469a608"
+
+    def test_aiter_dist_metadata_fallback_populates_dist_name(
+        self, isolated_env, monkeypatch
+    ):
+        """Path 3: aiter import succeeds but lacks __version__ AND
+        aiter._version; importlib.metadata.version("amd_aiter") provides
+        both the version string and the dist_name signal.
+        """
+        import builtins
+        import importlib.metadata as _md
+        import types
+
+        # aiter module without __version__ and no _version submodule.
+        fake_aiter = types.SimpleNamespace()
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_aiter if name == "aiter" else real_import(name, *a, **kw)
+            ),
+        )
+        # amd_aiter dist resolves; aiter dist does not.
+        real_version = _md.version
+
+        def fake_version(name):
+            if name == "amd_aiter":
+                return "0.1.11.dev32+g9a469a608"
+            if name == "aiter":
+                raise _md.PackageNotFoundError(name)
+            return real_version(name)
+
+        monkeypatch.setattr(_md, "version", fake_version)
+        block = env_mod._capture_aiter([])
+        assert block["package_version"] == "0.1.11.dev32+g9a469a608"
+        assert block["package_dist_name"] == "amd_aiter"
+        assert block["commit"] == "9a469a608"
+
 
 # ---------------------------------------------------------------------------
 # Real-torch integration -- complements TestPytorchVersion's monkeypatched
@@ -4392,6 +4455,66 @@ class TestProjectPytorchBuildFlags:
         out = env_mod._project_pytorch_build_flags(None)
         assert set(out.keys()) == set(env_mod.PYTORCH_BUILD_FLAG_NAMES)
         assert all(v is None for v in out.values())
+
+
+class TestCapturePytorchBuildFlagsRawSchema:
+    """Direct coverage for `_capture_pytorch_build_flags()` raw output.
+
+    The other tests cover `build_flags` (the projected stable subset)
+    and the brief lines, but the raw structured block (cxx_defines,
+    cxx_flags_raw, cuda_flags_raw, gpu_arch_list) feeds env.json and
+    callers reading the raw schema would silently regress without
+    direct coverage.
+    """
+
+    def _patch_torch(self, monkeypatch, fake_torch):
+        import builtins
+        real_import = builtins.__import__
+        monkeypatch.setattr(
+            builtins, "__import__",
+            lambda name, *a, **kw: (
+                fake_torch if name == "torch" else real_import(name, *a, **kw)
+            ),
+        )
+
+    def test_raw_fields_populated_from_full_config_show(self, monkeypatch):
+        import types
+        cfg = (
+            "Build settings: BUILD_TYPE=Release, USE_ROCM=ON, "
+            "CXX_FLAGS=-DUSE_ROCM_CK_SDPA -DFLASH_NAMESPACE=pytorch_flash -O3, "
+            "CUDA_FLAGS=-arch=gfx942 -DCUDA_ONLY"
+        )
+        fake_torch = types.SimpleNamespace(
+            __config__=types.SimpleNamespace(show=lambda: cfg),
+            cuda=types.SimpleNamespace(get_arch_list=lambda: ["gfx942", "gfx950"]),
+        )
+        self._patch_torch(monkeypatch, fake_torch)
+        out = env_mod._capture_pytorch_build_flags([])
+        assert out["build_settings"]["USE_ROCM"] == "ON"
+        assert out["build_settings"]["BUILD_TYPE"] == "Release"
+        assert out["cxx_defines"] == {
+            "FLASH_NAMESPACE": "pytorch_flash",
+            "USE_ROCM_CK_SDPA": None,
+        }
+        assert out["cxx_flags_raw"].startswith("-DUSE_ROCM_CK_SDPA")
+        assert out["cuda_flags_raw"].startswith("-arch=gfx942")
+        assert out["gpu_arch_list"] == ["gfx942", "gfx950"]
+
+    def test_arch_list_captured_when_config_show_unavailable(self, monkeypatch):
+        """gpu_arch_list source is independent of __config__.show()."""
+        import types
+        fake_torch = types.SimpleNamespace(
+            __config__=None,
+            cuda=types.SimpleNamespace(get_arch_list=lambda: ["gfx942"]),
+        )
+        self._patch_torch(monkeypatch, fake_torch)
+        reasons: list[str] = []
+        out = env_mod._capture_pytorch_build_flags(reasons)
+        assert out["gpu_arch_list"] == ["gfx942"]
+        assert out["build_settings"] is None
+        assert out["cxx_defines"] is None
+        # __config__.show unavailable adds a partial reason
+        assert any(r.startswith("pytorch_build.flags") for r in reasons)
 
 
 class TestCapturePytorchBuildFlagsFromConfigShow:
