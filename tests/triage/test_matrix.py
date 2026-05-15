@@ -498,6 +498,33 @@ def test_outcome_counts_empty_when_no_trial_speaks_new_contract():
     assert stats.outcome_counts == {}
 
 
+def test_outcome_counts_built_when_only_iter_fields_populated():
+    """Workload populates ``configured_iterations`` / ``executed_iterations``
+    but not ``main_work_started`` -> the new contract IS in use, even
+    partially. ``outcome_counts`` must be built (silent ``main_work_started``
+    classifies the trial as ``unknown``) so matrix.json doesn't contradict
+    matrix.md / the terminal log, both of which already treat the cell
+    as new-contract.
+
+    Round-4 Copilot catch on PR #175: previously the predicate was
+    narrow (``main_work_started is not None`` only) while runner.py and
+    output.py used the wider predicate, producing a partial-contract
+    cell that looked legacy in matrix.json but new-contract everywhere
+    else.
+    """
+    trials = [
+        _trial(executed_iterations=50, configured_iterations=50, passed=True),
+        _trial(executed_iterations=50, configured_iterations=50, passed=True),
+    ]
+    stats = _default_call(trials=trials)
+    # main_work_started absent -> classified as OUTCOME_UNKNOWN (not
+    # OUTCOME_COMPLETED -- completion requires main_work_started=True).
+    # The point is that the histogram is BUILT, not that the workload
+    # gets credit for completing.
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 2}
+    assert sum(stats.outcome_counts.values()) == stats.trials
+
+
 def test_outcome_counts_includes_unknown_for_silent_trials_in_mixed_cell():
     """As soon as ONE trial speaks the new contract, all trials are
     counted -- silent ones legitimately classify as ``unknown`` so the

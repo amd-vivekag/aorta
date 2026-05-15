@@ -470,9 +470,20 @@ def aggregate_cell(
     # As soon as ONE trial speaks the contract, all trials are counted --
     # silent ones legitimately classify as ``unknown`` in a mixed cell so
     # the histogram total matches ``trial_count``.
+    #
+    # The predicate must match runner.py::_format_cell_summary's "new
+    # contract in use" check (ANY of the three new fields, not just
+    # main_work_started). Otherwise a workload that populates only
+    # configured_iterations / executed_iterations renders new-grammar in
+    # the terminal log + Iters column in matrix.md, but matrix.json shows
+    # outcome_counts={} -- contradicting itself across renderers.
     new_contract_seen = any(
         isinstance(getattr(t, "result", None), dict)
-        and t.result.get("main_work_started") is not None
+        and (
+            t.result.get("main_work_started") is not None
+            or t.result.get("configured_iterations") is not None
+            or t.result.get("executed_iterations") is not None
+        )
         for t in trials
     )
     outcome_counter: Counter[str] = Counter()
