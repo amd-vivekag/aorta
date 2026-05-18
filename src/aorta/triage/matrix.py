@@ -45,6 +45,14 @@ from typing import Any, Literal
 
 StepTimeSource = Literal["per_step", "elapsed_per_iter", "wall_clock_total", "missing"]
 
+# Per-trial outcome enum. Snake-case so the JSON key, the Confound tag, and
+# the matrix.md / terminal display string are all the same string -- avoids
+# a translation layer that drifts between renderers.
+OUTCOME_DID_NOT_RUN = "did_not_run"
+OUTCOME_CRASHED_AFTER_ITERATIONS = "crashed_after_iterations"
+OUTCOME_COMPLETED = "completed"
+OUTCOME_UNKNOWN = "unknown"
+
 # Lower index == higher fidelity. The cell-level ``step_time_source`` is the
 # WORST source any trial in the cell actually contributed samples from -- if
 # even one trial fell back to ``wall_clock_total``, the cell's mean folds
@@ -94,6 +102,24 @@ class CellStats:
     Trials with no ``failure_details`` or no ``hint`` key contribute nothing.
     Order of appearance is preserved (first hint seen comes first) so the
     matrix.md renderer is stable across runs with the same trial order.
+
+    ``outcome_counts`` is a histogram across the cell's trials over the
+    platform-level outcome enum (``did_not_run``,
+    ``crashed_after_iterations``, ``completed``, ``unknown``). Always
+    populated (one entry per trial) for non-error cells: legacy
+    success-path trials land in ``unknown``; trials that the platform-
+    side inference (``_looks_like_did_not_run``) flags land in
+    ``did_not_run`` even when the workload doesn't speak the new
+    ``main_work_started`` contract; new-contract trials hit the explicit
+    branches. Error cells (``error is not None``) report ``{}`` because
+    no trials were aggregated.
+
+    ``executed_iter_min`` / ``executed_iter_max`` summarise how far the
+    cell's trials actually got; ``configured_iters`` records the
+    workload-reported denominator. ``iters_display`` is the pre-rendered
+    cell value for matrix.md's "Iters" column (e.g. ``"0/50"``,
+    ``"199..200/200"``, ``"?/?"`` if trials disagreed on the configured
+    count, or ``"—"`` when the workload didn't track iterations).
     """
 
     name: str
@@ -118,6 +144,11 @@ class CellStats:
     error: str | None = None
     step_time_source: StepTimeSource = "missing"
     failure_hints: list[tuple[str, int]] = field(default_factory=list)
+    outcome_counts: dict[str, int] = field(default_factory=dict)
+    executed_iter_min: int | None = None
+    executed_iter_max: int | None = None
+    configured_iters: int | None = None
+    iters_display: str = "—"
 
     @property
     def failure_rate(self) -> float:
@@ -143,6 +174,17 @@ def _step_times_from_trial(trial: Any, effective_steps: int) -> tuple[list[float
     ``"missing"`` (the trial produced no usable timing). The aggregator
     uses ``source`` to compute the cell-level ``step_time_source`` so
     downstream confound detection can reject incomparable comparisons.
+
+    When the workload explicitly reports ``main_work_started=False``
+    OR the platform-observable did-not-run pattern fires
+    (``_looks_like_did_not_run``), the wall-clock fallback is
+    suppressed: dividing setup-only wall clock by configured steps
+    would produce a number that looks like iteration timing but is
+    actually import-time variance (issue #173). The per-step /
+    elapsed-per-iter branches are still consulted first because a
+    workload that *did* surface those signals before deciding it
+    didn't really run is telling us something we should not throw
+    away.
     """
     result = getattr(trial, "result", None)
     if isinstance(result, dict):
@@ -160,10 +202,153 @@ def _step_times_from_trial(trial: Any, effective_steps: int) -> tuple[list[float
             and elapsed > 0
         ):
             return [float(elapsed) / iters * 1000.0], "elapsed_per_iter"
+        if result.get("main_work_started") is False or _looks_like_did_not_run(trial, result):
+            return [], "missing"
     wall = getattr(trial, "wall_clock_sec", 0.0) or 0.0
     if wall > 0 and effective_steps > 0:
         return [float(wall) / effective_steps * 1000.0], "wall_clock_total"
     return [], "missing"
+
+
+def _trial_outcome(trial: Any) -> str:
+    """Classify a trial against the platform-level outcome enum.
+
+    Two signal sources, in priority order:
+
+    1. **Explicit contract** -- the workload populated
+       ``main_work_started`` / ``executed_iterations`` /
+       ``configured_iterations`` on its ``WorkloadResult``. The
+       workload's report always wins.
+    2. **Platform inference** -- when ``main_work_started`` is unset,
+       inspect observable signals: a trial that exited with a
+       non-``ok`` ``exit_status``, produced no per-step times, and
+       reports ``elapsed_sec == 0`` is one that crashed before
+       measuring any iteration -- "workload didn't run" in the
+       sense the matrix.md reader cares about. Issue #173's problem
+       statement: "the platform detects 'workload didn't run' even
+       when the workload is silent about why." Demo case:
+       ``recom_repro`` ImportError trials carry exactly this
+       signature (passed=false, step_times_ms=[], elapsed_sec=0.0,
+       exit_status="workload_failed").
+
+    Returns ``OUTCOME_UNKNOWN`` for legacy success-path trials (no
+    explicit contract, no inference triggered) -- they continue to
+    render exactly as today.
+    """
+    result = getattr(trial, "result", None)
+    if not isinstance(result, dict):
+        return OUTCOME_UNKNOWN
+    started = result.get("main_work_started")
+    if started is False:
+        return OUTCOME_DID_NOT_RUN
+    if started is True:
+        executed = result.get("executed_iterations")
+        configured = result.get("configured_iterations")
+        if not isinstance(executed, int) or not isinstance(configured, int):
+            return OUTCOME_UNKNOWN
+        if executed >= configured:
+            return OUTCOME_COMPLETED
+        if result.get("passed") is False:
+            return OUTCOME_CRASHED_AFTER_ITERATIONS
+        return OUTCOME_UNKNOWN
+    # main_work_started is None -- platform inference branch.
+    if _looks_like_did_not_run(trial, result):
+        return OUTCOME_DID_NOT_RUN
+    return OUTCOME_UNKNOWN
+
+
+def _looks_like_did_not_run(trial: Any, result: dict) -> bool:
+    """Platform-observable did-not-run detector for legacy workloads.
+
+    Fires when ALL three signals agree:
+
+    * ``exit_status`` is set and is not ``"ok"`` (the trial actually
+      failed at the system level -- not just NaN-flagged).
+    * ``step_times_ms`` is missing or empty (the workload never
+      measured an iteration).
+    * ``elapsed_sec`` is missing or 0 (no measured runtime either).
+
+    The conjunction is deliberately strict so legacy perf workloads
+    that fail mid-run (and thus report partial step_times_ms or
+    non-zero elapsed_sec) keep their existing ``unknown`` outcome and
+    flow through the wall_clock_total fallback as today. Only the
+    "exited without producing any iteration data" pattern triggers
+    inferred did_not_run.
+
+    ``total_iterations`` is intentionally NOT consulted: workloads in
+    the wild (e.g. recom_repro) populate it with the *configured*
+    count even on setup-time crash, so trusting it would suppress the
+    very signal we want to surface.
+    """
+    exit_status = getattr(trial, "exit_status", None)
+    if exit_status is None or exit_status == "ok":
+        return False
+    step_times = result.get("step_times_ms")
+    if isinstance(step_times, list) and any(
+        isinstance(t, (int, float)) and t > 0 for t in step_times
+    ):
+        return False
+    elapsed = result.get("elapsed_sec")
+    if isinstance(elapsed, (int, float)) and elapsed > 0:
+        return False
+    return True
+
+
+def _aggregate_iter_counts(
+    trials: list[Any],
+) -> tuple[int | None, int | None, int | None, str]:
+    """Reduce per-trial iteration counts into the cell-level summary.
+
+    Returns ``(executed_min, executed_max, configured, display)``.
+
+    ``display`` rendering rules (matches issue #173 §"CellStats aggregation"):
+
+    * Workload doesn't populate iteration fields (no trial has
+      ``configured_iterations``): all four return values are ``None`` /
+      ``"—"``. The matrix.md renderer hides the column entirely if
+      *every* cell ends up here.
+    * Trials disagree on ``configured_iterations``: ``"?/?"``. Defensive
+      -- shouldn't happen in practice (recipe pins steps per cell), but
+      surfaces the contradiction instead of silently picking one value.
+    * Configured is known but at least one trial has
+      ``executed_iterations is None``: ``"—/<configured>"``. The budget
+      is real and worth surfacing; the missing executed count is the
+      honest part. Renders as a visible row instead of hiding the cell.
+    * All trials executed the same count: ``"<N>/<configured>"``.
+    * Trials executed different counts: ``"<min>..<max>/<configured>"``.
+    """
+    configured_values: list[int] = []
+    executed_values: list[int | None] = []
+    for trial in trials:
+        result = getattr(trial, "result", None)
+        if not isinstance(result, dict):
+            executed_values.append(None)
+            continue
+        cfg = result.get("configured_iterations")
+        if isinstance(cfg, int):
+            configured_values.append(cfg)
+        executed = result.get("executed_iterations")
+        executed_values.append(executed if isinstance(executed, int) else None)
+
+    if not configured_values:
+        return None, None, None, "—"
+
+    distinct_configured = set(configured_values)
+    configured = configured_values[0] if len(distinct_configured) == 1 else None
+    if configured is None:
+        return None, None, None, "?/?"
+
+    populated_executed = [e for e in executed_values if e is not None]
+    if len(populated_executed) != len(executed_values) or not populated_executed:
+        return None, None, configured, f"—/{configured}"
+
+    exec_min = min(populated_executed)
+    exec_max = max(populated_executed)
+    if exec_min == exec_max:
+        display = f"{exec_min}/{configured}"
+    else:
+        display = f"{exec_min}..{exec_max}/{configured}"
+    return exec_min, exec_max, configured, display
 
 
 def _reduce_step_time_sources(sources: list[StepTimeSource]) -> StepTimeSource:
@@ -322,6 +507,11 @@ def aggregate_cell(
             error=error,
             step_time_source="missing",
             failure_hints=_aggregate_failure_hints(trials),
+            outcome_counts={},
+            executed_iter_min=None,
+            executed_iter_max=None,
+            configured_iters=None,
+            iters_display="—",
         )
 
     trial_count = len(trials)
@@ -332,6 +522,16 @@ def aggregate_cell(
     wall_clocks: list[float] = []
     status_counter: Counter[str] = Counter()
     trial_sources: list[StepTimeSource] = []
+    # ``outcome_counts`` is always populated (one entry per trial). Legacy
+    # success-path trials classify as ``OUTCOME_UNKNOWN``; trials that
+    # platform-inference flags fall under ``OUTCOME_DID_NOT_RUN``; new-
+    # contract trials hit the explicit branches. The downstream
+    # "did_not_run legend" gate in output.py is on the rendered confound
+    # tag (not on this dict's emptiness), and ``is_did_not_run_cell``
+    # checks both ``set(counts) == {DID_NOT_RUN}`` AND the count covers
+    # every trial -- so an all-unknown legacy cell never false-flags as
+    # did_not_run.
+    outcome_counter: Counter[str] = Counter()
     for trial in trials:
         times, source = _step_times_from_trial(trial, effective_steps)
         all_step_times.extend(times)
@@ -339,14 +539,20 @@ def aggregate_cell(
         wall = getattr(trial, "wall_clock_sec", 0.0) or 0.0
         wall_clocks.append(float(wall))
         # Histogram by raw exit_status so callers can distinguish e.g.
-        # "workload_failed" (the workload returned a failed WorkloadResult)
-        # from "infrastructure_failed" (run_trials never got a result back).
+        # "workload_failed" (the workload's run() returned a failed
+        # WorkloadResult) from "infrastructure_failed" (B1's dispatcher
+        # caught an exception around setup/run/cleanup and synthesised a
+        # passed=False WorkloadResult so the cell still has a row).
+        # ``aorta.run.dispatcher`` populates a WorkloadResult in either
+        # case; the distinction is purely the exit_status value.
         # Falling back to "unknown" keeps the histogram total == trial_count
         # even for stand-in trial objects that omit the attribute.
         status = getattr(trial, "exit_status", None) or "unknown"
         status_counter[str(status)] += 1
+        outcome_counter[_trial_outcome(trial)] += 1
 
     cell_source = _reduce_step_time_sources(trial_sources)
+    exec_min, exec_max, configured_iters, iters_display = _aggregate_iter_counts(trials)
 
     if all_step_times:
         mean_step = float(statistics.fmean(all_step_times))
@@ -384,7 +590,20 @@ def aggregate_cell(
         error=None,
         step_time_source=cell_source,
         failure_hints=_aggregate_failure_hints(trials),
+        outcome_counts=dict(outcome_counter),
+        executed_iter_min=exec_min,
+        executed_iter_max=exec_max,
+        configured_iters=configured_iters,
+        iters_display=iters_display,
     )
 
 
-__all__ = ["CellStats", "StepTimeSource", "aggregate_cell"]
+__all__ = [
+    "CellStats",
+    "OUTCOME_COMPLETED",
+    "OUTCOME_CRASHED_AFTER_ITERATIONS",
+    "OUTCOME_DID_NOT_RUN",
+    "OUTCOME_UNKNOWN",
+    "StepTimeSource",
+    "aggregate_cell",
+]

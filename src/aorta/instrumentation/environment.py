@@ -63,73 +63,99 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "1.4"
-# 1.3 -> 1.4 (this commit):
-#   - Extended `pytorch_build.ninja_hipcc` with a fallback parser for
-#     PyTorch builds using the legacy `FindHIP.cmake` flow (e.g.
-#     `rocm/pytorch-private:*` Jenkins images on ROCm 7.2). On those
-#     images `.hip` files are compiled via `CUSTOM_COMMAND` ninja rules
-#     driving per-source `<src>_generated_*.hip.o.cmake` scripts, NOT
-#     the modern `enable_language(HIP)` shape -- so build.ninja itself
-#     carries no HIPCC defines/flags for HIP sources. New behaviour:
-#     when the ninja-only scan returns `targets: {}`, walk
-#     `<source>/build/**/<target>.dir/**/*.hip.o.cmake`, parse the
-#     `set(HIP_HIPCC_FLAGS …)` / `set(HIP_CLANG_FLAGS …)` cmake-list
-#     values, and aggregate per-target defines/codegen/archs in the
-#     same shape the modern path produces. Two new additive keys:
-#       * `pytorch_build.ninja_hipcc._parser` -- `"ninja_defines"` (modern)
-#         or `"legacy_findhip_per_source"` (fallback) or `null` (unscanned).
-#       * `pytorch_build.ninja_hipcc._legacy_scripts_scanned` -- int count
-#         of `.hip.o.cmake` scripts read; only set when the fallback fired.
-#   - Extended `_NINJA_HIPCC_TARGETS_OF_INTEREST` to include `ck_sdpa`
-#     (the CK-backed SDPA backend; carries USE_ROCM_CK_SDPA + CK_TILE_*
-#     + FLASHATTENTION_DISABLE_*) and `mslk` (Multi-Stream Layer Kernels).
-#     Pre-1.4 `targets` dicts only ever held torch_hip/torch_cpu/c10_hip;
-#     1.4 dicts may additionally hold ck_sdpa/mslk when the build links
-#     them. Consumers iterating `targets` are unaffected; consumers that
-#     hard-coded the three pre-1.4 names see additional rows on 1.4
-#     snapshots (extra info, never missing info).
-#   Backwards-compat: a 1.3 consumer reading `ninja_hipcc.targets[<x>]`
-#   keeps working; the new `_parser` / `_legacy_scripts_scanned` keys
-#   are additive under the same dict (KeyError only if directly indexed).
-#
-# 1.2 -> 1.3 (PR #177):
-#   - Added `pytorch_build.cmake_cache` (issue #176): parsed cmake
-#     cache entries from `<source>/build/CMakeCache.txt` for source /
-#     editable installs, filtered by an allowlist of name prefixes
-#     (USE_, CK_, AITER_, FLASH_, HIPBLAS, ...). Wheel installs
-#     render `entries: null` with no partial reason -- absence is the
+SCHEMA_VERSION = "1.5"
+# 1.4 -> 1.5 (this commit, PR #177 / issue #176):
+#   This entry collapses what was originally two separate version
+#   bumps on the PR #177 branch (1.2 -> 1.3 source-introspection plus
+#   1.3 -> 1.4 legacy-FindHIP fallback) because main shipped its own
+#   1.3 and 1.4 in parallel (PR #164 / PR #165). All five additive
+#   surfaces below are net-new on top of main's 1.4.
+#   - Added `pytorch_build.cmake_cache`: parsed cmake cache entries
+#     from `<source>/build/CMakeCache.txt` for source / editable
+#     installs, filtered by an allowlist of name prefixes (USE_,
+#     CK_, AITER_, FLASH_, HIPBLAS, ...). Wheel installs render
+#     `entries: null` with no partial reason -- absence is the
 #     documented common case.
-#   - Added `pytorch_build.ninja_hipcc` (issue #176): per-target HIPCC
-#     defines + codegen flags + offload archs, parsed by streaming
-#     `<source>/build/build.ninja` (350+ MB on a fully-built tree, so
-#     never slurped). Targets identified by the `-D<target>_EXPORTS`
-#     token cmake appends per shared-lib target. Reports torch_hip,
-#     torch_cpu, c10_hip. Wheel installs render `targets: null`.
-#   - Added `aiter.hsa_tree` (issue #176): per-arch fingerprint of
-#     aiter's pre-compiled HSA `.co` kernel binaries (file_count,
-#     co_count, deterministic combined_sha256 over sorted
-#     (relpath, sha256) pairs). Searches importlib.util.find_spec(
-#     "aiter_meta"), the sibling aiter_meta dir, and
-#     $AORTA_PYTORCH_SRC/third_party/aiter/hsa. Returns null when no
-#     tree is locatable -- silent absence (most installs lack it).
-#   - Added new top-level `pytorch_sdpa` block (issue #176): runtime
-#     SDPA backend state via `torch.backends.cuda.{flash,
-#     mem_efficient, math, cudnn}_sdp_enabled()`. Per-backend null
-#     when the getter is missing on older torch (distinguishable from
-#     True/False). 1.1/1.2 readers loading a 1.3 snapshot via
-#     EnvSnapshot.from_dict() see this as an unknown top-level key
-#     and silently skip it (from_dict's known-key filter rejects
-#     unknown keys). 1.3 readers loading a 1.1/1.2 snapshot get the
-#     "we couldn't ask" default-shape backends_enabled dict (all
-#     None) thanks to the dataclass default -- no TypeError.
-#   Same backwards-compat caveats as 1.2: top-level dict access still
-#   works, but new nested keys (cmake_cache, ninja_hipcc, hsa_tree)
-#   are NOT backfilled on 1.2 snapshots -- a consumer indexing them
-#   on a 1.2 snapshot gets a KeyError. Use `.get(key)` or guard on
-#   schema_version.
+#   - Added `pytorch_build.ninja_hipcc`: per-target HIPCC defines +
+#     codegen flags + offload archs. Two parser strategies in one
+#     block, discriminated by `_parser`:
+#       * `"ninja_defines"` -- streamed parse of
+#         `<source>/build/build.ninja` for the modern
+#         `enable_language(HIP)` build shape. Identifies targets via
+#         the `-D<target>_EXPORTS` token cmake appends per shared-lib
+#         target.
+#       * `"legacy_findhip_per_source"` -- fallback walk of
+#         `<source>/build/**/<target>.dir/**/*.hip.o.cmake` driver
+#         scripts when the ninja-only scan returns `targets: {}`
+#         (common on ROCm/PyTorch Jenkins images that still use the
+#         legacy `FindHIP.cmake` flow). Parses
+#         `set(HIP_HIPCC_FLAGS …)` / `set(HIP_CLANG_FLAGS …)` cmake-
+#         list values; `_legacy_scripts_scanned` reports the read
+#         count.
+#     Both parsers report the same per-target shape (`defines`,
+#     `use_defines_present`, `codegen_flags_present`,
+#     `offload_archs`). Targets reported: `torch_hip`, `torch_cpu`,
+#     `c10_hip`, `ck_sdpa` (CK-backed SDPA backend; owns
+#     USE_ROCM_CK_SDPA, CK_TILE_FMHA_*, FLASHATTENTION_DISABLE_* --
+#     statically linked into libtorch_hip.so so its flags don't
+#     appear in the wheel's host-side CXX_FLAGS), `mslk` (Multi-
+#     Stream Layer Kernels). Wheel installs render `targets: null`.
+#   - Added `aiter.hsa_tree`: per-arch fingerprint of aiter's pre-
+#     compiled HSA `.co` kernel binaries (file_count, co_count,
+#     deterministic combined_sha256 over sorted (relpath, sha256)
+#     pairs). Searches importlib.util.find_spec("aiter_meta"), the
+#     sibling aiter_meta dir, and $AORTA_PYTORCH_SRC/third_party/
+#     aiter/hsa. Returns null when no tree is locatable -- silent
+#     absence (most installs lack it).
+#   - Added new top-level `pytorch_sdpa` block: runtime SDPA backend
+#     state via torch.backends.cuda.{flash, mem_efficient, math,
+#     cudnn}_sdp_enabled(). Per-backend null when the getter is
+#     missing on older torch (distinguishable from True/False). Pre-
+#     1.5 readers loading a 1.5 snapshot via EnvSnapshot.from_dict()
+#     see this as an unknown top-level key and silently skip it
+#     (from_dict's known-key filter rejects unknown keys). 1.5
+#     readers loading a pre-1.5 snapshot get the dataclass-default
+#     backends_enabled dict (all None) -- no TypeError.
+#   Backwards-compat: every new nested key lives under existing top-
+#   level dicts (or, for pytorch_sdpa, behind a dataclass default),
+#   so 1.4 readers loading a 1.5 snapshot do NOT raise. Consumers
+#   indexing the new nested keys (cmake_cache, ninja_hipcc, hsa_tree,
+#   _parser, _legacy_scripts_scanned) directly on a 1.4 snapshot get
+#   KeyError, not None -- use `.get(key)` or guard on schema_version.
 #
-# 1.1 -> 1.2 (PR #174):
+# 1.3 -> 1.4 (issue #163 / A1.2b):
+#   - Added top-level `library_introspection` (list[dict], default `[]`)
+#     and `library_introspection_alternates` (list[dict], default `[]`).
+#     Both always present. Populated only when collect_env() is called
+#     with `buck_target=...` AND buck2 is functional; in that mode each
+#     transitive dep label matched against
+#     buck_introspect.KNOWN_LIBRARY_PATTERNS yields an entry of the
+#     form ``{"name", "source": "buck", "revision", "target"}``. When
+#     a library matched via Buck is also captured by A1's existing
+#     per-library blocks (hipblaslt, rocblas, ...), the A1-side
+#     identifiers are synthesised into a parallel entry placed in
+#     `library_introspection_alternates`. Outside buck mode both lists
+#     are empty; A1's existing per-library top-level blocks remain
+#     unchanged and authoritative.
+#
+# 1.2 -> 1.3 (issue #163 / A1.2a):
+#   - Added top-level `build_system` block (always present). Populated
+#     by aorta.instrumentation.build_system.detect_build_system(); the
+#     value is `{"kind": "buck2", "buck2_version": str, "repo_root":
+#     str, "revision": str | None}` when buck2 is on PATH AND both
+#     `buck2 --version` and `buck2 root` succeed (i.e. we are
+#     demonstrably inside a Buck checkout), or `{"kind": "none"}` in
+#     every other case -- including the common "buck2 is installed
+#     but cwd is not inside a Buck repo" branch where `buck2 root`
+#     exits non-zero. The buck2 shape's `buck2_version` and
+#     `repo_root` are guaranteed populated; only `revision` may be
+#     None. Existing system-package / pkg-config / Docker-digest
+#     blocks are unchanged.
+#   - `EnvSnapshot.from_dict()` defaults a missing `build_system` key
+#     to `{"kind": "none"}`, so a 1.3 reader can still load a 1.1 /
+#     1.2 env.json. Mirrors the existing `partial_reasons` tolerance.
+#
+# 1.1 -> 1.2:
 #   - Added `pytorch_build.flags` (build_settings, cxx_defines,
 #     cxx_flags_raw, cuda_flags_raw, gpu_arch_list) -- structured raw
 #     introspection from `torch.__config__.show()`.
@@ -586,14 +612,44 @@ class EnvSnapshot:
     pytorch_build: dict
     partial: bool
     partial_reasons: list[str] = field(default_factory=list)
-    # Defaulted so 1.2 snapshots loaded via `from_dict()` don't raise.
-    # The default is an all-None ``backends_enabled`` map -- the same
+    # build_system: A1.2a (issue #163, schema 1.3). Always present;
+    # ``{"kind": "none"}`` when buck2 isn't on PATH. Populated by
+    # detect_build_system() in collect_env() / _disaster_snapshot().
+    # Kept with a ``default_factory`` so existing direct callers --
+    # internal triage test fixtures, downstream tools that pin to an
+    # older schema, etc. -- can still construct an ``EnvSnapshot(...)``
+    # without supplying this 1.3 addition. Mirrors the ``partial_reasons``
+    # pattern: additive schema fields don't break constructors. The
+    # serialised JSON-key order is ... pytorch_build, partial,
+    # partial_reasons, build_system, library_introspection,
+    # library_introspection_alternates, pytorch_sdpa; the schema is
+    # order-insensitive (consumers parse by key) so this is purely a
+    # serialisation cosmetic.
+    build_system: dict = field(
+        default_factory=lambda: {"kind": "none"}
+    )
+    # library_introspection: A1.2b (issue #163, schema 1.4). Always
+    # present. Empty list outside buck mode. In buck mode, one entry
+    # per matched transitive dep, shape ``{"name", "source": "buck",
+    # "revision", "target"}``. See `aorta.instrumentation.buck_introspect`
+    # for the match patterns and the `--buck-target` CLI flag for the
+    # entry point.
+    library_introspection: list[dict] = field(default_factory=list)
+    # library_introspection_alternates: A1.2b. Empty outside buck mode.
+    # In buck mode, holds the synthesised A1-block-derived alternate
+    # entry for each library that buck *also* matched -- so a consumer
+    # can compare the buck label/revision against the system-package
+    # version/lib_hash. Same name appearing in both lists is the
+    # by-design overlap; the primary entry (buck) wins for downstream
+    # identity comparisons.
+    library_introspection_alternates: list[dict] = field(default_factory=list)
+    # pytorch_sdpa: PR #177 / issue #176 (schema 1.5). Defaulted so
+    # pre-1.5 snapshots loaded via `from_dict()` don't raise. The
+    # default is an all-None ``backends_enabled`` map -- the same
     # shape `_capture_pytorch_sdpa()` returns when torch is missing
     # (every getter unobservable), which is the correct reading of a
-    # 1.2 snapshot from 1.3's POV: we have no SDPA data for that
-    # historical capture. Definition follows ``partial_reasons`` (also
-    # defaulted) to satisfy the dataclass rule "fields with defaults
-    # follow fields without".
+    # pre-1.5 snapshot from 1.5's POV: we have no SDPA data for that
+    # historical capture.
     pytorch_sdpa: dict = field(
         default_factory=lambda: {
             "backends_enabled": {name: None for name in _PYTORCH_SDPA_GETTERS}
@@ -608,12 +664,32 @@ class EnvSnapshot:
     def from_dict(cls, d: dict[str, Any]) -> EnvSnapshot:
         """Reconstruct from a previously serialised env.json dict.
 
-        Tolerates extra unknown keys (forward-compat) and missing optional
-        ``partial_reasons`` (defaults to empty list).
+        Tolerates extra unknown keys (forward-compat) and back-fills
+        defaults for additive top-level fields that older snapshots
+        predate, so a 1.4 reader can still load a 1.1 / 1.2 / 1.3
+        env.json:
+
+        * ``partial_reasons`` -> ``[]`` (always optional).
+        * ``build_system`` -> ``{"kind": "none"}`` (added in schema 1.3;
+          equivalent to "we did not detect Buck2", which is the only
+          honest answer when the producer did not even run the probe).
+        * ``library_introspection`` -> ``[]`` (added in schema 1.4;
+          empty list means "no buck-aware introspection was run").
+        * ``library_introspection_alternates`` -> ``[]`` (added in
+          schema 1.4; empty list means "nothing was dropped in the
+          Buck-vs-A1 merge").
+
+        Strictly-required older fields (the schema-1.0/1.1 set) are NOT
+        defaulted -- a missing ``rocm`` or ``hipblaslt`` key still
+        raises ``TypeError``, because that indicates a malformed dict
+        rather than a forward-version mismatch.
         """
         known = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in d.items() if k in known}
         kwargs.setdefault("partial_reasons", [])
+        kwargs.setdefault("build_system", {"kind": "none"})
+        kwargs.setdefault("library_introspection", [])
+        kwargs.setdefault("library_introspection_alternates", [])
         return cls(**kwargs)
 
     def summary(self) -> str:
@@ -629,6 +705,7 @@ class EnvSnapshot:
         for line-width; the full values live in the JSON.
         """
         rt = self.runtime_context or {}
+        bs = self.build_system or {"kind": "none"}
         rocm = self.rocm or {}
         hip = self.hip or {}
         hipblaslt = self.hipblaslt or {}
@@ -682,6 +759,7 @@ class EnvSnapshot:
         return "\n".join(
             (
                 f"  runtime:   {rt.get('type', '?')} / python={rt.get('python_env', '?')}",
+                f"  build_sys: {self._summary_build_system_line(bs)}",
                 f"  rocm:      {rocm.get('version', '?')} (dev: {rocm.get('version_dev', '?')})",
                 f"  hip:       {hip.get('version', '?')} ({hip.get('platform', '?')})",
                 # ROCm release tweak (HIPBLASLT_VERSION_TWEAK et al.)
@@ -773,6 +851,23 @@ class EnvSnapshot:
         if dist:
             bits.append(f"pip dist={dist}")
         return " ".join(bits)
+
+    def _summary_build_system_line(self, bs: dict) -> str:
+        """One-line build_system rendering for the CLI brief.
+
+        ``{"kind": "none"}`` becomes a literal ``none`` so an operator
+        sees the field is honest about absence (matches the
+        ``(not installed)`` convention used elsewhere in the brief).
+        Buck2 hosts get the version + repo root + short revision.
+        """
+        kind = bs.get("kind") or "?"
+        if kind != "buck2":
+            return kind
+        version = bs.get("buck2_version") or "?"
+        repo_root = bs.get("repo_root") or "?"
+        rev = bs.get("revision")
+        rev_short = rev[:8] if rev else "?"
+        return f"buck2={version} repo_root={repo_root} rev={rev_short}"
 
     def _summary_pytorch_build_line(self) -> str:
         """Single-line summary of the structured pytorch_build block."""
@@ -1067,7 +1162,10 @@ class EnvSnapshot:
 # ---------------------------------------------------------------------------
 
 
-def collect_env() -> EnvSnapshot:
+def collect_env(
+    buck_target: str | None = None,
+    buck_timeout: int = 10,
+) -> EnvSnapshot:
     """Capture the current process environment as an :class:`EnvSnapshot`.
 
     NEVER raises. The promise is enforced two ways:
@@ -1084,6 +1182,16 @@ def collect_env() -> EnvSnapshot:
 
     No GPU compute. No tensor allocations. The optional ``import torch``
     for the version probe does NOT initialise CUDA / HIP context.
+
+    Buck mode (``buck_target=...``) opts into the A1.2b path: the
+    function additionally runs ``buck2 audit dependencies <target>
+    --transitive --json``, matches transitive deps against
+    ``buck_introspect.KNOWN_LIBRARY_PATTERNS``, and populates
+    ``library_introspection`` (plus ``library_introspection_alternates``
+    when an A1 per-library block also captured the same name). Outside
+    buck mode both lists stay empty and the existing per-library
+    top-level blocks remain authoritative. ``buck_timeout`` caps the
+    audit subprocess (seconds; default 10).
     """
     reasons: list[str] = []
     try:
@@ -1120,6 +1228,23 @@ def collect_env() -> EnvSnapshot:
             reasons, hip_symbol_cache=hip_symbol_cache
         )
         pytorch_sdpa = _capture_pytorch_sdpa(reasons)
+        build_system = _detect_build_system_safe()
+
+        a1_blocks_by_lib = {
+            "hipblaslt": hipblaslt,
+            "rocblas": rocblas,
+            "miopen": miopen,
+            "rccl": rccl,
+        }
+        library_introspection, library_introspection_alternates = (
+            _run_buck_introspection_safe(
+                buck_target=buck_target,
+                buck_timeout=buck_timeout,
+                build_system=build_system,
+                a1_blocks_by_lib=a1_blocks_by_lib,
+                reasons=reasons,
+            )
+        )
 
         return EnvSnapshot(
             schema_version=SCHEMA_VERSION,
@@ -1145,9 +1270,12 @@ def collect_env() -> EnvSnapshot:
             python_version=platform.python_version(),
             pytorch_version=pytorch_version,
             pytorch_build=pytorch_build,
-            pytorch_sdpa=pytorch_sdpa,
+            build_system=build_system,
             partial=bool(reasons),
             partial_reasons=reasons,
+            library_introspection=library_introspection,
+            library_introspection_alternates=library_introspection_alternates,
+            pytorch_sdpa=pytorch_sdpa,
         )
     except Exception as exc:  # noqa: BLE001 -- this is the never-raises gate
         log.info("collect_env() hit unexpected exception", exc_info=True)
@@ -1308,9 +1436,118 @@ def _disaster_snapshot(
         pytorch_sdpa={
             "backends_enabled": {name: None for name in _PYTORCH_SDPA_GETTERS},
         },
+        build_system={"kind": "none"},
         partial=True,
         partial_reasons=[*preceding_reasons, unexpected_reason],
+        library_introspection=[],
+        library_introspection_alternates=[],
     )
+
+
+def _detect_build_system_safe() -> dict:
+    """Wrapper that guarantees the never-raises contract.
+
+    ``detect_build_system`` already catches every documented failure
+    mode (missing buck2, subprocess errors, timeouts), but the env
+    probe's contract is that even unexpected failures (``ImportError``,
+    a future regression) cannot bring down ``collect_env``. This
+    belt-and-braces wrapper ensures the field is always populated.
+    """
+    try:
+        from aorta.instrumentation.build_system import detect_build_system
+
+        return detect_build_system()
+    except Exception as exc:  # noqa: BLE001 -- never-raises gate
+        log.info("build_system: detect_build_system raised (%s)", exc, exc_info=True)
+        return {"kind": "none"}
+
+
+def _run_buck_introspection_safe(
+    buck_target: str | None,
+    buck_timeout: int,
+    build_system: dict,
+    a1_blocks_by_lib: dict[str, dict],
+    reasons: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Run the A1.2b buck-aware library introspection if requested.
+
+    Returns ``(library_introspection, library_introspection_alternates)``.
+    Both are ``[]`` when ``buck_target is None``. When a target is
+    supplied but ``build_system["kind"] != "buck2"``, we still attempt
+    the audit (so an operator can force-run from a non-Buck cwd) but
+    record a partial reason so the disconnect is visible.
+
+    Per the env-probe never-raises contract: any unexpected exception
+    is swallowed and surfaced via ``reasons``; both lists are returned
+    empty.
+    """
+    if buck_target is None:
+        return [], []
+    try:
+        from aorta.instrumentation.buck_introspect import (
+            introspect_libraries_via_buck,
+        )
+
+        repo_revision = build_system.get("revision") if isinstance(build_system, dict) else None
+        cwd = build_system.get("repo_root") if isinstance(build_system, dict) else None
+        if isinstance(build_system, dict) and build_system.get("kind") != "buck2":
+            reasons.append(
+                f"library_introspection: --buck-target {buck_target} supplied but "
+                f"build_system.kind={build_system.get('kind')!r}; running anyway"
+            )
+        entries, buck_reasons = introspect_libraries_via_buck(
+            target=buck_target,
+            repo_revision=repo_revision,
+            timeout=buck_timeout,
+            cwd=cwd,
+        )
+        reasons.extend(buck_reasons)
+        alternates = _synthesise_library_alternates(entries, a1_blocks_by_lib)
+        return entries, alternates
+    except Exception as exc:  # noqa: BLE001 -- never-raises gate
+        log.info(
+            "library_introspection: buck introspection raised (%s)", exc, exc_info=True
+        )
+        reasons.append(
+            f"library_introspection: buck introspection raised "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return [], []
+
+
+def _synthesise_library_alternates(
+    buck_entries: list[dict], a1_blocks_by_lib: dict[str, dict]
+) -> list[dict]:
+    """Build the parallel A1-derived alternates list for buck matches.
+
+    For each buck entry whose library name has a matching A1 per-library
+    block, emit a single shape-aligned alternate entry pulling the
+    library's identifying fields out of the existing block. Libraries
+    A1 doesn't capture (e.g. ``pytorch``, ``rocm`` runtime) get no
+    alternate -- the buck entry is the only signal in that case.
+
+    The alternate's ``source`` is ``"package"`` for the rocm-release
+    kernel libs (which A1 captures via header + pkg-config + lib hash)
+    -- i.e. matches the existing per-library block's provenance.
+    """
+    alternates: list[dict] = []
+    for entry in buck_entries:
+        name = entry.get("name")
+        block = a1_blocks_by_lib.get(name) if name else None
+        if not block:
+            continue
+        alternates.append(
+            {
+                "name": name,
+                "source": "package",
+                "revision": block.get("rocm_release_tweak")
+                or block.get("version"),
+                "package_version": block.get("package_version")
+                or block.get("version"),
+                "lib_hash": block.get("lib_hash"),
+            }
+        )
+    return alternates
 
 
 def _utc_now_iso() -> str:

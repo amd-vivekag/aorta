@@ -258,6 +258,9 @@ REQUIRED_TOP_KEYS = {
     "python_version",
     "pytorch_version",
     "pytorch_build",
+    "build_system",
+    "library_introspection",
+    "library_introspection_alternates",
     "pytorch_sdpa",
 }
 
@@ -268,7 +271,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.4"
+        assert snapshot.schema_version == "1.5"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -315,7 +318,7 @@ class TestSchemaCompleteness:
 def _example_snapshot(**overrides) -> object:
     """Build a fully-populated EnvSnapshot for round-trip testing."""
     base = {
-        "schema_version": "1.3",
+        "schema_version": "1.5",
         "captured_at": "2026-04-28T12:00:00Z",
         "system_health": {"rdhc_version": "1.4.0", "tests": {}},
         "rocm": {
@@ -446,8 +449,11 @@ def _example_snapshot(**overrides) -> object:
             "cmake_cache": {"_source_file": None, "entries": None},
             "ninja_hipcc": {"_source_file": None, "targets": None},
         },
+        "build_system": {"kind": "none"},
         "partial": False,
         "partial_reasons": [],
+        "library_introspection": [],
+        "library_introspection_alternates": [],
         "pytorch_sdpa": {
             "backends_enabled": {
                 name: None for name in env_mod._PYTORCH_SDPA_GETTERS
@@ -481,7 +487,7 @@ class TestEnvSnapshot:
         d = _example_snapshot().to_dict()
         d["future_field_not_yet_added"] = {"hello": "world"}
         rebuilt = EnvSnapshot.from_dict(d)
-        assert rebuilt.schema_version == "1.3"
+        assert rebuilt.schema_version == "1.5"
 
     def test_from_dict_defaults_partial_reasons_when_missing(self):
         """Older env.json without partial_reasons still loads (defaults to [])."""
@@ -1055,18 +1061,23 @@ class TestCliIsThinWrapper:
 
     def test_total_file_size_is_bounded(self, cli_path: Path):
         # Total file budget (incl. docstring/imports/blank lines/error handling).
-        # The spec target is ~30 lines of substantive code; the cushion
-        # accommodates the module docstring, Click decorators, the
-        # try/except blocks that surface filesystem errors as
-        # ``click.ClickException`` (per Copilot review), the --verbose /
-        # --summary / --field flag wiring, the _lookup_field helper
-        # with friendly error messages, and the inline partial_reasons
-        # echo + closing status marker. The real "no-probing-in-CLI"
-        # guard is `test_cli_does_no_probing_imports` below -- this one
-        # is a soft canary against the file ballooning.
+        # The original #147 spec target was ~30 lines of substantive code
+        # for the single ``probe`` subcommand. Two later additions both
+        # grew the budget legitimately (none of them probing):
+        #
+        # * A1.2c added a second subcommand (``recipe``) with its own
+        #   click decorators, --format dispatch block, and error-
+        #   handling envelope.
+        # * PR #177 added --summary / --field output modes plus the
+        #   ``_lookup_field`` helper (dotted-path resolution with
+        #   friendly errors that list available keys).
+        #
+        # The real "no-probing-in-CLI" guard is
+        # `test_cli_does_no_probing_imports` below -- this one is a
+        # soft canary against the file ballooning beyond pure wiring.
         line_count = sum(1 for _ in cli_path.read_text().splitlines())
-        assert line_count <= 250, (
-            f"cli/env.py is {line_count} lines; soft budget is 250. "
+        assert line_count <= 350, (
+            f"cli/env.py is {line_count} lines; soft budget is 350. "
             "If you need more, check that the new code is genuinely "
             "wiring/error-handling and not probing -- "
             "test_cli_does_no_probing_imports is the strict guard."

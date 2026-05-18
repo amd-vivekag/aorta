@@ -69,7 +69,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.3) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.5) [PARTIAL]
   runtime:   baremetal / python=venv
   rocm:      7.2.1 (dev: None)
   hip:       7.2.53211-e1a6bc5663 (amd)
@@ -157,7 +157,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.3"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.5"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -181,8 +181,11 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `env_vars` | `dict[str, str \| null]` | explicit canonical list (currently 31 names; see `CANONICAL_ENV_VARS` in `environment.py` for the live set) | GPU scoping + HSA / runtime + GPU queue / codegen + NCCL/RCCL + FBGEMM + MIOpen + SDPA backend selection + GEMM backend preference + hipBLASLt autotune + PyTorch / inductor. Build-time cmake flags (`USE_ROCM_CK_SDPA`, `USE_ROCM_CK_GEMM`, `USE_FBGEMM*`) are NOT in this list -- they're surfaced under their respective library blocks instead, parsed from `torch.__config__.show()`. |
 | `python_version` | `str` | `platform.python_version()` | always populated |
 | `pytorch_version` | `str \| null` | optional `import torch` (no CUDA/HIP context init) | `null` when torch absent |
-| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` + parse of `<source>/build/CMakeCache.txt` + stream of `<source>/build/build.ninja` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference), `cmake_cache` (issue #176, source/editable installs only -- allowlisted entries from CMakeCache.txt), `ninja_hipcc` (issue #176, source/editable installs only -- per-target HIPCC defines + codegen flags + offload archs from build.ninja). See "PyTorch source-tree submodule probing" below. |
-| `pytorch_sdpa` | `dict` | `torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()` | `backends_enabled` dict, one bool per SDPA backend + per-getter `null` when missing on older torch. Runtime state, NOT compile-time -- combine with `pytorch_build.binary_introspection.libtorch_hip_symbol_counts` for the full "compiled in AND enabled" picture. |
+| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` + parse of `<source>/build/CMakeCache.txt` + stream of `<source>/build/build.ninja` (modern `enable_language(HIP)` path) or walk of `<source>/build/**/<target>.dir/**/*.hip.o.cmake` (legacy `FindHIP.cmake` fallback) | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference), `cmake_cache` (source/editable installs only -- allowlisted entries from CMakeCache.txt), `ninja_hipcc` (source/editable installs only -- per-target HIPCC defines + codegen flags + offload archs; `_parser` discriminates the two parser strategies). See "PyTorch source-tree submodule probing" below. |
+| `build_system` | `dict` | `buck2 --version` + `buck2 root` + `hg id -i` / `git rev-parse HEAD` | Always present. `{"kind": "buck2", "buck2_version": str, "repo_root": str, "revision": str \| null}` when buck2 is on PATH AND we are demonstrably inside a Buck checkout (both `buck2 --version` and `buck2 root` succeed); `buck2_version` and `repo_root` are guaranteed populated, only `revision` may be `null`. `{"kind": "none"}` in every other case, including the dominant "buck2 is installed but cwd is not inside a Buck checkout" scenario. Added in schema 1.3 for issue #163 (A1.2a) so consumers can branch on Buck2 vs. system-package environments. See "Running inside a Buck environment" below. |
+| `library_introspection` | `list[dict]` | `buck2 audit dependencies <target> --transitive --json` (only when `--buck-target` is supplied) | Always present. Empty `[]` outside Buck mode. In Buck mode, one entry per matched library: `{"name", "source": "buck", "revision", "target"}`. The matched library set lives in `KNOWN_LIBRARY_PATTERNS` in `src/aorta/instrumentation/buck_introspect.py`. Added in schema 1.4 for issue #163 (A1.2b). |
+| `library_introspection_alternates` | `list[dict]` | synthesised from A1's per-library blocks when a Buck match overlaps | Always present. Empty `[]` outside Buck mode and when no Buck-matched library is also captured by A1. Each entry mirrors the unified shape with `source: "package"` and pulls `revision` / `package_version` / `lib_hash` from the matching A1 block (e.g. `hipblaslt`). Added in schema 1.4 for issue #163 (A1.2b). |
+| `pytorch_sdpa` | `dict` | `torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()` | `backends_enabled` dict, one bool per SDPA backend + per-getter `null` when missing on older torch. Runtime state, NOT compile-time -- combine with `pytorch_build.binary_introspection.libtorch_hip_symbol_counts` for the full "compiled in AND enabled" picture. Added in schema 1.5 for issue #176 (PR #177). |
 
 `runtime_context.type` is one of `"docker" | "podman" | "singularity" | "baremetal"`. Adding values is a schema change.
 
@@ -345,105 +348,132 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.4` (current)
+### `1.5` (current)
 
-Extends `pytorch_build.ninja_hipcc` to handle PyTorch builds that use
-the **legacy `FindHIP.cmake`** flow (e.g. `rocm/pytorch-private:*`
-Jenkins images on ROCm 7.2). The 1.3 parser only handled the modern
-`enable_language(HIP)` shape, so on legacy-flow images `.hip` compiles
-are driven by `CUSTOM_COMMAND` ninja rules → per-source
-`*.hip.o.cmake` driver scripts, build.ninja itself carries no HIPCC
-defines for HIP sources, and the probe returned `targets: {}` -- no
-SDPA-NaN-actionable flags surfaced.
+Adds source/editable-install build introspection plus a runtime SDPA
+backend probe (PR #177, issue #176). This entry collapses what was
+originally two separate version bumps on the PR #177 branch (1.2 ->
+1.3 source-introspection plus 1.3 -> 1.4 legacy-FindHIP fallback)
+because main shipped its own 1.3 (build_system) and 1.4
+(library_introspection) in parallel via PR #164 / PR #165. All five
+additive surfaces below are net-new on top of main's 1.4.
 
-* `pytorch_build.ninja_hipcc._parser` (new) -- discriminates which
-  parser produced the result: `"ninja_defines"` (modern
-  `enable_language(HIP)`, the 1.3 path), `"legacy_findhip_per_source"`
-  (new -- walks per-source cmake scripts under each
-  `<target>.dir/`), or `null` (wheel install / file absent /
-  unreadable).
-* `pytorch_build.ninja_hipcc._legacy_scripts_scanned` (new) -- int
-  count of `*.hip.o.cmake` scripts read when the fallback fired;
-  `null` otherwise. Useful for sanity-checking that the fallback saw
-  the file population you expected (the ROCm 7.2 repro image yields
-  ~6k).
-* `pytorch_build.ninja_hipcc.targets` (extended) -- now additionally
-  reports `ck_sdpa` (the CK-backed SDPA backend; owns
-  `USE_ROCM_CK_SDPA`, `CK_TILE_FMHA_*`, `FLASHATTENTION_DISABLE_*`,
-  statically linked into `libtorch_hip.so` so its compile-time flags
-  don't appear in the wheel's host-side `CXX_FLAGS`) and `mslk`
-  (Multi-Stream Layer Kernels). Pre-1.4 snapshots only ever held
-  `torch_hip` / `torch_cpu` / `c10_hip`; 1.4 snapshots may
-  additionally hold `ck_sdpa` / `mslk` whenever the build links
-  them. Both parsers (`ninja_defines` and
-  `legacy_findhip_per_source`) report the same shape -- consumers
-  reading `targets[<name>]` don't need to branch on `_parser`.
-
-Backwards-compat notes:
-
-* The two new keys are additive under the same `ninja_hipcc` dict.
-  1.3 consumers reading `.ninja_hipcc.targets[<x>]` keep working;
-  only consumers that directly index `.ninja_hipcc._parser` or
-  `.ninja_hipcc._legacy_scripts_scanned` on a pre-1.4 snapshot get
-  `KeyError`. Use `.get(key)` or guard on `schema_version`.
-* `ck_sdpa` / `mslk` rows under `targets` are silent additions --
-  consumers iterating `targets` see additional rows on 1.4 snapshots
-  but the iteration shape is unchanged. Hard-coding the old
-  three-name list (`["torch_hip", "torch_cpu", "c10_hip"]`) still
-  works against 1.4 snapshots; you just don't see the new data.
-* No top-level shape changes -- the schema's dataclass field list is
-  identical to 1.3, so `EnvSnapshot.from_dict()` round-trips between
-  1.3 and 1.4 snapshots without raising.
-
-### `1.3`
-
-Adds source/editable-install build introspection (issue #176) plus a
-runtime SDPA backend probe. New fields are additive within existing
-top-level dicts plus one new top-level dict (`pytorch_sdpa`) which
-the 1.3 dataclass defaults to a "we couldn't ask" shape so loading
-older snapshots through `EnvSnapshot.from_dict(...)` does NOT raise.
-
-* `pytorch_build.cmake_cache` -- parsed `<source>/build/CMakeCache.txt`
-  for source / editable installs. `entries` is a sorted dict of
-  `<NAME>: {type, value}` filtered by an allowlist of name prefixes
-  (`USE_`, `CK_`, `AITER_`, `FLASH_`, `HIPBLAS`, `DISABLE_`,
-  `AOTRITON`, `ROCM_`, `HIP_PLATFORM`, `HIP_RUNTIME`, `HIP_COMPILER`,
-  `HIP_VERSION`, `PYTORCH_ROCM_ARCH`, `TORCH_BUILD_VERSION`,
-  `BUILD_TYPE`, `CMAKE_BUILD_TYPE`). Wheel installs render
-  `entries: null` and `_source_file: null` -- absence is the
-  documented common case, no partial reason.
-* `pytorch_build.ninja_hipcc` -- parsed `<source>/build/build.ninja`
-  per-target HIPCC defines, codegen flags, and `--offload-arch=`
-  list. Streamed line-by-line (build.ninja can be 350+ MB on a
-  fully-built tree). Targets reported: `torch_hip`, `torch_cpu`,
-  `c10_hip` (identified via the `-D<target>_EXPORTS` token cmake
-  appends per shared-lib target). Wheel installs render
-  `targets: null`.
+* `pytorch_build.cmake_cache` -- parsed
+  `<source>/build/CMakeCache.txt` for source / editable installs.
+  `entries` is a sorted dict of `<NAME>: {type, value}` filtered by
+  an allowlist of name prefixes (`USE_`, `CK_`, `AITER_`, `FLASH_`,
+  `HIPBLAS`, `DISABLE_`, `AOTRITON`, `ROCM_`, `HIP_PLATFORM`,
+  `HIP_RUNTIME`, `HIP_COMPILER`, `HIP_VERSION`, `PYTORCH_ROCM_ARCH`,
+  `TORCH_BUILD_VERSION`, `BUILD_TYPE`, `CMAKE_BUILD_TYPE`). Wheel
+  installs render `entries: null` and `_source_file: null` --
+  absence is the documented common case, no partial reason.
+* `pytorch_build.ninja_hipcc` -- per-target HIPCC defines + codegen
+  flags + offload archs. Two parser strategies in one block,
+  discriminated by `_parser`:
+    * `"ninja_defines"` -- streamed parse of
+      `<source>/build/build.ninja` for the modern
+      `enable_language(HIP)` build shape. Identifies targets via the
+      `-D<target>_EXPORTS` token cmake appends per shared-lib
+      target. Streamed line-by-line (build.ninja can be 350+ MB on a
+      fully-built tree).
+    * `"legacy_findhip_per_source"` -- fallback walk of
+      `<source>/build/**/<target>.dir/**/*.hip.o.cmake` driver
+      scripts when the ninja-only scan returns `targets: {}` (common
+      on ROCm/PyTorch Jenkins images that still use the legacy
+      `FindHIP.cmake` flow). Parses `set(HIP_HIPCC_FLAGS …)` /
+      `set(HIP_CLANG_FLAGS …)` cmake-list values;
+      `_legacy_scripts_scanned` reports the read count.
+  Both parsers report the same per-target shape (`defines`,
+  `use_defines_present`, `codegen_flags_present`, `offload_archs`).
+  Targets reported: `torch_hip`, `torch_cpu`, `c10_hip`, `ck_sdpa`
+  (CK-backed SDPA backend; owns `USE_ROCM_CK_SDPA`,
+  `CK_TILE_FMHA_*`, `FLASHATTENTION_DISABLE_*` -- statically linked
+  into `libtorch_hip.so` so its flags don't appear in the wheel's
+  host-side `CXX_FLAGS`), `mslk` (Multi-Stream Layer Kernels).
+  Wheel installs render `targets: null`.
 * `aiter.hsa_tree` -- per-arch fingerprint of aiter's pre-built HSA
   `.co` kernel binaries. Per arch: `file_count`, `co_count`,
   deterministic `combined_sha256` over sorted `(relpath, sha256)`
-  pairs. Three search roots: `importlib.util.find_spec("aiter_meta")`,
-  the sibling `aiter_meta` dir, and
-  `$AORTA_PYTORCH_SRC/third_party/aiter/hsa`. Returns `null` when no
-  tree is locatable -- silent absence (most installs lack it).
-* `pytorch_sdpa` (new top-level) -- `backends_enabled: {flash_sdp_enabled,
-  mem_efficient_sdp_enabled, math_sdp_enabled, cudnn_sdp_enabled}`.
-  Pure Python attribute lookups on `torch.backends.cuda` -- no GPU
-  work, no HIP context init. Per-getter `null` when the function is
-  missing on older torch (distinguishable from True/False).
+  pairs. Three search roots:
+  `importlib.util.find_spec("aiter_meta")`, the sibling
+  `aiter_meta` dir, and `$AORTA_PYTORCH_SRC/third_party/aiter/hsa`.
+  Returns `null` when no tree is locatable -- silent absence (most
+  installs lack it).
+* `pytorch_sdpa` (new top-level) -- `backends_enabled:
+  {flash_sdp_enabled, mem_efficient_sdp_enabled, math_sdp_enabled,
+  cudnn_sdp_enabled}`. Pure Python attribute lookups on
+  `torch.backends.cuda` -- no GPU work, no HIP context init. Per-
+  getter `null` when the function is missing on older torch
+  (distinguishable from True/False).
 
 Backwards-compat notes:
 
-* 1.2 readers loading a 1.3 snapshot get the new top-level
-  `pytorch_sdpa` filtered out by `from_dict()`'s known-key gate --
-  no error, just silently dropped.
-* 1.3 readers loading a 1.2 snapshot get the dataclass-default
-  `pytorch_sdpa` (all-None backends) instead of an absent field --
-  the dataclass default kicks in.
-* Same nested-key caveat as 1.2: new nested keys (`cmake_cache`,
-  `ninja_hipcc`, `hsa_tree`) are NOT backfilled on 1.2 snapshots --
-  consumers indexing them get `KeyError`. Use `.get(key)` or guard
-  on `schema_version`.
+* `pytorch_sdpa` is a new top-level dataclass field with a default
+  factory, so a 1.4 reader running `EnvSnapshot.from_dict()` on a
+  1.5 snapshot silently drops the unknown key, and a 1.5 reader
+  loading a pre-1.5 snapshot gets the dataclass-default
+  `backends_enabled` (all-None) instead of a missing field.
+* Every new nested key (`pytorch_build.cmake_cache`,
+  `pytorch_build.ninja_hipcc` plus its `_parser` /
+  `_legacy_scripts_scanned` keys, `aiter.hsa_tree`) lives under
+  existing top-level dicts. 1.4 consumers indexing these directly
+  on a 1.4 snapshot get `KeyError`, not `None` -- use `.get(key)`
+  or guard on `schema_version`.
+* The `ninja_hipcc.targets` extension (`ck_sdpa` / `mslk`) is a
+  silent addition. Consumers iterating `targets` see additional
+  rows on 1.5 snapshots but the iteration shape is unchanged.
+  Hard-coding the pre-1.5 three-name list still works; you just
+  don't see the new SDPA-relevant data.
+
+### `1.4`
+
+Additive change (issue #163, A1.2b):
+
+* New top-level `library_introspection` (list[dict], default `[]`)
+  and `library_introspection_alternates` (list[dict], default `[]`).
+  Both always present. Populated only when `collect_env(buck_target=...)`
+  is invoked (or `aorta env probe --buck-target ...`); each transitive
+  dep label of the Buck target that matches one of the patterns in
+  `KNOWN_LIBRARY_PATTERNS` (see `src/aorta/instrumentation/buck_introspect.py`)
+  yields one entry of shape `{"name", "source": "buck", "revision",
+  "target"}`. When a library matched via Buck is also captured by
+  A1's existing per-library blocks (`hipblaslt`, `rocblas`, `miopen`,
+  `rccl`), the A1-side identifiers are synthesised into a parallel
+  entry placed in `library_introspection_alternates` so consumers can
+  compare the buck label vs. the system-package version/lib_hash.
+  Outside Buck mode both lists stay empty; A1's existing per-library
+  top-level blocks remain authoritative.
+
+Schema 1.4 is forward- and backward-compatible: an env.json produced
+by 1.4 contains every 1.3 key unchanged. Loading a 1.1 / 1.2 / 1.3
+env.json into the 1.4 `EnvSnapshot.from_dict()` succeeds because all
+new fields default to empty (lists or `{"kind": "none"}` per their
+type).
+
+### `1.3`
+
+Additive change (issue #163, A1.2a):
+
+* New top-level `build_system` block, always present. Captures Buck2
+  presence + `buck2 --version` + `buck2 root` + source revision (`hg
+  id -i`, falling back to `git rev-parse HEAD`). The detector is
+  strict about what counts as `kind=buck2`: both `buck2 --version`
+  AND `buck2 root` must succeed, so the buck2 shape's `buck2_version`
+  and `repo_root` are guaranteed populated (only `revision` may be
+  `null`). Every other case -- buck2 absent, buck2 broken, or "buck2
+  is installed but cwd is not inside a Buck checkout" (where `buck2
+  root` exits non-zero) -- collapses to `{"kind": "none"}`. The bump
+  from 1.2 -> 1.3 isn't strictly required for an additive field, but
+  it makes the new key easy to detect in consumer pipelines.
+
+Schema 1.3 is forward- AND backward-compatible:
+
+* An env.json produced by 1.3 contains every 1.2 key unchanged.
+* Loading a 1.1 / 1.2 env.json (no `build_system` key) into the 1.3
+  `EnvSnapshot.from_dict()` succeeds: the missing field is back-filled
+  with `{"kind": "none"}` (the only honest default -- the producer
+  did not run the build_system probe at all). This mirrors the
+  existing tolerance for missing `partial_reasons`.
 
 ### `1.2`
 
@@ -771,6 +801,132 @@ is stable.
 See [the module README](../src/aorta/instrumentation/README.md#how-to-add-a-new-env-var-to-canonical_env_vars).
 Short version: edit `CANONICAL_ENV_VARS`, update
 `test_canonical_var_names_stable`, document why in your PR.
+
+## Running inside a Buck environment
+
+As of schema 1.3 (issue #163, A1.2a), the env probe detects whether
+it's running inside a [Buck2](https://buck2.build/) build environment
+and records the result in the top-level `build_system` block. As of
+schema 1.4 (issue #163, A1.2b), it can additionally introspect a
+target's transitive deps to populate the `library_introspection`
+list. As of `aorta env recipe --format buck` (issue #163, A1.2c), the
+captured `library_introspection` can be re-emitted as a best-effort
+BUCK file fragment for cross-environment handoff.
+
+Quick check:
+
+```bash
+# Outside any Buck repo
+aorta env probe -o /tmp/env.json
+jq '.build_system' /tmp/env.json
+# -> {"kind": "none"}
+
+# Inside a Buck2 checkout (e.g., the open-source examples at
+#  https://github.com/facebook/buck2/tree/main/examples)
+cd ~/buck2-examples/python/hello_world
+aorta env probe -o /tmp/env.json
+jq '.build_system' /tmp/env.json
+# -> {"kind": "buck2", "buck2_version": "buck2 ...",
+#     "repo_root": "/.../hello_world", "revision": "<sha>"}
+```
+
+The detector wraps `buck2 --version`, `buck2 root`, and a revision
+lookup (`hg id -i` then `git rev-parse HEAD`); none of these
+subprocesses are vendored. The `kind=buck2` shape is only emitted
+when both `buck2 --version` and `buck2 root` succeed -- so the field
+unambiguously means "we are demonstrably running inside a functional
+Buck2 checkout", not merely "the `buck2` binary happens to be
+installed somewhere on PATH". The dominant non-Buck case
+(developer laptop with vendored buck2 but cwd outside any Buck repo)
+therefore reports `{"kind": "none"}`, and the revision lookup never
+runs against an unrelated working directory. If only the revision
+lookup fails (no VCS at the Buck root), the dict is still populated
+with `revision: null`.
+
+### Buck-aware library introspection (`--buck-target`)
+
+```bash
+# Outside Buck mode the two introspection lists stay empty.
+aorta env probe -o /tmp/env.json
+jq '.library_introspection' /tmp/env.json              # -> []
+jq '.library_introspection_alternates' /tmp/env.json   # -> []
+
+# Inside a Buck checkout, point the probe at a top-level target. We
+# wrap `buck2 audit dependencies <target> --transitive --json` and
+# match each transitive dep label against KNOWN_LIBRARY_PATTERNS.
+aorta env probe --buck-target //myproj:training_main -o /tmp/env.json
+jq '.library_introspection' /tmp/env.json
+# -> [
+#   {"name":"hipblaslt","source":"buck","revision":"<repo-sha>","target":"//.../hipblaslt_lib"},
+#   {"name":"rccl","source":"buck","revision":"<repo-sha>","target":"//.../rccl_lib"},
+#   {"name":"pytorch","source":"buck","revision":"<repo-sha>","target":"//pytorch:torch"},
+#   ...
+# ]
+
+# When a Buck-matched library is also captured by an A1 per-library
+# block (hipblaslt, rocblas, miopen, rccl), an alternate entry is
+# synthesised from the A1 block so consumers can compare the buck
+# label against the system-package version/lib_hash:
+jq '.library_introspection_alternates[] | select(.name=="hipblaslt")' /tmp/env.json
+# -> {"name":"hipblaslt","source":"package","revision":"...","package_version":"...","lib_hash":"..."}
+```
+
+`--buck-timeout` (default 10 s) caps the audit subprocess. A timeout,
+non-zero exit, or unparseable JSON degrades gracefully: both lists are
+returned empty and the failure is recorded in `partial_reasons`. The
+match patterns currently cover `hipblaslt`, `rccl`, `pytorch`, and
+`rocm` runtime; new libraries are added by appending to
+`KNOWN_LIBRARY_PATTERNS` in `src/aorta/instrumentation/buck_introspect.py`.
+
+### Emitting a Buck recipe (`aorta env recipe --format buck`)
+
+Issue #163 (A1.2c) ships a read-only emitter that turns an env.json
+back into a BUCK file fragment for cross-environment handoff:
+
+```bash
+aorta env probe --buck-target //myproj:training_main -o /tmp/env.json
+aorta env recipe --format buck /tmp/env.json > BUCK.aorta-recipe
+head -n 20 BUCK.aorta-recipe
+# # ============================================================================
+# # AUTO-GENERATED BY `aorta env recipe --format buck` -- BEST-EFFORT, NOT EXACT.
+# # env.json captures observed state, not a complete build recipe. Internal
+# # targets, host-coupled driver state, mounted source trees, local patches,
+# # and private toolchains are not recoverable from observation. Use as a
+# # starting point.
+# # ============================================================================
+# # build_system: kind=buck2 buck2_version=buck2 ... repo_root=... revision=<sha>
+# # 3 buck-introspected libraries:
+#
+# # original_target = //third-party/rocm:hipblaslt
+# prebuilt_cxx_library(
+#     name = "hipblaslt",
+#     version = "<repo-sha>",
+#     # NOTE: emitted as prebuilt_cxx_library because env.json
+#     # captures the resolved binary, not the source-build recipe.
+#     ...
+# )
+```
+
+The emitter is text generation only: it does NOT invoke `buck2 build`,
+vendor any Buck rules / macros / rule libraries, or attempt to
+reconstruct internal targets, host-coupled driver state, mounted
+source trees, local patches, or private toolchains. Those are not
+recoverable from observation by construction; the loud header
+documents the limitation so consumers don't mistake the fragment
+for a complete build recipe.
+
+Each entry in `library_introspection` whose `source == "buck"` becomes
+one `prebuilt_cxx_library(...)` call pinning the captured `revision`
+as a `version` attribute. Entries with `source` set to `"pkg-config"`
+or `"elf"` (from A1's existing library introspection path) are
+skipped -- they have no Buck target to point at -- but any
+`library_introspection_alternates` entries are appended as a trailing
+comment block so a diff against a non-Buck reference snapshot can
+spot the merged-away identifiers.
+
+`--format dockerfile` is reserved on the CLI surface but exits with a
+"not yet implemented" error; the actual implementation tracks
+separately. Future formats slot in via the same `--format` flag.
 
 ## Testing the probe locally
 
