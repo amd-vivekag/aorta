@@ -465,6 +465,12 @@ def write_resolved_recipe(
             cell_doc["trials"] = cell.trials
         if cell.steps is not None:
             cell_doc["steps"] = cell.steps
+        if cell.workload_config:
+            # Emit cell-scope workload_config verbatim. The runner merges
+            # recipe-scope under cell-scope at execution time; the resolved
+            # YAML preserves both scopes (recipe-scope key below) so a
+            # round-trip load+run produces the same effective config.
+            cell_doc["workload_config"] = dict(cell.workload_config)
         resolved_cells.append(cell_doc)
 
     doc: dict[str, Any] = {
@@ -475,6 +481,11 @@ def write_resolved_recipe(
     }
     if recipe.ticket is not None:
         doc["ticket"] = recipe.ticket
+    if recipe.workload_config:
+        # Recipe-scope workload_config -- emitted only when non-empty so
+        # recipes that never used the field round-trip to byte-equivalent
+        # YAML. Cell-scope values are written per cell above.
+        doc["workload_config"] = dict(recipe.workload_config)
     doc["confound"] = {
         "threshold": recipe.confound.threshold,
         "baseline_cell": recipe.confound.baseline_cell,
