@@ -735,6 +735,191 @@ docker run --rm <image-B> aorta env probe -o /workspace/env_b.json
 diff <(jq -S . env_a.json) <(jq -S . env_b.json)
 ```
 
+## Output modes
+
+`aorta env probe` has three output modes. Pick whichever matches what
+you're actually doing — the JSON artifact, a quick eyeball, or one
+field for a script.
+
+| Mode | When to use | What it does |
+| --- | --- | --- |
+| Default | Producing an artifact to keep, diff, or attach to a trial result | Writes the full JSON to `env.json` (or `-o <path>`) and prints the brief to stdout |
+| `--summary` | "I just want to look at the build" — no archival need | Prints only the one-screen brief; **does not write JSON** |
+| `--field DOTTED.PATH` | Scripting a one-value lookup | Prints just that field's value as JSON (type preserved); **does not write JSON** |
+
+```bash
+# Default mode (artifact + brief)
+aorta env probe -o /tmp/env.json
+
+# Quick eyeball -- no file written
+aorta env probe --summary
+
+# One-field lookup, JSON-typed output (a bool prints as `true`, a
+# string prints as `"foo"`, a missing optional prints as `null`)
+aorta env probe --field schema_version
+aorta env probe --field pytorch_build.git_commit
+aorta env probe --field pytorch_build.ninja_hipcc.targets.ck_sdpa.use_defines_present.USE_ROCM_CK_SDPA
+```
+
+When `--field` can't resolve the path, it surfaces a one-line error
+listing the keys that *are* available at the parent level — so
+typos and renames are self-correcting:
+
+```bash
+$ aorta env probe --field pytorch_build.cmke_cache
+Error: Key 'cmke_cache' not found at 'pytorch_build'. Available keys:
+  binary_introspection, build_flags, cmake_cache, cuda_version, debug,
+  flags, git_commit, hip_version, install_kind, ninja_hipcc (+ 2 more)
+```
+
+`--field` supports simple dotted paths. For keys that themselves
+contain a `.` (the only one in the current schema is
+`"libaotriton_v2.so"` under `torch_lib_bundled`), use `jq` on a full
+snapshot instead.
+
+## jq cookbook
+
+Copy-paste recipes for the common questions. All assume you have a
+snapshot file at `/tmp/env.json` (or two snapshots: `good.json` and
+`bad.json` for diffs).
+
+### Is the build configured the way I think it is?
+
+```bash
+# All three vantages on USE_ROCM_CK_SDPA -- cmake-time, HIPCC-time,
+# and symbol-presence. They should all agree.
+jq '{
+  cmake:   .pytorch_build.cmake_cache.entries.USE_ROCM_CK_SDPA.value,
+  hipcc:   .pytorch_build.ninja_hipcc.targets.ck_sdpa.use_defines_present.USE_ROCM_CK_SDPA,
+  sym_fwd: .pytorch_build.binary_introspection.libtorch_hip_symbol_counts."ck_tile::FmhaFwd",
+  sym_bwd: .pytorch_build.binary_introspection.libtorch_hip_symbol_counts."ck_tile::FmhaBwd"
+}' /tmp/env.json
+
+# Same for AOTriton -- different libs and symbol families.
+jq '{
+  cmake:        .pytorch_build.cmake_cache.entries.USE_AOTRITON.value,
+  bundled_lib:  .aotriton.bundled_present,
+  bundled_dir:  .aotriton.bundled_images_dir_present,
+  bundled_sym:  .pytorch_build.binary_introspection.libtorch_hip_symbol_counts."aotriton::",
+  mha_fwd_aot:  .pytorch_build.binary_introspection.libtorch_hip_symbol_counts.mha_fwd_aot
+}' /tmp/env.json
+```
+
+### Which SDPA backends are compiled in AND enabled at runtime?
+
+```bash
+# Compiled in (build-time, derived from symbol counts)
+jq '.pytorch_build.binary_introspection.libtorch_hip_symbol_counts
+    | with_entries(.value = (.value > 0))' /tmp/env.json
+
+# Enabled at runtime (torch.backends.cuda.<...>_sdp_enabled())
+jq '.pytorch_sdpa.backends_enabled' /tmp/env.json
+```
+
+### What HIPCC defines + codegen flags did `ck_sdpa` compile with?
+
+```bash
+# Just the flags the SDPA-NaN triage cares about (yes/no per flag)
+jq '.pytorch_build.ninja_hipcc.targets.ck_sdpa.use_defines_present' /tmp/env.json
+
+# Codegen flags (denormal-flush, ffast-math, ffp-contract, ...)
+jq '.pytorch_build.ninja_hipcc.targets.ck_sdpa.codegen_flags_present' /tmp/env.json
+
+# GPU offload archs
+jq '.pytorch_build.ninja_hipcc.targets.ck_sdpa.offload_archs' /tmp/env.json
+
+# Which parser ran (build.ninja vs legacy FindHIP fallback) and how
+# many scripts the fallback walked
+jq '.pytorch_build.ninja_hipcc | {_parser, _legacy_scripts_scanned}' /tmp/env.json
+```
+
+### What's actually in the GEMM kernel libraries?
+
+```bash
+# hipBLASLt identity -- the four fields that motivated this whole
+# probe (a hipBLASLt swap is the #1 source of GEMM drift).
+jq '.hipblaslt | {rocm_release_tweak, package_version, lib_hash, kernel_db_revision}' /tmp/env.json
+
+# Same for rocBLAS, MIOpen, RCCL
+jq '{rocblas, miopen, rccl}' /tmp/env.json
+```
+
+### Diff two snapshots
+
+```bash
+# Full diff -- gold standard
+diff <(jq -S . good.json) <(jq -S . bad.json)
+
+# Just the SDPA-relevant compile state (much smaller diff)
+diff \
+  <(jq -S '.pytorch_build.ninja_hipcc.targets' good.json) \
+  <(jq -S '.pytorch_build.ninja_hipcc.targets' bad.json)
+
+# Just env_vars (most common runtime-state difference)
+diff \
+  <(jq -S '.env_vars' good.json) \
+  <(jq -S '.env_vars' bad.json)
+
+# Just GEMM library identities (most common build-time difference)
+diff \
+  <(jq -S '{hipblaslt, rocblas, miopen, rccl}' good.json) \
+  <(jq -S '{hipblaslt, rocblas, miopen, rccl}' bad.json)
+
+# Just submodule commits
+diff \
+  <(jq -S '.pytorch_build.submodule_commits' good.json) \
+  <(jq -S '.pytorch_build.submodule_commits' bad.json)
+```
+
+### Where can things have silently failed?
+
+```bash
+# Was anything missing? List every block that didn't probe cleanly.
+jq '{partial, partial_reasons}' /tmp/env.json
+
+# Just the action items -- one reason per line for grep / wc
+jq -r '.partial_reasons[]' /tmp/env.json
+```
+
+### One-liner answers for triage hotline questions
+
+```bash
+# "What ROCm + HIP versions is this build against?"
+jq '{rocm: .rocm.version, hip: .hip.version, gfx: .gpu_arch.gfx_targets}' /tmp/env.json
+
+# "Which submodule commits is this PyTorch built from?"
+jq '.pytorch_build.submodule_commits' /tmp/env.json
+
+# "Was the build done from source or installed as a wheel?"
+jq -r '.pytorch_build.install_kind' /tmp/env.json
+
+# "Is aiter installed, and which arches are its HSA blobs covering?"
+jq '.aiter | {package_dist_name, commit, archs: (.hsa_tree // {} | to_entries[0].value | keys)}' /tmp/env.json
+```
+
+### Build a SDPA-NaN triage one-pager from one snapshot
+
+```bash
+jq '{
+  build: {
+    rocm:           .rocm.version,
+    hip:            .hip.version,
+    pytorch_commit: .pytorch_build.git_commit,
+    install:        .pytorch_build.install_kind,
+    parser:         .pytorch_build.ninja_hipcc._parser
+  },
+  sdpa_compile_in: .pytorch_build.binary_introspection.libtorch_hip_symbol_counts
+    | with_entries(.value = (.value > 0)),
+  sdpa_runtime_enabled: .pytorch_sdpa.backends_enabled,
+  ck_sdpa_flags: (.pytorch_build.ninja_hipcc.targets.ck_sdpa // {}
+    | {defines: .use_defines_present, codegen: .codegen_flags_present, archs: .offload_archs}),
+  numerics_relevant_env: (.env_vars
+    | {HSA_XNACK, HSA_KERNARG_POOL_SIZE, HSA_NO_SCRATCH_RECLAIM,
+       AMDGCN_USE_BUFFER_OPS, DISABLE_TF32,
+       TORCH_ROCM_FA_PREFER_CK, TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL})
+}' /tmp/env.json
+```
+
 ## Out of scope (deferred to P1)
 
 * `aorta env matrix` (multi-docker fan-out)

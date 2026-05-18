@@ -1058,14 +1058,15 @@ class TestCliIsThinWrapper:
         # The spec target is ~30 lines of substantive code; the cushion
         # accommodates the module docstring, Click decorators, the
         # try/except blocks that surface filesystem errors as
-        # ``click.ClickException`` (per Copilot review), the --verbose
-        # flag wiring, and the inline partial_reasons echo + closing
-        # status marker. The real "no-probing-in-CLI" guard is
-        # `test_cli_does_no_probing_imports` below -- this one is a
-        # soft canary against the file ballooning.
+        # ``click.ClickException`` (per Copilot review), the --verbose /
+        # --summary / --field flag wiring, the _lookup_field helper
+        # with friendly error messages, and the inline partial_reasons
+        # echo + closing status marker. The real "no-probing-in-CLI"
+        # guard is `test_cli_does_no_probing_imports` below -- this one
+        # is a soft canary against the file ballooning.
         line_count = sum(1 for _ in cli_path.read_text().splitlines())
-        assert line_count <= 120, (
-            f"cli/env.py is {line_count} lines; soft budget is 120. "
+        assert line_count <= 250, (
+            f"cli/env.py is {line_count} lines; soft budget is 250. "
             "If you need more, check that the new code is genuinely "
             "wiring/error-handling and not probing -- "
             "test_cli_does_no_probing_imports is the strict guard."
@@ -1282,6 +1283,177 @@ class TestCliIsThinWrapper:
             "cli/env.py json.dumps call uses default=str -- this masks "
             "non-JSON types in the schema. Remove it so the failure is loud."
         )
+
+
+class TestCliSummaryAndFieldFlags:
+    """1.4: --summary and --field CLI modes (no file write).
+
+    Both short-circuit the JSON write so operators can quickly eyeball
+    the brief or script a one-field lookup. The default mode (no flag)
+    is unchanged.
+    """
+
+    @staticmethod
+    def _cli_mod():
+        cli_path = Path(env_mod.__file__).parent.parent / "cli" / "env.py"
+        spec = importlib.util.spec_from_file_location(
+            "aorta.cli.env", cli_path,
+        )
+        cli_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cli_mod
+        spec.loader.exec_module(cli_mod)
+        return cli_mod
+
+    def test_summary_flag_prints_brief_and_skips_file_write(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        # Run in tmp_path so the default env.json output path won't
+        # land in the project root if the flag fails to suppress it.
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(cli_mod.env, ["probe", "--summary"])
+            assert result.exit_code == 0, result.output
+            # Brief lines from EnvSnapshot.summary() must be present.
+            assert "runtime:" in result.output
+            assert "rocm:" in result.output
+            # No JSON dumped (the default mode would include the JSON
+            # file path; --summary should not).
+            assert "Wrote env probe to" not in result.output
+            # File MUST NOT be written -- the whole point of the flag.
+            assert not (Path.cwd() / "env.json").exists()
+
+    def test_field_flag_returns_top_level_scalar_as_json(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env, ["probe", "--field", "schema_version"],
+            )
+            assert result.exit_code == 0, result.output
+            # JSON-typed: a string surfaces with surrounding quotes.
+            assert result.output.strip() == f'"{env_mod.SCHEMA_VERSION}"'
+            # No file write.
+            assert not (Path.cwd() / "env.json").exists()
+
+    def test_field_flag_returns_nested_value(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            # all_disabled means most fields are null; pick one we know
+            # the default-shape snapshot populates (the new 1.4 keys).
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--field", "pytorch_build.ninja_hipcc._parser"],
+            )
+            assert result.exit_code == 0, result.output
+            assert result.output.strip() == "null"
+
+    def test_field_flag_returns_subdict_as_json(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env, ["probe", "--field", "env_vars"],
+            )
+            assert result.exit_code == 0, result.output
+            # Must be valid JSON and must be a dict.
+            payload = json.loads(result.output.strip())
+            assert isinstance(payload, dict)
+            # Spot-check one canonical key is present.
+            assert "HIP_VISIBLE_DEVICES" in payload
+
+    def test_field_flag_missing_top_level_key_lists_available(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--field", "does_not_exist"],
+            )
+            assert result.exit_code != 0
+            # Error message must be helpful: name the missing segment,
+            # the path it failed at, and (a sample of) available keys.
+            assert "does_not_exist" in result.output
+            assert "<root>" in result.output
+            assert "Available keys" in result.output
+
+    def test_field_flag_missing_nested_key_scopes_error_to_parent_path(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--field", "pytorch_build.nonsense_key"],
+            )
+            assert result.exit_code != 0
+            assert "nonsense_key" in result.output
+            # Parent path explicitly named, not "<root>".
+            assert "pytorch_build" in result.output
+
+    def test_field_flag_descending_into_scalar_explains_type(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--field", "schema_version.try_descend"],
+            )
+            assert result.exit_code != 0
+            # Must call out the actual mid-path type so user sees why.
+            assert "str" in result.output
+            assert "not an object" in result.output
+
+    def test_summary_and_field_are_mutually_exclusive(
+        self, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--summary", "--field", "schema_version"],
+            )
+            assert result.exit_code != 0
+            assert "mutually exclusive" in result.output
+
+    def test_default_mode_unchanged_writes_file(
+        self, all_disabled, tmp_path: Path,
+    ):
+        """Schema-stability: invoking probe without the new flags must
+        still write env.json + print the brief, like in 1.3 and earlier.
+        """
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        out = tmp_path / "env.json"
+        result = runner.invoke(cli_mod.env, ["probe", "-o", str(out)])
+        assert result.exit_code == 0, result.output
+        assert out.exists()
+        assert "Wrote env probe to" in result.output
+        # Snapshot is parseable JSON with the expected schema version.
+        payload = json.loads(out.read_text())
+        assert payload["schema_version"] == env_mod.SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
