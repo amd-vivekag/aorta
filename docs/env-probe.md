@@ -345,7 +345,57 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.3` (current)
+### `1.4` (current)
+
+Extends `pytorch_build.ninja_hipcc` to handle PyTorch builds that use
+the **legacy `FindHIP.cmake`** flow (e.g. `rocm/pytorch-private:*`
+Jenkins images on ROCm 7.2). The 1.3 parser only handled the modern
+`enable_language(HIP)` shape, so on legacy-flow images `.hip` compiles
+are driven by `CUSTOM_COMMAND` ninja rules → per-source
+`*.hip.o.cmake` driver scripts, build.ninja itself carries no HIPCC
+defines for HIP sources, and the probe returned `targets: {}` -- no
+SDPA-NaN-actionable flags surfaced.
+
+* `pytorch_build.ninja_hipcc._parser` (new) -- discriminates which
+  parser produced the result: `"ninja_defines"` (modern
+  `enable_language(HIP)`, the 1.3 path), `"legacy_findhip_per_source"`
+  (new -- walks per-source cmake scripts under each
+  `<target>.dir/`), or `null` (wheel install / file absent /
+  unreadable).
+* `pytorch_build.ninja_hipcc._legacy_scripts_scanned` (new) -- int
+  count of `*.hip.o.cmake` scripts read when the fallback fired;
+  `null` otherwise. Useful for sanity-checking that the fallback saw
+  the file population you expected (the ROCm 7.2 repro image yields
+  ~6k).
+* `pytorch_build.ninja_hipcc.targets` (extended) -- now additionally
+  reports `ck_sdpa` (the CK-backed SDPA backend; owns
+  `USE_ROCM_CK_SDPA`, `CK_TILE_FMHA_*`, `FLASHATTENTION_DISABLE_*`,
+  statically linked into `libtorch_hip.so` so its compile-time flags
+  don't appear in the wheel's host-side `CXX_FLAGS`) and `mslk`
+  (Multi-Stream Layer Kernels). Pre-1.4 snapshots only ever held
+  `torch_hip` / `torch_cpu` / `c10_hip`; 1.4 snapshots may
+  additionally hold `ck_sdpa` / `mslk` whenever the build links
+  them. Both parsers (`ninja_defines` and
+  `legacy_findhip_per_source`) report the same shape -- consumers
+  reading `targets[<name>]` don't need to branch on `_parser`.
+
+Backwards-compat notes:
+
+* The two new keys are additive under the same `ninja_hipcc` dict.
+  1.3 consumers reading `.ninja_hipcc.targets[<x>]` keep working;
+  only consumers that directly index `.ninja_hipcc._parser` or
+  `.ninja_hipcc._legacy_scripts_scanned` on a pre-1.4 snapshot get
+  `KeyError`. Use `.get(key)` or guard on `schema_version`.
+* `ck_sdpa` / `mslk` rows under `targets` are silent additions --
+  consumers iterating `targets` see additional rows on 1.4 snapshots
+  but the iteration shape is unchanged. Hard-coding the old
+  three-name list (`["torch_hip", "torch_cpu", "c10_hip"]`) still
+  works against 1.4 snapshots; you just don't see the new data.
+* No top-level shape changes -- the schema's dataclass field list is
+  identical to 1.3, so `EnvSnapshot.from_dict()` round-trips between
+  1.3 and 1.4 snapshots without raising.
+
+### `1.3`
 
 Adds source/editable-install build introspection (issue #176) plus a
 runtime SDPA backend probe. New fields are additive within existing
@@ -699,6 +749,12 @@ sources are:
 | `pytorch_build.source_path` | The detected/configured PyTorch source root; `null` for wheel installs |
 | `pytorch_build.submodule_commits.{composable_kernel,aiter,fbgemm}` | `git -C <source>/third_party/<name> rev-parse HEAD` when a source tree is detected; otherwise `null` and a `partial_reasons` line emits the GitHub URL template for manual lookup |
 | `pytorch_build.submodule_commits._source` | Provenance tag: `"git"` when populated from a source tree, `null` for wheel installs |
+| `pytorch_build.ninja_hipcc._source_file` | Path to `<source>/build/build.ninja` when at least one parser ran; `null` for wheel installs / build.ninja absent |
+| `pytorch_build.ninja_hipcc._parser` | `"ninja_defines"` when modern `enable_language(HIP)` ninja rules matched; `"legacy_findhip_per_source"` when the per-source `*.hip.o.cmake` fallback ran; `null` on wheel installs or when no parser succeeded |
+| `pytorch_build.ninja_hipcc._legacy_scripts_scanned` | int count of `*.hip.o.cmake` driver scripts read by the legacy-FindHIP fallback; `null` on the modern path or wheel installs |
+| `pytorch_build.ninja_hipcc.targets.{torch_hip,torch_cpu,c10_hip}` | Modern path: streamed parse of `build.ninja` `DEFINES = …` / `FLAGS = …` lines under `HIP_COMPILER__*` rules, attributed by `-D<target>_EXPORTS`. Legacy path: walked `<source>/build/**/<target>.dir/**/*.hip.o.cmake` scripts, parsed `set(HIP_HIPCC_FLAGS …)` / `set(HIP_CLANG_FLAGS …)` cmake-list values |
+| `pytorch_build.ninja_hipcc.targets.ck_sdpa` | Same parsing pipeline as the libtorch targets; surfaces the CK-backed SDPA backend's compile-time flags (`USE_ROCM_CK_SDPA`, `CK_TILE_FMHA_*`, `FLASHATTENTION_DISABLE_*`, `CK_USE_*`) that are otherwise invisible because ck_sdpa is statically linked into `libtorch_hip.so` and its flags don't propagate to the wheel's host-side `CXX_FLAGS` |
+| `pytorch_build.ninja_hipcc.targets.mslk` | Same parsing pipeline; surfaces Multi-Stream Layer Kernels compile-time flags |
 | `system_health` | `sudo -n -E rdhc --quick --json <tempfile>` |
 | `docker.image` / `docker.digest` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars set by the launcher |
 | `docker.container_id` | `/proc/self/cgroup` |
