@@ -200,27 +200,24 @@ def test_confound_na_is_distinct_from_neutral():
     assert CONFOUND_NEUTRAL == "-"
 
 
-# ---- step_time_source mismatch -------------------------------------------
+# ---- per-step instrumentation required (smoke-3) -------------------------
 #
-# Sonbol's review on PR #160 flagged that comparing a cell whose timing came
-# from per-step workload clocks against one whose timing came from
-# wall-clock-divided-by-step-count is an apples-to-oranges ratio: the latter
-# folds setup + teardown into the "step time". The classifier must refuse
-# such ratios with CONFOUND_NA so matrix.md doesn't claim a meaningful
-# comparison happened.
-
-
-def test_classify_returns_na_when_step_time_source_differs():
-    base = _stats("b", mean_step_time_ms=100.0, step_time_source="per_step", passed_count=0)
-    cell = _stats("c", mean_step_time_ms=120.0, step_time_source="wall_clock_total", passed_count=8)
-    tag, ratio = classify(cell, base, threshold=1.15)
-    assert tag == CONFOUND_NA
-    assert ratio is None
+# The 2026-05-13 smoke matrix produced ``speed (+3500%)`` tags from ratios
+# between two cells whose step times were ``wall_clock_total / configured_steps``
+# (the import-time wall-clock of a setup crash divided by a never-reached
+# step count). Those ratios are dominated by setup / teardown / crash time,
+# not per-step cost. Smoke-3's rule: confound classification requires
+# ``step_time_source == "per_step"`` on BOTH the cell and the baseline; any
+# fallback branch (``elapsed_per_iter`` or ``wall_clock_total``) on either
+# side collapses to ``CONFOUND_NA``. Strictly stronger than the older
+# "sources must match" rule from PR #160.
 
 
 def test_classify_returns_na_when_only_baseline_has_per_step():
-    """Asymmetric case: baseline measured cleanly, cell only has wall-clock.
-    The ratio would be (setup+steps)/steps, which is meaningless."""
+    """Baseline measured cleanly, cell fell back to elapsed_per_iter.
+    The fallback folds workload warm-up / shutdown into the per-iter number,
+    so the ratio is not a per-step comparison even though both sides have
+    *some* timing."""
     base = _stats("b", mean_step_time_ms=100.0, step_time_source="per_step")
     cell = _stats("c", mean_step_time_ms=110.0, step_time_source="elapsed_per_iter")
     tag, ratio = classify(cell, base, threshold=1.15)
@@ -228,13 +225,56 @@ def test_classify_returns_na_when_only_baseline_has_per_step():
     assert ratio is None
 
 
-def test_classify_computes_ratio_when_sources_match():
-    """Sanity check: matching sources still go through the normal classifier."""
-    base = _stats("b", mean_step_time_ms=400.0, step_time_source="wall_clock_total", passed_count=4)
-    slow = _stats(
+def test_classify_returns_na_when_only_cell_has_per_step():
+    """Symmetric: baseline fell back, cell measured cleanly. The baseline's
+    number folds setup time, so the ratio's denominator isn't iteration time."""
+    base = _stats("b", mean_step_time_ms=100.0, step_time_source="wall_clock_total")
+    cell = _stats("c", mean_step_time_ms=120.0, step_time_source="per_step")
+    tag, ratio = classify(cell, base, threshold=1.15)
+    assert tag == CONFOUND_NA
+    assert ratio is None
+
+
+def test_classify_returns_na_when_both_sources_are_wall_clock_total():
+    """The smoke-3 regression case: both sides fell back to wall-clock and the
+    old classifier (sources match) happily emitted a ``speed (+N%)`` tag.
+    Under the new rule, two wall-clock numbers can't anchor a per-step ratio
+    even when they agree on the fallback branch."""
+    base = _stats(
+        "b",
+        mean_step_time_ms=400.0,
+        step_time_source="wall_clock_total",
+        passed_count=4,
+    )
+    cell = _stats(
         "tf32-local",
         mean_step_time_ms=500.0,
         step_time_source="wall_clock_total",
+        passed_count=8,
+    )
+    tag, ratio = classify(cell, base, threshold=1.15)
+    assert tag == CONFOUND_NA
+    assert ratio is None
+
+
+def test_classify_returns_na_when_both_sources_are_elapsed_per_iter():
+    """Even the higher-fidelity fallback (elapsed/iterations from the workload's
+    own report) is excluded -- it still folds the workload's warm-up and any
+    untimed shutdown into the per-iter number."""
+    base = _stats("b", mean_step_time_ms=100.0, step_time_source="elapsed_per_iter")
+    cell = _stats("c", mean_step_time_ms=120.0, step_time_source="elapsed_per_iter")
+    tag, ratio = classify(cell, base, threshold=1.15)
+    assert tag == CONFOUND_NA
+    assert ratio is None
+
+
+def test_classify_computes_ratio_when_both_sources_are_per_step():
+    """Sanity check: per_step on both sides goes through the normal classifier."""
+    base = _stats("b", mean_step_time_ms=400.0, step_time_source="per_step", passed_count=4)
+    slow = _stats(
+        "tf32-local",
+        mean_step_time_ms=500.0,
+        step_time_source="per_step",
         passed_count=8,
     )
     tag, ratio = classify(slow, base, threshold=1.15)

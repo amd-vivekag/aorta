@@ -12,11 +12,16 @@ matrix.md captures exactly that distinction:
   causal conclusions.
 * ``no effect`` -- neither the failure rate nor the iteration time moved.
   The mitigation likely doesn't apply to this workload.
-* ``n/a`` -- the baseline cell errored or produced no usable timing data,
-  so no step-time ratio could be computed for *any* non-baseline cell.
-  Distinct from ``-`` (which advertises a trustworthy cell): re-using the
-  neutral tag here would mislead readers of matrix.md into trusting cells
-  that were never compared against anything.
+* ``n/a`` -- the cell could not be compared against the baseline. Fires
+  when (a) the baseline errored or produced no usable timing, (b) the
+  cell itself produced no usable timing, or (c) the cell or baseline
+  lacks per-step instrumentation (``step_time_source != "per_step"``);
+  fallback branches (``wall_clock_total``, ``elapsed_per_iter``) fold
+  setup / teardown / crash time into the per-iter number, so any
+  ratio against them would not be an iteration-time comparison.
+  Distinct from ``-`` (which advertises a trustworthy cell): re-using
+  the neutral tag here would mislead readers of matrix.md into trusting
+  cells that were never compared against anything.
 * ``error`` -- the whole cell failed. Row preserved so the matrix is
   complete; classification is skipped.
 
@@ -166,11 +171,15 @@ def classify(
     Returns:
         ``(tag, ratio)`` where ``tag`` is the matrix.md cell text and
         ``ratio`` is ``None`` for the baseline row or whenever a meaningful
-        ratio could not be computed (baseline errored, baseline has no
-        usable timing, the cell itself has no usable timing, or the cell
-        and baseline derived their step-time from different fallback
-        branches -- comparing per-step workload clocks against
-        wall-clock-divided-by-step-count would be apples to oranges).
+        ratio could not be computed: the baseline errored, the baseline
+        has no usable timing, the cell itself has no usable timing, or
+        either the cell or the baseline lacks per-step instrumentation
+        (``step_time_source != "per_step"``). The last clause is strictly
+        stronger than the prior "sources must differ" rule from PR #160:
+        two matching ``wall_clock_total`` numbers also fail it, because
+        ``wall_clock_total`` and ``elapsed_per_iter`` both fold setup /
+        teardown / crash time into the per-iter number and a ratio
+        between two such numbers is not an iteration-time comparison.
     """
     if cell.error is not None:
         return CONFOUND_ERROR, None
@@ -203,14 +212,20 @@ def classify(
         # without claiming the mitigation is trustworthy.
         return CONFOUND_NA, None
 
-    if cell.step_time_source != baseline.step_time_source:
-        # Mixing fidelity tiers (e.g. baseline ran a workload that emits
-        # per-step times, this cell ran one that only exposes wall-clock)
-        # produces a ratio between fundamentally different signals: the
-        # baseline's number is iteration time only, the cell's number folds
-        # setup / teardown. Refuse to label that comparison; matrix.json
-        # keeps both cells' ``step_time_source`` so reviewers can see why
-        # the row landed on n/a (issue #160 / Sonbol's review on PR #160).
+    if cell.step_time_source != "per_step" or baseline.step_time_source != "per_step":
+        # Only ``per_step`` is a real iteration-time signal. ``elapsed_per_iter``
+        # divides workload-reported elapsed by workload-reported iteration count
+        # (close, but folds any warm-up / shutdown the workload didn't separately
+        # account for). ``wall_clock_total`` divides the trial's whole wall clock
+        # by the configured step count (folds setup + teardown + crash time --
+        # the 2026-05-13 smoke matrix produced ``speed (+3500%)`` tags from
+        # ratios between two such wall-clock-derived numbers, none of which
+        # were iteration-time comparisons). Refuse the ratio whenever either
+        # side fell back. This is strictly stronger than the prior
+        # "sources must match" rule (issue #160 / Sonbol's review on PR #160):
+        # two ``wall_clock_total`` numbers also fail it. matrix.json keeps both
+        # cells' ``step_time_source`` so reviewers can see why the row landed
+        # on n/a.
         return CONFOUND_NA, None
 
     ratio = cell.mean_step_time_ms / baseline.mean_step_time_ms
