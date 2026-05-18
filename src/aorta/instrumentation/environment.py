@@ -63,8 +63,37 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "1.3"
-# 1.2 -> 1.3 (this commit):
+SCHEMA_VERSION = "1.4"
+# 1.3 -> 1.4 (this commit):
+#   - Extended `pytorch_build.ninja_hipcc` with a fallback parser for
+#     PyTorch builds using the legacy `FindHIP.cmake` flow (e.g.
+#     `rocm/pytorch-private:*` Jenkins images on ROCm 7.2). On those
+#     images `.hip` files are compiled via `CUSTOM_COMMAND` ninja rules
+#     driving per-source `<src>_generated_*.hip.o.cmake` scripts, NOT
+#     the modern `enable_language(HIP)` shape -- so build.ninja itself
+#     carries no HIPCC defines/flags for HIP sources. New behaviour:
+#     when the ninja-only scan returns `targets: {}`, walk
+#     `<source>/build/**/<target>.dir/**/*.hip.o.cmake`, parse the
+#     `set(HIP_HIPCC_FLAGS …)` / `set(HIP_CLANG_FLAGS …)` cmake-list
+#     values, and aggregate per-target defines/codegen/archs in the
+#     same shape the modern path produces. Two new additive keys:
+#       * `pytorch_build.ninja_hipcc._parser` -- `"ninja_defines"` (modern)
+#         or `"legacy_findhip_per_source"` (fallback) or `null` (unscanned).
+#       * `pytorch_build.ninja_hipcc._legacy_scripts_scanned` -- int count
+#         of `.hip.o.cmake` scripts read; only set when the fallback fired.
+#   - Extended `_NINJA_HIPCC_TARGETS_OF_INTEREST` to include `ck_sdpa`
+#     (the CK-backed SDPA backend; carries USE_ROCM_CK_SDPA + CK_TILE_*
+#     + FLASHATTENTION_DISABLE_*) and `mslk` (Multi-Stream Layer Kernels).
+#     Pre-1.4 `targets` dicts only ever held torch_hip/torch_cpu/c10_hip;
+#     1.4 dicts may additionally hold ck_sdpa/mslk when the build links
+#     them. Consumers iterating `targets` are unaffected; consumers that
+#     hard-coded the three pre-1.4 names see additional rows on 1.4
+#     snapshots (extra info, never missing info).
+#   Backwards-compat: a 1.3 consumer reading `ninja_hipcc.targets[<x>]`
+#   keeps working; the new `_parser` / `_legacy_scripts_scanned` keys
+#   are additive under the same dict (KeyError only if directly indexed).
+#
+# 1.2 -> 1.3 (PR #177):
 #   - Added `pytorch_build.cmake_cache` (issue #176): parsed cmake
 #     cache entries from `<source>/build/CMakeCache.txt` for source /
 #     editable installs, filtered by an allowlist of name prefixes
@@ -1269,7 +1298,12 @@ def _disaster_snapshot(
             },
             "build_flags": {name: None for name in PYTORCH_BUILD_FLAG_NAMES},
             "cmake_cache": {"_source_file": None, "entries": None},
-            "ninja_hipcc": {"_source_file": None, "targets": None},
+            "ninja_hipcc": {
+                "_source_file": None,
+                "_parser": None,
+                "_legacy_scripts_scanned": None,
+                "targets": None,
+            },
         },
         pytorch_sdpa={
             "backends_enabled": {name: None for name in _PYTORCH_SDPA_GETTERS},
@@ -3484,6 +3518,17 @@ _NINJA_HIPCC_TARGETS_OF_INTEREST: tuple[str, ...] = (
     "torch_hip",
     "torch_cpu",
     "c10_hip",
+    # CK-backed SDPA backend -- owns USE_ROCM_CK_SDPA, CK_TILE_FMHA_*,
+    # FLASHATTENTION_DISABLE_*. Built as a separate static lib that
+    # statically links into libtorch_hip.so. The modern enable_language
+    # (HIP) path puts these in build.ninja as a `ck_sdpa` target; the
+    # legacy FindHIP path puts them in ck_sdpa.dir/*.hip.o.cmake. Both
+    # surface under the same target name.
+    "ck_sdpa",
+    # Multi-Stream Layer Kernels -- ROCm-optimized layer kernels. Same
+    # static-lib pattern as ck_sdpa. Less SDPA-critical but cheap to
+    # surface and the operator wants the full set when diffing builds.
+    "mslk",
 )
 
 # Identify ninja per-rule lines. cmake's ninja generator indents every
@@ -3496,6 +3541,57 @@ _NINJA_FLAGS_PREFIX = "  FLAGS = "
 _NINJA_TARGET_EXPORTS_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)_EXPORTS\b")
 _NINJA_DEFINE_TOKEN_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?")
 _NINJA_OFFLOAD_ARCH_RE = re.compile(r"--offload-arch=(\S+)")
+
+# ---- Legacy FindHIP.cmake fallback ----
+#
+# When PyTorch is configured via the legacy `FindHIP.cmake` path (used
+# by ROCm/PyTorch's Jenkins build for rocm/pytorch-private:* images on
+# ROCm 7.2), `.hip` sources don't appear in `build.ninja` as
+# `HIP_COMPILER__*` rules. They appear as `CUSTOM_COMMAND` rules whose
+# only payload is `cmake -P <src>_generated_*.hip.o.cmake`. The real
+# HIPCC flags + defines live inside those per-source cmake driver
+# scripts, NOT in build.ninja itself. So the ninja-only parser finds
+# zero HIP rules and returns `targets: {}` -- correct in shape but
+# uninformative for SDPA NaN triage (which needs to know
+# USE_ROCM_CK_SDPA, CK_TILE_FMHA_*, FLASHATTENTION_DISABLE_*, etc).
+#
+# The fallback walks each `<target>.dir/` under the build tree and
+# parses the per-source `*.hip.o.cmake` scripts, accumulating defines
+# and codegen flags into the same per-target shape the modern parser
+# produces. Targets are identified by the `<target>.dir/` segment in
+# the path (cmake's per-target subdir layout).
+_LEGACY_FINDHIP_TARGET_DIR_NAMES: tuple[str, ...] = tuple(
+    f"{t}.dir" for t in _NINJA_HIPCC_TARGETS_OF_INTEREST
+)
+
+# FindHIP's per-source script template assigns flag-bearing variables
+# via `set(VAR val;val;val)` with NO surrounding quotes -- values are
+# cmake-list (`;`-separated). Confirmed against ROCm 7.2 ck_sdpa per-
+# source script. The variable names all start with one of these
+# prefixes; trailing `_RELEASE` / `_DEBUG` / `_MINSIZEREL` /
+# `_RELWITHDEBINFO` variants are usually empty but parsed for
+# completeness. The value capture group stops at the closing `)`,
+# which never appears inside a FindHIP-emitted set() value.
+_LEGACY_FINDHIP_SET_RE = re.compile(
+    r"^\s*set\s*\(\s*(HIP_(?:HIPCC|CLANG|HCC)_FLAGS(?:_[A-Z]+)?)\s+([^)]*)\)\s*$",
+    re.MULTILINE,
+)
+
+# Within a captured set() value, tokens are mostly `;`-separated cmake-
+# list elements but some elements pack a space-separated run of
+# `-D…` defines (cmake variable-inheritance quirk: an upstream variable
+# contributes its whole expansion as a single ;-element). Split on
+# BOTH `;` and whitespace before extracting tokens.
+_LEGACY_FINDHIP_TOKEN_SPLIT_RE = re.compile(r"[;\s]+")
+
+# Cap per-file read size. Real scripts on the repro image were ~13 KB;
+# allow generous headroom while still bounding pathological cases.
+_LEGACY_FINDHIP_MAX_FILE_BYTES = 1_048_576  # 1 MiB
+
+# Cap total scripts scanned -- defends against a runaway build tree
+# without bounding realistic ones. The repro image has ~6000 .hip.o.cmake
+# files total; 50000 leaves ~8x headroom.
+_LEGACY_FINDHIP_MAX_SCRIPTS = 50_000
 
 # `build <outputs>: <rule_name> <inputs>...` -- captures the rule
 # name. cmake's ninja generator names rules per-language, e.g.
@@ -3577,11 +3673,22 @@ def _capture_pytorch_ninja_hipcc(
       observed in the target's FLAGS line.
 
     Returns ``targets: None`` for wheel installs (build.ninja absent).
-    When build.ninja exists but no targets-of-interest matched (parser
-    miss, file scanned successfully but the build configured a
-    different set of shared-lib targets), returns ``_source_file``
-    populated and ``targets: {}`` -- distinguishable from the
-    wheel/no-file case so consumers know we DID scan.
+    When build.ninja exists but no targets-of-interest matched in the
+    ninja-only scan, the function falls back to
+    :func:`_capture_pytorch_legacy_findhip`, which walks per-source
+    ``*.hip.o.cmake`` driver scripts emitted by the legacy
+    ``FindHIP.cmake`` build path. If that fallback finds nothing
+    either, returns ``_source_file`` populated and ``targets: {}`` --
+    distinguishable from the wheel/no-file case so consumers know we
+    DID scan.
+
+    Two additive keys discriminate which parser produced the result:
+
+    * ``_parser`` -- ``"ninja_defines"`` (modern ``enable_language(HIP)``
+      shape) or ``"legacy_findhip_per_source"`` (the per-source cmake
+      script fallback) or ``None`` (no parse attempted / both failed).
+    * ``_legacy_scripts_scanned`` -- int count of ``*.hip.o.cmake``
+      files read when the fallback fired; ``None`` otherwise.
 
     Streams the file line-by-line: build.ninja can be 350+ MB on a
     fully-built tree so we must not slurp. Long Ninja variable
@@ -3590,7 +3697,12 @@ def _capture_pytorch_ninja_hipcc(
     lines isn't silently truncated (the per-target ``_EXPORTS`` marker
     or any -D define can land anywhere in the wrapped value).
     """
-    result: dict[str, Any] = {"_source_file": None, "targets": None}
+    result: dict[str, Any] = {
+        "_source_file": None,
+        "_parser": None,
+        "_legacy_scripts_scanned": None,
+        "targets": None,
+    }
     if install_kind not in ("source", "editable") or source_path is None:
         return result
     ninja_path = source_path / "build" / "build.ninja"
@@ -3655,6 +3767,20 @@ def _capture_pytorch_ninja_hipcc(
     # from "wheel install / file absent".
     result["_source_file"] = str(ninja_path)
     if not target_defines:
+        # Modern enable_language(HIP) parser matched nothing. Try the
+        # legacy FindHIP.cmake fallback before giving up. Common on
+        # ROCm/PyTorch Jenkins images where .hip compiles are driven
+        # by CUSTOM_COMMAND -> per-source *.hip.o.cmake scripts.
+        legacy = _capture_pytorch_legacy_findhip(source_path, reasons)
+        if legacy is not None:
+            legacy_targets, scripts_scanned = legacy
+            result["_parser"] = "legacy_findhip_per_source"
+            result["_legacy_scripts_scanned"] = scripts_scanned
+            result["targets"] = legacy_targets
+            return result
+        # Neither parser found anything. Leave targets: {} as the
+        # "scanned, found nothing" signal -- partial reason already
+        # recorded by the fallback.
         result["targets"] = {}
         return result
 
@@ -3702,8 +3828,158 @@ def _capture_pytorch_ninja_hipcc(
             "offload_archs": sorted(archs),
         }
     result["_source_file"] = str(ninja_path)
+    result["_parser"] = "ninja_defines"
     result["targets"] = targets_out
     return result
+
+
+def _capture_pytorch_legacy_findhip(
+    source_path: Path,
+    reasons: list[str],
+) -> tuple[dict[str, dict[str, Any]], int] | None:
+    """Fallback parser for PyTorch builds using legacy ``FindHIP.cmake``.
+
+    Used when :func:`_capture_pytorch_ninja_hipcc`'s ninja-only scan
+    finds zero HIP_COMPILER rules. Walks
+    ``<source>/build/**/<target>.dir/**/*.hip.o.cmake`` for each
+    target in :data:`_NINJA_HIPCC_TARGETS_OF_INTEREST` (via
+    :data:`_LEGACY_FINDHIP_TARGET_DIR_NAMES`). Each script holds one
+    source-file's HIPCC invocation in ``set(HIP_*_FLAGS …)`` cmake-
+    list assignments. We union every script's defines, codegen flag
+    presence, and offload archs into per-target dicts whose shape
+    matches the modern parser's output exactly -- consumers reading
+    ``targets[<name>]`` don't need to branch on parser strategy.
+
+    Returns ``(targets_dict, scripts_scanned)`` when at least one
+    script was readable for any target of interest, or ``None`` when
+    no candidate scripts existed (caller leaves ``targets: {}`` and
+    a partial reason is recorded). Per-target absence (target dir not
+    present at all) is silent -- only the global no-scripts case
+    appends a reason, because individual target absence is the common
+    case (an image may strip torch_hip.dir while keeping ck_sdpa.dir).
+
+    Bounded I/O: caps total scripts scanned at
+    :data:`_LEGACY_FINDHIP_MAX_SCRIPTS` and per-file read at
+    :data:`_LEGACY_FINDHIP_MAX_FILE_BYTES`. Truncation appends a
+    partial reason; per-file OSErrors are skipped with a count
+    summarised in a single reason at the end (avoids one reason per
+    unreadable file when permissions are mis-set).
+    """
+    build_dir = source_path / "build"
+    if not build_dir.is_dir():
+        return None
+
+    # Per-target accumulators: each target collects every (raw value
+    # string) seen across its scripts. We dedup with sets to keep the
+    # later regex pass bounded -- on the repro image many scripts
+    # share identical flag values.
+    target_flag_blobs: dict[str, set[str]] = {}
+    scripts_scanned = 0
+    scripts_unreadable = 0
+    truncated = False
+
+    for cmake_path in build_dir.rglob("*.hip.o.cmake"):
+        if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
+            truncated = True
+            break
+        # Identify which target this script belongs to by walking the
+        # path parts for a `<target>.dir` segment. `rglob` yields paths
+        # rooted at build_dir, so .parts contains build_dir's prefix
+        # too -- iterating handles either layout.
+        tgt: str | None = None
+        for part in cmake_path.parts:
+            for cand_dir in _LEGACY_FINDHIP_TARGET_DIR_NAMES:
+                if part == cand_dir:
+                    tgt = cand_dir[: -len(".dir")]
+                    break
+            if tgt is not None:
+                break
+        if tgt is None:
+            # Script belongs to a target we don't surface (gloo_hip,
+            # caffe2_nvrtc, HIP test binaries, ...). Skip silently.
+            continue
+
+        try:
+            text = cmake_path.read_text(
+                encoding="utf-8", errors="replace",
+            )
+        except OSError:
+            scripts_unreadable += 1
+            continue
+        if len(text) > _LEGACY_FINDHIP_MAX_FILE_BYTES:
+            # Defensive: real scripts are ~13 KB; this only trips on
+            # pathological inputs. Truncate the tail rather than skip
+            # so we still capture the leading set(...) blocks.
+            text = text[:_LEGACY_FINDHIP_MAX_FILE_BYTES]
+        scripts_scanned += 1
+        bucket = target_flag_blobs.setdefault(tgt, set())
+        for _var_name, value in _LEGACY_FINDHIP_SET_RE.findall(text):
+            if value:
+                bucket.add(value)
+
+    if not target_flag_blobs and scripts_scanned == 0:
+        if scripts_unreadable == 0:
+            reasons.append(
+                "pytorch_build.ninja_hipcc: legacy FindHIP fallback found "
+                f"no *.hip.o.cmake scripts under {build_dir}"
+            )
+        return None
+    if scripts_unreadable:
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: legacy FindHIP fallback skipped "
+            f"{scripts_unreadable} unreadable script(s)"
+        )
+    if truncated:
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: legacy FindHIP fallback truncated "
+            f"after scanning {scripts_scanned} scripts (cap "
+            f"{_LEGACY_FINDHIP_MAX_SCRIPTS})"
+        )
+
+    targets_out: dict[str, dict[str, Any]] = {}
+    for tgt in sorted(target_flag_blobs):
+        merged_defines: dict[str, str | None] = {}
+        codegen_present: dict[str, bool] = {
+            f: False for f in _NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST
+        }
+        archs: set[str] = set()
+        # Iterate raw set() values in sorted order so the "same macro,
+        # two values" tie-break is deterministic across runs (same
+        # rationale as the ninja parser's sorted() merge at the
+        # equivalent step).
+        for blob in sorted(target_flag_blobs[tgt]):
+            # Tokenize on both `;` (cmake list separator) and whitespace
+            # (the packed -D run inside a single list element).
+            for tok in _LEGACY_FINDHIP_TOKEN_SPLIT_RE.split(blob):
+                if not tok:
+                    continue
+                dm = _NINJA_DEFINE_TOKEN_RE.match(tok)
+                if dm:
+                    merged_defines[dm.group(1)] = dm.group(2)
+                    continue
+                am = _NINJA_OFFLOAD_ARCH_RE.match(tok)
+                if am:
+                    archs.add(am.group(1))
+                    continue
+            # Codegen-flag substring scan runs on the full blob (one
+            # pass per flag of interest, same as the ninja parser).
+            for f in _NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST:
+                if f in blob:
+                    codegen_present[f] = True
+
+        defines_sorted = {k: merged_defines[k] for k in sorted(merged_defines)}
+        use_present = {
+            name: name in merged_defines
+            for name in _NINJA_HIPCC_FLAGS_OF_INTEREST
+        }
+        targets_out[tgt] = {
+            "defines": defines_sorted,
+            "use_defines_present": use_present,
+            "codegen_flags_present": codegen_present,
+            "offload_archs": sorted(archs),
+        }
+
+    return targets_out, scripts_scanned
 
 
 # ---------------------------------------------------------------------------

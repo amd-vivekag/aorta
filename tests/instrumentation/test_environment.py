@@ -268,7 +268,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.3"
+        assert snapshot.schema_version == "1.4"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -4810,7 +4810,14 @@ class TestCapturePytorchNinjaHipcc:
     def test_wheel_install_returns_null(self, tmp_path):
         reasons: list[str] = []
         block = env_mod._capture_pytorch_ninja_hipcc("wheel", tmp_path, reasons)
-        assert block == {"_source_file": None, "targets": None}
+        # 1.4 additive keys (_parser, _legacy_scripts_scanned) are all
+        # None on the wheel path -- no parse attempted.
+        assert block == {
+            "_source_file": None,
+            "_parser": None,
+            "_legacy_scripts_scanned": None,
+            "targets": None,
+        }
         assert reasons == []
 
     def test_targets_of_interest_captured(self, tmp_path):
@@ -5007,6 +5014,186 @@ class TestCapturePytorchNinjaHipcc:
         env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
         # iter(fh) doesn't invoke .read() / .readlines(); slurp would.
         assert slurp_calls == []
+
+
+class TestCapturePytorchLegacyFindhipFallback:
+    """1.4: per-source *.hip.o.cmake fallback for legacy FindHIP builds.
+
+    When build.ninja has only CUSTOM_COMMAND rules for .hip compiles
+    (no HIP_COMPILER), HIPCC flags live in per-source
+    *.hip.o.cmake scripts instead. Exercised against ROCm 7.2
+    rocm/pytorch-private:* Jenkins image shape.
+    """
+
+    @staticmethod
+    def _make_build_tree(
+        tmp_path: Path,
+        cmake_scripts: dict[str, str],
+        ninja_body: str | None = None,
+    ) -> None:
+        """Synthesize <tmp>/build/ with a build.ninja + per-source scripts.
+
+        cmake_scripts maps relative path under build/ to file contents.
+        ninja_body defaults to a CUSTOM_COMMAND-only stub (no
+        HIP_COMPILER rule), which is what triggers the fallback.
+        """
+        build = tmp_path / "build"
+        build.mkdir()
+        if ninja_body is None:
+            ninja_body = (
+                "build foo.hip.o : CUSTOM_COMMAND src/foo.hip\n"
+                "  COMMAND = cmake -P foo.hip.o.cmake\n"
+            )
+        (build / "build.ninja").write_text(ninja_body, encoding="utf-8")
+        for relpath, body in cmake_scripts.items():
+            target = build / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+
+    def test_ck_sdpa_script_yields_full_target_block(self, tmp_path):
+        """Real-shape fixture mirroring the repro image's
+        ck_sdpa_generated_fmha_bwd_api.hip.o.cmake. Both HIP_HIPCC_FLAGS
+        and HIP_CLANG_FLAGS contribute -D defines + flags that surface
+        under the ck_sdpa target.
+        """
+        self._make_build_tree(tmp_path, {
+            "caffe2/aten/src/ATen/CMakeFiles/ck_sdpa.dir/native/transformers/"
+            "hip/flash_attn/ck/ck_sdpa_generated_fmha_bwd_api.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS --offload-compress;-std=c++17;"
+                "-fgpu-flush-denormals-to-zero;-DCK_USE_FNUZ_FP8 -DCK_USE_GFX94 "
+                "-DCK_USE_XDL -DUSE_ROCM_CK_SDPA -DROCM_VERSION=70200 "
+                "-DCK_TILE_FMHA_FWD_FAST_EXP2=1 "
+                "-DUSE_LAYERNORM_FAST_RECIPROCAL)\n"
+                "set(HIP_CLANG_FLAGS -fPIC;-DUSE_ROCM;-DHIPBLAS_V2;"
+                "-DHIPBLASLT_OUTER_VEC;-DUSE_ROCM_CK_GEMM;"
+                "--offload-arch=gfx950;--offload-arch=gfx942)\n"
+                "set(HIP_HIPCC_FLAGS_RELEASE )\n"
+                "set(HIP_NVCC_FLAGS )\n"
+            ),
+        })
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, reasons)
+        assert block["_parser"] == "legacy_findhip_per_source"
+        assert block["_legacy_scripts_scanned"] == 1
+        assert reasons == []
+        assert set(block["targets"]) == {"ck_sdpa"}
+        ck = block["targets"]["ck_sdpa"]
+        # SDPA-critical defines from HIP_HIPCC_FLAGS
+        assert ck["use_defines_present"]["USE_ROCM_CK_SDPA"] is True
+        assert ck["use_defines_present"]["CK_TILE_FMHA_FWD_FAST_EXP2"] is True
+        assert ck["use_defines_present"]["CK_USE_FNUZ_FP8"] is True
+        assert ck["use_defines_present"]["USE_LAYERNORM_FAST_RECIPROCAL"] is True
+        # Defines from HIP_CLANG_FLAGS must also be unioned in
+        assert ck["use_defines_present"]["HIPBLAS_V2"] is True
+        assert ck["use_defines_present"]["HIPBLASLT_OUTER_VEC"] is True
+        assert ck["use_defines_present"]["USE_ROCM_CK_GEMM"] is True
+        # Codegen flag picked up via substring scan
+        assert ck["codegen_flags_present"]["-fgpu-flush-denormals-to-zero"] is True
+        # --offload-arch values from HIP_CLANG_FLAGS, sorted
+        assert ck["offload_archs"] == ["gfx942", "gfx950"]
+        # Value parsing (not just presence) for ROCM_VERSION
+        assert ck["defines"]["ROCM_VERSION"] == "70200"
+
+    def test_scripts_for_multiple_targets_attributed_correctly(self, tmp_path):
+        """Each script's parent path-segment maps to one target. A
+        script under c10_hip.dir must not bleed into torch_hip.dir.
+        """
+        self._make_build_tree(tmp_path, {
+            "caffe2/CMakeFiles/torch_hip.dir/aten/torch_hip_generated_a.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DTORCH_HIP_ONLY;--offload-arch=gfx942)\n"
+            ),
+            "c10/hip/CMakeFiles/c10_hip.dir/c10_hip_generated_b.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DC10_HIP_ONLY;--offload-arch=gfx950)\n"
+            ),
+        })
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert block["_parser"] == "legacy_findhip_per_source"
+        assert block["_legacy_scripts_scanned"] == 2
+        assert set(block["targets"]) == {"torch_hip", "c10_hip"}
+        assert "TORCH_HIP_ONLY" in block["targets"]["torch_hip"]["defines"]
+        assert "C10_HIP_ONLY" not in block["targets"]["torch_hip"]["defines"]
+        assert "C10_HIP_ONLY" in block["targets"]["c10_hip"]["defines"]
+        assert "TORCH_HIP_ONLY" not in block["targets"]["c10_hip"]["defines"]
+        assert block["targets"]["torch_hip"]["offload_archs"] == ["gfx942"]
+        assert block["targets"]["c10_hip"]["offload_archs"] == ["gfx950"]
+
+    def test_scripts_under_non_interest_target_dirs_ignored(self, tmp_path):
+        """gloo_hip / caffe2_nvrtc / HIP test binaries don't appear in
+        _NINJA_HIPCC_TARGETS_OF_INTEREST. Scripts under their dirs
+        must be silently skipped (not error, not appear in targets).
+        """
+        self._make_build_tree(tmp_path, {
+            "third_party/gloo/gloo/CMakeFiles/gloo_hip.dir/x_generated.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DGLOO_HIP_DEFINE;--offload-arch=gfx900)\n"
+            ),
+            "caffe2/aten/src/ATen/CMakeFiles/ck_sdpa.dir/x_generated.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DCK_DEFINE;--offload-arch=gfx950)\n"
+            ),
+        })
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert set(block["targets"]) == {"ck_sdpa"}
+        # Only the ck_sdpa script counts -- gloo_hip script wasn't read.
+        assert block["_legacy_scripts_scanned"] == 1
+        assert "GLOO_HIP_DEFINE" not in block["targets"]["ck_sdpa"]["defines"]
+
+    def test_no_scripts_under_build_returns_empty_targets_with_reason(
+        self, tmp_path,
+    ):
+        """build.ninja exists, ninja-only scan finds zero HIP_COMPILER
+        rules, fallback walks build/ and finds zero *.hip.o.cmake
+        either. Must leave targets: {} (not None) and append a
+        partial reason explaining what was tried.
+        """
+        self._make_build_tree(tmp_path, {})  # only build.ninja, no scripts
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, reasons)
+        assert block["targets"] == {}
+        assert block["_parser"] is None
+        assert block["_legacy_scripts_scanned"] is None
+        assert any(
+            "legacy FindHIP fallback found no *.hip.o.cmake scripts" in r
+            for r in reasons
+        )
+
+    def test_multiline_set_packed_with_d_defines_tokenized(self, tmp_path):
+        """The packed-defines case: a single ;-element contains
+        multiple space-separated -D defines (cmake variable-inheritance
+        quirk). The tokenizer must split on BOTH `;` AND whitespace.
+        """
+        self._make_build_tree(tmp_path, {
+            "caffe2/aten/src/ATen/CMakeFiles/ck_sdpa.dir/x.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -std=c++17;"
+                "-DA=1 -DB=2 -DC=3 -DUSE_ROCM_CK_SDPA;-Wall)\n"
+            ),
+        })
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        defines = block["targets"]["ck_sdpa"]["defines"]
+        assert defines["A"] == "1"
+        assert defines["B"] == "2"
+        assert defines["C"] == "3"
+        assert "USE_ROCM_CK_SDPA" in defines
+        assert block["targets"]["ck_sdpa"]["use_defines_present"][
+            "USE_ROCM_CK_SDPA"
+        ] is True
+
+    def test_modern_ninja_path_still_sets_parser_marker(self, tmp_path):
+        """Schema-stability: when the modern ninja parser succeeds, the
+        new _parser key must be set to "ninja_defines" -- consumers
+        that check _parser to disambiguate strategies must get a clear
+        signal, not None.
+        """
+        build = tmp_path / "build"
+        build.mkdir()
+        (build / "build.ninja").write_text(
+            "build x.o: HIP_COMPILER__torch_hip_unscanned src/x.hip\n"
+            "  DEFINES = -Dtorch_hip_EXPORTS -DUSE_ROCM_CK_SDPA\n"
+            "  FLAGS = -O3 --offload-arch=gfx942\n",
+            encoding="utf-8",
+        )
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, [])
+        assert block["_parser"] == "ninja_defines"
+        assert block["_legacy_scripts_scanned"] is None
+        assert "torch_hip" in block["targets"]
 
 
 class TestCaptureAiterHsaTree:
