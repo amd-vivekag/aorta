@@ -4136,17 +4136,21 @@ def _capture_pytorch_legacy_findhip(
             # caffe2_nvrtc, HIP test binaries, ...). Skip silently.
             continue
 
+        # Bounded read: open and read at most MAX_BYTES+1 so the cap
+        # is enforced BEFORE a pathological multi-GB file is slurped
+        # into memory. read_text() would have loaded the whole file
+        # and only then truncated -- defeating the cap.
         try:
-            text = cmake_path.read_text(
-                encoding="utf-8", errors="replace",
-            )
+            with cmake_path.open("r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_LEGACY_FINDHIP_MAX_FILE_BYTES + 1)
         except OSError:
             scripts_unreadable += 1
             continue
         if len(text) > _LEGACY_FINDHIP_MAX_FILE_BYTES:
-            # Defensive: real scripts are ~13 KB; this only trips on
-            # pathological inputs. Truncate the tail rather than skip
-            # so we still capture the leading set(...) blocks.
+            # Trim the trailing sentinel byte so downstream regex
+            # passes don't see a half-token at the cap boundary. Real
+            # FindHIP scripts are ~13 KB; this only trips on
+            # pathological inputs.
             text = text[:_LEGACY_FINDHIP_MAX_FILE_BYTES]
         scripts_scanned += 1
         bucket = target_flag_blobs.setdefault(tgt, set())
@@ -4155,7 +4159,16 @@ def _capture_pytorch_legacy_findhip(
                 bucket.add(value)
 
     if not target_flag_blobs and scripts_scanned == 0:
-        if scripts_unreadable == 0:
+        # Two distinct empty paths surface here with different
+        # operator action items, so emit a different reason for each:
+        if scripts_unreadable:
+            reasons.append(
+                f"pytorch_build.ninja_hipcc: legacy FindHIP fallback found "
+                f"{scripts_unreadable} *.hip.o.cmake script(s) under "
+                f"{build_dir} but every one was unreadable (check "
+                f"permissions / mount state)"
+            )
+        else:
             reasons.append(
                 "pytorch_build.ninja_hipcc: legacy FindHIP fallback found "
                 f"no *.hip.o.cmake scripts under {build_dir}"

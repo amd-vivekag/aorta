@@ -5338,6 +5338,39 @@ class TestCapturePytorchLegacyFindhipFallback:
             for r in reasons
         )
 
+    def test_all_scripts_unreadable_emits_distinct_partial_reason(
+        self, tmp_path, monkeypatch,
+    ):
+        """When *.hip.o.cmake scripts exist under a target dir but
+        every read raises OSError (e.g. permissions stripped),
+        targets MUST end up `{}` AND a partial_reason MUST explain
+        the permissions case -- not be silently dropped as if no
+        scripts existed (Copilot round-7 review).
+        """
+        self._make_build_tree(tmp_path, {
+            "caffe2/aten/src/ATen/CMakeFiles/ck_sdpa.dir/x.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DUSE_ROCM_CK_SDPA)\n"
+            ),
+        })
+        real_open = env_mod.Path.open
+
+        def deny_cmake_open(self, *args, **kwargs):
+            if str(self).endswith(".hip.o.cmake"):
+                raise PermissionError("denied")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(env_mod.Path, "open", deny_cmake_open)
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_ninja_hipcc("source", tmp_path, reasons)
+        assert block["targets"] == {}
+        assert block["_parser"] is None
+        # The new reason must explicitly mention unreadable scripts so
+        # the operator knows to check permissions, not file presence.
+        assert any(
+            "unreadable" in r and "permissions" in r
+            for r in reasons
+        ), f"reasons did not mention unreadable / permissions: {reasons}"
+
     def test_multiline_set_packed_with_d_defines_tokenized(self, tmp_path):
         """The packed-defines case: a single ;-element contains
         multiple space-separated -D defines (cmake variable-inheritance

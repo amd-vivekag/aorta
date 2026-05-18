@@ -55,11 +55,34 @@ Usage: aorta env probe [OPTIONS]
   Capture trial-environment state to env.json (issue #147).
 
 Options:
-  -o, --output FILE  Path to write env.json.  [default: env.json]
-  -v, --verbose      After the brief, also print the full snapshot
-                     JSON to stdout.
-  --help             Show this message and exit.
+  -o, --output FILE        Path to write env.json (ignored with
+                           --summary / --field).  [default: env.json]
+  -v, --verbose            After the brief, also print the full
+                           snapshot JSON to stdout.
+  --summary                Print only the one-screen brief and exit
+                           (skip JSON write). Use for quick eyeballing
+                           without producing an artifact.
+  --field DOTTED.PATH      Print one snapshot field as JSON and exit
+                           (skip file write). Example: --field
+                           pytorch_build.ninja_hipcc.targets.ck_sdpa
+                           .use_defines_present.USE_ROCM_CK_SDPA. For
+                           keys containing '.' (e.g. 'libaotriton_v2
+                           .so'), use jq on a full snapshot.
+  --buck-target TEXT       Buck2 label to introspect for library
+                           identity. When given, the snapshot's
+                           library_introspection list is populated
+                           from `buck2 audit dependencies <label>
+                           --transitive --json`. Ignored if buck2
+                           isn't on PATH.
+  --buck-timeout INTEGER   Per-call timeout (seconds) for `buck2
+                           audit dependencies`.  [default: 10]
+  --help                   Show this message and exit.
 ```
+
+`--summary` and `--field` are mutually exclusive output modes; both
+short-circuit the JSON write entirely. Pair `aorta env probe -o
+env.json` with a follow-up `aorta env probe --field …` when you
+need both an archived snapshot and a scripted lookup.
 
 The CLI is a thin wrapper. It calls `collect_env()`, writes the JSON,
 and prints a multi-line per-block brief (~18 lines on a populated host).
@@ -1106,7 +1129,15 @@ jq '.pytorch_build.submodule_commits' /tmp/env.json
 jq -r '.pytorch_build.install_kind' /tmp/env.json
 
 # "Is aiter installed, and which arches are its HSA blobs covering?"
-jq '.aiter | {package_dist_name, commit, archs: (.hsa_tree // {} | to_entries[0].value | keys)}' /tmp/env.json
+jq '.aiter | {
+  package_dist_name,
+  commit,
+  archs: (
+    (.hsa_tree // {}) | to_entries
+    | (first // null)
+    | (if . then (.value | keys) else [] end)
+  )
+}' /tmp/env.json
 ```
 
 ### Build a SDPA-NaN triage one-pager from one snapshot
