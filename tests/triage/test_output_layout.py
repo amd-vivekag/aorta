@@ -485,6 +485,42 @@ def test_baseline_error_marks_other_cells_unclassified_not_neutral(
     assert "**unclassified**, not trustworthy" in md
 
 
+def test_wall_clock_only_cells_collapse_to_na_not_speed_confound(
+    tmp_path, patched_env, monkeypatch
+):
+    """smoke-3: ``wall_clock_total`` on both sides must NOT render as ``speed (+N%)``.
+
+    Reproduces the 2026-05-13 smoke matrix regression case: every cell has
+    ``step_time_source == "wall_clock_total"`` (workload completed but never
+    emitted per-step times, so the platform divided wall clock by configured
+    steps). Pre-smoke-3 the classifier matched the two sources and emitted a
+    bogus ``speed (+N%)`` tag whose numerator and denominator were both
+    wall-clock-derived. The fix collapses every non-baseline cell to ``n/a``
+    and updates the legend to name the new reason.
+    """
+    wall_only = _FakeTrial(
+        exit_status="ok",
+        wall_clock_sec=5.0,
+        result={"passed": True},  # no step_times_ms, no elapsed/total -> wall_clock_total
+    )
+    monkeypatch.setattr(runner, "run_trials", MagicMock(return_value=[wall_only, wall_only]))
+    r = _simple_recipe()
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    tf32 = next(c for c in doc["cells"] if c["name"] == "tf32_off-local")
+    assert tf32["step_time_source"] == "wall_clock_total"
+    assert tf32["confound"] == "n/a"
+    assert tf32["step_time_ratio"] is None
+
+    md = (run_dir / "matrix.md").read_text()
+    # Legend must name the new reason so an operator reading "n/a" can find
+    # the explanation without grepping source. Pin both halves so a future
+    # legend rewrite can't quietly drop the per-step requirement.
+    assert "lacks per-step instrumentation" in md
+    assert "`step_time_source != per_step`" in md
+
+
 # ---- Class D: matrix.json carries new aggregation fields -----------------
 
 

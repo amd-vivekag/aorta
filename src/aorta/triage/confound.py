@@ -203,14 +203,20 @@ def classify(
         # without claiming the mitigation is trustworthy.
         return CONFOUND_NA, None
 
-    if cell.step_time_source != baseline.step_time_source:
-        # Mixing fidelity tiers (e.g. baseline ran a workload that emits
-        # per-step times, this cell ran one that only exposes wall-clock)
-        # produces a ratio between fundamentally different signals: the
-        # baseline's number is iteration time only, the cell's number folds
-        # setup / teardown. Refuse to label that comparison; matrix.json
-        # keeps both cells' ``step_time_source`` so reviewers can see why
-        # the row landed on n/a (issue #160 / Sonbol's review on PR #160).
+    if cell.step_time_source != "per_step" or baseline.step_time_source != "per_step":
+        # Only ``per_step`` is a real iteration-time signal. ``elapsed_per_iter``
+        # divides workload-reported elapsed by workload-reported iteration count
+        # (close, but folds any warm-up / shutdown the workload didn't separately
+        # account for). ``wall_clock_total`` divides the trial's whole wall clock
+        # by the configured step count (folds setup + teardown + crash time --
+        # the 2026-05-13 smoke matrix produced ``speed (+3500%)`` tags from
+        # ratios between two such wall-clock-derived numbers, none of which
+        # were iteration-time comparisons). Refuse the ratio whenever either
+        # side fell back. This is strictly stronger than the prior
+        # "sources must match" rule (issue #160 / Sonbol's review on PR #160):
+        # two ``wall_clock_total`` numbers also fail it. matrix.json keeps both
+        # cells' ``step_time_source`` so reviewers can see why the row landed
+        # on n/a.
         return CONFOUND_NA, None
 
     ratio = cell.mean_step_time_ms / baseline.mean_step_time_ms

@@ -291,10 +291,10 @@ def write_matrix_md(
     lines.append(
         "  - `n/a` -- the cell could not be compared against the baseline. Possible "
         "reasons: the baseline errored, the baseline produced no usable timing, the "
-        "cell itself produced no usable timing, or the cell and baseline derived "
-        "their step-time from different fallback branches (e.g. `per_step` vs "
-        "`wall_clock_total`) so the ratio would mix fundamentally different "
-        "signals. Distinct from `-`: these cells are **unclassified**, not "
+        "cell itself produced no usable timing, or the cell or baseline lacks "
+        "per-step instrumentation (`step_time_source != per_step`) so the ratio "
+        "would be dominated by setup / teardown / crash time rather than per-step "
+        "cost. Distinct from `-`: these cells are **unclassified**, not "
         "trustworthy. Check `matrix.json::cells[*].step_time_source` to see which "
         "branch each row landed on."
     )
