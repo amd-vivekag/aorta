@@ -30,7 +30,7 @@ from aorta.triage.recipe import (
     build_recipe_from_flags,
     load_recipe,
 )
-from aorta.triage.runner import run_recipe
+from aorta.triage.runner import MatrixIncompleteError, run_recipe
 
 
 @click.group()
@@ -244,6 +244,16 @@ def triage_run(
             output_dir=output_dir,
             dry_run=dry_run,
         )
+    except MatrixIncompleteError as exc:
+        # Artifacts ARE written for inspection -- print where they
+        # landed first, then raise ClickException so the CLI exits
+        # non-zero with the degradation reason. This is distinct from
+        # RecipeCellError below: that's pre-execution validation
+        # failure (no artifacts), this is post-execution degradation
+        # (matrix.md / matrix.json present but classification couldn't
+        # anchor).
+        click.echo(f"Wrote matrix to {exc.run_dir}")
+        raise click.ClickException(str(exc)) from exc
     except (RegistryError, RecipeCellError, RecipeSchemaError) as exc:
         raise click.ClickException(str(exc)) from exc
     if not dry_run:

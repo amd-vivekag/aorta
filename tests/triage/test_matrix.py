@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from aorta.triage.matrix import CellStats, aggregate_cell
+from aorta.triage.matrix import (
+    OUTCOME_COMPLETED,
+    OUTCOME_CRASHED_AFTER_ITERATIONS,
+    OUTCOME_DID_NOT_RUN,
+    OUTCOME_UNKNOWN,
+    CellStats,
+    aggregate_cell,
+)
 
 
 def _trial(
@@ -15,6 +22,9 @@ def _trial(
     elapsed_sec: float | None = None,
     wall_clock_sec: float = 1.0,
     failure_details: list[dict] | None = None,
+    main_work_started: bool | None = None,
+    executed_iterations: int | None = None,
+    configured_iterations: int | None = None,
 ):
     """Build a TrialResult-shaped stand-in. aggregate_cell uses duck typing."""
     result: dict = {"passed": passed}
@@ -26,6 +36,12 @@ def _trial(
         result["elapsed_sec"] = elapsed_sec
     if failure_details is not None:
         result["failure_details"] = failure_details
+    if main_work_started is not None:
+        result["main_work_started"] = main_work_started
+    if executed_iterations is not None:
+        result["executed_iterations"] = executed_iterations
+    if configured_iterations is not None:
+        result["configured_iterations"] = configured_iterations
     return SimpleNamespace(
         exit_status=exit_status,
         wall_clock_sec=wall_clock_sec,
@@ -393,3 +409,325 @@ def test_failure_hints_for_error_cell_reflects_supplied_trials():
     trials = [_trial(passed=False, failure_details=[{"hint": "boom"}])]
     stats = _default_call(trials=trials, error="cell crashed")
     assert stats.failure_hints == [("boom", 1)]
+
+
+# ---- did_not_run outcome aggregation (issue #173) ------------------------
+#
+# When a workload populates the new `main_work_started` /
+# `executed_iterations` / `configured_iterations` fields the aggregator
+# must (a) classify each trial against the platform-level outcome enum,
+# (b) suppress the wall_clock_total step-time fallback for did_not_run
+# trials so matrix.json never carries a fake iteration-time number, and
+# (c) pre-render the cell-level Iters column. Workloads that don't
+# populate the new fields must continue to behave exactly as today.
+
+
+def test_platform_inference_did_not_run_for_legacy_setup_crash():
+    """Legacy workload that died in setup -- main_work_started absent,
+    but the observable signature (exit_status="workload_failed",
+    step_times_ms=[], elapsed_sec=0.0) is unmistakably "didn't run".
+
+    The platform must classify the trial as did_not_run from these
+    signals alone, without requiring the workload to be updated to the
+    new contract. This is the recom_repro nan-repro demo case from the
+    issue: trials died on ImportError at 3.5s, produced no per-step
+    times, no elapsed time, but did report passed=False.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            exit_status="workload_failed",
+            wall_clock_sec=3.5,
+            # main_work_started intentionally absent -- legacy workload
+        )
+        for _ in range(2)
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_DID_NOT_RUN: 2}
+    # The wall_clock_total fallback is suppressed for inferred
+    # did_not_run trials, same as for explicit main_work_started=False.
+    assert stats.mean_step_time_ms == 0.0
+    assert stats.step_time_source == "missing"
+
+
+def test_platform_inference_does_not_fire_when_step_times_present():
+    """Even with non-ok exit_status, a trial that produced ANY per-step
+    timing data is NOT inferred as did_not_run. That signature means the
+    workload reached its measurement loop and crashed mid-run -- the
+    wall_clock fallback path / explicit crashed_after_iterations
+    classification handles it correctly. Pin the predicate's strictness.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            exit_status="workload_failed",
+            step_times_ms=[100.0, 110.0, 95.0],
+            wall_clock_sec=3.5,
+        )
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 1}
+    assert stats.mean_step_time_ms > 0  # per-step timing preserved
+
+
+def test_platform_inference_does_not_fire_on_passing_trials():
+    """A trial with exit_status="ok" never triggers inference, even if
+    it has no step_times / elapsed (e.g. a workload that doesn't track
+    timing). Inference is strictly for failure paths."""
+    trials = [_trial(passed=True, exit_status="ok", wall_clock_sec=1.0)]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 1}
+
+
+def test_platform_inference_does_not_fire_when_elapsed_sec_present():
+    """A workload that measured *something* (elapsed_sec > 0) is not
+    inferred as did_not_run, even if it failed and produced no per-step
+    times. That signature is a workload that finished some measurable
+    work then crashed -- classification falls to the existing wall-clock
+    fallback path."""
+    trials = [
+        _trial(
+            passed=False,
+            exit_status="workload_failed",
+            elapsed_sec=2.0,
+            wall_clock_sec=2.5,
+        )
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 1}
+
+
+def test_outcome_counts_did_not_run_when_main_work_did_not_start():
+    trials = [
+        _trial(
+            passed=False,
+            main_work_started=False,
+            executed_iterations=0,
+            configured_iterations=50,
+            wall_clock_sec=3.5,
+        )
+        for _ in range(2)
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.outcome_counts == {OUTCOME_DID_NOT_RUN: 2}
+
+
+def test_outcome_counts_completed_when_executed_matches_configured():
+    trials = [
+        _trial(
+            passed=True,
+            main_work_started=True,
+            executed_iterations=50,
+            configured_iterations=50,
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_COMPLETED: 1}
+
+
+def test_outcome_counts_crashed_after_iterations():
+    trials = [
+        _trial(
+            passed=False,
+            main_work_started=True,
+            executed_iterations=12,
+            configured_iterations=50,
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_CRASHED_AFTER_ITERATIONS: 1}
+
+
+def test_outcome_counts_mixed_outcomes_in_one_cell():
+    trials = [
+        _trial(
+            main_work_started=True,
+            executed_iterations=50,
+            configured_iterations=50,
+            passed=True,
+        ),
+        _trial(
+            main_work_started=False,
+            executed_iterations=0,
+            configured_iterations=50,
+            passed=False,
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_COMPLETED: 1, OUTCOME_DID_NOT_RUN: 1}
+
+
+def test_outcome_counts_unknown_for_legacy_passing_trials():
+    """Legacy passing trials -> ``{"unknown": N}`` (always populated for
+    non-error cells now that platform inference is live).
+
+    The matrix.md ``did_not_run`` legend gate moved to "actual rendered
+    confound tag" rather than "outcome_counts presence", so an
+    all-unknown legacy cell can no longer leak the legend even though
+    its outcome_counts is non-empty. ``is_did_not_run_cell`` likewise
+    requires ``set(counts) == {DID_NOT_RUN}``, so an all-unknown cell
+    is never false-flagged.
+    """
+    trials = [_trial(passed=True), _trial(passed=True)]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 2}
+    assert sum(stats.outcome_counts.values()) == stats.trials
+
+
+def test_outcome_counts_built_when_only_iter_fields_populated():
+    """Workload populates ``configured_iterations`` / ``executed_iterations``
+    but not ``main_work_started`` -> the new contract IS in use, even
+    partially. ``outcome_counts`` must be built (silent ``main_work_started``
+    classifies the trial as ``unknown``) so matrix.json doesn't contradict
+    matrix.md / the terminal log, both of which already treat the cell
+    as new-contract.
+
+    Round-4 Copilot catch on PR #175: previously the predicate was
+    narrow (``main_work_started is not None`` only) while runner.py and
+    output.py used the wider predicate, producing a partial-contract
+    cell that looked legacy in matrix.json but new-contract everywhere
+    else.
+    """
+    trials = [
+        _trial(executed_iterations=50, configured_iterations=50, passed=True),
+        _trial(executed_iterations=50, configured_iterations=50, passed=True),
+    ]
+    stats = _default_call(trials=trials)
+    # main_work_started absent -> classified as OUTCOME_UNKNOWN (not
+    # OUTCOME_COMPLETED -- completion requires main_work_started=True).
+    # The point is that the histogram is BUILT, not that the workload
+    # gets credit for completing.
+    assert stats.outcome_counts == {OUTCOME_UNKNOWN: 2}
+    assert sum(stats.outcome_counts.values()) == stats.trials
+
+
+def test_outcome_counts_includes_unknown_for_silent_trials_in_mixed_cell():
+    """As soon as ONE trial speaks the new contract, all trials are
+    counted -- silent ones legitimately classify as ``unknown`` so the
+    histogram total matches ``trial_count``. This is the "mixed cell"
+    case where some trials use the new contract and others don't."""
+    trials = [
+        _trial(
+            main_work_started=True,
+            executed_iterations=50,
+            configured_iterations=50,
+            passed=True,
+        ),
+        _trial(passed=False),  # silent -- no main_work_started
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.outcome_counts == {OUTCOME_COMPLETED: 1, OUTCOME_UNKNOWN: 1}
+    assert sum(stats.outcome_counts.values()) == stats.trials
+
+
+def test_did_not_run_trials_suppress_wall_clock_step_time_fallback():
+    """Symmetric refusal: a trial that died in setup must not contribute
+    a fake step-time number derived from setup-only wall clock.
+
+    Demo case: the import-error trial in the issue's MI350 SHAMPOO run
+    produced 3.5s wall clock and 50 configured steps; the old aggregator
+    surfaced 70 ms/step. With the suppression the cell reports no
+    timing -- matrix.md will render n/a, matrix.json carries no
+    misleading number.
+    """
+    trials = [
+        _trial(
+            passed=False,
+            main_work_started=False,
+            executed_iterations=0,
+            configured_iterations=50,
+            wall_clock_sec=3.5,
+        )
+    ]
+    stats = _default_call(trials=trials, effective_steps=50)
+    assert stats.mean_step_time_ms == 0.0
+    assert stats.step_time_source == "missing"
+
+
+def test_iters_display_uniform_when_all_trials_executed_same_count():
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=50, configured_iterations=50, passed=True
+        )
+        for _ in range(3)
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "50/50"
+    assert stats.executed_iter_min == 50
+    assert stats.executed_iter_max == 50
+    assert stats.configured_iters == 50
+
+
+def test_iters_display_min_max_when_executed_counts_differ():
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=10, configured_iterations=50, passed=False
+        ),
+        _trial(
+            main_work_started=True, executed_iterations=42, configured_iterations=50, passed=False
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "10..42/50"
+    assert stats.executed_iter_min == 10
+    assert stats.executed_iter_max == 42
+
+
+def test_iters_display_question_marks_when_configured_disagrees():
+    """Defensive: a recipe pins `steps` per cell, so trials in the same
+    cell shouldn't disagree on configured_iterations. If they do, surface
+    the contradiction instead of silently picking one value."""
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=10, configured_iterations=50, passed=True
+        ),
+        _trial(
+            main_work_started=True, executed_iterations=10, configured_iterations=100, passed=True
+        ),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "?/?"
+    assert stats.configured_iters is None
+
+
+def test_iters_display_dash_when_no_trial_populates_iter_fields():
+    """Legacy workload: configured_iters is None so the display is the
+    em-dash placeholder. The output renderer hides the column entirely
+    when every cell lands here."""
+    trials = [_trial(passed=True), _trial(passed=False)]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "—"
+    assert stats.configured_iters is None
+    assert stats.executed_iter_min is None
+    assert stats.executed_iter_max is None
+
+
+def test_iters_display_renders_configured_when_executed_partial():
+    """Mixed populated/None ``executed_iterations`` across trials -> render
+    ``"—/<configured>"`` so the operator sees the budget that was set up
+    even when execution count is missing for some trials. Hiding the row
+    entirely (the previous behaviour) swallowed useful partial data --
+    Copilot's round-2 catch on PR #175.
+
+    The configured number is the load-bearing piece: it tells the reader
+    "the workload was asked to run N iterations". The em-dash on the
+    numerator says honestly "we don't know how far they got".
+    """
+    trials = [
+        _trial(
+            main_work_started=True, executed_iterations=42, configured_iterations=50, passed=True
+        ),
+        _trial(main_work_started=True, configured_iterations=50, passed=False),
+    ]
+    stats = _default_call(trials=trials)
+    assert stats.iters_display == "—/50"
+    assert stats.configured_iters == 50
+
+
+def test_error_cell_outcome_counts_empty_and_iters_display_dash():
+    """Error cells short-circuit aggregation: no outcome histogram, no
+    iters display."""
+    stats = _default_call(trials=[_trial()], error="docker pull failed")
+    assert stats.outcome_counts == {}
+    assert stats.iters_display == "—"
+    assert stats.configured_iters is None

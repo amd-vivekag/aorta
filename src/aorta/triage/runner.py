@@ -42,9 +42,17 @@ from aorta.registry.errors import RegistryError
 from aorta.run import RunRequest, TrialResult, run_trials
 from aorta.triage.confound import (
     classify_all,
+    is_did_not_run_cell,
     resolve_baseline,
 )
-from aorta.triage.matrix import CellStats, aggregate_cell
+from aorta.triage.matrix import (
+    OUTCOME_COMPLETED,
+    OUTCOME_CRASHED_AFTER_ITERATIONS,
+    OUTCOME_DID_NOT_RUN,
+    OUTCOME_UNKNOWN,
+    CellStats,
+    aggregate_cell,
+)
 from aorta.triage.output import (
     format_timestamp,
     resolve_run_dir,
@@ -53,12 +61,29 @@ from aorta.triage.output import (
     write_matrix_md,
     write_resolved_recipe,
 )
-from aorta.triage.recipe import InlineEnv, Recipe
+from aorta.triage.recipe import InlineEnv, Recipe, RecipeCellError
 
 log = logging.getLogger(__name__)
 
 _INLINE_SIDECAR_NAME = "inline_environments.sidecar.json"
 _OPERATOR_SIDECAR_DIR = "sidecars"
+
+
+class MatrixIncompleteError(Exception):
+    """Raised AFTER ``run_recipe`` successfully writes matrix.md /
+    matrix.json when the run completed but classification could not
+    anchor -- e.g. the explicit ``baseline_cell`` produced only
+    did_not_run trials, or every auto-baseline candidate did. The
+    matrix artifacts ARE present for inspection (the exception carries
+    ``run_dir``); the exception itself signals the degradation to the
+    CLI so it can exit non-zero. This is distinct from
+    :class:`aorta.triage.recipe.RecipeCellError`, which is for
+    pre-execution validation failures (no artifacts written).
+    """
+
+    def __init__(self, message: str, run_dir: Path) -> None:
+        super().__init__(message)
+        self.run_dir = run_dir
 
 
 def _merge_sidecar_files(
@@ -331,6 +356,184 @@ def _collect_trial_paths(results_dir: Path) -> list[str]:
     return [str(p) for p in found]
 
 
+def _trial_passed_for_log(trial: Any) -> bool:
+    """Mirror of ``aorta.triage.matrix._trial_passed`` for the per-cell
+    log line.
+
+    Kept local rather than imported from the matrix module's private
+    namespace so the runner doesn't depend on a leading-underscore
+    callable (Python convention: private to defining module). The
+    semantic is identical -- a trial passes iff ``exit_status == "ok"``
+    AND the wrapped ``WorkloadResult.passed`` is not False -- so the
+    log line and the matrix.md row agree on what counts as a pass.
+    """
+    if getattr(trial, "exit_status", None) != "ok":
+        return False
+    result = getattr(trial, "result", None)
+    if isinstance(result, dict) and result.get("passed") is False:
+        return False
+    return True
+
+
+_DID_NOT_RUN_CELL_SUFFIX = (
+    " WARNING: workload never reached main work phase; matrix step-time/"
+    "confound for this cell will be marked n/a"
+)
+
+
+def _format_cell_summary(trials: list[TrialResult], passed_count: int) -> tuple[str, str]:
+    """Format the bracketed cell-summary tail for the per-cell log line.
+
+    Returns ``(bracket, suffix)`` -- ``bracket`` is the
+    ``[outcome: ... | iters: ...]`` (or legacy ``[N/M trials passed]``)
+    chunk, ``suffix`` is either an empty string or the WARNING tail used
+    for did-not-run cells (issue #173).
+
+    Falls back to today's ``[N/M trials passed]`` shape when no trial in
+    the cell populated the new ``main_work_started`` /
+    ``executed_iterations`` / ``configured_iterations`` fields, so old
+    workloads keep their familiar terminal output exactly. The new shape
+    only kicks in once the workload speaks the new contract.
+    """
+    total = len(trials)
+    # Mirror aggregate_cell's outcome rules without importing the helper
+    # (which expects WorkloadResult-shaped objects vs. TrialResult here)
+    # to avoid coupling the runner's log line to the matrix module's
+    # internal helper signature.
+    #
+    # Switch to the new bracket grammar whenever the cell carries any
+    # signal the new grammar surfaces:
+    #   (a) any trial explicitly populates one of the new contract
+    #       fields (so matrix.md will show the Iters column for this
+    #       cell -- terminal log must agree), OR
+    #   (b) platform inference classifies any trial as non-UNKNOWN
+    #       (e.g. a legacy workload that crashed in setup -> inferred
+    #       did_not_run -> the matrix.md row will carry the
+    #       did_not_run tag).
+    # Otherwise stay in legacy ``[N/M trials passed]`` so plain-vanilla
+    # success runs keep their familiar terminal output exactly.
+    outcomes: list[str] = []
+    for trial in trials:
+        result = getattr(trial, "result", {})
+        outcomes.append(_outcome_for_log(trial, result if isinstance(result, dict) else {}))
+
+    explicit_contract = any(
+        isinstance(getattr(t, "result", None), dict)
+        and (
+            t.result.get("main_work_started") is not None
+            or t.result.get("configured_iterations") is not None
+            or t.result.get("executed_iterations") is not None
+        )
+        for t in trials
+    )
+    if not explicit_contract and all(o == OUTCOME_UNKNOWN for o in outcomes):
+        return f"[{passed_count}/{total} trials passed]", ""
+
+    counter: dict[str, int] = {}
+    for o in outcomes:
+        counter[o] = counter.get(o, 0) + 1
+    if len(counter) == 1:
+        only_outcome = next(iter(counter))
+        outcome_part = f"{counter[only_outcome]}/{total} {only_outcome}"
+    else:
+        outcome_part = "mixed"
+
+    iters_part = _iters_for_log(trials)
+    bracket = f"[outcome: {outcome_part} | iters: {iters_part}]"
+    suffix = _DID_NOT_RUN_CELL_SUFFIX if counter == {OUTCOME_DID_NOT_RUN: total} else ""
+    return bracket, suffix
+
+
+def _outcome_for_log(trial: Any, result: dict) -> str:
+    """Trial-outcome classifier mirroring aorta.triage.matrix._trial_outcome.
+
+    Two signal sources, in priority order:
+    1. Explicit contract via ``main_work_started`` /
+       ``executed_iterations`` / ``configured_iterations``.
+    2. Platform inference for legacy workloads (``main_work_started``
+       is None) -- non-ok exit_status with no per-step times and no
+       elapsed time => ``did_not_run``. Mirrors
+       ``aorta.triage.matrix._looks_like_did_not_run``; the two helpers
+       are kept in lockstep so the terminal log and matrix.json agree
+       on which trials get the inferred tag.
+    """
+    started = result.get("main_work_started")
+    if started is False:
+        return OUTCOME_DID_NOT_RUN
+    if started is True:
+        executed = result.get("executed_iterations")
+        configured = result.get("configured_iterations")
+        if not isinstance(executed, int) or not isinstance(configured, int):
+            return OUTCOME_UNKNOWN
+        if executed >= configured:
+            return OUTCOME_COMPLETED
+        if result.get("passed") is False:
+            return OUTCOME_CRASHED_AFTER_ITERATIONS
+        return OUTCOME_UNKNOWN
+    # main_work_started is None -- platform inference branch.
+    if _looks_like_did_not_run_for_log(trial, result):
+        return OUTCOME_DID_NOT_RUN
+    return OUTCOME_UNKNOWN
+
+
+def _looks_like_did_not_run_for_log(trial: Any, result: dict) -> bool:
+    """Mirror of ``aorta.triage.matrix._looks_like_did_not_run`` for the
+    runner's per-cell log line. Three signals must agree: non-ok
+    exit_status, no measured per-step times, and zero elapsed_sec.
+    Kept here (rather than imported) so the runner doesn't depend on a
+    matrix-private helper.
+    """
+    exit_status = getattr(trial, "exit_status", None)
+    if exit_status is None or exit_status == "ok":
+        return False
+    step_times = result.get("step_times_ms")
+    if isinstance(step_times, list) and any(
+        isinstance(t, (int, float)) and t > 0 for t in step_times
+    ):
+        return False
+    elapsed = result.get("elapsed_sec")
+    if isinstance(elapsed, (int, float)) and elapsed > 0:
+        return False
+    return True
+
+
+def _iters_for_log(trials: list[TrialResult]) -> str:
+    """Pre-render the ``iters: N/M`` fragment for the cell-summary log.
+
+    Same rules as ``aorta.triage.matrix._aggregate_iter_counts`` but
+    operating on dicts. Returns ``"—"`` only for true legacy cells (no
+    trial populated ``configured_iterations``); ``"?/?"`` when trials
+    disagreed on the configured count; ``"—/<configured>"`` when the
+    budget is known but ``executed_iterations`` is missing for some
+    trial. The terminal log line and the matrix.md row should agree on
+    what each cell looked like, so this helper mirrors the matrix-side
+    rules byte-for-byte.
+    """
+    configured: list[int] = []
+    executed: list[int | None] = []
+    for trial in trials:
+        result = getattr(trial, "result", {})
+        if not isinstance(result, dict):
+            executed.append(None)
+            continue
+        cfg = result.get("configured_iterations")
+        if isinstance(cfg, int):
+            configured.append(cfg)
+        ex = result.get("executed_iterations")
+        executed.append(ex if isinstance(ex, int) else None)
+
+    if not configured:
+        return "—"
+    if len(set(configured)) > 1:
+        return "?/?"
+    cfg_value = configured[0]
+    populated = [e for e in executed if e is not None]
+    if len(populated) != len(executed) or not populated:
+        return f"—/{cfg_value}"
+    lo, hi = min(populated), max(populated)
+    return f"{lo}/{cfg_value}" if lo == hi else f"{lo}..{hi}/{cfg_value}"
+
+
 def _run_one_cell(
     cell,
     recipe: Recipe,
@@ -555,18 +758,25 @@ def run_recipe(
                 cell_elapsed,
             )
         else:
-            # ``TrialResult.result`` is the WorkloadResult-serialised-to-dict
-            # (see ``aorta/run/results.py`` schema); use ``.get`` so a future
-            # workload that omits the key from its dict still classifies cleanly.
-            passed = sum(1 for t in trials if t.result.get("passed"))
+            # Use the canonical pass/fail predicate from
+            # ``aorta.triage.matrix._trial_passed`` so the per-cell log line
+            # agrees with the matrix-level passed_count: a trial is "passed"
+            # iff its exit_status is "ok" AND its WorkloadResult.passed is
+            # not False. Reading only ``result.get("passed")`` ignores the
+            # exit_status side -- ``aorta.run.dispatcher`` always populates
+            # a WorkloadResult, but on infrastructure exceptions sets
+            # exit_status="infrastructure_failed" with passed=False, so
+            # both halves of the predicate are needed.
+            passed = sum(1 for t in trials if _trial_passed_for_log(t))
+            summary, suffix = _format_cell_summary(trials, passed)
             log.info(
-                "cell %d/%d: %s -- done in %.1fs [%d/%d trials passed]",
+                "cell %d/%d: %s -- done in %.1fs %s%s",
                 cell_idx,
                 total_cells,
                 cell.name,
                 cell_elapsed,
-                passed,
-                len(trials),
+                summary,
+                suffix,
             )
 
         stats = aggregate_cell(
@@ -582,9 +792,85 @@ def run_recipe(
         )
         cell_stats.append(stats)
 
-    baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
-    confound_tags = classify_all(cell_stats, baseline_cell.name, recipe.confound.threshold)
+    # Did-not-run baseline disqualification (issue #173). Three cases,
+    # all of them produce matrix.md / matrix.json so the operator can
+    # inspect the run; the runner raises ``MatrixIncompleteError`` at
+    # the very end (after artifacts are written) for the two degraded
+    # cases so the CLI can exit non-zero:
+    #   1. Explicit ``confound.baseline_cell`` -> resolves first; if
+    #      that cell ended up all-did_not_run, append a loud warning
+    #      and mark the run incomplete. The matrix is still rendered
+    #      (the explicit cell shows its did_not_run tag, others fall
+    #      through to n/a) so the operator can see WHAT went wrong
+    #      from artifacts alone.
+    #   2. Auto-resolution -> SKIP all-did_not_run cells when applying
+    #      the resolution rules. If a usable candidate remains,
+    #      classify against that one normally -- no warning, no
+    #      degradation flag. This matches the issue's "auto-selection
+    #      skips all-did_not_run cells" rule.
+    #   3. Auto-resolution exhausted -> soft warning + every non-
+    #      baseline cell falls through to CONFOUND_NA via the existing
+    #      ``baseline.mean_step_time_ms <= 0`` branch in
+    #      confound.classify (the suppressed wall_clock_total fallback
+    #      in aggregate_cell ensures the mean lands at 0). Run is
+    #      marked incomplete.
+    # Legacy workloads (empty outcome_counts) never enter the skip set,
+    # so old runs keep their existing classification path unchanged.
+    #
+    # matrix.json::baseline_cell records the resolved name in cases 1
+    # and 3 (rather than null). Preserving the name keeps a record of
+    # which cell was attempted as the baseline -- useful for an
+    # operator diagnosing why every other row collapsed to n/a -- while
+    # the accompanying warning carries the "no usable comparison" signal.
+    disqualified_names = {s.name for s in cell_stats if is_did_not_run_cell(s)}
+    incomplete_reason: str | None = None
+
+    if recipe.confound.baseline_cell is not None:
+        baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
+        if baseline_cell.name in disqualified_names:
+            baseline_stats_ref = next(
+                c for c in cell_stats if c.name == baseline_cell.name
+            )
+            msg = (
+                f"explicit baseline_cell {baseline_cell.name!r} produced only "
+                f"did_not_run trials "
+                f"({baseline_stats_ref.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
+                f"{baseline_stats_ref.trials} trials, workload never reached "
+                "its main work phase). Confound classification disabled; "
+                f"non-baseline cells render n/a. Inspect "
+                f"cells/{safe_slug(baseline_cell.name)}/ for the failure "
+                "cause, or remove confound.baseline_cell from the recipe to "
+                "fall back to auto-resolution."
+            )
+            warnings.append(msg)
+            incomplete_reason = msg
+    else:
+        try:
+            baseline_cell = resolve_baseline(
+                recipe.cells, None, skip_names=disqualified_names
+            )
+        except RecipeCellError:
+            # Every candidate was disqualified -- fall back to the original
+            # auto-resolution (without the skip set) so matrix.json still
+            # records WHO would have been the baseline, then warn loudly.
+            baseline_cell = resolve_baseline(recipe.cells, None)
+            baseline_stats_ref = next(
+                c for c in cell_stats if c.name == baseline_cell.name
+            )
+            msg = (
+                f"Auto-baseline {baseline_cell.name!r} had "
+                f"{baseline_stats_ref.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
+                f"{baseline_stats_ref.trials} trials in did_not_run, and no "
+                "other cell in the recipe survived auto-baseline resolution "
+                "either. No usable baseline -- confound classification "
+                "disabled. Inspect "
+                f"cells/{safe_slug(baseline_cell.name)}/ for the failure cause."
+            )
+            warnings.append(msg)
+            incomplete_reason = msg
+
     baseline_stats = next(c for c in cell_stats if c.name == baseline_cell.name)
+    confound_tags = classify_all(cell_stats, baseline_cell.name, recipe.confound.threshold)
 
     if baseline_stats.error is not None:
         warnings.append(
@@ -631,7 +917,13 @@ def run_recipe(
             f"to rerun: cd {run_dir} && aorta triage run --recipe recipe.resolved.yaml {flags}"
         )
 
+    if incomplete_reason is not None:
+        # Artifacts are written; raise so the CLI can print the failure
+        # message and exit non-zero. Tests / programmatic callers can
+        # ``except MatrixIncompleteError`` to inspect ``run_dir``.
+        raise MatrixIncompleteError(incomplete_reason, run_dir)
+
     return run_dir
 
 
-__all__ = ["run_recipe"]
+__all__ = ["MatrixIncompleteError", "run_recipe"]

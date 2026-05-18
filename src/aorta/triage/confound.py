@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from aorta.triage.matrix import CellStats
+from aorta.triage.matrix import OUTCOME_DID_NOT_RUN, CellStats
 from aorta.triage.recipe import Cell, RecipeCellError
 
 # The em-dash is what matrix.md renders; keep it here as a single constant so
@@ -44,13 +44,47 @@ CONFOUND_ERROR = "error"
 # neutral tag would let "ratio could not be computed" cells render as
 # "mitigation works without a speed cost" in matrix.md.
 CONFOUND_NA = "n/a"
+# Cell whose every trial died before the workload's primary work phase
+# began. Refused from confound classification entirely (no ratio against
+# the baseline; no participation as the comparison target). Snake-case so
+# the JSON outcome key, the Confound tag, and the matrix.md / terminal
+# display string are the same string -- see issue #173 §"Design".
+CONFOUND_DID_NOT_RUN = OUTCOME_DID_NOT_RUN
 
-ConfoundTag = Literal["(baseline)", "-", "no effect", "error", "n/a"] | str
+ConfoundTag = Literal["(baseline)", "-", "no effect", "error", "n/a", "did_not_run"] | str
+
+
+def is_did_not_run_cell(stats: CellStats) -> bool:
+    """True iff every trial in the cell classified as ``did_not_run``.
+
+    Used by the runner to disqualify did-not-run baselines after
+    aggregation: an explicit ``baseline_cell`` that resolves to such a
+    cell is a hard error (the operator named it deliberately), an
+    auto-resolved one is a soft warning that downgrades every cell to
+    ``n/a``. ``stats.outcome_counts`` is empty for legacy workloads
+    that don't populate the new ``main_work_started`` field, in which
+    case the function returns False -- we never disqualify a baseline
+    on absence of data.
+
+    The count-vs-trials cross-check guards external callers that load
+    a ``CellStats``-shaped record from matrix.json or build one by hand:
+    in normal aggregation the histogram total is invariantly
+    ``stats.trials``, but a partial / truncated histogram constructed
+    elsewhere could otherwise misclassify a mixed cell as did-not-run
+    just because the only key present happens to be ``did_not_run``.
+    """
+    counts = stats.outcome_counts
+    if not counts:
+        return False
+    if set(counts) != {OUTCOME_DID_NOT_RUN}:
+        return False
+    return counts.get(OUTCOME_DID_NOT_RUN, 0) == stats.trials
 
 
 def resolve_baseline(
     cells: Iterable[Cell],
     explicit_name: str | None,
+    skip_names: Iterable[str] = (),
 ) -> Cell:
     """Resolve the baseline cell per the rules in the recipe schema.
 
@@ -60,8 +94,19 @@ def resolve_baseline(
        load time).
     2. First cell whose name starts with ``baseline-``.
     3. First cell whose mitigations == ``["none"]``.
-    4. If the recipe has exactly one cell, use it.
+    4. If exactly one candidate remains, use it (i.e. a single-cell
+       recipe with no skip set, or a multi-cell recipe where every
+       other cell is in ``skip_names``).
     5. Otherwise raise :class:`RecipeCellError`.
+
+    ``skip_names`` is applied to rules 2-4 only -- explicit naming
+    always wins (the operator's deliberate choice), so the runner
+    handles a disqualified explicit baseline as a hard error
+    separately. The skip set is the runner's hook for the
+    "auto-selection skips all-did_not_run cells" rule from issue #173:
+    the runner builds the set after aggregation and re-resolves; if
+    nothing survives, the runner falls back to its soft warning +
+    every-cell-n/a path.
 
     Raises:
         RecipeCellError: None of the rules resolves and the recipe has more
@@ -82,16 +127,19 @@ def resolve_baseline(
             f"cell name; cells: {sorted(c.name for c in cells_list)}"
         )
 
-    for c in cells_list:
+    skip_set = set(skip_names)
+    candidates = [c for c in cells_list if c.name not in skip_set]
+
+    for c in candidates:
         if c.name.startswith("baseline-"):
             return c
 
-    for c in cells_list:
+    for c in candidates:
         if tuple(c.mitigations) == ("none",):
             return c
 
-    if len(cells_list) == 1:
-        return cells_list[0]
+    if len(candidates) == 1:
+        return candidates[0]
 
     raise RecipeCellError(
         "cannot resolve baseline cell: no cell named 'baseline-*' and no "
@@ -126,6 +174,16 @@ def classify(
     """
     if cell.error is not None:
         return CONFOUND_ERROR, None
+
+    # Did-not-run cells are excluded from ratio classification entirely
+    # -- the cell's step-time was deliberately suppressed in
+    # ``aggregate_cell``, so any ratio would be zero / meaningless. The
+    # ``did_not_run`` tag makes it unambiguous to a matrix.md reader why
+    # the row carries no Confound verdict, distinct from ``n/a`` (which
+    # means "we tried to compare and couldn't") and ``error`` (which
+    # means the whole cell errored before producing trials).
+    if is_did_not_run_cell(cell):
+        return CONFOUND_DID_NOT_RUN, None
 
     if cell.name == baseline.name:
         return CONFOUND_BASELINE, None
@@ -195,6 +253,7 @@ def classify_all(
 
 __all__ = [
     "CONFOUND_BASELINE",
+    "CONFOUND_DID_NOT_RUN",
     "CONFOUND_ERROR",
     "CONFOUND_NA",
     "CONFOUND_NEUTRAL",
@@ -202,5 +261,6 @@ __all__ = [
     "ConfoundTag",
     "classify",
     "classify_all",
+    "is_did_not_run_cell",
     "resolve_baseline",
 ]

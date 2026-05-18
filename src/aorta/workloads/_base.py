@@ -35,6 +35,21 @@ class WorkloadResult:
         elapsed_sec: Total wall-clock elapsed time for the trial.
         metrics: Extension point for workload-specific scalars (overlap
             ratio, throughput, NaN rate per phase, etc.).
+        main_work_started: True once the workload's primary,
+            measurement-relevant code path begins (training loop entered;
+            first kernel dispatched; build invoked). Generic across workload
+            types — no "training" / "loop" / iteration assumption baked in.
+            False means the trial died during import/setup before doing any
+            measurable work; the triage matrix uses this to refuse step-time
+            and confound classification for the cell. None means the workload
+            doesn't track this, which opts the safety net out gracefully.
+        executed_iterations: Iterations actually completed by the workload
+            (workload defines what counts as an iteration). None when the
+            workload doesn't track this. Pairs with configured_iterations to
+            populate the matrix.md "Iters" column.
+        configured_iterations: Iterations the workload was asked to run.
+            None when the workload doesn't track this. Used as the
+            denominator of the "Iters" column.
     """
 
     passed: bool
@@ -45,6 +60,9 @@ class WorkloadResult:
     step_times_ms: list[float] = field(default_factory=list)
     elapsed_sec: float = 0.0
     metrics: dict[str, Any] = field(default_factory=dict)
+    main_work_started: bool | None = None
+    executed_iterations: int | None = None
+    configured_iterations: int | None = None
 
 
 class Workload(ABC):
