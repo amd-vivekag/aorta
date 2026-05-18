@@ -55,11 +55,34 @@ Usage: aorta env probe [OPTIONS]
   Capture trial-environment state to env.json (issue #147).
 
 Options:
-  -o, --output FILE  Path to write env.json.  [default: env.json]
-  -v, --verbose      After the brief, also print the full snapshot
-                     JSON to stdout.
-  --help             Show this message and exit.
+  -o, --output FILE        Path to write env.json (ignored with
+                           --summary / --field).  [default: env.json]
+  -v, --verbose            After the brief, also print the full
+                           snapshot JSON to stdout.
+  --summary                Print only the one-screen brief and exit
+                           (skip JSON write). Use for quick eyeballing
+                           without producing an artifact.
+  --field DOTTED.PATH      Print one snapshot field as JSON and exit
+                           (skip file write). Example: --field
+                           pytorch_build.ninja_hipcc.targets.ck_sdpa
+                           .use_defines_present.USE_ROCM_CK_SDPA. For
+                           keys containing '.' (e.g. 'libaotriton_v2
+                           .so'), use jq on a full snapshot.
+  --buck-target TEXT       Buck2 label to introspect for library
+                           identity. When given, the snapshot's
+                           library_introspection list is populated
+                           from `buck2 audit dependencies <label>
+                           --transitive --json`. Ignored if buck2
+                           isn't on PATH.
+  --buck-timeout INTEGER   Per-call timeout (seconds) for `buck2
+                           audit dependencies`.  [default: 10]
+  --help                   Show this message and exit.
 ```
+
+`--summary` and `--field` are mutually exclusive output modes; both
+short-circuit the JSON write entirely. Pair `aorta env probe -o
+env.json` with a follow-up `aorta env probe --field …` when you
+need both an archived snapshot and a scripted lookup.
 
 The CLI is a thin wrapper. It calls `collect_env()`, writes the JSON,
 and prints a multi-line per-block brief (~18 lines on a populated host).
@@ -69,7 +92,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.4) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.5) [PARTIAL]
   runtime:   baremetal / python=venv
   rocm:      7.2.1 (dev: None)
   hip:       7.2.53211-e1a6bc5663 (amd)
@@ -87,18 +110,30 @@ Wrote env probe to /tmp/env.json (schema_version=1.4) [PARTIAL]
   aotriton:  bundled=0.11.1 present=True images_dir=True  [AOTRITON_INSTALLED_PREFIX=(unset)]
   rdhc:      unavailable (system_health=null)
   python:    3.12.13 | pytorch: 2.9.1+rocm7.2.1.gitff65f5bc
-  torch build: git_commit=ff65f5bc install=wheel [third_party SHAs: set AORTA_PYTORCH_SRC=<src> or look up github.com/pytorch/pytorch/tree/ff65f5bc/third_party/<name>]
+  torch build: git_commit=ff65f5bc install=source | submodules(git): composable_kernel=23d531c8 aiter=9a469a60 fbgemm=8c1f8d2b
   torch flags: gpu_archs=[gfx942]  USE_ROCM=ON USE_CUDA=OFF USE_NCCL=ON USE_MKL=OFF USE_MKLDNN=ON USE_FBGEMM=yes USE_FBGEMM_GENAI=no USE_FLASH_ATTENTION=yes USE_MEM_EFF_ATTENTION=yes USE_ROCM_CK_SDPA=yes USE_ROCM_CK_GEMM=no DISABLE_AOTRITON=no FLASH_NAMESPACE=pytorch_flash
   torch syms:  pytorch_flash::=142 mha_fwd_aot=4 mha_fwd_ck=4 _efficient_attention=18 aotriton::=72 ck_tile::FmhaFwd=1820 ck_tile::FmhaBwd=1240 ck_tile::BlockFmha=890 ck_tile::TileFmha=320 group_gemm_ck=12 aiter::=0  |  libaotriton_v2.so=yes  |  -DUSE_ROCM_CK_SDPA=yes -DUSE_ROCM_CK_GEMM=no
   flags:       FLASH_ATTN=on CK_SDPA=on AOTRITON=on MEM_EFF=on
+  cmake cache: 32 allowlisted entries from /work/pytorch/build/CMakeCache.txt
+  ninja hipcc: c10_hip=18D archs=[gfx942] torch_cpu=14D archs=[?] torch_hip=42D archs=[gfx942]
+  aiter hsa:   aiter_meta/hsa:gfx942=1180.co/3a7b9e0f aiter_meta/hsa:gfx950=420.co/c1d2e8a4
+  sdpa:        flash=on mem_eff=on math=on cudnn=off
 
 Partial reasons:
   - system_health: rdhc exited 1 (stderr: sudo: a password is required)
   - rocm.version_dev: /opt/rocm/.info/version-dev missing, empty, or unreadable
-  - pytorch_build.submodule_commits: wheel install -- direct SHAs not recoverable; ...
 
-[PARTIAL, 3 reason(s)]
+[PARTIAL, 2 reason(s)]
 ```
+
+The sample shows a **source install** (`install=source`) so the new
+`cmake cache` / `ninja hipcc` lines have populated data. On a wheel
+install (`install=wheel`) those two lines render `(unavailable --
+wheel install or build/CMakeCache.txt missing)` /
+`(unavailable -- wheel install or build/build.ninja missing)`
+respectively, and `pytorch_build.submodule_commits` adds a
+`wheel install -- direct SHAs not recoverable; <github URL>` partial
+reason instead of the resolved per-submodule SHAs shown here.
 
 `[PARTIAL]` indicates at least one probe fell back to `None` -- the
 snapshot is still complete (every key present), it just records what
@@ -145,7 +180,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.4"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.5"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -162,17 +197,18 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `tensile` | `dict` | optional `import Tensile` + sorted-filenames hash over the union of hipBLASLt + rocBLAS kernel DBs | `package_version` (usually `null` outside builders), `kernel_db_combined_hash` |
 | `triton` | `dict` | `import triton; triton.__version__` | `package_version`. ROCm Triton fork bakes the source commit into `__version__`. |
 | `fbgemm` | `dict` | optional `import fbgemm_gpu` + parse of `torch.__config__.show()` for `-DUSE_FBGEMM*` defines | `package_version`, `pytorch_use_fbgemm`, `pytorch_use_fbgemm_genai`. The two booleans capture the build-time decision baked into the PyTorch wheel even when `fbgemm_gpu` isn't a separate pip package. |
-| `aiter` | `dict` | `import aiter; aiter.__version__` + `importlib.metadata.version("amd_aiter" \| "aiter")` | `package_version`, `package_dist_name` (which PyPI dist matched: `amd_aiter` is the canonical AMD-internal ROCm/PyTorch image dist; `aiter` is the upstream name), `commit` (parsed from the setuptools_scm `+g<sha>` local-version segment, matches the image tag's `aiter-<sha>` label). Most installs record `null` for everything; absence is silent. |
+| `aiter` | `dict` | `import aiter; aiter.__version__` + `importlib.metadata.version("amd_aiter" \| "aiter")` + scan of `aiter_meta/hsa/<gfx>/` (or `$AORTA_PYTORCH_SRC/third_party/aiter/hsa/`) | `package_version`, `package_dist_name` (which PyPI dist matched: `amd_aiter` is the canonical AMD-internal ROCm/PyTorch image dist; `aiter` is the upstream name), `commit` (parsed from the setuptools_scm `+g<sha>` local-version segment, matches the image tag's `aiter-<sha>` label), `hsa_tree` (issue #176 -- per-arch fingerprint of pre-built `.co` kernel binaries: file_count, co_count, deterministic combined_sha256). Most installs record `null` for everything; absence is silent. |
 | `aotriton` | `dict` | scan of `<torch>/lib/libaotriton_v2.so*` filenames + `sha256` of the resolved file + presence of `<torch>/lib/aotriton.images/` + `$AOTRITON_INSTALLED_PREFIX` | Default ROCm Flash Attention backend. Bundled in the wheel via `cmake/External/aotriton.cmake` (NOT a `third_party/` git submodule). Fields: `bundled_present`, `bundled_version`, `bundled_lib_hash`, `bundled_images_dir_present`, `installed_prefix`. CK is the alternative backend (toggled via `TORCH_ROCM_FA_PREFER_CK=1`). |
 | `runtime_context` | `dict` | `/.dockerenv`, `/run/.containerenv`, `$SINGULARITY_NAME`, `/proc/1/cgroup`, `sys.prefix`, `$CONDA_DEFAULT_ENV` | `type`, `python_env`, `venv_path`, `conda_env_name` |
 | `docker` | `dict \| null` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars + `/proc/self/cgroup` | `null` on baremetal; image+digest provided by the launcher (the only reliable way from inside a container) |
 | `env_vars` | `dict[str, str \| null]` | explicit canonical list (currently 31 names; see `CANONICAL_ENV_VARS` in `environment.py` for the live set) | GPU scoping + HSA / runtime + GPU queue / codegen + NCCL/RCCL + FBGEMM + MIOpen + SDPA backend selection + GEMM backend preference + hipBLASLt autotune + PyTorch / inductor. Build-time cmake flags (`USE_ROCM_CK_SDPA`, `USE_ROCM_CK_GEMM`, `USE_FBGEMM*`) are NOT in this list -- they're surfaced under their respective library blocks instead, parsed from `torch.__config__.show()`. |
 | `python_version` | `str` | `platform.python_version()` | always populated |
 | `pytorch_version` | `str \| null` | optional `import torch` (no CUDA/HIP context init) | `null` when torch absent |
-| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference). See "PyTorch source-tree submodule probing" below. |
+| `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` + parse of `<source>/build/CMakeCache.txt` + stream of `<source>/build/build.ninja` (modern `enable_language(HIP)` path) or walk of `<source>/build/**/<target>.dir/**/*.hip.o.cmake` (legacy `FindHIP.cmake` fallback) | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference), `cmake_cache` (source/editable installs only -- allowlisted entries from CMakeCache.txt), `ninja_hipcc` (source/editable installs only -- per-target HIPCC defines + codegen flags + offload archs; `_parser` discriminates the two parser strategies). See "PyTorch source-tree submodule probing" below. |
 | `build_system` | `dict` | `buck2 --version` + `buck2 root` + `hg id -i` / `git rev-parse HEAD` | Always present. `{"kind": "buck2", "buck2_version": str, "repo_root": str, "revision": str \| null}` when buck2 is on PATH AND we are demonstrably inside a Buck checkout (both `buck2 --version` and `buck2 root` succeed); `buck2_version` and `repo_root` are guaranteed populated, only `revision` may be `null`. `{"kind": "none"}` in every other case, including the dominant "buck2 is installed but cwd is not inside a Buck checkout" scenario. Added in schema 1.3 for issue #163 (A1.2a) so consumers can branch on Buck2 vs. system-package environments. See "Running inside a Buck environment" below. |
 | `library_introspection` | `list[dict]` | `buck2 audit dependencies <target> --transitive --json` (only when `--buck-target` is supplied) | Always present. Empty `[]` outside Buck mode. In Buck mode, one entry per matched library: `{"name", "source": "buck", "revision", "target"}`. The matched library set lives in `KNOWN_LIBRARY_PATTERNS` in `src/aorta/instrumentation/buck_introspect.py`. Added in schema 1.4 for issue #163 (A1.2b). |
 | `library_introspection_alternates` | `list[dict]` | synthesised from A1's per-library blocks when a Buck match overlaps | Always present. Empty `[]` outside Buck mode and when no Buck-matched library is also captured by A1. Each entry mirrors the unified shape with `source: "package"` and pulls `revision` / `package_version` / `lib_hash` from the matching A1 block (e.g. `hipblaslt`). Added in schema 1.4 for issue #163 (A1.2b). |
+| `pytorch_sdpa` | `dict` | `torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()` | `backends_enabled` dict, one bool per SDPA backend + per-getter `null` when missing on older torch. Runtime state, NOT compile-time -- combine with `pytorch_build.binary_introspection.libtorch_hip_symbol_counts` for the full "compiled in AND enabled" picture. Added in schema 1.5 for issue #176 (PR #177). |
 
 `runtime_context.type` is one of `"docker" | "podman" | "singularity" | "baremetal"`. Adding values is a schema change.
 
@@ -335,7 +371,84 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.4` (current)
+### `1.5` (current)
+
+Adds source/editable-install build introspection plus a runtime SDPA
+backend probe (PR #177, issue #176). This entry collapses what was
+originally two separate version bumps on the PR #177 branch (1.2 ->
+1.3 source-introspection plus 1.3 -> 1.4 legacy-FindHIP fallback)
+because main shipped its own 1.3 (build_system) and 1.4
+(library_introspection) in parallel via PR #164 / PR #165. All five
+additive surfaces below are net-new on top of main's 1.4.
+
+* `pytorch_build.cmake_cache` -- parsed
+  `<source>/build/CMakeCache.txt` for source / editable installs.
+  `entries` is a sorted dict of `<NAME>: {type, value}` filtered by
+  an allowlist of name prefixes (`USE_`, `CK_`, `AITER_`, `FLASH_`,
+  `HIPBLAS`, `DISABLE_`, `AOTRITON`, `ROCM_`, `HIP_PLATFORM`,
+  `HIP_RUNTIME`, `HIP_COMPILER`, `HIP_VERSION`, `PYTORCH_ROCM_ARCH`,
+  `TORCH_BUILD_VERSION`, `BUILD_TYPE`, `CMAKE_BUILD_TYPE`). Wheel
+  installs render `entries: null` and `_source_file: null` --
+  absence is the documented common case, no partial reason.
+* `pytorch_build.ninja_hipcc` -- per-target HIPCC defines + codegen
+  flags + offload archs. Two parser strategies in one block,
+  discriminated by `_parser`:
+    * `"ninja_defines"` -- streamed parse of
+      `<source>/build/build.ninja` for the modern
+      `enable_language(HIP)` build shape. Identifies targets via the
+      `-D<target>_EXPORTS` token cmake appends per shared-lib
+      target. Streamed line-by-line (build.ninja can be 350+ MB on a
+      fully-built tree).
+    * `"legacy_findhip_per_source"` -- fallback walk of
+      `<source>/build/**/<target>.dir/**/*.hip.o.cmake` driver
+      scripts when the ninja-only scan returns `targets: {}` (common
+      on ROCm/PyTorch Jenkins images that still use the legacy
+      `FindHIP.cmake` flow). Parses `set(HIP_HIPCC_FLAGS …)` /
+      `set(HIP_CLANG_FLAGS …)` cmake-list values;
+      `_legacy_scripts_scanned` reports the read count.
+  Both parsers report the same per-target shape (`defines`,
+  `use_defines_present`, `codegen_flags_present`, `offload_archs`).
+  Targets reported: `torch_hip`, `torch_cpu`, `c10_hip`, `ck_sdpa`
+  (CK-backed SDPA backend; owns `USE_ROCM_CK_SDPA`,
+  `CK_TILE_FMHA_*`, `FLASHATTENTION_DISABLE_*` -- statically linked
+  into `libtorch_hip.so` so its flags don't appear in the wheel's
+  host-side `CXX_FLAGS`), `mslk` (Multi-Stream Layer Kernels).
+  Wheel installs render `targets: null`.
+* `aiter.hsa_tree` -- per-arch fingerprint of aiter's pre-built HSA
+  `.co` kernel binaries. Per arch: `file_count`, `co_count`,
+  deterministic `combined_sha256` over sorted `(relpath, sha256)`
+  pairs. Three search roots:
+  `importlib.util.find_spec("aiter_meta")`, the sibling
+  `aiter_meta` dir, and `$AORTA_PYTORCH_SRC/third_party/aiter/hsa`.
+  Returns `null` when no tree is locatable -- silent absence (most
+  installs lack it).
+* `pytorch_sdpa` (new top-level) -- `backends_enabled:
+  {flash_sdp_enabled, mem_efficient_sdp_enabled, math_sdp_enabled,
+  cudnn_sdp_enabled}`. Pure Python attribute lookups on
+  `torch.backends.cuda` -- no GPU work, no HIP context init. Per-
+  getter `null` when the function is missing on older torch
+  (distinguishable from True/False).
+
+Backwards-compat notes:
+
+* `pytorch_sdpa` is a new top-level dataclass field with a default
+  factory, so a 1.4 reader running `EnvSnapshot.from_dict()` on a
+  1.5 snapshot silently drops the unknown key, and a 1.5 reader
+  loading a pre-1.5 snapshot gets the dataclass-default
+  `backends_enabled` (all-None) instead of a missing field.
+* Every new nested key (`pytorch_build.cmake_cache`,
+  `pytorch_build.ninja_hipcc` plus its `_parser` /
+  `_legacy_scripts_scanned` keys, `aiter.hsa_tree`) lives under
+  existing top-level dicts. 1.4 consumers indexing these directly
+  on a 1.4 snapshot get `KeyError`, not `None` -- use `.get(key)`
+  or guard on `schema_version`.
+* The `ninja_hipcc.targets` extension (`ck_sdpa` / `mslk`) is a
+  silent addition. Consumers iterating `targets` see additional
+  rows on 1.5 snapshots but the iteration shape is unchanged.
+  Hard-coding the pre-1.5 three-name list still works; you just
+  don't see the new SDPA-relevant data.
+
+### `1.4`
 
 Additive change (issue #163, A1.2b):
 
@@ -689,6 +802,12 @@ sources are:
 | `pytorch_build.source_path` | The detected/configured PyTorch source root; `null` for wheel installs |
 | `pytorch_build.submodule_commits.{composable_kernel,aiter,fbgemm}` | `git -C <source>/third_party/<name> rev-parse HEAD` when a source tree is detected; otherwise `null` and a `partial_reasons` line emits the GitHub URL template for manual lookup |
 | `pytorch_build.submodule_commits._source` | Provenance tag: `"git"` when populated from a source tree, `null` for wheel installs |
+| `pytorch_build.ninja_hipcc._source_file` | Path to `<source>/build/build.ninja` when at least one parser ran; `null` for wheel installs / build.ninja absent |
+| `pytorch_build.ninja_hipcc._parser` | `"ninja_defines"` when modern `enable_language(HIP)` ninja rules matched; `"legacy_findhip_per_source"` when the per-source `*.hip.o.cmake` fallback ran; `null` on wheel installs or when no parser succeeded |
+| `pytorch_build.ninja_hipcc._legacy_scripts_scanned` | int count of `*.hip.o.cmake` driver scripts read by the legacy-FindHIP fallback; `null` on the modern path or wheel installs |
+| `pytorch_build.ninja_hipcc.targets.{torch_hip,torch_cpu,c10_hip}` | Modern path: streamed parse of `build.ninja` `DEFINES = …` / `FLAGS = …` lines under `HIP_COMPILER__*` rules, attributed by `-D<target>_EXPORTS`. Legacy path: walked `<source>/build/**/<target>.dir/**/*.hip.o.cmake` scripts, parsed `set(HIP_HIPCC_FLAGS …)` / `set(HIP_CLANG_FLAGS …)` cmake-list values |
+| `pytorch_build.ninja_hipcc.targets.ck_sdpa` | Same parsing pipeline as the libtorch targets; surfaces the CK-backed SDPA backend's compile-time flags (`USE_ROCM_CK_SDPA`, `CK_TILE_FMHA_*`, `FLASHATTENTION_DISABLE_*`, `CK_USE_*`) that are otherwise invisible because ck_sdpa is statically linked into `libtorch_hip.so` and its flags don't propagate to the wheel's host-side `CXX_FLAGS` |
+| `pytorch_build.ninja_hipcc.targets.mslk` | Same parsing pipeline; surfaces Multi-Stream Layer Kernels compile-time flags |
 | `system_health` | `sudo -n -E rdhc --quick --json <tempfile>` |
 | `docker.image` / `docker.digest` | `$AORTA_DOCKER_IMAGE` / `$AORTA_DOCKER_DIGEST` env vars set by the launcher |
 | `docker.container_id` | `/proc/self/cgroup` |
@@ -849,6 +968,199 @@ jq '.hipblaslt.commit' /tmp/env_no_rdhc.json # still populated
 docker run --rm <image-A> aorta env probe -o /workspace/env_a.json
 docker run --rm <image-B> aorta env probe -o /workspace/env_b.json
 diff <(jq -S . env_a.json) <(jq -S . env_b.json)
+```
+
+## Output modes
+
+`aorta env probe` has three output modes. Pick whichever matches what
+you're actually doing — the JSON artifact, a quick eyeball, or one
+field for a script.
+
+| Mode | When to use | What it does |
+| --- | --- | --- |
+| Default | Producing an artifact to keep, diff, or attach to a trial result | Writes the full JSON to `env.json` (or `-o <path>`) and prints the brief to stdout |
+| `--summary` | "I just want to look at the build" — no archival need | Prints only the one-screen brief; **does not write JSON** |
+| `--field DOTTED.PATH` | Scripting a one-value lookup | Prints just that field's value as JSON (type preserved); **does not write JSON** |
+
+```bash
+# Default mode (artifact + brief)
+aorta env probe -o /tmp/env.json
+
+# Quick eyeball -- no file written
+aorta env probe --summary
+
+# One-field lookup, JSON-typed output (a bool prints as `true`, a
+# string prints as `"foo"`, a missing optional prints as `null`)
+aorta env probe --field schema_version
+aorta env probe --field pytorch_build.git_commit
+aorta env probe --field pytorch_build.ninja_hipcc.targets.ck_sdpa.use_defines_present.USE_ROCM_CK_SDPA
+```
+
+When `--field` can't resolve the path, it surfaces a one-line error
+listing the keys that *are* available at the parent level — so
+typos and renames are self-correcting:
+
+```bash
+$ aorta env probe --field pytorch_build.cmke_cache
+Error: Key 'cmke_cache' not found at 'pytorch_build'. Available keys:
+  binary_introspection, build_flags, cmake_cache, cuda_version, debug,
+  flags, git_commit, hip_version, install_kind, ninja_hipcc (+ 2 more)
+```
+
+`--field` supports simple dotted paths. For keys that themselves
+contain a `.` (the only one in the current schema is
+`"libaotriton_v2.so"` under `torch_lib_bundled`), use `jq` on a full
+snapshot instead.
+
+## jq cookbook
+
+Copy-paste recipes for the common questions. All assume you have a
+snapshot file at `/tmp/env.json` (or two snapshots: `good.json` and
+`bad.json` for diffs).
+
+### Is the build configured the way I think it is?
+
+```bash
+# All three vantages on USE_ROCM_CK_SDPA -- cmake-time, HIPCC-time,
+# and symbol-presence. They should all agree.
+jq '{
+  cmake:   .pytorch_build.cmake_cache.entries.USE_ROCM_CK_SDPA.value,
+  hipcc:   .pytorch_build.ninja_hipcc.targets.ck_sdpa.use_defines_present.USE_ROCM_CK_SDPA,
+  sym_fwd: .pytorch_build.binary_introspection.libtorch_hip_symbol_counts."ck_tile::FmhaFwd",
+  sym_bwd: .pytorch_build.binary_introspection.libtorch_hip_symbol_counts."ck_tile::FmhaBwd"
+}' /tmp/env.json
+
+# Same for AOTriton -- different libs and symbol families.
+jq '{
+  cmake:        .pytorch_build.cmake_cache.entries.USE_AOTRITON.value,
+  bundled_lib:  .aotriton.bundled_present,
+  bundled_dir:  .aotriton.bundled_images_dir_present,
+  bundled_sym:  .pytorch_build.binary_introspection.libtorch_hip_symbol_counts."aotriton::",
+  mha_fwd_aot:  .pytorch_build.binary_introspection.libtorch_hip_symbol_counts.mha_fwd_aot
+}' /tmp/env.json
+```
+
+### Which SDPA backends are compiled in AND enabled at runtime?
+
+```bash
+# Compiled in (build-time, derived from symbol counts)
+jq '.pytorch_build.binary_introspection.libtorch_hip_symbol_counts
+    | with_entries(.value = (.value > 0))' /tmp/env.json
+
+# Enabled at runtime (torch.backends.cuda.<...>_sdp_enabled())
+jq '.pytorch_sdpa.backends_enabled' /tmp/env.json
+```
+
+### What HIPCC defines + codegen flags did `ck_sdpa` compile with?
+
+```bash
+# Just the flags the SDPA-NaN triage cares about (yes/no per flag)
+jq '.pytorch_build.ninja_hipcc.targets.ck_sdpa.use_defines_present' /tmp/env.json
+
+# Codegen flags (denormal-flush, ffast-math, ffp-contract, ...)
+jq '.pytorch_build.ninja_hipcc.targets.ck_sdpa.codegen_flags_present' /tmp/env.json
+
+# GPU offload archs
+jq '.pytorch_build.ninja_hipcc.targets.ck_sdpa.offload_archs' /tmp/env.json
+
+# Which parser ran (build.ninja vs legacy FindHIP fallback) and how
+# many scripts the fallback walked
+jq '.pytorch_build.ninja_hipcc | {_parser, _legacy_scripts_scanned}' /tmp/env.json
+```
+
+### What's actually in the GEMM kernel libraries?
+
+```bash
+# hipBLASLt identity -- the four fields that motivated this whole
+# probe (a hipBLASLt swap is the #1 source of GEMM drift).
+jq '.hipblaslt | {rocm_release_tweak, package_version, lib_hash, kernel_db_revision}' /tmp/env.json
+
+# Same for rocBLAS, MIOpen, RCCL
+jq '{rocblas, miopen, rccl}' /tmp/env.json
+```
+
+### Diff two snapshots
+
+```bash
+# Full diff -- gold standard
+diff <(jq -S . good.json) <(jq -S . bad.json)
+
+# Just the SDPA-relevant compile state (much smaller diff)
+diff \
+  <(jq -S '.pytorch_build.ninja_hipcc.targets' good.json) \
+  <(jq -S '.pytorch_build.ninja_hipcc.targets' bad.json)
+
+# Just env_vars (most common runtime-state difference)
+diff \
+  <(jq -S '.env_vars' good.json) \
+  <(jq -S '.env_vars' bad.json)
+
+# Just GEMM library identities (most common build-time difference)
+diff \
+  <(jq -S '{hipblaslt, rocblas, miopen, rccl}' good.json) \
+  <(jq -S '{hipblaslt, rocblas, miopen, rccl}' bad.json)
+
+# Just submodule commits
+diff \
+  <(jq -S '.pytorch_build.submodule_commits' good.json) \
+  <(jq -S '.pytorch_build.submodule_commits' bad.json)
+```
+
+### Where can things have silently failed?
+
+```bash
+# Was anything missing? List every block that didn't probe cleanly.
+jq '{partial, partial_reasons}' /tmp/env.json
+
+# Just the action items -- one reason per line for grep / wc
+jq -r '.partial_reasons[]' /tmp/env.json
+```
+
+### One-liner answers for triage hotline questions
+
+```bash
+# "What ROCm + HIP versions is this build against?"
+jq '{rocm: .rocm.version, hip: .hip.version, gfx: .gpu_arch.gfx_targets}' /tmp/env.json
+
+# "Which submodule commits is this PyTorch built from?"
+jq '.pytorch_build.submodule_commits' /tmp/env.json
+
+# "Was the build done from source or installed as a wheel?"
+jq -r '.pytorch_build.install_kind' /tmp/env.json
+
+# "Is aiter installed, and which arches are its HSA blobs covering?"
+jq '.aiter | {
+  package_dist_name,
+  commit,
+  archs: (
+    (.hsa_tree // {}) | to_entries
+    | (first // null)
+    | (if . then (.value | keys) else [] end)
+  )
+}' /tmp/env.json
+```
+
+### Build a SDPA-NaN triage one-pager from one snapshot
+
+```bash
+jq '{
+  build: {
+    rocm:           .rocm.version,
+    hip:            .hip.version,
+    pytorch_commit: .pytorch_build.git_commit,
+    install:        .pytorch_build.install_kind,
+    parser:         .pytorch_build.ninja_hipcc._parser
+  },
+  sdpa_compile_in: .pytorch_build.binary_introspection.libtorch_hip_symbol_counts
+    | with_entries(.value = (.value > 0)),
+  sdpa_runtime_enabled: .pytorch_sdpa.backends_enabled,
+  ck_sdpa_flags: (.pytorch_build.ninja_hipcc.targets.ck_sdpa // {}
+    | {defines: .use_defines_present, codegen: .codegen_flags_present, archs: .offload_archs}),
+  numerics_relevant_env: (.env_vars
+    | {HSA_XNACK, HSA_KERNARG_POOL_SIZE, HSA_NO_SCRATCH_RECLAIM,
+       AMDGCN_USE_BUFFER_OPS, DISABLE_TF32,
+       TORCH_ROCM_FA_PREFER_CK, TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL})
+}' /tmp/env.json
 ```
 
 ## Out of scope (deferred to P1)

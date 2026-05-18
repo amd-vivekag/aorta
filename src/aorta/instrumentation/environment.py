@@ -55,6 +55,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -62,8 +63,67 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "1.4"
-# 1.3 -> 1.4 (this commit, issue #163 / A1.2b):
+SCHEMA_VERSION = "1.5"
+# 1.4 -> 1.5 (this commit, PR #177 / issue #176):
+#   This entry collapses what was originally two separate version
+#   bumps on the PR #177 branch (1.2 -> 1.3 source-introspection plus
+#   1.3 -> 1.4 legacy-FindHIP fallback) because main shipped its own
+#   1.3 and 1.4 in parallel (PR #164 / PR #165). All five additive
+#   surfaces below are net-new on top of main's 1.4.
+#   - Added `pytorch_build.cmake_cache`: parsed cmake cache entries
+#     from `<source>/build/CMakeCache.txt` for source / editable
+#     installs, filtered by an allowlist of name prefixes (USE_,
+#     CK_, AITER_, FLASH_, HIPBLAS, ...). Wheel installs render
+#     `entries: null` with no partial reason -- absence is the
+#     documented common case.
+#   - Added `pytorch_build.ninja_hipcc`: per-target HIPCC defines +
+#     codegen flags + offload archs. Two parser strategies in one
+#     block, discriminated by `_parser`:
+#       * `"ninja_defines"` -- streamed parse of
+#         `<source>/build/build.ninja` for the modern
+#         `enable_language(HIP)` build shape. Identifies targets via
+#         the `-D<target>_EXPORTS` token cmake appends per shared-lib
+#         target.
+#       * `"legacy_findhip_per_source"` -- fallback walk of
+#         `<source>/build/**/<target>.dir/**/*.hip.o.cmake` driver
+#         scripts when the ninja-only scan returns `targets: {}`
+#         (common on ROCm/PyTorch Jenkins images that still use the
+#         legacy `FindHIP.cmake` flow). Parses
+#         `set(HIP_HIPCC_FLAGS …)` / `set(HIP_CLANG_FLAGS …)` cmake-
+#         list values; `_legacy_scripts_scanned` reports the read
+#         count.
+#     Both parsers report the same per-target shape (`defines`,
+#     `use_defines_present`, `codegen_flags_present`,
+#     `offload_archs`). Targets reported: `torch_hip`, `torch_cpu`,
+#     `c10_hip`, `ck_sdpa` (CK-backed SDPA backend; owns
+#     USE_ROCM_CK_SDPA, CK_TILE_FMHA_*, FLASHATTENTION_DISABLE_* --
+#     statically linked into libtorch_hip.so so its flags don't
+#     appear in the wheel's host-side CXX_FLAGS), `mslk` (Multi-
+#     Stream Layer Kernels). Wheel installs render `targets: null`.
+#   - Added `aiter.hsa_tree`: per-arch fingerprint of aiter's pre-
+#     compiled HSA `.co` kernel binaries (file_count, co_count,
+#     deterministic combined_sha256 over sorted (relpath, sha256)
+#     pairs). Searches importlib.util.find_spec("aiter_meta"), the
+#     sibling aiter_meta dir, and $AORTA_PYTORCH_SRC/third_party/
+#     aiter/hsa. Returns null when no tree is locatable -- silent
+#     absence (most installs lack it).
+#   - Added new top-level `pytorch_sdpa` block: runtime SDPA backend
+#     state via torch.backends.cuda.{flash, mem_efficient, math,
+#     cudnn}_sdp_enabled(). Per-backend null when the getter is
+#     missing on older torch (distinguishable from True/False). Pre-
+#     1.5 readers loading a 1.5 snapshot via EnvSnapshot.from_dict()
+#     see this as an unknown top-level key and silently skip it
+#     (from_dict's known-key filter rejects unknown keys). 1.5
+#     readers loading a pre-1.5 snapshot get the dataclass-default
+#     backends_enabled dict (all None) -- no TypeError.
+#   Backwards-compat: every new nested key lives under existing top-
+#   level dicts (or, for pytorch_sdpa, behind a dataclass default),
+#   so 1.4 readers loading a 1.5 snapshot do NOT raise. Consumers
+#   indexing the new nested keys (cmake_cache, ninja_hipcc, hsa_tree,
+#   _parser, _legacy_scripts_scanned) directly on a 1.4 snapshot get
+#   KeyError, not None -- use `.get(key)` or guard on schema_version.
+#
+# 1.3 -> 1.4 (issue #163 / A1.2b):
 #   - Added top-level `library_introspection` (list[dict], default `[]`)
 #     and `library_introspection_alternates` (list[dict], default `[]`).
 #     Both always present. Populated only when collect_env() is called
@@ -552,27 +612,28 @@ class EnvSnapshot:
     pytorch_build: dict
     partial: bool
     partial_reasons: list[str] = field(default_factory=list)
-    # build_system: A1.2a (issue #163). Always present; ``{"kind": "none"}``
-    # when buck2 isn't on PATH. Populated by detect_build_system() in
-    # collect_env() / _disaster_snapshot(). Kept with a ``default_factory``
-    # so existing direct callers -- internal triage test fixtures,
-    # downstream tools that pin to an older schema, etc. -- can still
-    # construct an ``EnvSnapshot(...)`` without supplying this 1.3
-    # addition. Mirrors the ``partial_reasons`` pattern: additive schema
-    # fields don't break constructors. The serialised JSON-key order is
-    # ... pytorch_build, partial, partial_reasons, build_system,
-    # library_introspection, library_introspection_alternates; the
-    # schema is order-insensitive (consumers parse by key) so this is
-    # purely a serialisation cosmetic.
+    # build_system: A1.2a (issue #163, schema 1.3). Always present;
+    # ``{"kind": "none"}`` when buck2 isn't on PATH. Populated by
+    # detect_build_system() in collect_env() / _disaster_snapshot().
+    # Kept with a ``default_factory`` so existing direct callers --
+    # internal triage test fixtures, downstream tools that pin to an
+    # older schema, etc. -- can still construct an ``EnvSnapshot(...)``
+    # without supplying this 1.3 addition. Mirrors the ``partial_reasons``
+    # pattern: additive schema fields don't break constructors. The
+    # serialised JSON-key order is ... pytorch_build, partial,
+    # partial_reasons, build_system, library_introspection,
+    # library_introspection_alternates, pytorch_sdpa; the schema is
+    # order-insensitive (consumers parse by key) so this is purely a
+    # serialisation cosmetic.
     build_system: dict = field(
         default_factory=lambda: {"kind": "none"}
     )
-    # library_introspection: A1.2b (issue #163). Always present. Empty
-    # list outside buck mode. In buck mode, one entry per matched
-    # transitive dep, shape ``{"name", "source": "buck", "revision",
-    # "target"}``. See `aorta.instrumentation.buck_introspect` for the
-    # match patterns and the `--buck-target` CLI flag for the entry
-    # point.
+    # library_introspection: A1.2b (issue #163, schema 1.4). Always
+    # present. Empty list outside buck mode. In buck mode, one entry
+    # per matched transitive dep, shape ``{"name", "source": "buck",
+    # "revision", "target"}``. See `aorta.instrumentation.buck_introspect`
+    # for the match patterns and the `--buck-target` CLI flag for the
+    # entry point.
     library_introspection: list[dict] = field(default_factory=list)
     # library_introspection_alternates: A1.2b. Empty outside buck mode.
     # In buck mode, holds the synthesised A1-block-derived alternate
@@ -582,6 +643,18 @@ class EnvSnapshot:
     # by-design overlap; the primary entry (buck) wins for downstream
     # identity comparisons.
     library_introspection_alternates: list[dict] = field(default_factory=list)
+    # pytorch_sdpa: PR #177 / issue #176 (schema 1.5). Defaulted so
+    # pre-1.5 snapshots loaded via `from_dict()` don't raise. The
+    # default is an all-None ``backends_enabled`` map -- the same
+    # shape `_capture_pytorch_sdpa()` returns when torch is missing
+    # (every getter unobservable), which is the correct reading of a
+    # pre-1.5 snapshot from 1.5's POV: we have no SDPA data for that
+    # historical capture.
+    pytorch_sdpa: dict = field(
+        default_factory=lambda: {
+            "backends_enabled": {name: None for name in _PYTORCH_SDPA_GETTERS}
+        }
+    )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to the env.json shape. Round-trip pair with from_dict."""
@@ -757,6 +830,10 @@ class EnvSnapshot:
                 f"  torch flags: {self._summary_pytorch_build_flags_line()}",
                 f"  torch syms:  {self._summary_pytorch_binary_introspection_line()}",
                 f"  flags:       {self._summary_stable_build_flags_line()}",
+                f"  cmake cache: {self._summary_pytorch_cmake_cache_line()}",
+                f"  ninja hipcc: {self._summary_pytorch_ninja_hipcc_line()}",
+                f"  aiter hsa:   {self._summary_aiter_hsa_tree_line()}",
+                f"  sdpa:        {self._summary_pytorch_sdpa_line()}",
             )
         )
 
@@ -997,6 +1074,88 @@ class EnvSnapshot:
             cell("MEM_EFF", "USE_MEM_EFF_ATTENTION"),
         ))
 
+    def _summary_pytorch_cmake_cache_line(self) -> str:
+        """Brief: count of allowlisted CMakeCache entries + source path.
+
+        Wheels (no CMakeCache.txt on disk) render ``(unavailable -- ...)``
+        rather than empty cells -- absence is a meaningful signal that
+        the operator is on a wheel install.
+        """
+        block = (self.pytorch_build or {}).get("cmake_cache") or {}
+        entries = block.get("entries")
+        if entries is None:
+            return "(unavailable -- wheel install or build/CMakeCache.txt missing)"
+        src = block.get("_source_file") or "?"
+        return f"{len(entries)} allowlisted entries from {src}"
+
+    def _summary_pytorch_ninja_hipcc_line(self) -> str:
+        """Brief: per-target define-count + offload arch list.
+
+        One short cell per :data:`_NINJA_HIPCC_TARGETS_OF_INTEREST` we
+        actually saw. Wheels (no build.ninja) render ``(unavailable
+        -- ...)``.
+        """
+        block = (self.pytorch_build or {}).get("ninja_hipcc") or {}
+        targets = block.get("targets")
+        if targets is None:
+            return "(unavailable -- wheel install or build/build.ninja missing)"
+        cells: list[str] = []
+        for tgt in sorted(targets):
+            t = targets[tgt] or {}
+            defines = t.get("defines") or {}
+            archs = t.get("offload_archs") or []
+            arch_part = ",".join(archs) if archs else "?"
+            cells.append(f"{tgt}={len(defines)}D archs=[{arch_part}]")
+        return " ".join(cells) if cells else "(no targets of interest matched)"
+
+    def _summary_aiter_hsa_tree_line(self) -> str:
+        """Brief: per-(root, arch) co_count + first 8 hex of combined sha.
+
+        Absent (no aiter_meta + no source-tree fallback) renders
+        ``(not present)`` -- silent absence, not a failure.
+        """
+        tree = (self.aiter or {}).get("hsa_tree")
+        if not tree:
+            return "(not present)"
+        cells: list[str] = []
+        # Disambiguate roots so two trees sharing the same arch (e.g.
+        # an installed aiter_meta dist + a vendored source-tree fallback
+        # that both ship gfx942) don't render as duplicate `gfx942=...`
+        # cells. Prefix is the last 2 path components (`aiter_meta/hsa`,
+        # `aiter/hsa`) -- enough to tell them apart in the brief; the
+        # full root path lives in the JSON for callers who need it.
+        for root in sorted(tree):
+            root_label = "/".join(Path(root).parts[-2:])
+            arches = tree[root] or {}
+            for arch in sorted(arches):
+                stats = arches[arch] or {}
+                co = stats.get("co_count")
+                sha = stats.get("combined_sha256")
+                short = sha[:8] if isinstance(sha, str) else "?"
+                cells.append(f"{root_label}:{arch}={co}.co/{short}")
+        return " ".join(cells) if cells else "(empty trees)"
+
+    def _summary_pytorch_sdpa_line(self) -> str:
+        """Brief: yes/no/? per torch.backends.cuda SDPA backend."""
+        backends = ((self.pytorch_sdpa or {}).get("backends_enabled")) or {}
+        if not backends or all(v is None for v in backends.values()):
+            return "(unavailable -- torch import failed or backends.cuda missing)"
+
+        def render(short: str, key: str) -> str:
+            v = backends.get(key)
+            if v is True:
+                return f"{short}=on"
+            if v is False:
+                return f"{short}=off"
+            return f"{short}=?"
+
+        return " ".join((
+            render("flash", "flash_sdp_enabled"),
+            render("mem_eff", "mem_efficient_sdp_enabled"),
+            render("math", "math_sdp_enabled"),
+            render("cudnn", "cudnn_sdp_enabled"),
+        ))
+
 
 # ---------------------------------------------------------------------------
 # collect_env -- the public entrypoint B1 / B2 / CLI all call
@@ -1068,6 +1227,7 @@ def collect_env(
         pytorch_build = _capture_pytorch_build(
             reasons, hip_symbol_cache=hip_symbol_cache
         )
+        pytorch_sdpa = _capture_pytorch_sdpa(reasons)
         build_system = _detect_build_system_safe()
 
         a1_blocks_by_lib = {
@@ -1115,6 +1275,7 @@ def collect_env(
             partial_reasons=reasons,
             library_introspection=library_introspection,
             library_introspection_alternates=library_introspection_alternates,
+            pytorch_sdpa=pytorch_sdpa,
         )
     except Exception as exc:  # noqa: BLE001 -- this is the never-raises gate
         log.info("collect_env() hit unexpected exception", exc_info=True)
@@ -1193,7 +1354,12 @@ def _disaster_snapshot(
             "pytorch_use_fbgemm": None,
             "pytorch_use_fbgemm_genai": None,
         },
-        aiter={"package_version": None, "package_dist_name": None, "commit": None},
+        aiter={
+            "package_version": None,
+            "package_dist_name": None,
+            "commit": None,
+            "hsa_tree": None,
+        },
         aotriton={
             "bundled_present": False,
             "bundled_version": None,
@@ -1259,6 +1425,16 @@ def _disaster_snapshot(
                 "cxx_flags_use_defines": None,
             },
             "build_flags": {name: None for name in PYTORCH_BUILD_FLAG_NAMES},
+            "cmake_cache": {"_source_file": None, "entries": None},
+            "ninja_hipcc": {
+                "_source_file": None,
+                "_parser": None,
+                "_legacy_scripts_scanned": None,
+                "targets": None,
+            },
+        },
+        pytorch_sdpa={
+            "backends_enabled": {name: None for name in _PYTORCH_SDPA_GETTERS},
         },
         build_system={"kind": "none"},
         partial=True,
@@ -2787,7 +2963,7 @@ def _read_pytorch_fbgemm_flags(
     return (use_fbgemm, use_fbgemm_genai)
 
 
-def _capture_aiter(reasons: list[str]) -> dict[str, str | None]:
+def _capture_aiter(reasons: list[str]) -> dict[str, Any]:
     """Capture AITER (AMD Iterative kernel library) identity.
 
     AITER is a ROCm inference kernel library built on top of CK. In the
@@ -2818,10 +2994,11 @@ def _capture_aiter(reasons: list[str]) -> dict[str, str | None]:
     """
     from importlib import metadata as _md
 
-    result: dict[str, str | None] = {
+    result: dict[str, Any] = {
         "package_version": None,
         "package_dist_name": None,
         "commit": None,
+        "hsa_tree": None,
     }
 
     imported = False
@@ -2874,7 +3051,185 @@ def _capture_aiter(reasons: list[str]) -> dict[str, str | None]:
 
     result["package_version"] = version
     result["package_dist_name"] = dist_name
+    result["hsa_tree"] = _capture_aiter_hsa_tree(mod, reasons)
     return result
+
+
+def _capture_aiter_hsa_tree(
+    aiter_mod: Any | None,
+    reasons: list[str],
+) -> dict[str, Any] | None:
+    """Per-arch fingerprint of aiter's pre-compiled HSA code-object tree.
+
+    aiter ships pre-built GCN/CDNA assembly blobs (``.co`` files = HSA
+    code objects, one per ``(gfx target, kernel shape, dtype, rounding,
+    masking, ...)`` tuple) under ``hsa/<gfx>/...``. The C++ dispatch
+    code (``mha_bwd.hip`` etc.) selects which ``.co`` to load via
+    ``hipModuleLoad`` at runtime; the kernel binaries themselves are
+    NOT compiled from the wheel's HIPCC flags. Two images can share
+    identical compile-time aiter SHAs but ship different ``.co`` bytes
+    (or vice versa), and either drift can change numerics.
+
+    Per arch we report:
+
+    * ``file_count`` -- number of regular files under the arch dir
+      (``.co`` plus any sidecars). Mismatch alone is a strong drift
+      signal.
+    * ``co_count`` -- subset that are ``.co`` files.
+    * ``combined_sha256`` -- sha256 over the sorted ``(relpath,
+      sha256)`` pairs. Stable across hash-equal trees regardless of
+      mtime / inode order.
+
+    Three search roots, each independently reported (an image can ship
+    both a pip dist tree and a vendored source-tree copy):
+
+    1. ``importlib.util.find_spec("aiter_meta")`` -> ``<spec>/hsa/<gfx>/``
+       (the pip-installed dist's code-object location -- ``aiter_meta``
+       is a separate distribution from the import package ``aiter``).
+    2. ``<aiter_pkg>/../aiter_meta/hsa/<gfx>/`` (some layouts).
+    3. ``$AORTA_PYTORCH_SRC/third_party/aiter/hsa/<gfx>/`` when the
+       env var is set (mirrors the AORTA_PYTORCH_SRC convention used
+       by the submodule probe).
+
+    Returns ``None`` when no tree is locatable -- silent absence (most
+    installs lack it).
+    """
+    roots: list[Path] = []
+
+    # Source 1: importlib.util.find_spec("aiter_meta").
+    try:
+        import importlib.util as _iutil
+        spec = _iutil.find_spec("aiter_meta")
+    except Exception:  # noqa: BLE001 -- defensive
+        spec = None
+    if spec is not None:
+        origin = getattr(spec, "origin", None) or ""
+        locations = list(getattr(spec, "submodule_search_locations", None) or ())
+        for loc in (*locations, origin):
+            if not loc:
+                continue
+            base = Path(loc)
+            # spec.origin can be a file (__init__.py) or a directory.
+            if base.is_file():
+                base = base.parent
+            candidate = base / "hsa"
+            if candidate.is_dir():
+                roots.append(candidate)
+
+    # Source 2: sibling aiter_meta near the imported aiter package.
+    if aiter_mod is not None:
+        aiter_file = getattr(aiter_mod, "__file__", None)
+        if aiter_file:
+            sibling = Path(aiter_file).resolve().parent.parent / "aiter_meta" / "hsa"
+            if sibling.is_dir():
+                roots.append(sibling)
+
+    # Source 3: $AORTA_PYTORCH_SRC/third_party/aiter/hsa.
+    src_env = os.environ.get(AORTA_PYTORCH_SRC_ENV)
+    if src_env:
+        candidate = (
+            Path(src_env).expanduser() / "third_party" / "aiter" / "hsa"
+        )
+        if candidate.is_dir():
+            roots.append(candidate)
+
+    # Deduplicate by resolved path while preserving order.
+    seen: set[Path] = set()
+    unique_roots: list[Path] = []
+    for r in roots:
+        try:
+            resolved = r.resolve()
+        except OSError:
+            resolved = r
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_roots.append(resolved)
+
+    if not unique_roots:
+        return None
+
+    out: dict[str, Any] = {}
+    for root in unique_roots:
+        per_arch: dict[str, dict[str, Any]] = {}
+        try:
+            arch_dirs = sorted(p for p in root.iterdir() if p.is_dir())
+        except OSError as exc:
+            reasons.append(
+                f"aiter.hsa_tree: scan failed for {root} ({type(exc).__name__})"
+            )
+            continue
+        for arch_dir in arch_dirs:
+            per_arch[arch_dir.name] = _hash_aiter_arch_dir(arch_dir, reasons)
+        if per_arch:
+            out[str(root)] = per_arch
+    return out or None
+
+
+def _hash_aiter_arch_dir(
+    arch_dir: Path, reasons: list[str]
+) -> dict[str, Any]:
+    """Walk a single ``hsa/<gfx>/`` dir; return file_count, co_count,
+    combined_sha256 over sorted (relpath, sha256) pairs.
+
+    Hashing is deterministic across mtime / inode order: pairs are
+    sorted by POSIX-style relpath before being fed into the outer
+    sha256, and each file's bytes are hashed in chunks (no slurping
+    .co files which can be tens of MB each).
+
+    Per-file read failures (OSError -- permission denied, IO error)
+    null out ``combined_sha256`` for the whole arch even though the
+    counts stay valid: a partial-tree hash silently compares-equal to
+    another partial-tree hash with the same readable subset, which
+    would lead consumers to conclude two trees match when they may
+    not. ``file_count`` / ``co_count`` reflect the directory listing
+    (which we DID see) so they remain useful as a coarse drift
+    signal even when the hash is unknown.
+    """
+    file_count = 0
+    co_count = 0
+    pairs: list[tuple[str, str]] = []
+    any_read_failed = False
+    try:
+        files = sorted(p for p in arch_dir.rglob("*") if p.is_file())
+    except OSError as exc:
+        reasons.append(
+            f"aiter.hsa_tree: rglob failed for {arch_dir} ({type(exc).__name__})"
+        )
+        return {"file_count": None, "co_count": None, "combined_sha256": None}
+    for path in files:
+        file_count += 1
+        if path.suffix == ".co":
+            co_count += 1
+        try:
+            h = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError as exc:
+            reasons.append(
+                f"aiter.hsa_tree: read failed for {path} ({type(exc).__name__})"
+            )
+            any_read_failed = True
+            continue
+        rel = path.relative_to(arch_dir).as_posix()
+        pairs.append((rel, h.hexdigest()))
+
+    if any_read_failed:
+        combined: str | None = None
+    else:
+        outer = hashlib.sha256()
+        for rel, digest in sorted(pairs):
+            outer.update(rel.encode("utf-8"))
+            outer.update(b"\0")
+            outer.update(digest.encode("ascii"))
+            outer.update(b"\n")
+        combined = outer.hexdigest()
+    return {
+        "file_count": file_count,
+        "co_count": co_count,
+        "combined_sha256": combined,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2948,6 +3303,8 @@ def _capture_pytorch_build(
         hip_symbol_cache=hip_symbol_cache,
     )
     build_flags = _project_pytorch_build_flags(flags)
+    cmake_cache = _capture_pytorch_cmake_cache(install_kind, source_path, reasons)
+    ninja_hipcc = _capture_pytorch_ninja_hipcc(install_kind, source_path, reasons)
 
     return {
         "git_commit": git_commit,
@@ -2960,6 +3317,8 @@ def _capture_pytorch_build(
         "flags": flags,
         "build_flags": build_flags,
         "binary_introspection": binary_introspection,
+        "cmake_cache": cmake_cache,
+        "ninja_hipcc": ninja_hipcc,
     }
 
 
@@ -3246,6 +3605,710 @@ def _capture_pytorch_build_flags(reasons: list[str]) -> dict[str, Any]:
         "cuda_flags_raw": cuda_flags_raw,
         "gpu_arch_list": arch_list,
     }
+
+
+# ---------------------------------------------------------------------------
+# CMakeCache.txt + build.ninja introspection (source/editable installs only)
+# ---------------------------------------------------------------------------
+
+# CMakeCache entries to surface. Allowlist of name *prefixes*; the parser
+# captures every matching ``<name>:<type>=<value>`` entry. Tuned to the
+# variables that shape SDPA dispatch, CK / aiter / hipBLASLt backends,
+# and ROCm/HIP toolchain identity. CMakeCache.txt has 1000+ vars on a
+# fully-configured PyTorch build; this allowlist keeps the captured
+# dict to a few dozen entries.
+_CMAKE_CACHE_PREFIX_ALLOWLIST: tuple[str, ...] = (
+    "USE_",
+    "CK_",
+    "AITER_",
+    "FLASH_",
+    "HIPBLAS",
+    "DISABLE_",
+    "AOTRITON",
+    "ROCM_",
+    "HIP_PLATFORM",
+    "HIP_RUNTIME",
+    "HIP_COMPILER",
+    "HIP_VERSION",
+    "PYTORCH_ROCM_ARCH",
+    "TORCH_BUILD_VERSION",
+    "BUILD_TYPE",
+    "CMAKE_BUILD_TYPE",
+)
+
+# CMakeCache line format: ``NAME:TYPE=VALUE``. NAME is an uppercase
+# identifier; TYPE is one of BOOL/STRING/PATH/FILEPATH/INTERNAL/STATIC/
+# UNINITIALIZED. Comment lines start with ``//`` or ``#``.
+_CMAKE_CACHE_LINE_RE = re.compile(r"^([A-Z_][A-Z0-9_]*):([A-Z_]+)=(.*)$")
+
+
+def _capture_pytorch_cmake_cache(
+    install_kind: str,
+    source_path: Path | None,
+    reasons: list[str],
+) -> dict[str, Any]:
+    """Parse ``<source>/build/CMakeCache.txt`` for SDPA / CK / AOTriton vars.
+
+    For source / editable installs the cmake configure step writes the
+    full set of cache variables to ``CMakeCache.txt`` -- including the
+    ones ``torch.__config__.show()`` doesn't whitelist for emission
+    (USE_FLASH_ATTENTION, USE_MEM_EFF_ATTENTION, USE_ROCM_CK_SDPA,
+    USE_AOTRITON, USE_MSLK, FLASH_NAMESPACE, ...). Reading this file
+    gives the operator the authoritative cmake-configure view of every
+    build option that shaped the wheel.
+
+    Wheel installs don't ship CMakeCache.txt (it stays on the builder),
+    so this returns ``entries: None`` with no partial reason -- absence
+    is the documented common case.
+
+    Filters captured entries to :data:`_CMAKE_CACHE_PREFIX_ALLOWLIST`
+    so the JSON stays grep-friendly (~30 entries) instead of dumping
+    all 1000+ cache vars.
+    """
+    result: dict[str, Any] = {"_source_file": None, "entries": None}
+    if install_kind not in ("source", "editable") or source_path is None:
+        return result
+    cache_path = source_path / "build" / "CMakeCache.txt"
+    if not cache_path.is_file():
+        # Source tree present but no build dir -- common for in-place
+        # checkouts not yet compiled, or src-installs whose build dir
+        # was cleaned. Not a partial reason.
+        return result
+    try:
+        text = cache_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        reasons.append(
+            f"pytorch_build.cmake_cache: read failed for {cache_path} "
+            f"({type(exc).__name__})"
+        )
+        return result
+
+    entries: dict[str, dict[str, str]] = {}
+    for line in text.splitlines():
+        if not line or line.startswith(("//", "#")):
+            continue
+        m = _CMAKE_CACHE_LINE_RE.match(line)
+        if not m:
+            continue
+        name, type_, value = m.group(1), m.group(2), m.group(3)
+        if not any(name.startswith(p) for p in _CMAKE_CACHE_PREFIX_ALLOWLIST):
+            continue
+        entries[name] = {"type": type_, "value": value}
+    result["_source_file"] = str(cache_path)
+    result["entries"] = dict(sorted(entries.items()))
+    return result
+
+
+# Customer-relevant build-time defines we explicitly check for in the
+# torch_hip ninja DEFINES block. Reported as a yes/no per name in
+# ``ninja_hipcc.targets[<target>].use_defines_present`` for fast
+# operator-side diffing. The full sorted set is also reported in
+# ``defines`` for completeness.
+_NINJA_HIPCC_FLAGS_OF_INTEREST: tuple[str, ...] = (
+    "USE_FLASH_ATTENTION",
+    "USE_MEM_EFF_ATTENTION",
+    "USE_ROCM_CK_SDPA",
+    "USE_ROCM_CK_GEMM",
+    "USE_AOTRITON",
+    "DISABLE_AOTRITON",
+    "USE_MKL",
+    "FLASH_NAMESPACE",
+    "CK_TILE_FMHA_FWD_FAST_EXP2",
+    "CK_TILE_FMHA_FWD_APPENDKV_API",
+    "CK_TILE_FMHA_FWD_PAGEDKV_API",
+    "CK_TILE_FMHA_FWD_SPLITKV_API",
+    "CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT",
+    "CK_USE_XDL",
+    "CK_USE_FNUZ_FP8",
+    "CK_USE_GFX94",
+    "USE_LAYERNORM_FAST_RECIPROCAL",
+    "UNFUSE_FMA",
+    "FLASHATTENTION_DISABLE_ALIBI",
+    "FLASHATTENTION_DISABLE_SOFTCAP",
+    "HIPBLASLT_USE_ROCROLLER",
+    "HIPBLASLT_HAS_GETINDEXFROMALGO",
+    "HIPBLAS_V2",
+    "HIPBLASLT_OUTER_VEC",
+    "HIP_ENABLE_WARP_SYNC_BUILTINS",
+    "ROCM_VERSION",
+    "TORCH_HIP_VERSION",
+)
+
+# Codegen flags worth surfacing per target. Substring presence in the
+# command line (build.ninja ``FLAGS = ...``). These do NOT appear as -D
+# defines so they need a separate scan.
+_NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST: tuple[str, ...] = (
+    "-fgpu-flush-denormals-to-zero",
+    "-ffast-math",
+    "-fno-fast-math",
+    "-ffp-contract=fast",
+    "-ffp-contract=on",
+    "-ffp-contract=off",
+    "-fdenormal-fp-math",
+)
+
+# Targets in build.ninja are identified by the ``-D<target>_EXPORTS``
+# token cmake appends to every shared-lib target's DEFINES. Limit to
+# the ones we care about (torch_hip, torch_cpu, c10_hip) to keep the
+# JSON small.
+_NINJA_HIPCC_TARGETS_OF_INTEREST: tuple[str, ...] = (
+    "torch_hip",
+    "torch_cpu",
+    "c10_hip",
+    # CK-backed SDPA backend -- owns USE_ROCM_CK_SDPA, CK_TILE_FMHA_*,
+    # FLASHATTENTION_DISABLE_*. Built as a separate static lib that
+    # statically links into libtorch_hip.so. The modern enable_language
+    # (HIP) path puts these in build.ninja as a `ck_sdpa` target; the
+    # legacy FindHIP path puts them in ck_sdpa.dir/*.hip.o.cmake. Both
+    # surface under the same target name.
+    "ck_sdpa",
+    # Multi-Stream Layer Kernels -- ROCm-optimized layer kernels. Same
+    # static-lib pattern as ck_sdpa. Less SDPA-critical but cheap to
+    # surface and the operator wants the full set when diffing builds.
+    "mslk",
+)
+
+# Identify ninja per-rule lines. cmake's ninja generator indents every
+# variable inside a build statement by two spaces; the variable lines
+# we care about are ``  DEFINES = ...`` and ``  FLAGS = ...``. Each
+# build statement attributes to its target via the ``-D<target>_EXPORTS``
+# token cmake appends per shared-lib target.
+_NINJA_DEFINES_PREFIX = "  DEFINES = "
+_NINJA_FLAGS_PREFIX = "  FLAGS = "
+_NINJA_TARGET_EXPORTS_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)_EXPORTS\b")
+_NINJA_DEFINE_TOKEN_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?")
+_NINJA_OFFLOAD_ARCH_RE = re.compile(r"--offload-arch=(\S+)")
+
+# ---- Legacy FindHIP.cmake fallback ----
+#
+# When PyTorch is configured via the legacy `FindHIP.cmake` path (used
+# by ROCm/PyTorch's Jenkins build for rocm/pytorch-private:* images on
+# ROCm 7.2), `.hip` sources don't appear in `build.ninja` as
+# `HIP_COMPILER__*` rules. They appear as `CUSTOM_COMMAND` rules whose
+# only payload is `cmake -P <src>_generated_*.hip.o.cmake`. The real
+# HIPCC flags + defines live inside those per-source cmake driver
+# scripts, NOT in build.ninja itself. So the ninja-only parser finds
+# zero HIP rules and returns `targets: {}` -- correct in shape but
+# uninformative for SDPA NaN triage (which needs to know
+# USE_ROCM_CK_SDPA, CK_TILE_FMHA_*, FLASHATTENTION_DISABLE_*, etc).
+#
+# The fallback walks each `<target>.dir/` under the build tree and
+# parses the per-source `*.hip.o.cmake` scripts, accumulating defines
+# and codegen flags into the same per-target shape the modern parser
+# produces. Targets are identified by the `<target>.dir/` segment in
+# the path (cmake's per-target subdir layout).
+_LEGACY_FINDHIP_TARGET_DIR_NAMES: tuple[str, ...] = tuple(
+    f"{t}.dir" for t in _NINJA_HIPCC_TARGETS_OF_INTEREST
+)
+
+# FindHIP's per-source script template assigns flag-bearing variables
+# via `set(VAR val;val;val)` with NO surrounding quotes -- values are
+# cmake-list (`;`-separated). Confirmed against ROCm 7.2 ck_sdpa per-
+# source script. The variable names all start with one of these
+# prefixes; trailing `_RELEASE` / `_DEBUG` / `_MINSIZEREL` /
+# `_RELWITHDEBINFO` variants are usually empty but parsed for
+# completeness. The value capture group stops at the closing `)`,
+# which never appears inside a FindHIP-emitted set() value.
+_LEGACY_FINDHIP_SET_RE = re.compile(
+    r"^\s*set\s*\(\s*(HIP_(?:HIPCC|CLANG|HCC)_FLAGS(?:_[A-Z]+)?)\s+([^)]*)\)\s*$",
+    re.MULTILINE,
+)
+
+# Within a captured set() value, tokens are mostly `;`-separated cmake-
+# list elements but some elements pack a space-separated run of
+# `-D…` defines (cmake variable-inheritance quirk: an upstream variable
+# contributes its whole expansion as a single ;-element). Split on
+# BOTH `;` and whitespace before extracting tokens.
+_LEGACY_FINDHIP_TOKEN_SPLIT_RE = re.compile(r"[;\s]+")
+
+# Cap per-file read size. Real scripts on the repro image were ~13 KB;
+# allow generous headroom while still bounding pathological cases.
+_LEGACY_FINDHIP_MAX_FILE_BYTES = 1_048_576  # 1 MiB
+
+# Cap total scripts scanned -- defends against a runaway build tree
+# without bounding realistic ones. The repro image has ~6000 .hip.o.cmake
+# files total; 50000 leaves ~8x headroom.
+_LEGACY_FINDHIP_MAX_SCRIPTS = 50_000
+
+# `build <outputs>: <rule_name> <inputs>...` -- captures the rule
+# name. cmake's ninja generator names rules per-language, e.g.
+# ``HIP_COMPILER__torch_hip_unscanned_<hash>`` for .hip files in the
+# torch_hip target and ``CXX_COMPILER__torch_hip_unscanned_<hash>``
+# for .cpp files in the same target. Both rules' DEFINES blocks
+# carry ``-Dtorch_hip_EXPORTS`` (cmake propagates target-level
+# defines to all sources), so without this filter the parser would
+# pollute torch_hip's reported defines/flags with the host-compiler
+# rule's data and report empty offload_archs (CXX rules carry no
+# --offload-arch).
+_NINJA_BUILD_LINE_RE = re.compile(r"^build [^:]*:\s+(\S+)")
+_NINJA_HIP_RULE_PREFIX = "HIP_COMPILER"
+
+
+def _iter_ninja_logical_lines(fh) -> Iterator[str]:
+    """Stream Ninja logical lines, folding ``$``-continued physical lines.
+
+    Ninja allows long variable assignments to wrap by ending a line with
+    ``$`` (the next line continues the value). cmake's ninja generator
+    routinely emits multi-hundred-character DEFINES / FLAGS values that
+    wrap several times. Without folding, the second-and-later physical
+    lines look like indented continuations and the parser drops every
+    define / arch / flag past the first line -- including any
+    ``-D<target>_EXPORTS`` marker landing on a continuation, which
+    silently misclassifies the whole build statement.
+
+    Strips the trailing ``$`` and concatenates with a single space (the
+    ninja convention -- the unfolded value is whitespace-tokenised
+    anyway). Newline at end-of-line is dropped.
+    """
+    pending: list[str] = []
+    for raw in fh:
+        stripped = raw.rstrip("\n")
+        if stripped.endswith("$"):
+            pending.append(stripped[:-1])
+            continue
+        if pending:
+            pending.append(stripped)
+            yield " ".join(pending)
+            pending = []
+        else:
+            yield stripped
+    if pending:
+        # Trailing $ at EOF -- emit what we have.
+        yield " ".join(pending)
+
+
+def _capture_pytorch_ninja_hipcc(
+    install_kind: str,
+    source_path: Path | None,
+    reasons: list[str],
+) -> dict[str, Any]:
+    """Parse ``<source>/build/build.ninja`` for per-target HIPCC defines.
+
+    The authoritative source for what HIPCC actually compiled the .hip
+    files with. ``torch.__config__.show()`` only exposes the host-side
+    ``CXX_FLAGS``; the per-target HIPCC flags (``USE_ROCM_CK_SDPA``,
+    ``DISABLE_AOTRITON``, ``CK_TILE_FMHA_FWD_FAST_EXP2``,
+    ``-fgpu-flush-denormals-to-zero``, ...) live ONLY in build.ninja's
+    per-rule ``DEFINES = ...`` and ``FLAGS = ...`` blocks.
+
+    cmake's ninja generator emits the same DEFINES line for every
+    source file in a target, so build.ninja typically has thousands of
+    identical DEFINES lines collapsing to ~50 unique blocks. Each
+    block is identified by the ``-D<target>_EXPORTS`` token cmake
+    appends per shared-lib target (``torch_hip_EXPORTS``,
+    ``c10_hip_EXPORTS``, ...).
+
+    Captured per target in :data:`_NINJA_HIPCC_TARGETS_OF_INTEREST`:
+
+    * ``defines`` -- sorted dict of every ``-D`` define passed to that
+      target (name -> value or ``None``).
+    * ``use_defines_present`` -- yes/no map for the customer-relevant
+      flags in :data:`_NINJA_HIPCC_FLAGS_OF_INTEREST`. Fast diff key.
+    * ``codegen_flags_present`` -- yes/no map for the FP / denormal
+      codegen flags in :data:`_NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST`.
+    * ``offload_archs`` -- sorted list of ``--offload-arch=`` values
+      observed in the target's FLAGS line.
+
+    Returns ``targets: None`` for wheel installs (build.ninja absent).
+    When build.ninja exists but no targets-of-interest matched in the
+    ninja-only scan, the function falls back to
+    :func:`_capture_pytorch_legacy_findhip`, which walks per-source
+    ``*.hip.o.cmake`` driver scripts emitted by the legacy
+    ``FindHIP.cmake`` build path. If that fallback finds nothing
+    either, returns ``_source_file`` populated and ``targets: {}`` --
+    distinguishable from the wheel/no-file case so consumers know we
+    DID scan.
+
+    Two additive keys discriminate which parser produced the result:
+
+    * ``_parser`` -- ``"ninja_defines"`` (modern ``enable_language(HIP)``
+      shape) or ``"legacy_findhip_per_source"`` (the per-source cmake
+      script fallback) or ``None`` (no parse attempted / both failed).
+    * ``_legacy_scripts_scanned`` -- int count of ``*.hip.o.cmake``
+      files read when the fallback fired; ``None`` otherwise.
+
+    Streams the file line-by-line: build.ninja can be 350+ MB on a
+    fully-built tree so we must not slurp. Long Ninja variable
+    assignments use ``$\\n`` continuation; the inner generator folds
+    those before the regex pass so a DEFINES that wraps onto follow-on
+    lines isn't silently truncated (the per-target ``_EXPORTS`` marker
+    or any -D define can land anywhere in the wrapped value).
+    """
+    result: dict[str, Any] = {
+        "_source_file": None,
+        "_parser": None,
+        "_legacy_scripts_scanned": None,
+        "targets": None,
+    }
+    if install_kind not in ("source", "editable") or source_path is None:
+        return result
+    ninja_path = source_path / "build" / "build.ninja"
+    if not ninja_path.is_file():
+        return result
+
+    target_defines: dict[str, set[str]] = {}
+    target_flags: dict[str, set[str]] = {}
+    pending_target: str | None = None
+    pending_lines_left = 0
+    in_hip_build = False
+    try:
+        with ninja_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in _iter_ninja_logical_lines(fh):
+                build_match = _NINJA_BUILD_LINE_RE.match(line)
+                if build_match:
+                    rule_name = build_match.group(1)
+                    in_hip_build = rule_name.startswith(_NINJA_HIP_RULE_PREFIX)
+                    # Reset pending DEFINES->FLAGS state on rule
+                    # transitions so a HIP build's pending FLAGS slot
+                    # can't be filled by the next non-HIP build's FLAGS.
+                    pending_target = None
+                    pending_lines_left = 0
+                    continue
+                if not in_hip_build:
+                    continue
+                if line.startswith(_NINJA_DEFINES_PREFIX):
+                    defines_str = line[len(_NINJA_DEFINES_PREFIX):]
+                    tgt_match = _NINJA_TARGET_EXPORTS_RE.search(defines_str)
+                    tgt = tgt_match.group(1) if tgt_match else None
+                    if tgt and tgt in _NINJA_HIPCC_TARGETS_OF_INTEREST:
+                        target_defines.setdefault(tgt, set()).add(defines_str)
+                        pending_target = tgt
+                        # cmake emits FLAGS within ~5 logical lines of
+                        # DEFINES; 10-line window leaves slack for
+                        # unrelated variables (DEPFILE, RSP_FILE, ...)
+                        # without wandering into the next build
+                        # statement.
+                        pending_lines_left = 10
+                    else:
+                        pending_target = None
+                        pending_lines_left = 0
+                elif pending_target and line.startswith(_NINJA_FLAGS_PREFIX):
+                    flags_str = line[len(_NINJA_FLAGS_PREFIX):]
+                    target_flags.setdefault(pending_target, set()).add(flags_str)
+                    pending_target = None
+                    pending_lines_left = 0
+                elif pending_target:
+                    pending_lines_left -= 1
+                    if pending_lines_left <= 0 or not line.startswith("  "):
+                        pending_target = None
+                        pending_lines_left = 0
+    except OSError as exc:
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: read failed for {ninja_path} "
+            f"({type(exc).__name__})"
+        )
+        return result
+
+    # File was readable. Even if no targets-of-interest matched, set
+    # _source_file so consumers can tell "scanned, no matches" apart
+    # from "wheel install / file absent".
+    result["_source_file"] = str(ninja_path)
+    if not target_defines:
+        # Modern enable_language(HIP) parser matched nothing. Try the
+        # legacy FindHIP.cmake fallback before giving up. Common on
+        # ROCm/PyTorch Jenkins images where .hip compiles are driven
+        # by CUSTOM_COMMAND -> per-source *.hip.o.cmake scripts.
+        legacy = _capture_pytorch_legacy_findhip(source_path, reasons)
+        if legacy is not None:
+            legacy_targets, scripts_scanned = legacy
+            result["_parser"] = "legacy_findhip_per_source"
+            result["_legacy_scripts_scanned"] = scripts_scanned
+            result["targets"] = legacy_targets
+            return result
+        # Neither parser found anything. Leave targets: {} as the
+        # "scanned, found nothing" signal -- partial reason already
+        # recorded by the fallback.
+        result["targets"] = {}
+        return result
+
+    targets_out: dict[str, Any] = {}
+    for tgt in sorted(target_defines):
+        # Collapse all unique DEFINES blocks for this target into one
+        # sorted dict (target gets the union of every block's defines;
+        # for sub-target variation the union captures everything).
+        # Iterate the deduplicated DEFINES blocks in lexicographic
+        # order. ``target_defines[tgt]`` is a set (used to dedup the
+        # thousands of identical DEFINES lines cmake emits per
+        # source file in a target); set iteration is hash-order,
+        # so without sorting two probes of the same wheel could
+        # yield different `defines` dicts whenever two blocks set
+        # the same macro to different values (rare but possible
+        # under per-source compile_definitions overrides). Sorted
+        # ordering -> "lexicographically-largest block wins on
+        # conflict", deterministic across runs.
+        merged_defines: dict[str, str | None] = {}
+        for block in sorted(target_defines[tgt]):
+            for m in _NINJA_DEFINE_TOKEN_RE.finditer(block):
+                merged_defines[m.group(1)] = m.group(2)
+        defines_sorted = {k: merged_defines[k] for k in sorted(merged_defines)}
+
+        codegen_present: dict[str, bool] = {
+            f: False for f in _NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST
+        }
+        archs: set[str] = set()
+        for fblock in target_flags.get(tgt, ()):
+            for f in _NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST:
+                if f in fblock:
+                    codegen_present[f] = True
+            for am in _NINJA_OFFLOAD_ARCH_RE.finditer(fblock):
+                archs.add(am.group(1))
+
+        use_present = {
+            name: name in merged_defines
+            for name in _NINJA_HIPCC_FLAGS_OF_INTEREST
+        }
+
+        targets_out[tgt] = {
+            "defines": defines_sorted,
+            "use_defines_present": use_present,
+            "codegen_flags_present": codegen_present,
+            "offload_archs": sorted(archs),
+        }
+    result["_source_file"] = str(ninja_path)
+    result["_parser"] = "ninja_defines"
+    result["targets"] = targets_out
+    return result
+
+
+def _capture_pytorch_legacy_findhip(
+    source_path: Path,
+    reasons: list[str],
+) -> tuple[dict[str, dict[str, Any]], int] | None:
+    """Fallback parser for PyTorch builds using legacy ``FindHIP.cmake``.
+
+    Used when :func:`_capture_pytorch_ninja_hipcc`'s ninja-only scan
+    finds zero HIP_COMPILER rules. Walks
+    ``<source>/build/**/<target>.dir/**/*.hip.o.cmake`` for each
+    target in :data:`_NINJA_HIPCC_TARGETS_OF_INTEREST` (via
+    :data:`_LEGACY_FINDHIP_TARGET_DIR_NAMES`). Each script holds one
+    source-file's HIPCC invocation in ``set(HIP_*_FLAGS …)`` cmake-
+    list assignments. We union every script's defines, codegen flag
+    presence, and offload archs into per-target dicts whose shape
+    matches the modern parser's output exactly -- consumers reading
+    ``targets[<name>]`` don't need to branch on parser strategy.
+
+    Returns ``(targets_dict, scripts_scanned)`` when at least one
+    script was readable for any target of interest, or ``None`` when
+    no candidate scripts existed (caller leaves ``targets: {}`` and
+    a partial reason is recorded). Per-target absence (target dir not
+    present at all) is silent -- only the global no-scripts case
+    appends a reason, because individual target absence is the common
+    case (an image may strip torch_hip.dir while keeping ck_sdpa.dir).
+
+    Bounded I/O: caps total scripts scanned at
+    :data:`_LEGACY_FINDHIP_MAX_SCRIPTS` and per-file read at
+    :data:`_LEGACY_FINDHIP_MAX_FILE_BYTES`. Truncation appends a
+    partial reason; per-file OSErrors are skipped with a count
+    summarised in a single reason at the end (avoids one reason per
+    unreadable file when permissions are mis-set).
+    """
+    build_dir = source_path / "build"
+    if not build_dir.is_dir():
+        return None
+
+    # Per-target accumulators: each target collects every (raw value
+    # string) seen across its scripts. We dedup with sets to keep the
+    # later regex pass bounded -- on the repro image many scripts
+    # share identical flag values.
+    target_flag_blobs: dict[str, set[str]] = {}
+    scripts_scanned = 0
+    scripts_unreadable = 0
+    scripts_truncated_file = 0
+    truncated_cap = False
+
+    # Per-target traversal: first locate `<target>.dir` directories,
+    # then scan inside each. This bounds the walk by the count of
+    # target-of-interest scripts -- a pathological build tree with
+    # 100k+ gloo_hip / test scripts under non-interest dirs is never
+    # iterated. Target attribution is implicit (we already know which
+    # target dir we descended from), so the post-hoc path-parts walk
+    # the previous shape needed is gone.
+    for tgt_dir_name in _LEGACY_FINDHIP_TARGET_DIR_NAMES:
+        if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
+            truncated_cap = True
+            break
+        tgt = tgt_dir_name[: -len(".dir")]
+        for tgt_dir in build_dir.rglob(tgt_dir_name):
+            if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
+                truncated_cap = True
+                break
+            if not tgt_dir.is_dir():
+                continue
+            for cmake_path in tgt_dir.rglob("*.hip.o.cmake"):
+                if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
+                    truncated_cap = True
+                    break
+
+                # Bounded read: open and read at most MAX_BYTES+1 so
+                # the cap is enforced BEFORE a pathological multi-GB
+                # file is slurped into memory. read_text() would have
+                # loaded the whole file and only then truncated --
+                # defeating the cap.
+                try:
+                    with cmake_path.open(
+                        "r", encoding="utf-8", errors="replace",
+                    ) as fh:
+                        text = fh.read(_LEGACY_FINDHIP_MAX_FILE_BYTES + 1)
+                except OSError:
+                    scripts_unreadable += 1
+                    continue
+                if len(text) > _LEGACY_FINDHIP_MAX_FILE_BYTES:
+                    # Trim the trailing sentinel byte so downstream
+                    # regex passes don't see a half-token at the cap
+                    # boundary. Real FindHIP scripts are ~13 KB; this
+                    # only trips on pathological inputs. Count for the
+                    # partial reason below -- a silent omission of
+                    # tail defines/flags would be data loss the
+                    # operator can't see in the snapshot.
+                    text = text[:_LEGACY_FINDHIP_MAX_FILE_BYTES]
+                    scripts_truncated_file += 1
+                scripts_scanned += 1
+                bucket = target_flag_blobs.setdefault(tgt, set())
+                for _var_name, value in _LEGACY_FINDHIP_SET_RE.findall(text):
+                    if value:
+                        bucket.add(value)
+
+    if not target_flag_blobs and scripts_scanned == 0:
+        # Two distinct empty paths surface here with different
+        # operator action items, so emit a different reason for each:
+        if scripts_unreadable:
+            reasons.append(
+                f"pytorch_build.ninja_hipcc: legacy FindHIP fallback found "
+                f"{scripts_unreadable} *.hip.o.cmake script(s) under "
+                f"{build_dir} but every one was unreadable (check "
+                f"permissions / mount state)"
+            )
+        else:
+            reasons.append(
+                "pytorch_build.ninja_hipcc: legacy FindHIP fallback found "
+                f"no *.hip.o.cmake scripts under {build_dir}"
+            )
+        return None
+    if scripts_unreadable:
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: legacy FindHIP fallback skipped "
+            f"{scripts_unreadable} unreadable script(s)"
+        )
+    if scripts_truncated_file:
+        # Tail defines/flags past the 1 MiB cap were silently dropped
+        # from the affected target(s). Real FindHIP scripts are ~13 KB
+        # so this only fires on pathological inputs, but a silent
+        # omission would leave the snapshot looking complete while
+        # actually missing data -- explicit reason is the only way the
+        # operator can see this happened.
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: legacy FindHIP fallback truncated "
+            f"{scripts_truncated_file} script(s) at "
+            f"{_LEGACY_FINDHIP_MAX_FILE_BYTES} bytes (defines/flags past "
+            f"the cap were dropped from the affected target)"
+        )
+    if truncated_cap:
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: legacy FindHIP fallback truncated "
+            f"after scanning {scripts_scanned} scripts (cap "
+            f"{_LEGACY_FINDHIP_MAX_SCRIPTS})"
+        )
+
+    targets_out: dict[str, dict[str, Any]] = {}
+    for tgt in sorted(target_flag_blobs):
+        merged_defines: dict[str, str | None] = {}
+        codegen_present: dict[str, bool] = {
+            f: False for f in _NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST
+        }
+        archs: set[str] = set()
+        # Iterate raw set() values in sorted order so the "same macro,
+        # two values" tie-break is deterministic across runs (same
+        # rationale as the ninja parser's sorted() merge at the
+        # equivalent step).
+        for blob in sorted(target_flag_blobs[tgt]):
+            # Tokenize on both `;` (cmake list separator) and whitespace
+            # (the packed -D run inside a single list element).
+            for tok in _LEGACY_FINDHIP_TOKEN_SPLIT_RE.split(blob):
+                if not tok:
+                    continue
+                dm = _NINJA_DEFINE_TOKEN_RE.match(tok)
+                if dm:
+                    merged_defines[dm.group(1)] = dm.group(2)
+                    continue
+                am = _NINJA_OFFLOAD_ARCH_RE.match(tok)
+                if am:
+                    archs.add(am.group(1))
+                    continue
+            # Codegen-flag substring scan runs on the full blob (one
+            # pass per flag of interest, same as the ninja parser).
+            for f in _NINJA_HIPCC_CODEGEN_FLAGS_OF_INTEREST:
+                if f in blob:
+                    codegen_present[f] = True
+
+        defines_sorted = {k: merged_defines[k] for k in sorted(merged_defines)}
+        use_present = {
+            name: name in merged_defines
+            for name in _NINJA_HIPCC_FLAGS_OF_INTEREST
+        }
+        targets_out[tgt] = {
+            "defines": defines_sorted,
+            "use_defines_present": use_present,
+            "codegen_flags_present": codegen_present,
+            "offload_archs": sorted(archs),
+        }
+
+    return targets_out, scripts_scanned
+
+
+# ---------------------------------------------------------------------------
+# torch.backends.cuda SDPA backend runtime states
+# ---------------------------------------------------------------------------
+
+_PYTORCH_SDPA_GETTERS: tuple[str, ...] = (
+    "flash_sdp_enabled",
+    "mem_efficient_sdp_enabled",
+    "math_sdp_enabled",
+    "cudnn_sdp_enabled",
+)
+
+
+def _capture_pytorch_sdpa(reasons: list[str]) -> dict[str, Any]:
+    """Capture the runtime-enabled state of each SDPA backend in torch.
+
+    ``torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()``
+    return whether each backend is currently enabled in the SDP
+    dispatcher's runtime state. They are NOT compile-time flags --
+    a backend can be compiled in (symbols present in libtorch_hip.so
+    per ``pytorch_build.binary_introspection``) but disabled at
+    runtime, or vice versa. Together with the symbol counts the
+    operator gets the full "compiled in AND enabled" picture.
+
+    No GPU work: pure Python attribute lookups on torch's SDP backend
+    state machine; no HIP context init, no allocations.
+
+    Per-getter ``None`` when the function is missing on the installed
+    torch version (older wheels lack one or more of these getters) --
+    distinguishable from ``True/False`` which means we successfully
+    asked.
+    """
+    backends: dict[str, bool | None] = {name: None for name in _PYTORCH_SDPA_GETTERS}
+    result: dict[str, Any] = {"backends_enabled": backends}
+
+    torch_mod = _safe_import_torch(reasons, "pytorch_sdpa")
+    if torch_mod is None:
+        return result
+    cuda_backend = getattr(getattr(torch_mod, "backends", None), "cuda", None)
+    if cuda_backend is None:
+        reasons.append("pytorch_sdpa: torch.backends.cuda unavailable")
+        return result
+    for name in _PYTORCH_SDPA_GETTERS:
+        getter = getattr(cuda_backend, name, None)
+        if getter is None:
+            continue
+        try:
+            backends[name] = bool(getter())
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            log.debug("torch.backends.cuda.%s() raised: %s", name, exc)
+            reasons.append(
+                f"pytorch_sdpa.{name}: torch.backends.cuda.{name}() "
+                f"raised ({type(exc).__name__})"
+            )
+    return result
 
 
 def _detect_pytorch_install_kind() -> tuple[str, Path | None]:
