@@ -16,6 +16,9 @@ Stress-test GPU queue scheduling with 8-64+ concurrent streams. Includes 15 work
 
 ![hw_queue_cmds](docs/hw_queue_cmds.png)
 
+**Environment Snapshot for Reproducibility**
+Capture a versioned, schema-stable snapshot of the trial environment — ROCm / HIP / hipBLASLt / rocBLAS / MIOpen / RCCL identities, GPU arch, PyTorch build flags + cmake cache + per-target HIPCC defines, runtime SDPA backend state, ~30 numerics-relevant env vars — so cross-environment regressions become a `jq` diff instead of a multi-day investigation. Used standalone (`aorta env probe`) and embedded automatically into every trial result.
+
 
 ## Quick Start
 
@@ -35,6 +38,12 @@ python -m aorta.hw_queue_eval run comms_compute_overlap --streams 4 --profile
 torchrun --nproc_per_node=8 -m aorta.hw_queue_eval run comms_compute_overlap \
     --streams 4 --real-collectives --async-op --backend nccl \
     --process-groups "[0,1,2,3,4,5,6,7]" --profile --profile-dir traces/
+
+# Environment snapshot for reproducibility
+aorta env probe -o env.json                               # full snapshot to disk
+aorta env probe --summary                                 # one-screen brief, no file write
+aorta env probe --field pytorch_build.git_commit          # one field, JSON-typed
+diff <(jq -S . env_a.json) <(jq -S . env_b.json)          # diff two snapshots
 ```
 
 ## Example Analysis
@@ -56,6 +65,7 @@ AORTA generates comprehensive performance reports comparing ROCm versions across
 | [Hardware Queue Eval](docs/hw-queue-eval.md) | Workloads, CLI usage, metrics |
 | [Configuration](docs/configuration.md) | FSDP tuning, RCCL variables, profiler settings |
 | [Profiling](docs/profiling.md) | Torch profiler, rocprofv3, overlap reports |
+| [Environment Probe](docs/env-probe.md) | Capture / diff / query a versioned environment snapshot; jq cookbook |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues |
 
 ## Repository Layout
@@ -66,8 +76,9 @@ src/aorta/
 ├── hw_queue_eval/     # Hardware queue evaluation framework
 ├── models/            # Synthetic ranking transformer
 ├── profiling/         # Stream profiler for overlap measurement
+├── instrumentation/   # Environment probe (versioned env.json schema + capture)
 ├── registry/          # Mitigations + environments registry (extension points)
-├── cli/               # `aorta` CLI command groups
+├── cli/               # `aorta` CLI command groups (run, env probe, ...)
 └── utils/             # Config loading, timing, device detection
 
 config/                # YAML configurations for different scenarios
