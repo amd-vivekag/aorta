@@ -4113,50 +4113,60 @@ def _capture_pytorch_legacy_findhip(
     target_flag_blobs: dict[str, set[str]] = {}
     scripts_scanned = 0
     scripts_unreadable = 0
-    truncated = False
+    scripts_truncated_file = 0
+    truncated_cap = False
 
-    for cmake_path in build_dir.rglob("*.hip.o.cmake"):
+    # Per-target traversal: first locate `<target>.dir` directories,
+    # then scan inside each. This bounds the walk by the count of
+    # target-of-interest scripts -- a pathological build tree with
+    # 100k+ gloo_hip / test scripts under non-interest dirs is never
+    # iterated. Target attribution is implicit (we already know which
+    # target dir we descended from), so the post-hoc path-parts walk
+    # the previous shape needed is gone.
+    for tgt_dir_name in _LEGACY_FINDHIP_TARGET_DIR_NAMES:
         if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
-            truncated = True
+            truncated_cap = True
             break
-        # Identify which target this script belongs to by walking the
-        # path parts for a `<target>.dir` segment. `rglob` yields paths
-        # rooted at build_dir, so .parts contains build_dir's prefix
-        # too -- iterating handles either layout.
-        tgt: str | None = None
-        for part in cmake_path.parts:
-            for cand_dir in _LEGACY_FINDHIP_TARGET_DIR_NAMES:
-                if part == cand_dir:
-                    tgt = cand_dir[: -len(".dir")]
-                    break
-            if tgt is not None:
+        tgt = tgt_dir_name[: -len(".dir")]
+        for tgt_dir in build_dir.rglob(tgt_dir_name):
+            if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
+                truncated_cap = True
                 break
-        if tgt is None:
-            # Script belongs to a target we don't surface (gloo_hip,
-            # caffe2_nvrtc, HIP test binaries, ...). Skip silently.
-            continue
+            if not tgt_dir.is_dir():
+                continue
+            for cmake_path in tgt_dir.rglob("*.hip.o.cmake"):
+                if scripts_scanned >= _LEGACY_FINDHIP_MAX_SCRIPTS:
+                    truncated_cap = True
+                    break
 
-        # Bounded read: open and read at most MAX_BYTES+1 so the cap
-        # is enforced BEFORE a pathological multi-GB file is slurped
-        # into memory. read_text() would have loaded the whole file
-        # and only then truncated -- defeating the cap.
-        try:
-            with cmake_path.open("r", encoding="utf-8", errors="replace") as fh:
-                text = fh.read(_LEGACY_FINDHIP_MAX_FILE_BYTES + 1)
-        except OSError:
-            scripts_unreadable += 1
-            continue
-        if len(text) > _LEGACY_FINDHIP_MAX_FILE_BYTES:
-            # Trim the trailing sentinel byte so downstream regex
-            # passes don't see a half-token at the cap boundary. Real
-            # FindHIP scripts are ~13 KB; this only trips on
-            # pathological inputs.
-            text = text[:_LEGACY_FINDHIP_MAX_FILE_BYTES]
-        scripts_scanned += 1
-        bucket = target_flag_blobs.setdefault(tgt, set())
-        for _var_name, value in _LEGACY_FINDHIP_SET_RE.findall(text):
-            if value:
-                bucket.add(value)
+                # Bounded read: open and read at most MAX_BYTES+1 so
+                # the cap is enforced BEFORE a pathological multi-GB
+                # file is slurped into memory. read_text() would have
+                # loaded the whole file and only then truncated --
+                # defeating the cap.
+                try:
+                    with cmake_path.open(
+                        "r", encoding="utf-8", errors="replace",
+                    ) as fh:
+                        text = fh.read(_LEGACY_FINDHIP_MAX_FILE_BYTES + 1)
+                except OSError:
+                    scripts_unreadable += 1
+                    continue
+                if len(text) > _LEGACY_FINDHIP_MAX_FILE_BYTES:
+                    # Trim the trailing sentinel byte so downstream
+                    # regex passes don't see a half-token at the cap
+                    # boundary. Real FindHIP scripts are ~13 KB; this
+                    # only trips on pathological inputs. Count for the
+                    # partial reason below -- a silent omission of
+                    # tail defines/flags would be data loss the
+                    # operator can't see in the snapshot.
+                    text = text[:_LEGACY_FINDHIP_MAX_FILE_BYTES]
+                    scripts_truncated_file += 1
+                scripts_scanned += 1
+                bucket = target_flag_blobs.setdefault(tgt, set())
+                for _var_name, value in _LEGACY_FINDHIP_SET_RE.findall(text):
+                    if value:
+                        bucket.add(value)
 
     if not target_flag_blobs and scripts_scanned == 0:
         # Two distinct empty paths surface here with different
@@ -4179,7 +4189,20 @@ def _capture_pytorch_legacy_findhip(
             f"pytorch_build.ninja_hipcc: legacy FindHIP fallback skipped "
             f"{scripts_unreadable} unreadable script(s)"
         )
-    if truncated:
+    if scripts_truncated_file:
+        # Tail defines/flags past the 1 MiB cap were silently dropped
+        # from the affected target(s). Real FindHIP scripts are ~13 KB
+        # so this only fires on pathological inputs, but a silent
+        # omission would leave the snapshot looking complete while
+        # actually missing data -- explicit reason is the only way the
+        # operator can see this happened.
+        reasons.append(
+            f"pytorch_build.ninja_hipcc: legacy FindHIP fallback truncated "
+            f"{scripts_truncated_file} script(s) at "
+            f"{_LEGACY_FINDHIP_MAX_FILE_BYTES} bytes (defines/flags past "
+            f"the cap were dropped from the affected target)"
+        )
+    if truncated_cap:
         reasons.append(
             f"pytorch_build.ninja_hipcc: legacy FindHIP fallback truncated "
             f"after scanning {scripts_scanned} scripts (cap "

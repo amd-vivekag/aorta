@@ -5371,6 +5371,79 @@ class TestCapturePytorchLegacyFindhipFallback:
             for r in reasons
         ), f"reasons did not mention unreadable / permissions: {reasons}"
 
+    def test_oversized_script_emits_truncation_partial_reason(
+        self, tmp_path,
+    ):
+        """A pathologically large *.hip.o.cmake (> 1 MiB) gets
+        truncated to keep the read bounded, but tail defines/flags
+        past the cap are silently dropped from the target. A partial
+        reason MUST surface this so the operator can tell the
+        snapshot is incomplete -- otherwise the data loss is invisible
+        (Copilot round-9 review).
+        """
+        # Build a >1 MiB script by padding the value section. The
+        # leading set(...) is still parseable so the target gets
+        # populated; the truncation reason proves we noticed.
+        pad = "x" * (env_mod._LEGACY_FINDHIP_MAX_FILE_BYTES + 64)
+        self._make_build_tree(tmp_path, {
+            "caffe2/aten/src/ATen/CMakeFiles/ck_sdpa.dir/big.hip.o.cmake": (
+                f"set(HIP_HIPCC_FLAGS -DUSE_ROCM_CK_SDPA;{pad})\n"
+            ),
+        })
+        reasons: list[str] = []
+        block = env_mod._capture_pytorch_ninja_hipcc(
+            "source", tmp_path, reasons,
+        )
+        # Defines from the leading portion still surface.
+        assert "ck_sdpa" in block["targets"]
+        # Reason must explicitly call out truncation so the operator
+        # knows the snapshot is partial.
+        assert any(
+            "truncated" in r and "bytes" in r
+            for r in reasons
+        ), f"reasons missing truncation notice: {reasons}"
+
+    def test_per_target_traversal_skips_non_interest_directories(
+        self, tmp_path,
+    ):
+        """The parser must NOT iterate per-source scripts under target
+        dirs we don't surface (gloo_hip / caffe2_nvrtc / HIP test
+        binaries). The previous global rglob would walk every
+        ``*.hip.o.cmake`` under build/ and discard non-interest paths
+        post-hoc; the per-target form should never even open them
+        (Copilot round-9 review).
+        """
+        self._make_build_tree(tmp_path, {
+            # Interest target
+            "caffe2/aten/src/ATen/CMakeFiles/ck_sdpa.dir/keep.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DUSE_ROCM_CK_SDPA)\n"
+            ),
+            # Non-interest target -- must not be opened
+            "third_party/gloo/gloo/CMakeFiles/gloo_hip.dir/skip.hip.o.cmake": (
+                "set(HIP_HIPCC_FLAGS -DGLOO_HIP_DEFINE)\n"
+            ),
+        })
+        opened: list[str] = []
+        real_open = env_mod.Path.open
+
+        def tracking_open(self, *args, **kwargs):
+            if str(self).endswith(".hip.o.cmake"):
+                opened.append(self.name)
+            return real_open(self, *args, **kwargs)
+
+        # Patch is on the env_mod re-export so the parser's calls hit it.
+        import unittest.mock as _mock
+        with _mock.patch.object(env_mod.Path, "open", tracking_open):
+            block = env_mod._capture_pytorch_ninja_hipcc(
+                "source", tmp_path, [],
+            )
+        assert "ck_sdpa" in block["targets"]
+        assert "keep.hip.o.cmake" in opened
+        # The gloo_hip script must never have been opened.
+        assert "skip.hip.o.cmake" not in opened, (
+            f"per-target traversal still walked non-interest scripts: {opened}"
+        )
+
     def test_multiline_set_packed_with_d_defines_tokenized(self, tmp_path):
         """The packed-defines case: a single ;-element contains
         multiple space-separated -D defines (cmake variable-inheritance
