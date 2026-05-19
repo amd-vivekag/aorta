@@ -384,6 +384,37 @@ def test_resolved_recipe_inline_envs_emit_docker_shorthand(
     assert reloaded.cells[0].environment == r.cells[0].environment
 
 
+def test_resolved_recipe_round_trips_workload_config(
+    tmp_path, patched_env, patched_run_trials
+):
+    """B2.2: workload_config at recipe + cell scope must survive load -> run -> reload."""
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe, load_recipe
+
+    r = Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=1,
+        steps=10,
+        cells=(
+            Cell(name="a", mitigations=("none",), environment="local"),
+            Cell(
+                name="b",
+                mitigations=("none",),
+                environment="local",
+                workload_config={"shampoo_api": "old"},
+            ),
+        ),
+        ticket="WC-RT",
+        confound=ConfoundCfg(baseline_cell="a"),
+        workload_config={"shampoo_api": "new", "warmup": 5},
+    )
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    reloaded = load_recipe(run_dir / "recipe.resolved.yaml")
+    assert reloaded.workload_config == {"shampoo_api": "new", "warmup": 5}
+    assert reloaded.cells[0].workload_config == {}
+    assert reloaded.cells[1].workload_config == {"shampoo_api": "old"}
+
+
 def test_matrix_json_records_resolved_environment_per_cell(
     tmp_path, patched_env, patched_run_trials
 ):

@@ -164,6 +164,78 @@ def test_cell_overrides_flow_through_effective_values(tmp_path, patched_env, pat
     assert (reqs[1].trials, reqs[1].steps) == (7, 999)
 
 
+def test_workload_config_recipe_scope_reaches_dispatcher(
+    tmp_path, patched_env, patched_run_trials
+):
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe
+
+    r = Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=1,
+        steps=10,
+        cells=(Cell(name="a", mitigations=("none",), environment="local"),),
+        ticket="WC-1",
+        confound=ConfoundCfg(baseline_cell="a"),
+        workload_config={"shampoo_api": "new"},
+    )
+    runner.run_recipe(r, output_dir=tmp_path)
+    req: RunRequest = patched_run_trials.call_args_list[0].args[0]
+    assert req.config_overrides == {"shampoo_api": "new"}
+
+
+def test_workload_config_cell_overrides_recipe_and_merges(
+    tmp_path, patched_env, patched_run_trials
+):
+    """Cell-scope wins on key collision; non-collision keys union (B2.2)."""
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe
+
+    r = Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=1,
+        steps=10,
+        cells=(
+            Cell(name="a", mitigations=("none",), environment="local"),
+            Cell(
+                name="b",
+                mitigations=("none",),
+                environment="local",
+                workload_config={"shampoo_api": "old", "batch_size": 64},
+            ),
+        ),
+        ticket="WC-2",
+        confound=ConfoundCfg(baseline_cell="a"),
+        workload_config={"shampoo_api": "new", "warmup": 5},
+    )
+    runner.run_recipe(r, output_dir=tmp_path)
+    reqs = [c.args[0] for c in patched_run_trials.call_args_list]
+    assert reqs[0].config_overrides == {"shampoo_api": "new", "warmup": 5}
+    # Cell b: shampoo_api collides -> cell wins ('old'); warmup carries through
+    # from recipe; batch_size unions in from cell.
+    assert reqs[1].config_overrides == {
+        "shampoo_api": "old",
+        "warmup": 5,
+        "batch_size": 64,
+    }
+
+
+def test_workload_config_absent_yields_empty_overrides(
+    tmp_path, patched_env, patched_run_trials
+):
+    """Recipes without workload_config behave byte-equivalent to today."""
+    r = build_recipe_from_flags(
+        workload="fsdp",
+        mitigation_axis="none",
+        environment_axis="local",
+        trials=1,
+        steps=10,
+    )
+    runner.run_recipe(r, output_dir=tmp_path)
+    req: RunRequest = patched_run_trials.call_args_list[0].args[0]
+    assert req.config_overrides == {}
+
+
 def test_inline_docker_sidecar_written_and_passed_to_run_trials(
     tmp_path, patched_env, patched_run_trials
 ):

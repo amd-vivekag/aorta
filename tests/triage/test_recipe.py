@@ -383,6 +383,64 @@ def test_extra_env_must_be_strings(tmp_path):
         load_recipe(_write_yaml(tmp_path, text))
 
 
+# ---- workload_config ------------------------------------------------------
+
+
+def test_workload_config_defaults_empty(tmp_path):
+    r = load_recipe(_write_yaml(tmp_path, _MINIMAL_YAML))
+    assert r.workload_config == {}
+    assert r.cells[0].workload_config == {}
+
+
+def test_workload_config_recipe_scope(tmp_path):
+    text = _MINIMAL_YAML + "workload_config:\n  shampoo_api: new\n  batch_size: 32\n"
+    r = load_recipe(_write_yaml(tmp_path, text))
+    assert r.workload_config == {"shampoo_api": "new", "batch_size": 32}
+
+
+def test_workload_config_cell_scope(tmp_path):
+    text = _MINIMAL_YAML.replace(
+        "    environment: local\n",
+        "    environment: local\n    workload_config:\n      shampoo_api: old\n",
+    )
+    r = load_recipe(_write_yaml(tmp_path, text))
+    assert r.cells[0].workload_config == {"shampoo_api": "old"}
+
+
+def test_workload_config_must_be_mapping(tmp_path):
+    text = _MINIMAL_YAML + "workload_config: not-a-dict\n"
+    with pytest.raises(RecipeSchemaError, match="workload_config"):
+        load_recipe(_write_yaml(tmp_path, text))
+
+
+def test_workload_config_rejects_non_string_keys(tmp_path):
+    # YAML int key triggers the str-key validator.
+    text = _MINIMAL_YAML + "workload_config:\n  1: foo\n"
+    with pytest.raises(RecipeSchemaError, match="keys must be strings"):
+        load_recipe(_write_yaml(tmp_path, text))
+
+
+def test_workload_config_rejects_reserved_steps_key(tmp_path):
+    text = _MINIMAL_YAML + "workload_config:\n  steps: 9999\n"
+    with pytest.raises(RecipeSchemaError, match="reserved"):
+        load_recipe(_write_yaml(tmp_path, text))
+
+
+def test_workload_config_rejects_aorta_prefix(tmp_path):
+    text = _MINIMAL_YAML + "workload_config:\n  _aorta_environment: x\n"
+    with pytest.raises(RecipeSchemaError, match="reserved"):
+        load_recipe(_write_yaml(tmp_path, text))
+
+
+def test_workload_config_cell_scope_validation_path(tmp_path):
+    text = _MINIMAL_YAML.replace(
+        "    environment: local\n",
+        "    environment: local\n    workload_config:\n      steps: 1\n",
+    )
+    with pytest.raises(RecipeSchemaError, match=r"cells\[0\].workload_config"):
+        load_recipe(_write_yaml(tmp_path, text))
+
+
 # ---- Flag-mode builder ----------------------------------------------------
 
 

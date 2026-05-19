@@ -88,6 +88,32 @@ cells:
   mitigation bundle, so it can override a registered mitigation's env var
   for one-off experiments without polluting the registry. Recorded in
   `matrix.json` for audit.
+- **`workload_config`** -- optional `dict[str, Any]`, allowed at both
+  recipe scope (top level) and per cell. Forwarded to the workload
+  constructor through the dispatcher's `Request.config_overrides`. Use
+  this for workload-specific knobs that aren't env vars -- e.g.
+  `shampoo_api: old` on the `recom_repro` workload to select the V2
+  Meta-internal SHAMPOO entry script. Cell-scope merges over recipe-scope
+  on a per-key basis (cell wins on collision; non-collision keys union),
+  so a recipe can set a workload-wide default and opt one cell out.
+  Reserved keys: `"steps"` (first-class field; would be silently
+  overwritten by the dispatcher) and any `_aorta_*` prefix
+  (platform-supplied) are rejected at load time. Example:
+
+  ```yaml
+  workload: recom_repro
+  workload_config:
+    shampoo_api: new          # recipe default
+  cells:
+    - name: v3-baseline
+      mitigations: [none]
+      environment: nan-repro-v3
+    - name: v2-baseline
+      mitigations: [none]
+      environment: nan-repro-v2-image
+      workload_config:
+        shampoo_api: old      # cell override
+  ```
 
 Every validation error reports a path like `cells[2].mitigations` so the
 failure is localisable without reading the loader source.

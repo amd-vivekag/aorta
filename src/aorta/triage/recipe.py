@@ -37,11 +37,36 @@ from aorta.registry import (
 SCHEMA_VERSION = 1
 
 _VALID_TOP_LEVEL = frozenset(
-    {"schema_version", "ticket", "workload", "trials", "steps", "confound", "cells"}
+    {
+        "schema_version",
+        "ticket",
+        "workload",
+        "trials",
+        "steps",
+        "confound",
+        "cells",
+        "workload_config",
+    }
 )
 _VALID_CONFOUND_KEYS = frozenset({"threshold", "baseline_cell"})
-_VALID_CELL_KEYS = frozenset({"name", "mitigations", "environment", "extra_env", "trials", "steps"})
+_VALID_CELL_KEYS = frozenset(
+    {"name", "mitigations", "environment", "extra_env", "trials", "steps", "workload_config"}
+)
 _VALID_INLINE_ENV_KEYS = frozenset({"docker"})
+
+# Keys that workload_config (recipe- or cell-scope) is NOT allowed to set.
+# - "steps" is a first-class recipe/cell field; the dispatcher writes
+#   ``config["steps"] = request.steps`` AFTER spreading config_overrides
+#   (src/aorta/run/dispatcher.py), so a workload_config["steps"] would be
+#   silently clobbered. Reject at load time so the recipe author finds out
+#   immediately instead of debugging a step count that mysteriously ignores
+#   their override.
+# - The ``_aorta_*`` prefix is reserved for platform-supplied keys
+#   (currently ``_aorta_environment``); the dispatcher already rejects them
+#   at runtime. Mirror the rejection at recipe-load time so the failure
+#   surfaces before any trial runs.
+_RESERVED_WORKLOAD_CONFIG_KEYS = frozenset({"steps"})
+_RESERVED_WORKLOAD_CONFIG_PREFIX = "_aorta_"
 
 # Cell names become directory components under cells/<name>/ in the run output
 # tree.  Reject characters that would let a recipe escape its own cells/
@@ -108,6 +133,13 @@ class Cell:
             disagreements are flagged as errors.
         trials: Optional per-cell override of the recipe-level ``trials``.
         steps: Optional per-cell override of the recipe-level ``steps``.
+        workload_config: Arbitrary ``dict[str, Any]`` forwarded to the
+            workload constructor via ``Request.config_overrides``. Merged
+            over the recipe-level ``workload_config`` (cell wins on key
+            collision). Keys must be strings; ``"steps"`` and any
+            ``_aorta_*`` key are rejected at load time -- ``steps`` is a
+            first-class field the dispatcher would silently overwrite, and
+            ``_aorta_*`` is reserved for platform-supplied keys.
     """
 
     name: str
@@ -116,6 +148,7 @@ class Cell:
     extra_env: dict[str, str] = field(default_factory=dict)
     trials: int | None = None
     steps: int | None = None
+    workload_config: dict[str, Any] = field(default_factory=dict)
 
     def effective_trials(self, recipe_trials: int) -> int:
         return self.trials if self.trials is not None else recipe_trials
@@ -160,6 +193,12 @@ class Recipe:
             flag-mode). Surfaced in ``matrix.md``.
         source_sha256: SHA-256 of the source file text (None for flag-mode).
             Surfaced in ``matrix.md`` for reproducibility.
+        workload_config: Recipe-scope ``dict[str, Any]`` applied to every
+            cell as the base ``Request.config_overrides``. Per-cell
+            ``Cell.workload_config`` merges over this on a per-key basis
+            (cell wins on collision; non-collision keys union). Empty dict
+            when the recipe omits the field -- behaviourally identical to
+            today's recipes.
     """
 
     schema_version: int
@@ -173,6 +212,7 @@ class Recipe:
     sidecar_files: tuple[Path, ...] = ()
     source_path: Path | None = None
     source_sha256: str | None = None
+    workload_config: dict[str, Any] = field(default_factory=dict)
 
 
 def inline_env_name(docker_ref: str) -> str:
@@ -272,6 +312,46 @@ def _parse_environment(path_hint: str, raw: Any, inline_envs: dict[str, InlineEn
     return auto_name
 
 
+def _parse_workload_config(path_hint: str, raw: Any) -> dict[str, Any]:
+    """Validate and copy a ``workload_config`` mapping.
+
+    Returns an empty dict when ``raw`` is None / missing so the caller can
+    just call ``_parse_workload_config(hint, data.get("workload_config"))``
+    without branching. The returned dict is a shallow copy -- values are
+    forwarded as-is to the workload constructor (``dict[str, Any]``),
+    keys MUST be strings, and the reserved set in
+    :data:`_RESERVED_WORKLOAD_CONFIG_KEYS` / the ``_aorta_`` prefix is
+    rejected at load time (see their docstring for the rationale).
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise RecipeSchemaError(
+            f"{path_hint}.workload_config: must be a mapping, got {type(raw).__name__}"
+        )
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            raise RecipeSchemaError(
+                f"{path_hint}.workload_config: keys must be strings, "
+                f"got {type(k).__name__} ({k!r})"
+            )
+        if k in _RESERVED_WORKLOAD_CONFIG_KEYS:
+            raise RecipeSchemaError(
+                f"{path_hint}.workload_config: key {k!r} is reserved -- "
+                "it is a first-class recipe/cell field and would be silently "
+                "overwritten by the dispatcher. Set it at the recipe/cell scope instead."
+            )
+        if k.startswith(_RESERVED_WORKLOAD_CONFIG_PREFIX):
+            raise RecipeSchemaError(
+                f"{path_hint}.workload_config: key {k!r} uses the reserved "
+                f"{_RESERVED_WORKLOAD_CONFIG_PREFIX!r} prefix "
+                "(platform-supplied; not a user override)."
+            )
+        out[k] = v
+    return out
+
+
 def _parse_cell(idx: int, raw: Any, inline_envs: dict[str, InlineEnv]) -> Cell:
     path_hint = f"cells[{idx}]"
     if not isinstance(raw, dict):
@@ -328,6 +408,8 @@ def _parse_cell(idx: int, raw: Any, inline_envs: dict[str, InlineEnv]) -> Cell:
     if steps is not None and (not isinstance(steps, int) or isinstance(steps, bool) or steps < 1):
         raise RecipeSchemaError(f"{path_hint}.steps: must be a positive int, got {steps!r}")
 
+    workload_config = _parse_workload_config(path_hint, raw.get("workload_config"))
+
     return Cell(
         name=name,
         mitigations=tuple(mitigations),
@@ -335,6 +417,7 @@ def _parse_cell(idx: int, raw: Any, inline_envs: dict[str, InlineEnv]) -> Cell:
         extra_env=extra_env,
         trials=trials,
         steps=steps,
+        workload_config=workload_config,
     )
 
 
@@ -550,6 +633,7 @@ def _build_recipe(
         )
 
     confound = _parse_confound("recipe", data.get("confound"))
+    workload_config = _parse_workload_config("recipe", data.get("workload_config"))
 
     raw_cells = data["cells"]
     if not isinstance(raw_cells, list) or not raw_cells:
@@ -583,6 +667,7 @@ def _build_recipe(
         sidecar_files=tuple(sidecar_files) if sidecar_files else (),
         source_path=source_path,
         source_sha256=source_sha256,
+        workload_config=workload_config,
     )
 
 

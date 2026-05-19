@@ -554,6 +554,13 @@ def _run_one_cell(
 
     resolved_env_vars = _resolve_cell_env_vars(cell.mitigations, cell.extra_env, sidecar_files)
 
+    # Recipe-scope workload_config is the base; cell-scope merges over it so
+    # the cell wins on key collision and non-collision keys union. Empty
+    # dicts on both sides collapse to ``{}``, which RunRequest.__post_init__
+    # deep-copies and the dispatcher spreads into ``config`` -- so omitting
+    # workload_config from the recipe stays byte-equivalent to today.
+    merged_workload_config = {**recipe.workload_config, **cell.workload_config}
+
     request = RunRequest(
         workload=recipe.workload,
         trials=cell.effective_trials(recipe.trials),
@@ -561,6 +568,7 @@ def _run_one_cell(
         mitigations=tuple(cell.mitigations),
         extra_env=dict(cell.extra_env),
         steps=cell.effective_steps(recipe.steps),
+        config_overrides=merged_workload_config,
         results_dir=cell_dir,
         sidecar_files=sidecar_files,
     )
@@ -604,14 +612,25 @@ def _preflight_validate(recipe: Recipe) -> None:
 def _print_dry_run(recipe: Recipe) -> None:
     """Write the resolved cell list to stdout without touching the filesystem."""
     click.echo(f"Dry run: {recipe.workload} / ticket={recipe.ticket or '(none)'}")
+    if recipe.workload_config:
+        click.echo(f"Recipe workload_config: {recipe.workload_config}")
     click.echo(f"Cells ({len(recipe.cells)}):")
     for cell in recipe.cells:
+        # Mirror the runner's merge so the dry-run shows the EFFECTIVE config
+        # the workload would be constructed with -- cell-scope wins on key
+        # collision, non-collision keys union with recipe-scope.
+        effective_workload_config = {**recipe.workload_config, **cell.workload_config}
         click.echo(
             f"  - {cell.name}: mitigations={list(cell.mitigations)} "
             f"environment={cell.environment} "
             f"trials={cell.effective_trials(recipe.trials)} "
             f"steps={cell.effective_steps(recipe.steps)}"
             + (f" extra_env={cell.extra_env}" if cell.extra_env else "")
+            + (
+                f" workload_config={effective_workload_config}"
+                if effective_workload_config
+                else ""
+            )
         )
     if recipe.inline_environments:
         click.echo("Inline docker environments:")
