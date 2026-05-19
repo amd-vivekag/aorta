@@ -798,6 +798,10 @@ def run_recipe(
                 suffix,
             )
 
+        # Mirror _run_one_cell's merge so CellStats.workload_config records
+        # what the dispatcher actually constructed the workload with. Cell-
+        # scope wins on collision; non-collision keys union with recipe-
+        # scope. Stays {} when neither scope sets workload_config.
         stats = aggregate_cell(
             name=cell.name,
             mitigations=tuple(cell.mitigations),
@@ -808,6 +812,7 @@ def run_recipe(
             effective_steps=cell.effective_steps(recipe.steps),
             trial_paths=trial_paths,
             error=error,
+            workload_config={**recipe.workload_config, **cell.workload_config},
         )
         cell_stats.append(stats)
 

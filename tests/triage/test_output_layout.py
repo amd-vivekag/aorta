@@ -415,6 +415,104 @@ def test_resolved_recipe_round_trips_workload_config(
     assert reloaded.cells[1].workload_config == {"shampoo_api": "old"}
 
 
+# ---- Config column (diffs-only workload_config) --------------------------
+#
+# The column surfaces per-cell workload_config keys whose value varies
+# across cells. Hidden when no cell sets workload_config OR when every
+# cell agrees. Confound classification unchanged: this column is the
+# disambiguation when two otherwise-identical rows differ only on a
+# workload knob (e.g. `shampoo_api=old` selecting the V1 SHAMPOO entry).
+
+
+def _cell(name: str, *, workload_config: dict | None = None):
+    """One-line Cell builder for Config-column tests."""
+    from aorta.triage.recipe import Cell
+
+    return Cell(
+        name=name,
+        mitigations=("none",),
+        environment="local",
+        workload_config=workload_config or {},
+    )
+
+
+def _recipe_with_cells(*cells, recipe_workload_config: dict | None = None):
+    from aorta.triage.recipe import ConfoundCfg, Recipe
+
+    return Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=1,
+        steps=10,
+        cells=tuple(cells),
+        ticket="CFG",
+        confound=ConfoundCfg(baseline_cell=cells[0].name),
+        workload_config=recipe_workload_config or {},
+    )
+
+
+def test_matrix_md_config_column_hidden_when_no_workload_config(
+    tmp_path, patched_env, patched_run_trials
+):
+    r = _recipe_with_cells(_cell("a"), _cell("b"))
+    md = (runner.run_recipe(r, output_dir=tmp_path) / "matrix.md").read_text(encoding="utf-8")
+    assert "| Config " not in md
+
+
+def test_matrix_md_config_column_hidden_when_all_cells_share_config(
+    tmp_path, patched_env, patched_run_trials
+):
+    r = _recipe_with_cells(_cell("a"), _cell("b"),
+                           recipe_workload_config={"shampoo_api": "new"})
+    md = (runner.run_recipe(r, output_dir=tmp_path) / "matrix.md").read_text(encoding="utf-8")
+    assert "| Config " not in md
+
+
+def test_matrix_md_config_column_shows_only_varying_keys(
+    tmp_path, patched_env, patched_run_trials
+):
+    """One cell flips shampoo_api -> Config column appears; only that key is rendered."""
+    r = _recipe_with_cells(
+        _cell("a"),
+        _cell("b", workload_config={"shampoo_api": "old"}),
+        recipe_workload_config={"warmup": 5},  # shared key: NOT rendered
+    )
+    md = (runner.run_recipe(r, output_dir=tmp_path) / "matrix.md").read_text(encoding="utf-8")
+    assert "| Config " in md
+    assert "shampoo_api=old" in md
+    assert "warmup=5" not in md  # shared across cells -> hidden
+    assert "- `Config` --" in md  # legend bullet present
+
+
+def test_matrix_md_config_column_renders_dash_for_cell_with_no_varying_keys(
+    tmp_path, patched_env, patched_run_trials
+):
+    r = _recipe_with_cells(
+        _cell("a"),
+        _cell("b", workload_config={"shampoo_api": "old"}),
+    )
+    md = (runner.run_recipe(r, output_dir=tmp_path) / "matrix.md").read_text(encoding="utf-8")
+    # Cell "a" has no workload_config; under Config column it must show "—".
+    a_row = next(line for line in md.splitlines() if line.startswith("| a "))
+    assert "| — " in a_row
+
+
+def test_matrix_json_records_workload_config_per_cell(
+    tmp_path, patched_env, patched_run_trials
+):
+    """Persisted on CellStats so downstream consumers can re-render the column."""
+    r = _recipe_with_cells(
+        _cell("a"),
+        _cell("b", workload_config={"shampoo_api": "old"}),
+        recipe_workload_config={"warmup": 5},
+    )
+    run_dir = runner.run_recipe(r, output_dir=tmp_path)
+    doc = json.loads((run_dir / "matrix.json").read_text())
+    by_name = {c["name"]: c for c in doc["cells"]}
+    assert by_name["a"]["workload_config"] == {"warmup": 5}
+    assert by_name["b"]["workload_config"] == {"warmup": 5, "shampoo_api": "old"}
+
+
 def test_matrix_json_records_resolved_environment_per_cell(
     tmp_path, patched_env, patched_run_trials
 ):

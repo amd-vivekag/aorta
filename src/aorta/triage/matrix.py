@@ -120,6 +120,14 @@ class CellStats:
     cell value for matrix.md's "Iters" column (e.g. ``"0/50"``,
     ``"199..200/200"``, ``"?/?"`` if trials disagreed on the configured
     count, or ``"—"`` when the workload didn't track iterations).
+
+    ``workload_config`` is the per-cell ``Request.config_overrides`` dict
+    (the merge of ``recipe.workload_config`` and ``cell.workload_config``,
+    cell wins on collision). Persisted in matrix.json so the report
+    renderer can surface workload-knob differences (e.g.
+    ``shampoo_api=old``) in the matrix.md ``Config`` column. Empty dict
+    when the recipe omits the field for every cell -- behaviourally
+    identical to the pre-B2.2 schema.
     """
 
     name: str
@@ -149,6 +157,7 @@ class CellStats:
     executed_iter_max: int | None = None
     configured_iters: int | None = None
     iters_display: str = "—"
+    workload_config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def failure_rate(self) -> float:
@@ -457,6 +466,7 @@ def aggregate_cell(
     effective_steps: int,
     trial_paths: list[str] | None = None,
     error: str | None = None,
+    workload_config: dict[str, Any] | None = None,
 ) -> CellStats:
     """Aggregate a list of TrialResult-shaped objects into a :class:`CellStats`.
 
@@ -479,10 +489,16 @@ def aggregate_cell(
             files; recorded in matrix.json.
         error: Cell-level error message; when set, the cell is marked as an
             error row and all numeric aggregates are forced to zero / 0.0.
+        workload_config: Per-cell merged ``workload_config`` dict (recipe
+            scope union cell scope, cell wins on collision). Persisted on
+            the returned :class:`CellStats` so matrix.md and matrix.json
+            can surface workload-knob differences across cells. ``None``
+            and ``{}`` both collapse to an empty dict on the result.
 
     Returns:
         :class:`CellStats` populated from the trials.
     """
+    workload_config = dict(workload_config or {})
     if error is not None:
         return CellStats(
             name=name,
@@ -512,6 +528,7 @@ def aggregate_cell(
             executed_iter_max=None,
             configured_iters=None,
             iters_display="—",
+            workload_config=workload_config,
         )
 
     trial_count = len(trials)
@@ -595,6 +612,7 @@ def aggregate_cell(
         executed_iter_max=exec_max,
         configured_iters=configured_iters,
         iters_display=iters_display,
+        workload_config=workload_config,
     )
 
 
