@@ -82,8 +82,23 @@ class RunRequest:
             ``contextlib.redirect_*`` only catches Python-level writes;
             subprocesses are not captured. Wrappers that own a
             subprocess can opt in by reading the platform-supplied
-            ``_aorta_save_logs`` / ``_aorta_log_stdout`` /
-            ``_aorta_log_stderr`` config keys this dispatcher injects.
+            ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys
+            this dispatcher injects; the basename is the trial filename
+            stem (e.g. ``trial_d0_m0_t0``) and the wrapper derives a
+            non-colliding sibling path such as
+            ``<basename>.subprocess.{stdout,stderr}.log`` -- the
+            dispatcher already holds open the
+            ``<basename>.{stdout,stderr}.log`` paths and double-writing
+            them would race.
+
+            The ``redirect_*`` rebinding is process-wide. Today no
+            caller invokes ``run_trials`` from multiple threads
+            concurrently (``aorta run`` is one cell, ``aorta triage``
+            iterates cells serially), so cross-thread crosstalk is
+            theoretical. If that ever changes, this knob would need a
+            different capture mechanism -- this mirrors the same
+            single-caller assumption the env-restore block on this
+            function relies on.
     """
 
     workload: str
@@ -345,10 +360,22 @@ def _run_single_trial(
     # ``save_logs`` opens per-trial log files and redirects
     # ``sys.stdout`` / ``sys.stderr`` for the duration of
     # ``setup()`` + ``run()`` + ``cleanup()``. The reserved
-    # ``_aorta_save_logs`` / ``_aorta_log_{stdout,stderr}`` config keys
-    # let subprocess-based wrappers (whose child output
-    # ``redirect_stdout`` doesn't catch) opt in and write their own
-    # capture to a non-colliding path.
+    # ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys let
+    # subprocess-based wrappers (whose child output ``redirect_stdout``
+    # doesn't catch) opt in and write their own capture to a sibling
+    # path derived from the basename -- the dispatcher already holds
+    # open the ``<basename>.{stdout,stderr}.log`` paths so wrappers
+    # must NOT write to them directly.
+    #
+    # ``encoding="utf-8", errors="backslashreplace"`` is deliberate:
+    # the platform default encoding is locale-dependent (cp1252 on
+    # Windows, ASCII under ``LC_ALL=C``), and a workload printing a
+    # non-ASCII glyph would otherwise raise ``UnicodeEncodeError``
+    # inside ``print()`` -- which the trial's ``except Exception``
+    # would catch and flip the run to ``infrastructure_failed``.
+    # Enabling a debug knob must never break an otherwise-healthy
+    # trial; ``backslashreplace`` keeps the file lossless-enough for
+    # grep without ever raising.
     trial_log_stdout: Path | None = None
     trial_log_stderr: Path | None = None
     if request.save_logs and should_write:
@@ -358,13 +385,16 @@ def _run_single_trial(
         trial_log_stdout = results_dir / f"{log_basename}.stdout.log"
         trial_log_stderr = results_dir / f"{log_basename}.stderr.log"
         config["_aorta_save_logs"] = True
-        config["_aorta_log_stdout"] = str(trial_log_stdout)
-        config["_aorta_log_stderr"] = str(trial_log_stderr)
+        config["_aorta_log_basename"] = log_basename
 
     with contextlib.ExitStack() as log_stack:
         if trial_log_stdout is not None and trial_log_stderr is not None:
-            stdout_fh = log_stack.enter_context(open(trial_log_stdout, "w"))
-            stderr_fh = log_stack.enter_context(open(trial_log_stderr, "w"))
+            stdout_fh = log_stack.enter_context(
+                open(trial_log_stdout, "w", encoding="utf-8", errors="backslashreplace")
+            )
+            stderr_fh = log_stack.enter_context(
+                open(trial_log_stderr, "w", encoding="utf-8", errors="backslashreplace")
+            )
             log_stack.enter_context(contextlib.redirect_stdout(stdout_fh))
             log_stack.enter_context(contextlib.redirect_stderr(stderr_fh))
 

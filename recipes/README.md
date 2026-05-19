@@ -97,8 +97,12 @@ cells:
   that spawn subprocesses (e.g. `recom_repro` invoking `docker run`)
   don't have their subprocess output captured automatically. Those
   wrappers can opt in by reading the platform-supplied
-  `_aorta_save_logs` / `_aorta_log_stdout` / `_aorta_log_stderr` config
-  keys the dispatcher injects when `save_logs=true`.
+  `_aorta_save_logs` / `_aorta_log_basename` config keys the dispatcher
+  injects when `save_logs=true`, and writing their own capture to a
+  sibling path derived from the basename (e.g.
+  `<basename>.subprocess.stdout.log`). The dispatcher already holds the
+  `<basename>.{stdout,stderr}.log` paths open, so wrappers must NOT
+  write to them directly.
 - **`workload_config`** -- optional `dict[str, Any]`, allowed at both
   recipe scope (top level) and per cell. Forwarded to the workload
   constructor through the dispatcher's `Request.config_overrides`. Use

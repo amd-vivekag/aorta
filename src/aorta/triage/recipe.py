@@ -208,9 +208,10 @@ class Recipe:
             process's TTY). Workloads that spawn subprocesses don't have
             their subprocess output captured by ``redirect_*``; those
             wrappers can opt in by reading the platform-supplied
-            ``_aorta_save_logs`` / ``_aorta_log_stdout`` /
-            ``_aorta_log_stderr`` config keys the dispatcher injects
-            when ``save_logs=True``.
+            ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys
+            the dispatcher injects when ``save_logs=True`` and writing
+            their own capture to a sibling path derived from the
+            basename (e.g. ``<basename>.subprocess.stdout.log``).
     """
 
     schema_version: int

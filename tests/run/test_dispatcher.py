@@ -1006,6 +1006,24 @@ class NoisyWorkload(Workload):
         pass
 
 
+class NoisyCrashingWorkload(Workload):
+    """Prints, then raises -- exercises ExitStack flush on exception."""
+
+    launch_mode = "single_process"
+    min_world_size = 1
+
+    def setup(self) -> None:
+        pass
+
+    def run(self) -> WorkloadResult:
+        print("BEFORE-CRASH-STDOUT")
+        print("BEFORE-CRASH-STDERR", file=sys.stderr)
+        raise RuntimeError("boom")
+
+    def cleanup(self) -> None:
+        pass
+
+
 class TestSaveLogs:
     """Per-trial stdout/stderr capture knob (default off)."""
 
@@ -1030,14 +1048,28 @@ class TestSaveLogs:
         assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "STDERR-FROM-WORKLOAD"
 
     def test_on_injects_aorta_log_keys_for_subprocess_wrappers(self, tmp_path):
-        cell_dir = self._run(tmp_path, save_logs=True)
+        self._run(tmp_path, save_logs=True)
         cfg = NoisyWorkload.seen_config
         assert cfg["_aorta_save_logs"] is True
-        assert cfg["_aorta_log_stdout"] == str(cell_dir / "trial_d0_m0_t0.stdout.log")
-        assert cfg["_aorta_log_stderr"] == str(cell_dir / "trial_d0_m0_t0.stderr.log")
+        assert cfg["_aorta_log_basename"] == "trial_d0_m0_t0"
 
     def test_on_non_rank_zero_writes_no_log_files(self, tmp_path):
         with patch.dict(os.environ, {"RANK": "1"}):
             cell_dir = self._run(tmp_path, save_logs=True)
         assert not (cell_dir / "trial_d0_m0_t0.stdout.log").exists()
         assert not (cell_dir / "trial_d0_m0_t0.stderr.log").exists()
+
+    def test_on_captures_output_even_when_workload_raises(self, tmp_path):
+        mock_ep = MagicMock(name="crasher")
+        mock_ep.name = "crasher"
+        mock_ep.load.return_value = NoisyCrashingWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            results = run_trials(
+                RunRequest(workload="crasher", trials=1, results_dir=tmp_path, save_logs=True)
+            )
+        cell_dir = tmp_path / "crasher"
+        assert results[0].exit_status == "infrastructure_failed"
+        assert (cell_dir / "trial_d0_m0_t0.stdout.log").read_text().strip() == "BEFORE-CRASH-STDOUT"
+        assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "BEFORE-CRASH-STDERR"
