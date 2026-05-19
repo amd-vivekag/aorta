@@ -204,14 +204,17 @@ class Recipe:
             in-process ``stdout`` / ``stderr`` writes (via
             ``contextlib.redirect_*``) into per-trial files alongside the
             trial JSON. Default ``False`` preserves today's behaviour
-            (writes go nowhere captured; they appear on the parent
+            (writes are not captured -- they appear on the parent
             process's TTY). Workloads that spawn subprocesses don't have
             their subprocess output captured by ``redirect_*``; those
             wrappers can opt in by reading the platform-supplied
             ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys
-            the dispatcher injects when ``save_logs=True`` and writing
-            their own capture to a sibling path derived from the
-            basename (e.g. ``<basename>.subprocess.stdout.log``).
+            the dispatcher injects and writing their own capture to a
+            sibling path derived from the basename (e.g.
+            ``<basename>.subprocess.stdout.log``). Both file capture and
+            key injection are **rank-0 only** -- matches the trial-JSON
+            write guarantee. Wrappers running on non-rank-0 won't see
+            the keys and should treat capture as off there.
     """
 
     schema_version: int

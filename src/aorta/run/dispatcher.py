@@ -78,7 +78,10 @@ class RunRequest:
             ``stdout`` / ``stderr`` writes to per-trial files alongside
             the trial JSON (``trial_d{d}_m{m}_t{t}.{stdout,stderr}.log``).
             Default ``False`` preserves today's behaviour (no capture).
-            Rank-0 only -- matches the trial-JSON write guarantee.
+            Both file capture and the reserved-key injection described
+            below are **rank-0 only** -- matches the trial-JSON write
+            guarantee. Wrappers running on non-rank-0 won't see the
+            keys and should treat capture as off there.
             ``contextlib.redirect_*`` only catches Python-level writes;
             subprocesses are not captured. Wrappers that own a
             subprocess can opt in by reading the platform-supplied

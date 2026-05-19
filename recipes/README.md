@@ -92,17 +92,19 @@ cells:
 - **`save_logs`** -- optional `bool`, default `false`. When `true`, the
   dispatcher captures the workload's in-process `stdout` / `stderr`
   writes into `trial_d{d}_m{m}_t{t}.{stdout,stderr}.log` files alongside
-  the trial JSON. Rank-0 only (matches the trial-JSON write guarantee).
+  the trial JSON. Both the file capture and the reserved-key injection
+  described below are **rank-0 only** (matches the trial-JSON write
+  guarantee); wrappers running on non-rank-0 won't see the keys and
+  should treat capture as off there.
   `contextlib.redirect_*` only catches Python-level writes; workloads
   that spawn subprocesses (e.g. `recom_repro` invoking `docker run`)
   don't have their subprocess output captured automatically. Those
   wrappers can opt in by reading the platform-supplied
   `_aorta_save_logs` / `_aorta_log_basename` config keys the dispatcher
-  injects when `save_logs=true`, and writing their own capture to a
-  sibling path derived from the basename (e.g.
-  `<basename>.subprocess.stdout.log`). The dispatcher already holds the
-  `<basename>.{stdout,stderr}.log` paths open, so wrappers must NOT
-  write to them directly.
+  injects, and writing their own capture to a sibling path derived from
+  the basename (e.g. `<basename>.subprocess.stdout.log`). The
+  dispatcher already holds the `<basename>.{stdout,stderr}.log` paths
+  open, so wrappers must NOT write to them directly.
 - **`workload_config`** -- optional `dict[str, Any]`, allowed at both
   recipe scope (top level) and per cell. Forwarded to the workload
   constructor through the dispatcher's `Request.config_overrides`. Use
