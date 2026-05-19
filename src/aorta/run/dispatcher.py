@@ -379,25 +379,55 @@ def _run_single_trial(
     # Enabling a debug knob must never break an otherwise-healthy
     # trial; ``backslashreplace`` keeps the file lossless-enough for
     # grep without ever raising.
-    trial_log_stdout: Path | None = None
-    trial_log_stderr: Path | None = None
+    #
+    # The opens happen up-front in their own ``try/except OSError``
+    # for two reasons:
+    #   1. An opt-in debug knob must not crash the run -- if the disk
+    #      is full or the dir lost write permission, we warn and let
+    #      the trial proceed without capture.
+    #   2. We've already mutated ``os.environ`` above with the
+    #      mitigation / extra_env overlay. If an OSError escaped the
+    #      ``with log_stack:`` block below, the env-restore ``finally``
+    #      inside that block would never run and the mitigation vars
+    #      would leak into the caller's process -- corrupting
+    #      subsequent triage cells.
+    # The ``_aorta_*`` config keys are only injected on success so
+    # that wrappers can trust "if you see the keys, capture is on".
+    stdout_fh: Any = None
+    stderr_fh: Any = None
     if request.save_logs and should_write:
         log_basename = (
             f"trial_d{request.dataset_index}_m{request.mitigation_index}_t{trial_idx}"
         )
-        trial_log_stdout = results_dir / f"{log_basename}.stdout.log"
-        trial_log_stderr = results_dir / f"{log_basename}.stderr.log"
-        config["_aorta_save_logs"] = True
-        config["_aorta_log_basename"] = log_basename
+        candidate_stdout = results_dir / f"{log_basename}.stdout.log"
+        candidate_stderr = results_dir / f"{log_basename}.stderr.log"
+        try:
+            stdout_fh = open(
+                candidate_stdout, "w", encoding="utf-8", errors="backslashreplace"
+            )
+            stderr_fh = open(
+                candidate_stderr, "w", encoding="utf-8", errors="backslashreplace"
+            )
+        except OSError as exc:
+            if stdout_fh is not None:
+                stdout_fh.close()
+                stdout_fh = None
+            logger.warning(
+                "save_logs=True but failed to open log files in %s "
+                "(%s: %s); trial '%s' will run without capture.",
+                results_dir,
+                type(exc).__name__,
+                exc,
+                trial_id,
+            )
+        else:
+            config["_aorta_save_logs"] = True
+            config["_aorta_log_basename"] = log_basename
 
     with contextlib.ExitStack() as log_stack:
-        if trial_log_stdout is not None and trial_log_stderr is not None:
-            stdout_fh = log_stack.enter_context(
-                open(trial_log_stdout, "w", encoding="utf-8", errors="backslashreplace")
-            )
-            stderr_fh = log_stack.enter_context(
-                open(trial_log_stderr, "w", encoding="utf-8", errors="backslashreplace")
-            )
+        if stdout_fh is not None and stderr_fh is not None:
+            log_stack.callback(stderr_fh.close)
+            log_stack.callback(stdout_fh.close)
             log_stack.enter_context(contextlib.redirect_stdout(stdout_fh))
             log_stack.enter_context(contextlib.redirect_stderr(stderr_fh))
 

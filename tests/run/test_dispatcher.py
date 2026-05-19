@@ -1073,3 +1073,39 @@ class TestSaveLogs:
         assert results[0].exit_status == "infrastructure_failed"
         assert (cell_dir / "trial_d0_m0_t0.stdout.log").read_text().strip() == "BEFORE-CRASH-STDOUT"
         assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "BEFORE-CRASH-STDERR"
+
+    def test_log_open_failure_degrades_gracefully_and_restores_env(self, tmp_path):
+        """If log-file open() raises, the trial must still run, the env
+        overlay must still be restored (otherwise mitigation vars leak
+        across cells), and the _aorta_* keys must NOT be injected."""
+        real_open = open
+
+        def raising_open(path, *args, **kwargs):
+            if str(path).endswith((".stdout.log", ".stderr.log")):
+                raise PermissionError("simulated log-open failure")
+            return real_open(path, *args, **kwargs)
+
+        os.environ.pop("AORTA_LEAK_PROBE", None)
+        NoisyWorkload.seen_config = {}
+        mock_ep = MagicMock(name="noisy")
+        mock_ep.name = "noisy"
+        mock_ep.load.return_value = NoisyWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps), patch(
+            "builtins.open", side_effect=raising_open
+        ):
+            results = run_trials(
+                RunRequest(
+                    workload="noisy",
+                    trials=1,
+                    results_dir=tmp_path,
+                    save_logs=True,
+                    extra_env={"AORTA_LEAK_PROBE": "leaked"},
+                )
+            )
+        assert results[0].exit_status == "ok"
+        assert not (tmp_path / "noisy" / "trial_d0_m0_t0.stdout.log").exists()
+        assert "AORTA_LEAK_PROBE" not in os.environ, "env overlay leaked when log-open failed"
+        assert "_aorta_save_logs" not in NoisyWorkload.seen_config
+        assert "_aorta_log_basename" not in NoisyWorkload.seen_config
