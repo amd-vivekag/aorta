@@ -17,6 +17,7 @@ ticket: EXAMPLE-001                  # optional; drives output dir grouping
 workload: fsdp                       # required; resolved via aorta.workloads entry-point group
 trials: 8                            # required; per-cell trial count
 steps: 5000                          # required; per-cell step count
+save_logs: false                     # optional; when true, dispatcher writes per-trial stdout/stderr files
 
 confound:
   threshold: 1.15                    # default; > 1.15 -> "speed (+N%)" flag
@@ -88,13 +89,25 @@ cells:
   mitigation bundle, so it can override a registered mitigation's env var
   for one-off experiments without polluting the registry. Recorded in
   `matrix.json` for audit.
+- **`save_logs`** -- optional `bool`, default `false`. When `true`, the
+  dispatcher captures the workload's in-process `stdout` / `stderr`
+  writes into `trial_d{d}_m{m}_t{t}.{stdout,stderr}.log` files alongside
+  the trial JSON. Rank-0 only (matches the trial-JSON write guarantee).
+  `contextlib.redirect_*` only catches Python-level writes; workloads
+  that spawn subprocesses (e.g. `recom_repro` invoking `docker run`)
+  don't have their subprocess output captured automatically. Those
+  wrappers can opt in by reading the platform-supplied
+  `_aorta_save_logs` / `_aorta_log_stdout` / `_aorta_log_stderr` config
+  keys the dispatcher injects when `save_logs=true`.
 - **`workload_config`** -- optional `dict[str, Any]`, allowed at both
   recipe scope (top level) and per cell. Forwarded to the workload
   constructor through the dispatcher's `Request.config_overrides`. Use
   this for workload-specific knobs that aren't env vars -- e.g.
-  `shampoo_api: old` on the `recom_repro` workload to select the V2
-  Meta-internal SHAMPOO entry script. Cell-scope merges over recipe-scope
-  on a per-key basis (cell wins on collision; non-collision keys union),
+  `shampoo_api: old` on the `recom_repro` workload to select the V1
+  flat-kwarg SHAMPOO entry script (both `new` and `old` import from the
+  OSS `distributed_shampoo` package; they differ in constructor shape).
+  Cell-scope merges over recipe-scope on a per-key basis (cell wins on
+  collision; non-collision keys union),
   so a recipe can set a workload-wide default and opt one cell out.
   Reserved keys: `"steps"` (first-class field; would be silently
   overwritten by the dispatcher) and any `_aorta_*` prefix

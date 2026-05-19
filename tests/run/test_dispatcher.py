@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -982,3 +983,61 @@ class TestEnvironmentRestoration:
                 os.environ.pop("TEST_RESTORE_VAR", None)
             else:
                 os.environ["TEST_RESTORE_VAR"] = original_value
+
+
+class NoisyWorkload(Workload):
+    """Workload that writes a marker to stdout + stderr and records the
+    ``_aorta_log_*`` keys the dispatcher injected, for save_logs tests."""
+
+    launch_mode = "single_process"
+    min_world_size = 1
+    seen_config: dict = {}
+
+    def setup(self) -> None:
+        pass
+
+    def run(self) -> WorkloadResult:
+        NoisyWorkload.seen_config = dict(self.config)
+        print("STDOUT-FROM-WORKLOAD")
+        print("STDERR-FROM-WORKLOAD", file=sys.stderr)
+        return WorkloadResult(passed=True)
+
+    def cleanup(self) -> None:
+        pass
+
+
+class TestSaveLogs:
+    """Per-trial stdout/stderr capture knob (default off)."""
+
+    def _run(self, tmp_path, **kw) -> Path:
+        mock_ep = MagicMock(name="noisy")
+        mock_ep.name = "noisy"
+        mock_ep.load.return_value = NoisyWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            run_trials(RunRequest(workload="noisy", trials=1, results_dir=tmp_path, **kw))
+        return tmp_path / "noisy"
+
+    def test_default_off_writes_no_log_files(self, tmp_path):
+        cell_dir = self._run(tmp_path)
+        assert not (cell_dir / "trial_d0_m0_t0.stdout.log").exists()
+        assert not (cell_dir / "trial_d0_m0_t0.stderr.log").exists()
+
+    def test_on_captures_stdout_and_stderr(self, tmp_path):
+        cell_dir = self._run(tmp_path, save_logs=True)
+        assert (cell_dir / "trial_d0_m0_t0.stdout.log").read_text().strip() == "STDOUT-FROM-WORKLOAD"
+        assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "STDERR-FROM-WORKLOAD"
+
+    def test_on_injects_aorta_log_keys_for_subprocess_wrappers(self, tmp_path):
+        cell_dir = self._run(tmp_path, save_logs=True)
+        cfg = NoisyWorkload.seen_config
+        assert cfg["_aorta_save_logs"] is True
+        assert cfg["_aorta_log_stdout"] == str(cell_dir / "trial_d0_m0_t0.stdout.log")
+        assert cfg["_aorta_log_stderr"] == str(cell_dir / "trial_d0_m0_t0.stderr.log")
+
+    def test_on_non_rank_zero_writes_no_log_files(self, tmp_path):
+        with patch.dict(os.environ, {"RANK": "1"}):
+            cell_dir = self._run(tmp_path, save_logs=True)
+        assert not (cell_dir / "trial_d0_m0_t0.stdout.log").exists()
+        assert not (cell_dir / "trial_d0_m0_t0.stderr.log").exists()

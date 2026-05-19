@@ -571,6 +571,7 @@ def _run_one_cell(
         config_overrides=merged_workload_config,
         results_dir=cell_dir,
         sidecar_files=sidecar_files,
+        save_logs=recipe.save_logs,
     )
 
     try:

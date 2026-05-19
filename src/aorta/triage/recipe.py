@@ -46,6 +46,7 @@ _VALID_TOP_LEVEL = frozenset(
         "confound",
         "cells",
         "workload_config",
+        "save_logs",
     }
 )
 _VALID_CONFOUND_KEYS = frozenset({"threshold", "baseline_cell"})
@@ -199,6 +200,17 @@ class Recipe:
             (cell wins on collision; non-collision keys union). Empty dict
             when the recipe omits the field -- behaviourally identical to
             today's recipes.
+        save_logs: When ``True``, the dispatcher captures the workload's
+            in-process ``stdout`` / ``stderr`` writes (via
+            ``contextlib.redirect_*``) into per-trial files alongside the
+            trial JSON. Default ``False`` preserves today's behaviour
+            (writes go nowhere captured; they appear on the parent
+            process's TTY). Workloads that spawn subprocesses don't have
+            their subprocess output captured by ``redirect_*``; those
+            wrappers can opt in by reading the platform-supplied
+            ``_aorta_save_logs`` / ``_aorta_log_stdout`` /
+            ``_aorta_log_stderr`` config keys the dispatcher injects
+            when ``save_logs=True``.
     """
 
     schema_version: int
@@ -213,6 +225,7 @@ class Recipe:
     source_path: Path | None = None
     source_sha256: str | None = None
     workload_config: dict[str, Any] = field(default_factory=dict)
+    save_logs: bool = False
 
 
 def inline_env_name(docker_ref: str) -> str:
@@ -635,6 +648,12 @@ def _build_recipe(
     confound = _parse_confound("recipe", data.get("confound"))
     workload_config = _parse_workload_config("recipe", data.get("workload_config"))
 
+    raw_save_logs = data.get("save_logs", False)
+    if not isinstance(raw_save_logs, bool):
+        raise RecipeSchemaError(
+            f"recipe.save_logs: must be a boolean, got {type(raw_save_logs).__name__}"
+        )
+
     raw_cells = data["cells"]
     if not isinstance(raw_cells, list) or not raw_cells:
         raise RecipeSchemaError(f"recipe.cells: must be a non-empty list, got {raw_cells!r}")
@@ -668,6 +687,7 @@ def _build_recipe(
         source_path=source_path,
         source_sha256=source_sha256,
         workload_config=workload_config,
+        save_logs=raw_save_logs,
     )
 
 
