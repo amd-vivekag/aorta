@@ -1467,6 +1467,143 @@ class TestCliSummaryAndFieldFlags:
         assert payload["schema_version"] == env_mod.SCHEMA_VERSION
 
 
+class TestProbeBuckTimeoutValidation:
+    """Per Copilot review on PR #165: ``--buck-timeout`` must reject
+    values <= 0 at arg-parse time. ``subprocess.run(timeout=...)``
+    raises ``ValueError`` on a non-positive timeout, which would
+    short-circuit the buck audit into the never-raises fallback path
+    instead of failing loudly. Catching it in Click means the operator
+    sees the typo, not a silent "no introspection done".
+    """
+
+    @staticmethod
+    def _cli_mod():
+        cli_path = Path(env_mod.__file__).parent.parent / "cli" / "env.py"
+        spec = importlib.util.spec_from_file_location(
+            "aorta.cli.env", cli_path,
+        )
+        cli_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cli_mod
+        spec.loader.exec_module(cli_mod)
+        return cli_mod
+
+    @pytest.mark.parametrize("bad_value", ["0", "-1", "-100"])
+    def test_buck_timeout_non_positive_rejected_by_click(
+        self, bad_value, all_disabled, tmp_path: Path,
+    ):
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--buck-timeout", bad_value, "--summary"],
+            )
+            assert result.exit_code != 0
+            # Click's IntRange formatting names the option and the
+            # offending value; assert on stable text.
+            lower = result.output.lower()
+            assert "buck-timeout" in lower
+            assert "invalid value" in lower or "not in the range" in lower
+            # No Python traceback should leak.
+            assert "Traceback" not in result.output
+
+    def test_buck_timeout_positive_value_accepted(
+        self, all_disabled, tmp_path: Path,
+    ):
+        """Sanity: any value >= 1 still parses (no regression on the
+        documented default of 10 or any other reasonable override).
+        """
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(
+                cli_mod.env,
+                ["probe", "--buck-timeout", "5", "--summary"],
+            )
+            assert result.exit_code == 0, result.output
+
+
+class TestProbeWritesUtf8:
+    """Per Copilot review on PR #181: `aorta env probe` must write
+    env.json with `encoding="utf-8"` so the symmetric
+    `aorta env recipe` reader (which forces utf-8) can always read it
+    back, regardless of the host's default encoding. Without this,
+    a non-UTF-8 default locale (e.g. cp1252) on the producing host
+    could silently produce a file that the consumer refuses to decode.
+    """
+
+    @staticmethod
+    def _cli_mod():
+        cli_path = Path(env_mod.__file__).parent.parent / "cli" / "env.py"
+        spec = importlib.util.spec_from_file_location(
+            "aorta.cli.env", cli_path,
+        )
+        cli_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cli_mod
+        spec.loader.exec_module(cli_mod)
+        return cli_mod
+
+    def test_probe_passes_utf8_encoding_to_write_text(
+        self, all_disabled, tmp_path: Path,
+    ):
+        """Direct regression guard: patch ``Path.write_text`` and
+        assert ``encoding="utf-8"`` is in the call. This is the only
+        unambiguous way to assert the writer side of the round-trip
+        contract without manufacturing a non-UTF-8 host environment.
+        """
+        from click.testing import CliRunner
+
+        captured_kwargs: dict = {}
+        original_write_text = Path.write_text
+
+        def fake_write_text(self, *args, **kwargs):
+            # Capture the kwargs the CLI passed and then delegate to
+            # the real implementation so the file actually lands and
+            # the rest of the CLI path (echoes, summary, etc.) runs.
+            captured_kwargs.update(kwargs)
+            return original_write_text(self, *args, **kwargs)
+
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        out = tmp_path / "env.json"
+        with patch.object(Path, "write_text", fake_write_text):
+            result = runner.invoke(cli_mod.env, ["probe", "-o", str(out)])
+
+        assert result.exit_code == 0, result.output
+        assert captured_kwargs.get("encoding") == "utf-8", (
+            f"probe must pass encoding='utf-8' to write_text; "
+            f"got kwargs={captured_kwargs}"
+        )
+
+    def test_probe_then_recipe_round_trip_succeeds(
+        self, all_disabled, tmp_path: Path,
+    ):
+        """End-to-end: write a snapshot with ``probe``, then read it
+        with ``recipe`` and confirm the recipe is emitted. This is the
+        operator-visible contract Copilot's comment was protecting.
+        """
+        from click.testing import CliRunner
+        cli_mod = self._cli_mod()
+        runner = CliRunner()
+        out = tmp_path / "env.json"
+
+        probe_result = runner.invoke(cli_mod.env, ["probe", "-o", str(out)])
+        assert probe_result.exit_code == 0, probe_result.output
+        assert out.exists()
+
+        # The file must be valid UTF-8.
+        decoded = out.read_text(encoding="utf-8")
+        assert "schema_version" in decoded
+
+        recipe_result = runner.invoke(
+            cli_mod.env, ["recipe", str(out), "--format", "buck"]
+        )
+        assert recipe_result.exit_code == 0, recipe_result.output
+        assert "BEST-EFFORT, NOT EXACT" in recipe_result.output
+
+
 # ---------------------------------------------------------------------------
 # RDHC wrapper
 # ---------------------------------------------------------------------------
