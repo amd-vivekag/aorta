@@ -190,8 +190,19 @@ def _varying_workload_config_keys(cell_stats: list[CellStats]) -> list[str]:
 
 
 def _canon(value: Any) -> str:
-    """Stable canonical form for cross-cell value comparison."""
-    return json.dumps(value, sort_keys=True, default=repr)
+    """Stable canonical form for cross-cell value comparison.
+
+    ``json.dumps`` can still raise even with ``default=repr``: circular
+    references are detected before the ``default`` callback runs, and a
+    user-defined ``__repr__`` could itself raise from inside ``default``.
+    Fall back to bare ``repr`` so a pathological workload_config value
+    can never crash matrix rendering -- Python's ``repr`` handles
+    circular structures natively (prints ``[[...]]``).
+    """
+    try:
+        return json.dumps(value, sort_keys=True, default=repr)
+    except (ValueError, TypeError):
+        return repr(value)
 
 
 def _escape_md_cell(s: str) -> str:
