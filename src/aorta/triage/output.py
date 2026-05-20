@@ -168,8 +168,14 @@ def _varying_workload_config_keys(cell_stats: list[CellStats]) -> list[str]:
     "Effective value" includes absence -- a cell that omits a key is
     distinct from one that sets it. ``repr`` is used for the equality
     comparison so unhashable values (e.g. dict, list) don't blow up the
-    set construction. Returns ``[]`` when no cell has workload_config or
-    when every cell agrees on every key.
+    set construction, and ``sort_keys=True`` keeps the canonical form
+    stable across insertion-order differences -- ``{a:1,b:2}`` and
+    ``{b:2,a:1}`` are semantically equal but ``repr``-different in
+    Python 3.7+, which would otherwise flag spurious "varying" keys
+    from programmatically-generated recipes. ``default=repr`` falls
+    back for the absent-key sentinel and any non-JSON values.
+    Returns ``[]`` when no cell has workload_config or when every cell
+    agrees on every key.
     """
     all_keys: set[str] = set()
     for c in cell_stats:
@@ -179,8 +185,18 @@ def _varying_workload_config_keys(cell_stats: list[CellStats]) -> list[str]:
     return sorted(
         k
         for k in all_keys
-        if len({repr(c.workload_config.get(k, _CONFIG_KEY_ABSENT)) for c in cell_stats}) > 1
+        if len({_canon(c.workload_config.get(k, _CONFIG_KEY_ABSENT)) for c in cell_stats}) > 1
     )
+
+
+def _canon(value: Any) -> str:
+    """Stable canonical form for cross-cell value comparison."""
+    return json.dumps(value, sort_keys=True, default=repr)
+
+
+def _escape_md_cell(s: str) -> str:
+    """Escape characters that would break a markdown table row."""
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
 
 
 def _format_workload_config(cell: CellStats, varying_keys: list[str]) -> str:
@@ -190,8 +206,15 @@ def _format_workload_config(cell: CellStats, varying_keys: list[str]) -> str:
     the cell has none of the varying keys at all, render ``"—"`` so the
     column stays width-aligned. ``str(value)`` keeps scalar values
     unquoted (``shampoo_api=old`` rather than ``shampoo_api='old'``).
+    Values are passed through ``_escape_md_cell`` so a ``|`` or newline
+    in a workload_config value (workload_config is not schema-validated)
+    can't break the markdown table layout.
     """
-    parts = [f"{k}={cell.workload_config[k]}" for k in varying_keys if k in cell.workload_config]
+    parts = [
+        f"{k}={_escape_md_cell(str(cell.workload_config[k]))}"
+        for k in varying_keys
+        if k in cell.workload_config
+    ]
     return ", ".join(parts) if parts else "—"
 
 

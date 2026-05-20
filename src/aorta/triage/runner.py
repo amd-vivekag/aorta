@@ -799,9 +799,14 @@ def run_recipe(
             )
 
         # Mirror _run_one_cell's merge so CellStats.workload_config records
-        # what the dispatcher actually constructed the workload with. Cell-
-        # scope wins on collision; non-collision keys union with recipe-
-        # scope. Stays {} when neither scope sets workload_config.
+        # the effective user-supplied ``config_overrides`` for the cell
+        # (recipe-scope + cell-scope workload_config merged; cell wins on
+        # collision; non-collision keys union). NOT the full runtime config
+        # the dispatcher constructs -- the dispatcher additionally injects
+        # ``steps`` and ``_aorta_*`` keys (e.g. ``_aorta_environment``,
+        # ``_aorta_save_logs``) which are runtime/platform-supplied and
+        # deliberately not surfaced in the matrix. Stays {} when neither
+        # scope sets workload_config.
         stats = aggregate_cell(
             name=cell.name,
             mitigations=tuple(cell.mitigations),
