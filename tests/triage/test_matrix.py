@@ -731,3 +731,18 @@ def test_error_cell_outcome_counts_empty_and_iters_display_dash():
     assert stats.outcome_counts == {}
     assert stats.iters_display == "—"
     assert stats.configured_iters is None
+
+
+def test_workload_config_defaults_to_empty_dict():
+    assert _default_call(trials=[_trial()]).workload_config == {}
+
+
+def test_workload_config_persisted_on_cellstats():
+    stats = _default_call(trials=[_trial()], workload_config={"shampoo_api": "old"})
+    assert stats.workload_config == {"shampoo_api": "old"}
+
+
+def test_workload_config_persisted_on_error_cell():
+    stats = _default_call(trials=[_trial()], error="docker pull failed",
+                          workload_config={"shampoo_api": "old"})
+    assert stats.workload_config == {"shampoo_api": "old"}

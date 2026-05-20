@@ -180,6 +180,11 @@ failure is localisable without reading the loader source.
 - `resolved_env_vars` -- the env-var bundle as actually applied (mitigation
   union + `extra_env`).
 - `resolved_environment` -- the resolved `Environment` descriptor.
+- `workload_config` -- the merged per-cell `workload_config` dict (recipe
+  scope union cell scope, cell wins on collision). Empty `{}` when neither
+  scope sets it. `matrix.md` surfaces keys whose value varies across cells
+  in a `Config` column (diffs only; the column is hidden when no cell has
+  workload_config or when every cell agrees on every key).
 - `trial_paths` -- per-trial JSON paths, sorted by trial index (NOT
   lexicographically, so `trial_2.json` precedes `trial_10.json`).
 

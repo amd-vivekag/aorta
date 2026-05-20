@@ -159,6 +159,76 @@ def _format_confound(tag: ConfoundTag) -> str:
     return str(tag)
 
 
+_CONFIG_KEY_ABSENT = object()
+
+
+def _varying_workload_config_keys(cell_stats: list[CellStats]) -> list[str]:
+    """Sorted keys whose effective value differs across cells.
+
+    "Effective value" includes absence -- a cell that omits a key is
+    distinct from one that sets it. ``repr`` is used for the equality
+    comparison so unhashable values (e.g. dict, list) don't blow up the
+    set construction, and ``sort_keys=True`` keeps the canonical form
+    stable across insertion-order differences -- ``{a:1,b:2}`` and
+    ``{b:2,a:1}`` are semantically equal but ``repr``-different in
+    Python 3.7+, which would otherwise flag spurious "varying" keys
+    from programmatically-generated recipes. ``default=repr`` falls
+    back for the absent-key sentinel and any non-JSON values.
+    Returns ``[]`` when no cell has workload_config or when every cell
+    agrees on every key.
+    """
+    all_keys: set[str] = set()
+    for c in cell_stats:
+        all_keys.update(c.workload_config.keys())
+    if not all_keys:
+        return []
+    return sorted(
+        k
+        for k in all_keys
+        if len({_canon(c.workload_config.get(k, _CONFIG_KEY_ABSENT)) for c in cell_stats}) > 1
+    )
+
+
+def _canon(value: Any) -> str:
+    """Stable canonical form for cross-cell value comparison.
+
+    ``json.dumps`` can still raise even with ``default=repr``: circular
+    references are detected before the ``default`` callback runs, and a
+    user-defined ``__repr__`` could itself raise from inside ``default``.
+    Fall back to bare ``repr`` so a pathological workload_config value
+    can never crash matrix rendering -- Python's ``repr`` handles
+    circular structures natively (prints ``[[...]]``).
+    """
+    try:
+        return json.dumps(value, sort_keys=True, default=repr)
+    except (ValueError, TypeError):
+        return repr(value)
+
+
+def _escape_md_cell(s: str) -> str:
+    """Escape characters that would break a markdown table row."""
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+def _format_workload_config(cell: CellStats, varying_keys: list[str]) -> str:
+    """Render only the varying-key subset of one cell's workload_config.
+
+    Keys omitted from the cell render nothing (no ``key=—`` noise). When
+    the cell has none of the varying keys at all, render ``"—"`` so the
+    column stays width-aligned. ``str(value)`` keeps scalar values
+    unquoted (``shampoo_api=old`` rather than ``shampoo_api='old'``).
+    Values are passed through ``_escape_md_cell`` so a ``|`` or newline
+    in a workload_config value (workload_config is not schema-validated)
+    can't break the markdown table layout.
+    """
+    parts = [
+        f"{k}={_escape_md_cell(str(cell.workload_config[k]))}"
+        for k in varying_keys
+        if k in cell.workload_config
+    ]
+    return ", ".join(parts) if parts else "—"
+
+
 def _render_failure_hints(cell_stats: list[CellStats]) -> list[str]:
     """Build the ``## Failure hints`` section for matrix.md.
 
@@ -233,13 +303,22 @@ def write_matrix_md(
     # contradiction itself is exactly what an operator needs to see --
     # hiding the column would silently swallow it.
     show_iters = any(c.iters_display != "—" for c in cell_stats)
+    # Config column surfaces per-cell workload_config keys whose values
+    # vary across cells -- e.g. ``shampoo_api=old`` when one cell flips
+    # the optimizer API and others don't. Hidden entirely when no cell
+    # has workload_config, or when every cell agrees on every key.
+    # ``Confound`` stays unchanged: this column carries the disambiguation,
+    # not a new confound tag.
+    varying_config_keys = _varying_workload_config_keys(cell_stats)
+    show_config = bool(varying_config_keys)
     header_cells: list[str] = [
         "Cell",
         "Mitigations",
         "Environment",
-        "Failure rate",
-        "Failures",
     ]
+    if show_config:
+        header_cells.append("Config")
+    header_cells.extend(["Failure rate", "Failures"])
     if show_iters:
         header_cells.append("Iters")
     header_cells.extend(["Mean step (ms)", "Confound"])
@@ -251,9 +330,10 @@ def write_matrix_md(
             cell.name,
             _format_mitigations(cell.mitigations),
             cell.environment,
-            _format_failure_rate(cell),
-            _format_failures(cell),
         ]
+        if show_config:
+            row.append(_format_workload_config(cell, varying_config_keys))
+        row.extend([_format_failure_rate(cell), _format_failures(cell)])
         if show_iters:
             row.append(cell.iters_display)
         row.extend([_format_step_ms(cell), _format_confound(tag)])
@@ -323,6 +403,17 @@ def write_matrix_md(
             "on the configured count (defensive; should not happen under a single recipe). "
             "`—` = workload didn't track iterations. The column is hidden entirely "
             "when no cell in the matrix populates the new field."
+        )
+    if show_config:
+        lines.append(
+            "- `Config` -- per-cell `workload_config` keys whose value differs across "
+            "cells (rendered `key=value, key2=value2`). Only varying keys appear, so "
+            "a key set identically by every cell stays hidden. `—` means the cell "
+            "has none of the varying keys. Confound classification is unchanged; this "
+            "column carries the disambiguation when two otherwise-identical rows "
+            "behave differently because of a workload knob (e.g. `shampoo_api=old` "
+            "selecting the V1 SHAMPOO entry script). The column is hidden entirely "
+            "when no cell sets `workload_config`, or when every cell agrees on every key."
         )
     lines.append(
         "- `Failures` is `failed_count / trial_count` (e.g. `3 / 8` = three failed out "
