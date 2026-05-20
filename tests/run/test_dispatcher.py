@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1048,3 +1049,129 @@ class TestEnvironmentRestoration:
                 os.environ.pop("TEST_RESTORE_VAR", None)
             else:
                 os.environ["TEST_RESTORE_VAR"] = original_value
+
+
+class NoisyWorkload(Workload):
+    """Workload that writes a marker to stdout + stderr and records the
+    ``_aorta_log_*`` keys the dispatcher injected, for save_logs tests."""
+
+    launch_mode = "single_process"
+    min_world_size = 1
+    seen_config: dict = {}
+
+    def setup(self) -> None:
+        pass
+
+    def run(self) -> WorkloadResult:
+        NoisyWorkload.seen_config = dict(self.config)
+        print("STDOUT-FROM-WORKLOAD")
+        print("STDERR-FROM-WORKLOAD", file=sys.stderr)
+        return WorkloadResult(passed=True)
+
+    def cleanup(self) -> None:
+        pass
+
+
+class NoisyCrashingWorkload(Workload):
+    """Prints, then raises -- exercises ExitStack flush on exception."""
+
+    launch_mode = "single_process"
+    min_world_size = 1
+
+    def setup(self) -> None:
+        pass
+
+    def run(self) -> WorkloadResult:
+        print("BEFORE-CRASH-STDOUT")
+        print("BEFORE-CRASH-STDERR", file=sys.stderr)
+        raise RuntimeError("boom")
+
+    def cleanup(self) -> None:
+        pass
+
+
+class TestSaveLogs:
+    """Per-trial stdout/stderr capture knob (default off)."""
+
+    def _run(self, tmp_path, **kw) -> Path:
+        mock_ep = MagicMock(name="noisy")
+        mock_ep.name = "noisy"
+        mock_ep.load.return_value = NoisyWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            run_trials(RunRequest(workload="noisy", trials=1, results_dir=tmp_path, **kw))
+        return tmp_path / "noisy"
+
+    def test_default_off_writes_no_log_files(self, tmp_path):
+        cell_dir = self._run(tmp_path)
+        assert not (cell_dir / "trial_d0_m0_t0.stdout.log").exists()
+        assert not (cell_dir / "trial_d0_m0_t0.stderr.log").exists()
+
+    def test_on_captures_stdout_and_stderr(self, tmp_path):
+        cell_dir = self._run(tmp_path, save_logs=True)
+        assert (cell_dir / "trial_d0_m0_t0.stdout.log").read_text().strip() == "STDOUT-FROM-WORKLOAD"
+        assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "STDERR-FROM-WORKLOAD"
+
+    def test_on_injects_aorta_log_keys_for_subprocess_wrappers(self, tmp_path):
+        self._run(tmp_path, save_logs=True)
+        cfg = NoisyWorkload.seen_config
+        assert cfg["_aorta_save_logs"] is True
+        assert cfg["_aorta_log_basename"] == "trial_d0_m0_t0"
+
+    def test_on_non_rank_zero_writes_no_log_files(self, tmp_path):
+        with patch.dict(os.environ, {"RANK": "1"}):
+            cell_dir = self._run(tmp_path, save_logs=True)
+        assert not (cell_dir / "trial_d0_m0_t0.stdout.log").exists()
+        assert not (cell_dir / "trial_d0_m0_t0.stderr.log").exists()
+
+    def test_on_captures_output_even_when_workload_raises(self, tmp_path):
+        mock_ep = MagicMock(name="crasher")
+        mock_ep.name = "crasher"
+        mock_ep.load.return_value = NoisyCrashingWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            results = run_trials(
+                RunRequest(workload="crasher", trials=1, results_dir=tmp_path, save_logs=True)
+            )
+        cell_dir = tmp_path / "crasher"
+        assert results[0].exit_status == "infrastructure_failed"
+        assert (cell_dir / "trial_d0_m0_t0.stdout.log").read_text().strip() == "BEFORE-CRASH-STDOUT"
+        assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "BEFORE-CRASH-STDERR"
+
+    def test_log_open_failure_degrades_gracefully_and_restores_env(self, tmp_path):
+        """If log-file open() raises, the trial must still run, the env
+        overlay must still be restored (otherwise mitigation vars leak
+        across cells), and the _aorta_* keys must NOT be injected."""
+        real_open = open
+
+        def raising_open(path, *args, **kwargs):
+            if str(path).endswith((".stdout.log", ".stderr.log")):
+                raise PermissionError("simulated log-open failure")
+            return real_open(path, *args, **kwargs)
+
+        os.environ.pop("AORTA_LEAK_PROBE", None)
+        NoisyWorkload.seen_config = {}
+        mock_ep = MagicMock(name="noisy")
+        mock_ep.name = "noisy"
+        mock_ep.load.return_value = NoisyWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps), patch(
+            "builtins.open", side_effect=raising_open
+        ):
+            results = run_trials(
+                RunRequest(
+                    workload="noisy",
+                    trials=1,
+                    results_dir=tmp_path,
+                    save_logs=True,
+                    extra_env={"AORTA_LEAK_PROBE": "leaked"},
+                )
+            )
+        assert results[0].exit_status == "ok"
+        assert not (tmp_path / "noisy" / "trial_d0_m0_t0.stdout.log").exists()
+        assert "AORTA_LEAK_PROBE" not in os.environ, "env overlay leaked when log-open failed"
+        assert "_aorta_save_logs" not in NoisyWorkload.seen_config
+        assert "_aorta_log_basename" not in NoisyWorkload.seen_config

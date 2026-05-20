@@ -8,6 +8,7 @@ The dispatcher is the core of `aorta run`. It:
 5. Persists results as JSON (rank 0 only for distributed)
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -73,6 +74,34 @@ class RunRequest:
             rationale as ``dataset_index``).  ``aorta triage`` varies
             this across its mitigation axis; ``aorta run`` always emits
             ``m0``.
+        save_logs: When ``True``, capture the workload's in-process
+            ``stdout`` / ``stderr`` writes to per-trial files alongside
+            the trial JSON (``trial_d{d}_m{m}_t{t}.{stdout,stderr}.log``).
+            Default ``False`` preserves today's behaviour (no capture).
+            Both file capture and the reserved-key injection described
+            below are **rank-0 only** -- matches the trial-JSON write
+            guarantee. Wrappers running on non-rank-0 won't see the
+            keys and should treat capture as off there.
+            ``contextlib.redirect_*`` only catches Python-level writes;
+            subprocesses are not captured. Wrappers that own a
+            subprocess can opt in by reading the platform-supplied
+            ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys
+            this dispatcher injects; the basename is the trial filename
+            stem (e.g. ``trial_d0_m0_t0``) and the wrapper derives a
+            non-colliding sibling path such as
+            ``<basename>.subprocess.{stdout,stderr}.log`` -- the
+            dispatcher already holds open the
+            ``<basename>.{stdout,stderr}.log`` paths and double-writing
+            them would race.
+
+            The ``redirect_*`` rebinding is process-wide. Today no
+            caller invokes ``run_trials`` from multiple threads
+            concurrently (``aorta run`` is one cell, ``aorta triage``
+            iterates cells serially), so cross-thread crosstalk is
+            theoretical. If that ever changes, this knob would need a
+            different capture mechanism -- this mirrors the same
+            single-caller assumption the env-restore block on this
+            function relies on.
     """
 
     workload: str
@@ -87,6 +116,7 @@ class RunRequest:
     sidecar_files: tuple[Path, ...] = field(default_factory=tuple)
     dataset_index: int = 0
     mitigation_index: int = 0
+    save_logs: bool = False
 
     def __post_init__(self) -> None:
         # Defensively deep-copy mutable dict fields.  ``frozen=True``
@@ -335,65 +365,144 @@ def _run_single_trial(
     workload_result: WorkloadResult
     workload: Workload | None = None
 
-    try:
-        # Construct positionally to match the documented Workload(config)
-        # contract -- third-party plugins are free to name their first
-        # parameter something other than ``config``.
-        workload = workload_cls(config)
-        workload.setup()
-        workload_result = workload.run()
-
-        if not workload_result.passed:
-            exit_status = "workload_failed"
-
-    except Exception as e:
-        exit_status = "infrastructure_failed"
-        # Create error WorkloadResult
-        workload_result = WorkloadResult(
-            passed=False,
-            failure_count=1,
-            failure_details=[{"error": str(e), "type": type(e).__name__}],
+    # ``save_logs`` opens per-trial log files and redirects
+    # ``sys.stdout`` / ``sys.stderr`` for the duration of
+    # ``setup()`` + ``run()`` + ``cleanup()``. The reserved
+    # ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys let
+    # subprocess-based wrappers (whose child output ``redirect_stdout``
+    # doesn't catch) opt in and write their own capture to a sibling
+    # path derived from the basename -- the dispatcher already holds
+    # open the ``<basename>.{stdout,stderr}.log`` paths so wrappers
+    # must NOT write to them directly.
+    #
+    # ``encoding="utf-8", errors="backslashreplace"`` is deliberate:
+    # the platform default encoding is locale-dependent (cp1252 on
+    # Windows, ASCII under ``LC_ALL=C``), and a workload printing a
+    # non-ASCII glyph would otherwise raise ``UnicodeEncodeError``
+    # inside ``print()`` -- which the trial's ``except Exception``
+    # would catch and flip the run to ``infrastructure_failed``.
+    # Enabling a debug knob must never break an otherwise-healthy
+    # trial; ``backslashreplace`` keeps the file lossless-enough for
+    # grep without ever raising.
+    #
+    # The opens happen up-front in their own ``try/except OSError``
+    # for two reasons:
+    #   1. An opt-in debug knob must not crash the run -- if the disk
+    #      is full or the dir lost write permission, we warn and let
+    #      the trial proceed without capture.
+    #   2. We've already mutated ``os.environ`` above with the
+    #      mitigation / extra_env overlay. If an OSError escaped the
+    #      ``with log_stack:`` block below, the env-restore ``finally``
+    #      inside that block would never run and the mitigation vars
+    #      would leak into the caller's process -- corrupting
+    #      subsequent triage cells.
+    # The ``_aorta_*`` config keys are only injected on success so
+    # that wrappers can trust "if you see the keys, capture is on".
+    stdout_fh: Any = None
+    stderr_fh: Any = None
+    if request.save_logs and should_write:
+        log_basename = (
+            f"trial_d{request.dataset_index}_m{request.mitigation_index}_t{trial_idx}"
         )
+        candidate_stdout = results_dir / f"{log_basename}.stdout.log"
+        candidate_stderr = results_dir / f"{log_basename}.stderr.log"
+        try:
+            stdout_fh = open(
+                candidate_stdout, "w", encoding="utf-8", errors="backslashreplace"
+            )
+            stderr_fh = open(
+                candidate_stderr, "w", encoding="utf-8", errors="backslashreplace"
+            )
+        except OSError as exc:
+            if stdout_fh is not None:
+                stdout_fh.close()
+                stdout_fh = None
+            # Best-effort cleanup so a 0-byte stub doesn't masquerade
+            # as the trial's captured output -- if stdout opened but
+            # stderr failed, the empty stdout.log is still on disk.
+            for path in (candidate_stdout, candidate_stderr):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            logger.warning(
+                "save_logs=True but failed to open log files in %s "
+                "(%s: %s); trial '%s' will run without capture.",
+                results_dir,
+                type(exc).__name__,
+                exc,
+                trial_id,
+            )
+        else:
+            config["_aorta_save_logs"] = True
+            config["_aorta_log_basename"] = log_basename
 
-    finally:
-        # Always attempt cleanup if the workload was constructed, even
-        # when setup()/run() raised -- otherwise we leak GPU memory,
-        # process groups, file handles, etc.  Cleanup failures are not
-        # allowed to mask the original exception/exit_status.
-        if workload is not None:
-            try:
-                workload.cleanup()
-            except Exception as cleanup_exc:
-                # Log -- silently swallowing makes leaked GPU memory /
-                # process groups invisible to the operator.  Use
-                # ``exc_info=True`` so the original traceback survives.
-                logger.warning(
-                    "workload.cleanup() raised %s during trial '%s'; "
-                    "continuing so the original outcome is preserved.",
-                    type(cleanup_exc).__name__,
-                    trial_id,
-                    exc_info=True,
-                )
-        # Restore environment by diff against the pre-trial snapshot.
-        # We deliberately do NOT use ``os.environ.clear() +
-        # os.environ.update(snapshot)`` -- ``run_trials`` is a public
-        # library API and ``clear()`` would, for an instant, blank the
-        # entire environment for every other thread in the process.
-        # The diff approach has no such window: each key transitions
-        # at most once, directly to its target value.
-        current_keys = set(os.environ)
-        saved_keys = set(pre_trial_env)
-        for key in current_keys - saved_keys:
-            # Added during the trial (mitigation / extra_env / workload
-            # setup) -- remove.
-            del os.environ[key]
-        for key, value in pre_trial_env.items():
-            # Restore both the keys we overwrote and any workload-side
-            # mutations to pre-existing keys.  ``os.environ.get`` is
-            # cheap; this skip avoids a redundant write when the value
-            # is already correct.
-            if os.environ.get(key) != value:
-                os.environ[key] = value
+    with contextlib.ExitStack() as log_stack:
+        if stdout_fh is not None and stderr_fh is not None:
+            log_stack.callback(stderr_fh.close)
+            log_stack.callback(stdout_fh.close)
+            log_stack.enter_context(contextlib.redirect_stdout(stdout_fh))
+            log_stack.enter_context(contextlib.redirect_stderr(stderr_fh))
+
+        try:
+            # Construct positionally to match the documented Workload(config)
+            # contract -- third-party plugins are free to name their first
+            # parameter something other than ``config``.
+            workload = workload_cls(config)
+            workload.setup()
+            workload_result = workload.run()
+
+            if not workload_result.passed:
+                exit_status = "workload_failed"
+
+        except Exception as e:
+            exit_status = "infrastructure_failed"
+            # Create error WorkloadResult
+            workload_result = WorkloadResult(
+                passed=False,
+                failure_count=1,
+                failure_details=[{"error": str(e), "type": type(e).__name__}],
+            )
+
+        finally:
+            # Always attempt cleanup if the workload was constructed, even
+            # when setup()/run() raised -- otherwise we leak GPU memory,
+            # process groups, file handles, etc.  Cleanup failures are not
+            # allowed to mask the original exception/exit_status.
+            if workload is not None:
+                try:
+                    workload.cleanup()
+                except Exception as cleanup_exc:
+                    # Log -- silently swallowing makes leaked GPU memory /
+                    # process groups invisible to the operator.  Use
+                    # ``exc_info=True`` so the original traceback survives.
+                    logger.warning(
+                        "workload.cleanup() raised %s during trial '%s'; "
+                        "continuing so the original outcome is preserved.",
+                        type(cleanup_exc).__name__,
+                        trial_id,
+                        exc_info=True,
+                    )
+            # Restore environment by diff against the pre-trial snapshot.
+            # We deliberately do NOT use ``os.environ.clear() +
+            # os.environ.update(snapshot)`` -- ``run_trials`` is a public
+            # library API and ``clear()`` would, for an instant, blank the
+            # entire environment for every other thread in the process.
+            # The diff approach has no such window: each key transitions
+            # at most once, directly to its target value.
+            current_keys = set(os.environ)
+            saved_keys = set(pre_trial_env)
+            for key in current_keys - saved_keys:
+                # Added during the trial (mitigation / extra_env / workload
+                # setup) -- remove.
+                del os.environ[key]
+            for key, value in pre_trial_env.items():
+                # Restore both the keys we overwrote and any workload-side
+                # mutations to pre-existing keys.  ``os.environ.get`` is
+                # cheap; this skip avoids a redundant write when the value
+                # is already correct.
+                if os.environ.get(key) != value:
+                    os.environ[key] = value
 
     wall_clock = time.perf_counter() - start_time
 
