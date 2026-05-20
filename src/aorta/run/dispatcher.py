@@ -412,6 +412,14 @@ def _run_single_trial(
             if stdout_fh is not None:
                 stdout_fh.close()
                 stdout_fh = None
+            # Best-effort cleanup so a 0-byte stub doesn't masquerade
+            # as the trial's captured output -- if stdout opened but
+            # stderr failed, the empty stdout.log is still on disk.
+            for path in (candidate_stdout, candidate_stderr):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
             logger.warning(
                 "save_logs=True but failed to open log files in %s "
                 "(%s: %s); trial '%s' will run without capture.",
