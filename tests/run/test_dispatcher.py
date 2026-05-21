@@ -1114,10 +1114,13 @@ class TestSaveLogs:
         assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "STDERR-FROM-WORKLOAD"
 
     def test_on_injects_aorta_log_keys_for_subprocess_wrappers(self, tmp_path):
-        self._run(tmp_path, save_logs=True)
+        cell_dir = self._run(tmp_path, save_logs=True)
         cfg = NoisyWorkload.seen_config
         assert cfg["_aorta_save_logs"] is True
-        assert cfg["_aorta_log_basename"] == "trial_d0_m0_t0"
+        # Absolute path-with-stem so wrappers can build sibling files
+        # (``<prefix>.subprocess.{stdout,stderr}.log``) without needing
+        # to know ``results_dir``.
+        assert cfg["_aorta_log_prefix"] == str(cell_dir / "trial_d0_m0_t0")
 
     def test_on_non_rank_zero_writes_no_log_files(self, tmp_path):
         with patch.dict(os.environ, {"RANK": "1"}):
@@ -1174,4 +1177,4 @@ class TestSaveLogs:
         assert not (tmp_path / "noisy" / "trial_d0_m0_t0.stdout.log").exists()
         assert "AORTA_LEAK_PROBE" not in os.environ, "env overlay leaked when log-open failed"
         assert "_aorta_save_logs" not in NoisyWorkload.seen_config
-        assert "_aorta_log_basename" not in NoisyWorkload.seen_config
+        assert "_aorta_log_prefix" not in NoisyWorkload.seen_config
