@@ -32,7 +32,10 @@ The aggregator does NOT inspect *why* a trial failed (NaN vs corruption vs
 divergence vs infrastructure crash); that's :class:`WorkloadResult` /
 ``exit_status`` territory and is preserved separately via the
 ``exit_status_counts`` histogram so callers can distinguish e.g.
-``workload_failed`` from ``infrastructure_failed`` when triaging.
+``workload_failed`` (run() returned passed=False) from
+``workload_setup_failed`` (setup() raised, never reached the
+measurement) from ``infrastructure_failed`` (construction or run()
+itself raised) when triaging.
 """
 
 from __future__ import annotations
@@ -82,9 +85,13 @@ class CellStats:
     consumer without forcing them to recompute.
 
     ``exit_status_counts`` is a histogram keyed by ``TrialResult.exit_status``
-    (``"ok"``, ``"workload_failed"``, ``"infrastructure_failed"``, ...). It
-    lets matrix.json consumers distinguish failure modes that ``failure_rate``
-    alone collapses into a single number.
+    (``"ok"``, ``"workload_failed"``, ``"workload_setup_failed"``,
+    ``"infrastructure_failed"``, ...). It lets matrix.json consumers
+    distinguish failure modes that ``failure_rate`` alone collapses
+    into a single number. ``workload_setup_failed`` specifically calls
+    out trials where ``workload.setup()`` raised, so a row of all-setup-
+    failures can't be misread as "the bug reproduces 100 %" -- the
+    workload never got far enough to test the bug.
 
     ``step_time_source`` records which branch of the fallback ladder
     populated ``step_times_ms`` -- ``"per_step"``, ``"elapsed_per_iter"``,
@@ -557,10 +564,12 @@ def aggregate_cell(
         wall_clocks.append(float(wall))
         # Histogram by raw exit_status so callers can distinguish e.g.
         # "workload_failed" (the workload's run() returned a failed
-        # WorkloadResult) from "infrastructure_failed" (B1's dispatcher
-        # caught an exception around setup/run/cleanup and synthesised a
-        # passed=False WorkloadResult so the cell still has a row).
-        # ``aorta.run.dispatcher`` populates a WorkloadResult in either
+        # WorkloadResult), "workload_setup_failed" (setup() raised --
+        # the workload never reached the measurement), and
+        # "infrastructure_failed" (B1's dispatcher caught an exception
+        # around construction or run() and synthesised a passed=False
+        # WorkloadResult so the cell still has a row).
+        # ``aorta.run.dispatcher`` populates a WorkloadResult in every
         # case; the distinction is purely the exit_status value.
         # Falling back to "unknown" keeps the histogram total == trial_count
         # even for stand-in trial objects that omit the attribute.

@@ -197,12 +197,14 @@ def test_min_max_p90_step_times_populated():
 
 def test_exit_status_histogram_distinguishes_failure_modes():
     """Pin the new exit_status_counts field. Failure rate alone is generic;
-    callers triaging a cell need to tell workload_failed from infrastructure_failed.
+    callers triaging a cell need to tell workload_failed from
+    workload_setup_failed from infrastructure_failed.
     """
     trials = [
         _trial(passed=True, exit_status="ok"),
         _trial(passed=True, exit_status="ok"),
         _trial(passed=False, exit_status="workload_failed"),
+        _trial(passed=False, exit_status="workload_setup_failed"),
         _trial(passed=False, exit_status="infrastructure_failed"),
         _trial(passed=False, exit_status="infrastructure_failed"),
     ]
@@ -210,12 +212,13 @@ def test_exit_status_histogram_distinguishes_failure_modes():
     assert stats.exit_status_counts == {
         "ok": 2,
         "workload_failed": 1,
+        "workload_setup_failed": 1,
         "infrastructure_failed": 2,
     }
     # Histogram total must equal trial count, by construction.
     assert sum(stats.exit_status_counts.values()) == stats.trials
-    # And the failure_rate is consistent with the histogram (3 of 5 not "ok").
-    assert abs(stats.failure_rate - 0.6) < 1e-9
+    # And the failure_rate is consistent with the histogram (4 of 6 not "ok").
+    assert abs(stats.failure_rate - (4.0 / 6.0)) < 1e-9
 
 
 def test_failure_rate_docstring_is_general_not_nan_specific():

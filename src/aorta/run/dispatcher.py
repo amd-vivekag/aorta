@@ -463,11 +463,35 @@ def _run_single_trial(
             # contract -- third-party plugins are free to name their first
             # parameter something other than ``config``.
             workload = workload_cls(config)
-            workload.setup()
-            workload_result = workload.run()
-
-            if not workload_result.passed:
-                exit_status = "workload_failed"
+            # setup() is split into its own try so a setup-time exception
+            # gets the "workload_setup_failed" bucket instead of being
+            # lumped under "infrastructure_failed". The distinction
+            # matters: a row of all-setup-failures means the workload
+            # never got off the ground (missing dep, broken probe), not
+            # that the measurement under test failed -- matrix.md readers
+            # need to see those differently. Construction failures and
+            # run()-time exceptions still flow to the outer except as
+            # infrastructure_failed (unchanged).
+            try:
+                workload.setup()
+            except Exception as e:
+                exit_status = "workload_setup_failed"
+                workload_result = WorkloadResult(
+                    passed=False,
+                    failure_count=1,
+                    failure_details=[
+                        {
+                            "error": str(e),
+                            "type": type(e).__name__,
+                            "phase": "setup",
+                        }
+                    ],
+                    main_work_started=False,
+                )
+            else:
+                workload_result = workload.run()
+                if not workload_result.passed:
+                    exit_status = "workload_failed"
 
         except Exception as e:
             exit_status = "infrastructure_failed"
