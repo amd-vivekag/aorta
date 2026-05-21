@@ -208,13 +208,15 @@ class Recipe:
             process's TTY). Workloads that spawn subprocesses don't have
             their subprocess output captured by ``redirect_*``; those
             wrappers can opt in by reading the platform-supplied
-            ``_aorta_save_logs`` / ``_aorta_log_basename`` config keys
+            ``_aorta_save_logs`` / ``_aorta_log_prefix`` config keys
             the dispatcher injects and writing their own capture to a
-            sibling path derived from the basename (e.g.
-            ``<basename>.subprocess.stdout.log``). Both file capture and
-            key injection are **rank-0 only** -- matches the trial-JSON
-            write guarantee. Wrappers running on non-rank-0 won't see
-            the keys and should treat capture as off there.
+            sibling path derived from the prefix (e.g.
+            ``<prefix>.subprocess.stdout.log``). The prefix is an
+            absolute path-with-stem so wrappers don't need to know
+            ``results_dir``. Both file capture and key injection are
+            **rank-0 only** -- matches the trial-JSON write guarantee.
+            Wrappers running on non-rank-0 won't see the keys and
+            should treat capture as off there.
     """
 
     schema_version: int

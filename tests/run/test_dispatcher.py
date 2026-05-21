@@ -1114,10 +1114,33 @@ class TestSaveLogs:
         assert (cell_dir / "trial_d0_m0_t0.stderr.log").read_text().strip() == "STDERR-FROM-WORKLOAD"
 
     def test_on_injects_aorta_log_keys_for_subprocess_wrappers(self, tmp_path):
-        self._run(tmp_path, save_logs=True)
+        cell_dir = self._run(tmp_path, save_logs=True)
         cfg = NoisyWorkload.seen_config
         assert cfg["_aorta_save_logs"] is True
-        assert cfg["_aorta_log_basename"] == "trial_d0_m0_t0"
+        # Absolute path-with-stem so wrappers can build sibling files
+        # (``<prefix>.subprocess.{stdout,stderr}.log``) without needing
+        # to know ``results_dir``. ``tmp_path`` is already absolute, so
+        # the dispatcher's ``.absolute()`` call is a no-op here -- but
+        # the relative-input path is covered by
+        # ``test_on_injects_absolute_prefix_even_with_relative_results_dir``.
+        assert cfg["_aorta_log_prefix"] == str((cell_dir / "trial_d0_m0_t0").absolute())
+        assert Path(cfg["_aorta_log_prefix"]).is_absolute()
+
+    def test_on_injects_absolute_prefix_even_with_relative_results_dir(self, tmp_path, monkeypatch):
+        """Default ``RunRequest(results_dir=Path("results"))`` is relative;
+        wrappers whose subprocesses run with a different cwd (docker bind
+        mounts, torchrun-launched workers) would otherwise be unable to
+        locate the sibling-log directory. Pin that the dispatcher
+        anchors the prefix against cwd before injection."""
+        monkeypatch.chdir(tmp_path)
+        mock_ep = MagicMock(name="noisy")
+        mock_ep.name = "noisy"
+        mock_ep.load.return_value = NoisyWorkload
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            run_trials(RunRequest(workload="noisy", trials=1, save_logs=True))
+        assert Path(NoisyWorkload.seen_config["_aorta_log_prefix"]).is_absolute()
 
     def test_on_non_rank_zero_writes_no_log_files(self, tmp_path):
         with patch.dict(os.environ, {"RANK": "1"}):
@@ -1174,4 +1197,4 @@ class TestSaveLogs:
         assert not (tmp_path / "noisy" / "trial_d0_m0_t0.stdout.log").exists()
         assert "AORTA_LEAK_PROBE" not in os.environ, "env overlay leaked when log-open failed"
         assert "_aorta_save_logs" not in NoisyWorkload.seen_config
-        assert "_aorta_log_basename" not in NoisyWorkload.seen_config
+        assert "_aorta_log_prefix" not in NoisyWorkload.seen_config
