@@ -411,6 +411,7 @@ class TestRunTrials:
         assert details[0]["type"] == "ImportError"
         assert details[0]["phase"] == "setup"
         assert "missing dependency" in details[0]["error"]
+        assert results[0].result["main_work_started"] is False
 
     def test_one_failing_trial_doesnt_stop_others(self, tmp_path):
         """One trial failing doesn't prevent other trials from running."""

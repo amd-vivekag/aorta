@@ -479,8 +479,14 @@ def _run_single_trial(
                 workload_result = WorkloadResult(
                     passed=False,
                     failure_count=1,
-                    failure_details=[{"error": str(e), "type": type(e).__name__,
-                                      "phase": "setup"}],
+                    failure_details=[
+                        {
+                            "error": str(e),
+                            "type": type(e).__name__,
+                            "phase": "setup",
+                        }
+                    ],
+                    main_work_started=False,
                 )
             else:
                 workload_result = workload.run()

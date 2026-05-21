@@ -139,7 +139,12 @@ class TestTrialResult:
         it.  Re-add it (and this test entry) in the same commit that
         adds a producer.
         """
-        for status in ["ok", "workload_failed", "infrastructure_failed"]:
+        for status in [
+            "ok",
+            "workload_failed",
+            "workload_setup_failed",
+            "infrastructure_failed",
+        ]:
             result = TrialResult(
                 trial_id="test",
                 workload="test",
