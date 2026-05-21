@@ -49,11 +49,30 @@ class TrialResult:
             ``partial`` / ``partial_reasons``, etc.).
         result: WorkloadResult serialized to dict.
         wall_clock_sec: Total wall clock time for the trial.
-        exit_status: Outcome of the trial execution.  ``"timeout"`` is
-            deliberately NOT in the literal: B1 ships no ``--timeout``
-            flag and no watchdog, so no code path can produce it.
-            Re-add the value in the same commit that adds a producer
-            (e.g. when a ``--timeout`` watchdog lands).
+        exit_status: Outcome of the trial execution.  Values:
+
+            * ``"ok"`` -- workload ran and reported ``passed=True``.
+            * ``"workload_failed"`` -- workload ran and reported
+              ``passed=False`` from ``run()`` (e.g. NaN detected,
+              assertion fired mid-loop).
+            * ``"workload_setup_failed"`` -- ``workload.setup()`` raised
+              before the workload's main work could begin (e.g. missing
+              dependency at import time, broken env probe). Distinct
+              from ``infrastructure_failed`` so a setup-time crash
+              can't masquerade as a 100 % failure rate of the
+              measurement under test -- a row of all-setup-failures
+              means the workload never got off the ground, not that
+              the bug reproduces every trial.
+            * ``"infrastructure_failed"`` -- the dispatcher caught an
+              exception that wasn't attributable to ``setup()``: the
+              workload class itself failed to construct
+              (``workload_cls(config)`` raised), or ``run()`` raised
+              after ``setup()`` returned cleanly.
+
+            ``"timeout"`` is deliberately NOT in the literal: B1 ships
+            no ``--timeout`` flag and no watchdog, so no code path can
+            produce it.  Re-add the value in the same commit that adds
+            a producer (e.g. when a ``--timeout`` watchdog lands).
     """
 
     trial_id: str
@@ -64,7 +83,9 @@ class TrialResult:
     env: dict[str, Any]
     result: dict[str, Any]
     wall_clock_sec: float
-    exit_status: Literal["ok", "workload_failed", "infrastructure_failed"]
+    exit_status: Literal[
+        "ok", "workload_failed", "workload_setup_failed", "infrastructure_failed"
+    ]
     schema_version: str = "0.1"
 
     def __post_init__(self) -> None:

@@ -72,6 +72,25 @@ class CrashingWorkload(Workload):
         pass
 
 
+class SetupCrashingWorkload(Workload):
+    """Mock workload whose setup() raises (e.g. missing dependency at import)."""
+
+    launch_mode = "single_process"
+    min_world_size = 1
+
+    def setup(self) -> None:
+        raise ImportError("simulated missing dependency in setup()")
+
+    def run(self) -> WorkloadResult:
+        # Should never be reached; assert just in case so a regression where
+        # the dispatcher swallows setup() failures and proceeds to run()
+        # surfaces loudly instead of silently passing the test.
+        raise AssertionError("run() must not be called when setup() raised")
+
+    def cleanup(self) -> None:
+        pass
+
+
 class TestRunRequest:
     """Tests for RunRequest dataclass."""
 
@@ -359,6 +378,39 @@ class TestRunTrials:
         assert len(results) == 1
         assert results[0].exit_status == "infrastructure_failed"
         assert "RuntimeError" in str(results[0].result["failure_details"])
+
+    def test_setup_crashing_workload_sets_workload_setup_failed(self, tmp_path):
+        """setup() exception gets its own bucket, not infrastructure_failed.
+
+        A row of all-setup-failures must read as "workload never got off
+        the ground", not "100% reproduction of the bug under test" -- so
+        the dispatcher splits the setup() try-block out and attributes
+        its exception to workload_setup_failed. The failure_details
+        record carries a ``phase: "setup"`` marker so trial_*.json is
+        self-describing.
+        """
+        mock_ep = MagicMock()
+        mock_ep.name = "setup_crashing"
+        mock_ep.load.return_value = SetupCrashingWorkload
+
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            req = RunRequest(
+                workload="setup_crashing",
+                trials=1,
+                results_dir=tmp_path,
+            )
+            results = run_trials(req)
+
+        assert len(results) == 1
+        assert results[0].exit_status == "workload_setup_failed"
+        details = results[0].result["failure_details"]
+        assert len(details) == 1
+        assert details[0]["type"] == "ImportError"
+        assert details[0]["phase"] == "setup"
+        assert "missing dependency" in details[0]["error"]
 
     def test_one_failing_trial_doesnt_stop_others(self, tmp_path):
         """One trial failing doesn't prevent other trials from running."""

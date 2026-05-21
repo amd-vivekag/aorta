@@ -420,8 +420,11 @@ def write_matrix_md(
         "of eight). `Failure rate` is the same data as a percentage and counts every "
         "trial whose `exit_status != ok` or whose `WorkloadResult.passed` is False; "
         "neither is NaN-specific. Use `matrix.json::cells[*].exit_status_counts` to "
-        "break failures down by mode (`workload_failed` vs `infrastructure_failed` "
-        "vs `unknown`, etc.)."
+        "break failures down by mode: `workload_failed` (run() reported "
+        "passed=False), `workload_setup_failed` (setup() raised, so the "
+        "workload never reached the measurement -- a 100% setup-fail row is "
+        "NOT a 100% reproduction), `infrastructure_failed` (construction or "
+        "run() itself raised), `unknown`, etc."
     )
     lines.append(
         "- Only `mean step (ms)` is shown here. Per-cell `std`, `min`, `max`, "
