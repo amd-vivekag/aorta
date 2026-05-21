@@ -87,8 +87,11 @@ class RunRequest:
             subprocess can opt in by reading the platform-supplied
             ``_aorta_save_logs`` / ``_aorta_log_prefix`` config keys
             this dispatcher injects; the prefix is an absolute
-            path-with-stem (e.g. ``<results_dir>/trial_d0_m0_t0``) and
-            the wrapper derives a non-colliding sibling path such as
+            path-with-stem rooted in the per-workload results
+            subdirectory (e.g. ``<results_dir>/<workload>/trial_d0_m0_t0``,
+            anchored via ``Path.absolute()`` so a relative
+            ``RunRequest.results_dir`` still yields a usable prefix)
+            and the wrapper derives a non-colliding sibling path such as
             ``<prefix>.subprocess.{stdout,stderr}.log`` -- the
             dispatcher already holds open the
             ``<prefix>.{stdout,stderr}.log`` paths and double-writing
@@ -438,8 +441,15 @@ def _run_single_trial(
             config["_aorta_save_logs"] = True
             # Absolute path-with-stem: wrappers compose sibling files as
             # f"{prefix}.subprocess.{stdout,stderr}.log" without needing
-            # to know ``results_dir``.
-            config["_aorta_log_prefix"] = str(results_dir / log_basename)
+            # to know ``results_dir``. ``.absolute()`` (not ``.resolve()``)
+            # because we only need to anchor relative inputs against cwd
+            # -- a default ``RunRequest(results_dir=Path("results"))``
+            # would otherwise leak a relative prefix to wrappers whose
+            # subprocesses run with a different cwd (docker bind mounts,
+            # torchrun-launched workers). ``.resolve()`` would also walk
+            # symlinks and touch the filesystem, which is unnecessary
+            # here and surprising on Windows.
+            config["_aorta_log_prefix"] = str((results_dir / log_basename).absolute())
 
     with contextlib.ExitStack() as log_stack:
         if stdout_fh is not None and stderr_fh is not None:

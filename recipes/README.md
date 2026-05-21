@@ -103,10 +103,13 @@ cells:
   `_aorta_save_logs` / `_aorta_log_prefix` config keys the dispatcher
   injects, and writing their own capture to a sibling path derived from
   the prefix (e.g. `<prefix>.subprocess.stdout.log`). The prefix is an
-  absolute path-with-stem (e.g. `<results_dir>/trial_d0_m0_t0`), so
-  wrappers don't need to know `results_dir`. The dispatcher already
-  holds the `<prefix>.{stdout,stderr}.log` paths open, so wrappers must
-  NOT write to them directly.
+  absolute path-with-stem rooted in the per-workload results
+  subdirectory (e.g. `<results_dir>/<workload>/trial_d0_m0_t0`,
+  anchored via `Path.absolute()` so a relative `results_dir` still
+  yields a usable prefix), so wrappers don't need to know
+  `results_dir`. The dispatcher already holds the
+  `<prefix>.{stdout,stderr}.log` paths open, so wrappers must NOT
+  write to them directly.
 - **`workload_config`** -- optional `dict[str, Any]`, allowed at both
   recipe scope (top level) and per cell. Forwarded to the workload
   constructor through the dispatcher's `Request.config_overrides`. Use
