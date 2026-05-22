@@ -256,16 +256,122 @@ class TestBuck2FailureModes:
         assert any("non-JSON output" in r for r in reasons)
 
     def test_unexpected_json_shape_returns_reason(self):
+        """Both ``list`` (modern cquery output) and ``dict`` (legacy
+        audit-dependencies output) are accepted shapes. Anything else
+        (scalar, null) trips the unexpected-shape reason."""
         with patch.object(
             bi_mod.subprocess,
             "run",
-            return_value=_make_completed(stdout=json.dumps(["//a", "//b"])),
+            return_value=_make_completed(stdout=json.dumps(42)),
         ):
             entries, reasons = bi_mod.introspect_libraries_via_buck(
                 target="//foo", repo_revision="r"
             )
         assert entries == []
         assert any("unexpected JSON shape" in r for r in reasons)
+
+
+class TestBuck2CqueryShape:
+    """Modern ``buck2 cquery 'deps(...)' --json`` returns a flat list
+    of stringified labels, each suffixed with a parenthesised
+    configuration descriptor. Verifies the loader handles both that
+    shape and the per-label suffix stripping the matcher relies on."""
+
+    def setup_method(self):
+        self._patch = patch.object(bi_mod.shutil, "which", lambda _name: "/usr/bin/buck2")
+        self._patch.start()
+
+    def teardown_method(self):
+        self._patch.stop()
+
+    def test_cquery_list_shape_yields_matches(self):
+        """The modern cquery shape (flat list of labels) round-trips
+        through the loader and the matcher just like the legacy dict
+        shape did."""
+        payload = [
+            "//third-party/rocm:hipblaslt_lib (prelude//platforms:default#abc)",
+            "//third-party/pytorch:torch (prelude//platforms:default#abc)",
+            "//util:logging (prelude//platforms:default#abc)",
+        ]
+        with patch.object(
+            bi_mod.subprocess,
+            "run",
+            return_value=_make_completed(stdout=json.dumps(payload)),
+        ):
+            entries, reasons = bi_mod.introspect_libraries_via_buck(
+                target="//foo", repo_revision="r"
+            )
+        assert reasons == []
+        names = sorted(e["name"] for e in entries)
+        assert names == ["hipblaslt", "pytorch"]
+
+    def test_config_suffix_stripped_before_pattern_match(self):
+        """The cquery suffix ``(prelude//platforms:default#hash)`` is a
+        configuration tag, not part of the target label. ``_match_library``
+        strips it so KNOWN_LIBRARY_PATTERNS authors don't have to bake
+        the suffix into every regex."""
+        suffixed = "//third-party/rocm:hipblaslt-lib (prelude//platforms:default#abc123)"
+        assert bi_mod._match_library(suffixed) == "hipblaslt"
+        # _strip_config_suffix is the unit doing the work; pin its
+        # behaviour directly so a future change there can't silently
+        # break label matching.
+        assert bi_mod._strip_config_suffix(suffixed) == (
+            "//third-party/rocm:hipblaslt-lib"
+        )
+
+    def test_config_suffix_absent_match_unaffected(self):
+        """A label without the suffix (older buck2 audit output, or
+        the unit-test fixture which pre-dates the cquery migration)
+        still matches identically -- the strip is a no-op there."""
+        assert bi_mod._match_library("//third-party/rocm:hipblaslt-lib") == "hipblaslt"
+
+    def test_entry_stores_canonical_and_configured_target(self):
+        """Schema 1.6 (PR #187 review): each entry carries BOTH the
+        canonical Buck label (``target``, suitable for re-querying
+        buck2) and the raw cquery output (``configured_target``,
+        preserves the per-run config suffix for forensics). Storing
+        only the suffixed form (as the schema-1.4 draft did) made
+        env.json diffs unstable across repeat probes because the
+        suffix hash changes between buck2 daemon restarts."""
+        suffixed = (
+            "//third-party/rocm:hipblaslt_lib "
+            "(prelude//platforms:default#abc123)"
+        )
+        payload = [suffixed]
+        with patch.object(
+            bi_mod.subprocess,
+            "run",
+            return_value=_make_completed(stdout=json.dumps(payload)),
+        ):
+            entries, reasons = bi_mod.introspect_libraries_via_buck(
+                target="//foo", repo_revision="r"
+            )
+        assert reasons == []
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["target"] == "//third-party/rocm:hipblaslt_lib"
+        assert entry["configured_target"] == suffixed
+        # The canonical form must be re-strippable to itself (idempotent).
+        assert bi_mod._strip_config_suffix(entry["target"]) == entry["target"]
+
+    def test_no_suffix_collapses_target_and_configured_target(self):
+        """When buck2 emits a label *without* a configuration suffix
+        (legacy audit-dependencies output, or a future cquery flag
+        that omits it), ``target`` and ``configured_target`` are
+        equal -- the schema contract still holds, the strip is just
+        a no-op."""
+        unsuffixed = "//third-party/rocm:hipblaslt_lib"
+        payload = [unsuffixed]
+        with patch.object(
+            bi_mod.subprocess,
+            "run",
+            return_value=_make_completed(stdout=json.dumps(payload)),
+        ):
+            entries, _ = bi_mod.introspect_libraries_via_buck(
+                target="//foo", repo_revision="r"
+            )
+        assert entries[0]["target"] == unsuffixed
+        assert entries[0]["configured_target"] == unsuffixed
 
 
 # ---------------------------------------------------------------------------

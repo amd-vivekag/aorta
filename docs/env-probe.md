@@ -71,11 +71,14 @@ Options:
   --buck-target TEXT       Buck2 label to introspect for library
                            identity. When given, the snapshot's
                            library_introspection list is populated
-                           from `buck2 audit dependencies <label>
-                           --transitive --json`. Ignored if buck2
-                           isn't on PATH.
-  --buck-timeout INTEGER   Per-call timeout (seconds) for `buck2
-                           audit dependencies`.  [default: 10]
+                           from `buck2 cquery 'deps(<label>)' --json`
+                           (each matched entry carries both a
+                           stripped `target` and the raw
+                           `configured_target`, schema 1.6). Ignored
+                           if buck2 isn't on PATH.
+  --buck-timeout INTEGER   Per-call timeout (seconds, must be >= 1)
+                           for `buck2 cquery 'deps(...)'`.
+                           [default: 10]
   --help                   Show this message and exit.
 ```
 
@@ -92,7 +95,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.5) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.6) [PARTIAL]
   runtime:   baremetal / python=venv
   build_sys: none
   rocm:      7.2.1 (dev: None)
@@ -181,7 +184,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.5"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.6"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -207,7 +210,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `pytorch_version` | `str \| null` | optional `import torch` (no CUDA/HIP context init) | `null` when torch absent |
 | `pytorch_build` | `dict` | `torch.version.{git_version,hip,cuda,debug}` + install-kind detection + optional `git -C <src>/third_party/<sub> rev-parse HEAD` + parse of `torch.__config__.show()` + `nm -D libtorch_hip.so \| c++filt` symbol grep + scan of `<torch>/lib/` + parse of `<source>/build/CMakeCache.txt` + stream of `<source>/build/build.ninja` (modern `enable_language(HIP)` path) or walk of `<source>/build/**/<target>.dir/**/*.hip.o.cmake` (legacy `FindHIP.cmake` fallback) | `git_commit` is the linchpin -- pins every vendored submodule deterministically. Sub-blocks: `flags` (raw `build_settings`, `cxx_defines`, `cxx_flags_raw`, `cuda_flags_raw`, `gpu_arch_list`), `build_flags` (issue #170 stable 17-key parsed bool/str/None subset, with `CAFFE2_USE_MIOPEN` aliased to `USE_MIOPEN`), `binary_introspection` (`libtorch_hip_symbol_counts`, `torch_lib_bundled`, `cxx_flags_use_defines` -- pure facts, no ON/OFF inference), `cmake_cache` (source/editable installs only -- allowlisted entries from CMakeCache.txt), `ninja_hipcc` (source/editable installs only -- per-target HIPCC defines + codegen flags + offload archs; `_parser` discriminates the two parser strategies). See "PyTorch source-tree submodule probing" below. |
 | `build_system` | `dict` | `buck2 --version` + `buck2 root` + `hg id -i` / `git rev-parse HEAD` | Always present. `{"kind": "buck2", "buck2_version": str, "repo_root": str, "revision": str \| null}` when buck2 is on PATH AND we are demonstrably inside a Buck checkout (both `buck2 --version` and `buck2 root` succeed); `buck2_version` and `repo_root` are guaranteed populated, only `revision` may be `null`. `{"kind": "none"}` in every other case, including the dominant "buck2 is installed but cwd is not inside a Buck checkout" scenario. Added in schema 1.3 for issue #163 (A1.2a) so consumers can branch on Buck2 vs. system-package environments. See "Running inside a Buck environment" below. |
-| `library_introspection` | `list[dict]` | `buck2 audit dependencies <target> --transitive --json` (only when `--buck-target` is supplied) | Always present. Empty `[]` outside Buck mode. In Buck mode, one entry per matched library: `{"name", "source": "buck", "revision", "target"}`. The matched library set lives in `KNOWN_LIBRARY_PATTERNS` in `src/aorta/instrumentation/buck_introspect.py`. Added in schema 1.4 for issue #163 (A1.2b). |
+| `library_introspection` | `list[dict]` | `buck2 cquery 'deps(<target>)' --json` (only when `--buck-target` is supplied) | Always present. Empty `[]` outside Buck mode. In Buck mode, one entry per matched library: `{"name", "source": "buck", "revision", "target", "configured_target"}`. `target` is the canonical Buck label (stable across daemon restarts); `configured_target` preserves the raw cquery output including its per-run configuration suffix (`(prelude//platforms:default#<hash>)`) for forensics. The matched library set lives in `KNOWN_LIBRARY_PATTERNS` in `src/aorta/instrumentation/buck_introspect.py`. Added in schema 1.4 for issue #163 (A1.2b); migrated from `buck2 audit dependencies` to `buck2 cquery` and split `target` / `configured_target` in schema 1.6 (PR #187). |
 | `library_introspection_alternates` | `list[dict]` | synthesised from A1's per-library blocks when a Buck match overlaps | Always present. Empty `[]` outside Buck mode and when no Buck-matched library is also captured by A1. Each entry mirrors the unified shape with `source: "package"` and pulls `revision` / `package_version` / `lib_hash` from the matching A1 block (e.g. `hipblaslt`). Added in schema 1.4 for issue #163 (A1.2b). |
 | `pytorch_sdpa` | `dict` | `torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()` | `backends_enabled` dict, one bool per SDPA backend + per-getter `null` when missing on older torch. Runtime state, NOT compile-time -- combine with `pytorch_build.binary_introspection.libtorch_hip_symbol_counts` for the full "compiled in AND enabled" picture. Added in schema 1.5 for issue #176 (PR #177). |
 
@@ -372,7 +375,41 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.5` (current)
+### `1.6` (current)
+
+Additive change to `library_introspection` (PR #187, issue #183):
+
+* Each `library_introspection[*]` entry now carries two Buck-label
+  fields instead of one. `target` is the canonical Buck label with
+  the cquery configuration suffix stripped -- stable across daemon
+  restarts and the form that round-trips into another
+  `buck2 query` / `buck2 build`. `configured_target` preserves the
+  raw `buck2 cquery` output including its per-run configuration
+  suffix (`(prelude//platforms:default#<hash>)`) for forensics when
+  reconciling two probes that diverged on the same source tree.
+
+Bundled with the cquery migration: A1.2b's original implementation
+called `buck2 audit dependencies --transitive --json`, which was
+removed from open-source buck2 before A1.2b ever ran end-to-end.
+PR #187 swapped it for `buck2 cquery 'deps(<target>)' --json`
+(buck2 docs' recommended replacement; same configured-graph
+semantics as the deprecated `audit dependencies --transitive`).
+This is a runtime-behaviour change, not a schema change -- the
+emitted `library_introspection` entries take the same shape
+either way, but the new `configured_target` field is what motivated
+the schema bump.
+
+Backwards-compat:
+
+* 1.5 readers loading a 1.6 snapshot see `configured_target` as an
+  unknown nested key inside each entry and silently ignore it
+  (entries are plain dicts, not dataclasses, so `from_dict` doesn't
+  trip on the new key).
+* 1.6 readers loading a 1.5 snapshot get entries without
+  `configured_target` and must guard with `.get("configured_target")`
+  if they want it.
+
+### `1.5`
 
 Adds source/editable-install build introspection plus a runtime SDPA
 backend probe (PR #177, issue #176). This entry collapses what was
@@ -876,14 +913,17 @@ jq '.library_introspection' /tmp/env.json              # -> []
 jq '.library_introspection_alternates' /tmp/env.json   # -> []
 
 # Inside a Buck checkout, point the probe at a top-level target. We
-# wrap `buck2 audit dependencies <target> --transitive --json` and
-# match each transitive dep label against KNOWN_LIBRARY_PATTERNS.
+# wrap `buck2 cquery 'deps(<target>)' --json` and match each
+# transitive dep label against KNOWN_LIBRARY_PATTERNS. Schema 1.6
+# emits both `target` (the canonical Buck label, stable across
+# daemon restarts) and `configured_target` (the raw cquery output
+# with its per-run configuration suffix; preserved for forensics).
 aorta env probe --buck-target //myproj:training_main -o /tmp/env.json
 jq '.library_introspection' /tmp/env.json
 # -> [
-#   {"name":"hipblaslt","source":"buck","revision":"<repo-sha>","target":"//.../hipblaslt_lib"},
-#   {"name":"rccl","source":"buck","revision":"<repo-sha>","target":"//.../rccl_lib"},
-#   {"name":"pytorch","source":"buck","revision":"<repo-sha>","target":"//pytorch:torch"},
+#   {"name":"hipblaslt","source":"buck","revision":"<repo-sha>","target":"//.../hipblaslt_lib","configured_target":"//.../hipblaslt_lib (prelude//platforms:default#abc...)"},
+#   {"name":"rccl","source":"buck","revision":"<repo-sha>","target":"//.../rccl_lib","configured_target":"//.../rccl_lib (prelude//platforms:default#abc...)"},
+#   {"name":"pytorch","source":"buck","revision":"<repo-sha>","target":"//pytorch:torch","configured_target":"//pytorch:torch (prelude//platforms:default#abc...)"},
 #   ...
 # ]
 
@@ -895,7 +935,7 @@ jq '.library_introspection_alternates[] | select(.name=="hipblaslt")' /tmp/env.j
 # -> {"name":"hipblaslt","source":"package","revision":"...","package_version":"...","lib_hash":"..."}
 ```
 
-`--buck-timeout` (default 10 s) caps the audit subprocess. A timeout,
+`--buck-timeout` (default 10 s) caps the cquery subprocess. A timeout,
 non-zero exit, or unparseable JSON degrades gracefully: both lists are
 returned empty and the failure is recorded in `partial_reasons`. The
 match patterns currently cover `hipblaslt`, `rccl`, `pytorch`, and
