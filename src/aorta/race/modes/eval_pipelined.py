@@ -310,6 +310,213 @@ class HSTUModel(nn.Module):
         return self.prediction_head(pooled)
 
 
+class _IG3BottomMLP(nn.Module):
+    """Bottom MLP from IG3 trace: input -> 512 -> 256 -> 128 with LayerNorm + sigmoid."""
+
+    def __init__(self, input_dim: int, dims: List[int]):
+        super().__init__()
+        layers: List[nn.Module] = []
+        in_d = input_dim
+        for out_d in dims:
+            layers.append(nn.Linear(in_d, out_d))
+            layers.append(nn.LayerNorm(out_d))
+            layers.append(nn.Sigmoid())
+            in_d = out_d
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
+class _IG3InteractionModule(nn.Module):
+    """Multi-head BMM interaction from IG3 trace.
+
+    BMM shape: (B, 32, 128) x (B, 128, 482) -> (B, 32, 482).
+    """
+
+    def __init__(
+        self,
+        over_arch_hidden: int = 1024,
+        num_heads: int = 32,
+        head_dim: int = 128,
+        num_interactions: int = 482,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_interactions = num_interactions
+
+        total_input_dim = num_heads * head_dim
+        self.output_dim = total_input_dim
+
+        self.query_proj = nn.Linear(over_arch_hidden, total_input_dim)
+        self.key_proj = nn.Linear(over_arch_hidden, num_interactions * head_dim)
+
+        bmm_out_dim = num_heads * num_interactions
+        self.out_proj = nn.Linear(bmm_out_dim, self.output_dim)
+        self.layer_norm = nn.LayerNorm(self.output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        q = self.query_proj(x).view(B, self.num_heads, self.head_dim)
+        k = self.key_proj(x).view(B, self.head_dim, self.num_interactions)
+        interaction = torch.bmm(q, k).reshape(B, -1)
+        interaction = self.out_proj(interaction)
+        return self.layer_norm(interaction)
+
+
+class _IG3TopMLP(nn.Module):
+    """Top MLP from IG3 trace: 1024 -> 2048 -> 4096 -> 2048 -> 1024."""
+
+    def __init__(self, input_dim: int, dims: List[int]):
+        super().__init__()
+        layers: List[nn.Module] = []
+        in_d = input_dim
+        for out_d in dims:
+            layers.append(nn.Linear(in_d, out_d))
+            layers.append(nn.LayerNorm(out_d))
+            layers.append(nn.Sigmoid())
+            in_d = out_d
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
+class IG3RecProxyModel(nn.Module):
+    """Recommendation model proxy from IG3 TraceLens trace (pruned_trace_ig3).
+
+    Architecture faithfully reproduces the production dense compute patterns:
+      dense(512) -> bottom_mlp(512->256->128)
+      sparse -> EmbeddingBag tables -> proj(tables*128 -> 1024)
+      [dense_out, sparse_out] -> over_arch(1152 -> 1024) -> interaction(BMM 32h)
+      -> top_mlp(1024->2048->4096->2048->1024) -> output_heads(BCE:36 + MSE:10)
+
+    The multi-task output is reduced to (B, 1) for compatibility with the
+    reproducer's metric pipeline.
+
+    Trace-derived architecture constants are hardcoded. Only scaling parameters
+    (num_tables, embedding_rows, batch_size) are configurable.
+    """
+
+    # Trace-derived constants
+    DENSE_INPUT_DIM = 512
+    BOTTOM_MLP_DIMS = [512, 256, 128]
+    TOP_MLP_DIMS = [1024, 2048, 4096, 2048, 1024]
+    OVER_ARCH_HIDDEN = 1024
+    INTERACTION_HEADS = 32
+    INTERACTION_HEAD_DIM = 128
+    INTERACTION_FEATURES = 482
+    NUM_BCE_TASKS = 36
+    NUM_MSE_TASKS = 10
+
+    def __init__(
+        self,
+        num_tables: int = 50,
+        embedding_rows: int = 10_000,
+        embedding_dim: int = 128,
+        pooling_factor: int = 40,
+    ):
+        super().__init__()
+        self.needs_sparse = True
+        self.needs_seq_embeddings = False
+        self.dense_input_dim = self.DENSE_INPUT_DIM
+        self.num_tables = num_tables
+        self.pooling_factor = pooling_factor
+
+        self.bottom_mlp = _IG3BottomMLP(self.DENSE_INPUT_DIM, self.BOTTOM_MLP_DIMS)
+        bottom_out_dim = self.BOTTOM_MLP_DIMS[-1]
+
+        self.embeddings = nn.ModuleList([
+            nn.EmbeddingBag(embedding_rows, embedding_dim, mode="sum", sparse=False)
+            for _ in range(num_tables)
+        ])
+        self.sparse_proj = nn.Linear(
+            num_tables * embedding_dim, self.OVER_ARCH_HIDDEN
+        )
+
+        combine_dim = bottom_out_dim + self.OVER_ARCH_HIDDEN
+        self.over_arch = nn.Sequential(
+            nn.Linear(combine_dim, self.OVER_ARCH_HIDDEN),
+            nn.LayerNorm(self.OVER_ARCH_HIDDEN),
+            nn.Sigmoid(),
+        )
+
+        self.interaction = _IG3InteractionModule(
+            over_arch_hidden=self.OVER_ARCH_HIDDEN,
+            num_heads=self.INTERACTION_HEADS,
+            head_dim=self.INTERACTION_HEAD_DIM,
+            num_interactions=self.INTERACTION_FEATURES,
+        )
+
+        interaction_out_dim = self.INTERACTION_HEADS * self.INTERACTION_HEAD_DIM
+        self.top_input_proj = nn.Linear(interaction_out_dim, self.TOP_MLP_DIMS[0])
+        self.top_input_norm = nn.LayerNorm(self.TOP_MLP_DIMS[0])
+        self.top_mlp = _IG3TopMLP(self.TOP_MLP_DIMS[0], self.TOP_MLP_DIMS[1:])
+        top_out_dim = self.TOP_MLP_DIMS[-1]
+
+        self.bce_head = nn.Linear(top_out_dim, self.NUM_BCE_TASKS)
+        self.mse_head = nn.Linear(top_out_dim, self.NUM_MSE_TASKS)
+
+        self._init_weights()
+
+        total_params = sum(p.numel() for p in self.parameters())
+        emb_params = sum(p.numel() for e in self.embeddings for p in e.parameters())
+        mlp_params = total_params - emb_params
+        log.info(
+            f"IG3RecProxyModel: {num_tables} tables x {embedding_rows} rows x "
+            f"{embedding_dim} dim, pool={pooling_factor}, "
+            f"params: {total_params / 1e6:.1f}M total "
+            f"({emb_params / 1e6:.1f}M embed + {mlp_params / 1e6:.1f}M MLP)"
+        )
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.EmbeddingBag):
+                nn.init.uniform_(module.weight, -0.01, 0.01)
+
+    def forward(self, dense: torch.Tensor, sparse_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            dense: (batch, 512) float32
+            sparse_ids: (num_tables, batch * pooling_factor) int64
+        Returns:
+            (batch, 1) averaged multi-task output
+        """
+        B = dense.shape[0]
+
+        dense_out = self.bottom_mlp(dense)
+
+        offsets = torch.arange(
+            0, B * self.pooling_factor, self.pooling_factor,
+            device=dense.device, dtype=torch.long,
+        )
+        pooled = []
+        for i in range(self.num_tables):
+            pooled.append(self.embeddings[i](sparse_ids[i], offsets))
+        sparse_out = self.sparse_proj(torch.cat(pooled, dim=-1))
+
+        combined = torch.cat([dense_out, sparse_out], dim=-1)
+        arch_out = self.over_arch(combined)
+
+        interact_out = self.interaction(arch_out)
+
+        top_in = self.top_input_norm(torch.sigmoid(self.top_input_proj(interact_out)))
+        top_out = self.top_mlp(top_in)
+
+        bce_logits = self.bce_head(top_out)
+        mse_preds = self.mse_head(top_out)
+        all_outputs = torch.cat([bce_logits, mse_preds], dim=-1)
+        return all_outputs.mean(dim=-1, keepdim=True)
+
+
 # =============================================================================
 # Reproducer
 # =============================================================================
@@ -511,6 +718,13 @@ class EvalPipelinedReproducer(BaseReproducer):
                 num_attn_layers=cfg.hstu_attn_num_layers,
                 num_attn_heads=cfg.hstu_num_heads,
             ).to(device=device, dtype=torch.float32)
+        elif cfg.model_type == "ig3_rec_proxy":
+            self.model = IG3RecProxyModel(
+                num_tables=min(cfg.num_embedding_tables, 50),
+                embedding_rows=cfg.embedding_rows,
+                embedding_dim=cfg.embedding_dim,
+                pooling_factor=cfg.sparse_pooling_factor,
+            ).to(device=device, dtype=torch.float32)
         elif cfg.model_type == "dlrm":
             self.model = DLRMModel(
                 feature_dim=cfg.feature_dim,
@@ -529,6 +743,7 @@ class EvalPipelinedReproducer(BaseReproducer):
 
         self._uses_sparse = getattr(self.model, "needs_sparse", False)
         self._uses_seq_embeddings = getattr(self.model, "needs_seq_embeddings", False)
+        self._dense_dim = getattr(self.model, "dense_input_dim", cfg.feature_dim)
         self._datadist_in_compiled = False
         self.model.eval()
 
@@ -572,16 +787,18 @@ class EvalPipelinedReproducer(BaseReproducer):
     def _setup_pipeline_buffers(self) -> None:
         cfg = self.config
         device = torch.device("cuda")
+        dense_dim = self._dense_dim
 
         self.batch_gpu_current = torch.empty(
-            cfg.batch_size, cfg.feature_dim, dtype=torch.float32, device=device
+            cfg.batch_size, dense_dim, dtype=torch.float32, device=device
         )
         self.labels_gpu_current = torch.empty(
             cfg.batch_size, 1, dtype=torch.float32, device=device
         )
 
         if self._uses_sparse:
-            sparse_shape = (cfg.num_embedding_tables, cfg.batch_size * cfg.sparse_pooling_factor)
+            num_tables = min(cfg.num_embedding_tables, 50) if cfg.model_type == "ig3_rec_proxy" else cfg.num_embedding_tables
+            sparse_shape = (num_tables, cfg.batch_size * cfg.sparse_pooling_factor)
             self.sparse_gpu_current = torch.zeros(sparse_shape, dtype=torch.long, device=device)
 
         if self._uses_seq_embeddings:
@@ -592,7 +809,7 @@ class EvalPipelinedReproducer(BaseReproducer):
 
         if cfg.enable_pipelining and not cfg.cca_cross_stream_alloc:
             self.batch_gpu_next = torch.empty(
-                cfg.batch_size, cfg.feature_dim, dtype=torch.float32, device=device
+                cfg.batch_size, dense_dim, dtype=torch.float32, device=device
             )
             self.labels_gpu_next = torch.empty(
                 cfg.batch_size, 1, dtype=torch.float32, device=device
@@ -663,7 +880,7 @@ class EvalPipelinedReproducer(BaseReproducer):
 
             if not self._datadist_in_compiled:
                 self.datadist_proj = nn.Linear(
-                    shard_per_sample, cfg.feature_dim, bias=False,
+                    shard_per_sample, dense_dim, bias=False,
                 ).to(device=device, dtype=torch.float32)
                 self.datadist_proj.eval()
                 for p in self.datadist_proj.parameters():
@@ -671,7 +888,7 @@ class EvalPipelinedReproducer(BaseReproducer):
                 log.info(
                     f"Datadist->forward projection (eager): shard ({shard_size},) -> "
                     f"({cfg.batch_size}, {shard_per_sample}) -> "
-                    f"({cfg.batch_size}, {cfg.feature_dim})"
+                    f"({cfg.batch_size}, {dense_dim})"
                 )
 
         seq_info = ""
@@ -712,10 +929,13 @@ class EvalPipelinedReproducer(BaseReproducer):
         gen = torch.Generator()
         gen.manual_seed(42 + self.rank)
 
+        dense_dim = self._dense_dim
+        num_tables = min(cfg.num_embedding_tables, 50) if cfg.model_type == "ig3_rec_proxy" else cfg.num_embedding_tables
+
         for _ in range(total):
             self.all_batches_cpu.append(
                 torch.randn(
-                    cfg.batch_size, cfg.feature_dim,
+                    cfg.batch_size, dense_dim,
                     dtype=torch.float32, generator=gen,
                 ).pin_memory()
             )
@@ -729,7 +949,7 @@ class EvalPipelinedReproducer(BaseReproducer):
                 self.all_sparse_cpu.append(
                     torch.randint(
                         0, cfg.embedding_rows,
-                        (cfg.num_embedding_tables, cfg.batch_size * cfg.sparse_pooling_factor),
+                        (num_tables, cfg.batch_size * cfg.sparse_pooling_factor),
                         dtype=torch.long,
                     ).pin_memory()
                 )
@@ -765,14 +985,16 @@ class EvalPipelinedReproducer(BaseReproducer):
             seq_emb = self.all_seq_emb_cpu[idx] if self._uses_seq_embeddings else None
             return self.all_batches_cpu[idx], self.all_labels_cpu[idx], sparse, seq_emb
         cfg = self.config
-        batch = torch.randn(cfg.batch_size, cfg.feature_dim, dtype=torch.float32)
+        dense_dim = self._dense_dim
+        batch = torch.randn(cfg.batch_size, dense_dim, dtype=torch.float32)
         labels = torch.randint(0, 2, (cfg.batch_size, 1), dtype=torch.float32)
         sparse = None
         seq_emb = None
         if self._uses_sparse:
+            num_tables = min(cfg.num_embedding_tables, 50) if cfg.model_type == "ig3_rec_proxy" else cfg.num_embedding_tables
             sparse = torch.randint(
                 0, cfg.embedding_rows,
-                (cfg.num_embedding_tables, cfg.batch_size * cfg.sparse_pooling_factor),
+                (num_tables, cfg.batch_size * cfg.sparse_pooling_factor),
                 dtype=torch.long,
             )
         if self._uses_seq_embeddings:
@@ -786,11 +1008,12 @@ class EvalPipelinedReproducer(BaseReproducer):
         cfg = self.config
         pipelined = cfg.enable_pipelining
         cca = cfg.cca_cross_stream_alloc and pipelined
+        dense_dim = self._dense_dim
 
         with torch.cuda.stream(self.memcpy_stream):
             if cca:
                 target_batch = torch.empty(
-                    cfg.batch_size, cfg.feature_dim,
+                    cfg.batch_size, dense_dim,
                     dtype=torch.float32, device="cuda",
                 )
                 target_labels = torch.empty(
@@ -807,8 +1030,9 @@ class EvalPipelinedReproducer(BaseReproducer):
             if sparse_cpu is not None:
                 target_sparse = self.sparse_gpu_next if pipelined else self.sparse_gpu_current
                 if cca:
+                    num_tables = sparse_cpu.shape[0]
                     target_sparse = torch.zeros(
-                        cfg.num_embedding_tables,
+                        num_tables,
                         cfg.batch_size * cfg.sparse_pooling_factor,
                         dtype=torch.long, device="cuda",
                     )
@@ -1414,10 +1638,11 @@ class EvalPipelinedReproducer(BaseReproducer):
     def _run_iteration_unpipelined(self, iteration: int) -> None:
         """Fully independent iteration -- no cross-iteration buffer sharing."""
         cfg = self.config
+        dense_dim = self._dense_dim
 
         if cfg.fresh_buffers_each_iter:
             batch_gpu = torch.empty(
-                cfg.batch_size, cfg.feature_dim,
+                cfg.batch_size, dense_dim,
                 dtype=torch.float32, device="cuda",
             )
             labels_gpu = torch.empty(
@@ -1427,8 +1652,9 @@ class EvalPipelinedReproducer(BaseReproducer):
             sparse_gpu = None
             seq_emb_gpu = None
             if self._uses_sparse:
+                num_tables = min(cfg.num_embedding_tables, 50) if cfg.model_type == "ig3_rec_proxy" else cfg.num_embedding_tables
                 sparse_gpu = torch.zeros(
-                    cfg.num_embedding_tables, cfg.batch_size * cfg.sparse_pooling_factor,
+                    num_tables, cfg.batch_size * cfg.sparse_pooling_factor,
                     dtype=torch.long, device="cuda",
                 )
             if self._uses_seq_embeddings:
@@ -1827,4 +2053,4 @@ class EvalPipelinedReproducer(BaseReproducer):
         log.info("Pipeline bootstrapped (first batch loaded)")
 
 
-__all__ = ["EvalPipelinedReproducer", "EvalModel"]
+__all__ = ["EvalPipelinedReproducer", "EvalModel", "IG3RecProxyModel"]

@@ -37,6 +37,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -235,8 +236,13 @@ def parse_args() -> argparse.Namespace:
     )
     eval_group.add_argument(
         "--model-type", type=str, default=None,
-        choices=["mlp", "dlrm", "dlrm_v3"],
-        help="Model type: mlp (simple MLP), dlrm (TorchRec-like DLRM), or dlrm_v3 (HSTU attention model). Default: mlp"
+        choices=["mlp", "dlrm", "dlrm_v3", "ig3_rec_proxy"],
+        help=(
+            "Model type: mlp (simple MLP), dlrm (TorchRec-like DLRM), "
+            "dlrm_v3 (HSTU attention model), or ig3_rec_proxy "
+            "(IG3 trace proxy: bottom MLP + 50 EmbeddingBags + BMM interaction "
+            "+ top MLP + multi-task heads). Default: mlp"
+        ),
     )
     eval_group.add_argument(
         "--num-embedding-tables", type=int, default=None,
@@ -394,7 +400,7 @@ def parse_args() -> argparse.Namespace:
 def init_distributed() -> tuple[int, int]:
     """Initialize distributed process group."""
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=timedelta(seconds=1200))
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -637,6 +643,15 @@ def main():
                          f"heads={config.hstu_num_heads}, "
                          f"emb_dim={config.embedding_dim}, "
                          f"bfloat16={config.use_bfloat16}")
+            elif config.model_type == "ig3_rec_proxy":
+                log.info(f"  IG3 Proxy: tables={min(config.num_embedding_tables, 50)}, "
+                         f"rows={config.embedding_rows}, "
+                         f"emb_dim={config.embedding_dim}, "
+                         f"pool={config.sparse_pooling_factor}, "
+                         f"dense_input=512, "
+                         f"interaction=32hx128d, "
+                         f"top_mlp=[1024,2048,4096,2048,1024], "
+                         f"tasks=36BCE+10MSE")
             log.info(f"  use_compile={config.use_compile}, pipelining={config.enable_pipelining}")
             log.info(f"  sync_policy={config.sync_policy}, metrics={config.simulate_metrics}")
             log.info(f"  datadist_stream={config.use_datadist_stream}")

@@ -273,6 +273,14 @@ class ReproducerConfig:
                  attention -- the only model heavy enough to create CPU-GPU lag
                  for Experiment A NaN reproduction. No GPU-side embedding tables;
                  sparse lookups happen on CPU and results are transferred.
+    - "ig3_rec_proxy": IG3 TraceLens proxy -- full DLRM-style recommendation
+                 model from pruned_trace_ig3. Dense bottom MLP (512->256->128),
+                 50 EmbeddingBag tables (128 dim), multi-head BMM interaction
+                 (32 heads), top MLP (1024->2048->4096->2048->1024), and
+                 multi-task output heads (36 BCE + 10 MSE). Architecture
+                 constants are trace-derived; num_embedding_tables (capped at
+                 50), embedding_rows, embedding_dim, and sparse_pooling_factor
+                 are configurable.
     """
 
     num_embedding_tables: int = 64
@@ -649,28 +657,28 @@ class RaceConfig:
     gpu_max_hw_queues: Optional[int] = None
     """
     Set GPU_MAX_HW_QUEUES environment variable.
-    
+
     CRITICAL for race exposure:
     - 1-2: Streams share HW queues → implicit serialization → RACE MASKED
     - 4+: Each stream gets own HW queue → true parallelism → RACE EXPOSED
-    
+
     Recommended: 4 for race testing, or 3 with production_stream_layout.
     """
 
     client_stream_layout: bool = False
     """
     Use production stream layout for accurate reproduction of the NaN issue.
-    
+
     When enabled:
     - 3 streams only: default_stream, memcpy_stream, datadist_stream
     - Forward/backward/clip/optimizer/FSDP collectives run on default stream
     - Only H2D and datadist operations on separate racing streams
     - DistributedOpsInterceptor is bypassed (no stream redirection for collectives)
-    
+
     This matches the production TorchRec-style architecture where:
     - memcpy_stream races with default stream (H2D not synced before forward)
     - datadist_stream races with default stream (all_to_all not synced before collective)
-    
+
     Recommended: Use with gpu_max_hw_queues: 3 for 1:1 stream-to-queue mapping.
     """
 
@@ -704,13 +712,13 @@ class RaceConfig:
     timing_debug_logs: bool = False
     """
     Enable detailed timing logs around H2D, datadist, and forward operations.
-    
+
     When enabled, logs wall-clock timestamps for:
     - H2D copy (memcpy_stream operations)
     - Datadist racing (all_to_all operations)
     - Timing skew delay
     - Forward pass
-    
+
     Also logs gap/overlap between operations to verify if race windows exist.
     Negative gap = overlap = potential race.
     """
@@ -718,19 +726,19 @@ class RaceConfig:
     gpu_event_timing: bool = False
     """
     Enable GPU event-based timing to measure actual stream overlap.
-    
+
     Unlike timing_debug_logs which measures CPU-side timestamps, this uses
     CUDA/HIP events to measure actual GPU execution times and overlap.
-    
+
     Event recording is non-blocking and doesn't interfere with race conditions.
     Timing calculations happen AFTER the iteration completes (when we sync anyway).
-    
+
     Logs GPU-side durations and overlap between streams:
     - GPU_H2D_DUR: Actual GPU time for H2D copy
     - GPU_DD_DUR: Actual GPU time for datadist all_to_all
     - GPU_FWD_DUR: Actual GPU time for forward pass
     - GPU_OVERLAP: Time between stream operations (negative = overlap = race!)
-    
+
     WARNING: Cross-stream timing (e.g., DD->FWD) is INACCURATE because events
     are on different streams. Use nccl_async_diagnostic for accurate overlap detection.
     """
@@ -738,15 +746,15 @@ class RaceConfig:
     nccl_async_diagnostic: bool = False
     """
     Enable NCCL async behavior diagnostic.
-    
+
     When enabled, checks if the datadist all_to_all work is still in-flight
     when forward pass starts. This uses work.is_completed() which is non-blocking
     and does NOT affect the race condition.
-    
+
     Logs:
-    - NCCL_DIAG: Whether all_to_all is PENDING (async, race possible) or 
+    - NCCL_DIAG: Whether all_to_all is PENDING (async, race possible) or
       COMPLETED (sync, race may be masked by NCCL internal sync)
-    
+
     This is the authoritative way to verify if a race window exists, because
     it directly queries the NCCL work handle status rather than relying on
     GPU event timing which is inaccurate for cross-stream measurements.
@@ -755,12 +763,12 @@ class RaceConfig:
     datadist_use_real_dependency: bool = True
     """
     Make datadist output actually used by forward pass.
-    
+
     When enabled, the all_to_all output tensor is added as noise to batch["dense"],
     creating a real data dependency that forward must read. This more accurately
     reproduces the TorchRec pattern where distributed embeddings race
     with the forward pass.
-    
+
     Without this, datadist creates synthetic tensors that are discarded,
     so there's no actual data race with forward (just stream contention).
     """
@@ -847,10 +855,10 @@ class RaceConfig:
     datadist_tensor_size: Optional[int] = 1_000_000
     """
     Fixed tensor size for datadist all_to_all operation.
-    
+
     If set, uses this fixed size instead of basing it on dense.numel().
     This allows controlling the all_to_all duration independently of dense_dim.
-    
+
     Recommended: 1M-10M elements for ~100-500ms all_to_all duration.
     Set to None to use dense.numel() (original behavior, but can be very slow
     with large dense_dim).

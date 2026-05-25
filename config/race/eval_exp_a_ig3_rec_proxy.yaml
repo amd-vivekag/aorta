@@ -1,0 +1,70 @@
+# IG3 TraceLens Proxy Model -- Race Reproducer
+#
+# Full DLRM-style recommendation model derived from pruned_trace_ig3:
+#   - Dense bottom MLP (512 -> 256 -> 128) with LayerNorm + sigmoid
+#   - 50 EmbeddingBag tables (10K rows x 128 dim, scaled from 324 prod tables)
+#   - Multi-head BMM interaction (32 heads, 128 head_dim, 482 interactions)
+#   - Top MLP (1024 -> 2048 -> 4096 -> 2048 -> 1024) with LayerNorm + sigmoid
+#   - Multi-task output heads (36 BCE + 10 MSE tasks)
+#
+# This model is compute-heavier than the basic dlrm model due to the BMM
+# interaction and large top MLP towers.
+#
+# NOTE: sync_policy=none causes RCCL deadlock during GPU drain with this
+# model because the cross-stream collectives (fwd alltoall on default_stream
+# + datadist collectives on datadist_stream) create ordering issues in the
+# deep AQL queue.  Use end_only or periodic instead.
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m aorta.race \
+#       --config config/race/eval_exp_a_ig3_rec_proxy.yaml
+
+mode: eval_pipelined
+
+# IG3 proxy model (trace-faithful architecture, only scale params below)
+model_type: ig3_rec_proxy
+batch_size: 4096
+
+# Embedding config (scaled from production ~19B entries)
+num_embedding_tables: 50
+embedding_rows: 10000
+embedding_dim: 128
+sparse_pooling_factor: 40
+
+# Pipeline structure
+use_compile: false
+enable_pipelining: true
+use_datadist_stream: true
+simulate_metrics: true
+
+# Periodic sync: checks for NaN every 100 iterations.
+# Avoids RCCL deadlock from deep queue drain while still allowing
+# CPU-GPU lag within each sync window.
+sync_policy: periodic
+nan_check_interval: 100
+
+# Iterations
+warmup_iterations: 0
+verify_iterations: 5000
+log_interval: 100
+stop_on_first_corruption: true
+
+# HW queue settings
+gpu_max_hw_queues: 4
+gpu_padding_dispatches: 0
+
+# Data: pre-generate a pool of CPU batches
+pre_generate_data: true
+pre_generate_pool_size: 20
+
+# Datadist (multi-GPU data distribution)
+embed_tensor_size: 2000000
+p2p_tensor_size: 1000000
+
+# Skip post-loop lag diagnostics (avoids extra collectives after main loop)
+skip_lag_diagnostics: true
+
+# Profiler off for reproduction (adds host overhead)
+profile: false
+profile_iterations: 0
+profile_output_dir: traces
