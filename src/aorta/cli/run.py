@@ -40,6 +40,18 @@ from aorta.run.dispatcher import RunRequest, run_trials
     "--environment", default="local", show_default=True, help="Registered environment name."
 )
 @click.option(
+    "--buck-target",
+    type=str,
+    default=None,
+    help=(
+        "Buck2 target label (e.g. '//workloads/recom_repro:recom_repro') "
+        "to overlay onto the resolved environment's buck_target field. "
+        "Other axes (docker, venv, source_package) of the named "
+        "--environment are preserved. When omitted, the named "
+        "environment's existing buck_target (if any) is used as-is."
+    ),
+)
+@click.option(
     "--mitigations", default="none", show_default=True, help="Comma-separated mitigation names."
 )
 @click.option(
@@ -76,16 +88,16 @@ from aorta.run.dispatcher import RunRequest, run_trials
     help=(
         "Stream per-trial progress (rank 0 only) to stderr. -v = INFO "
         "(trial start/finish, timings, exit_status); -vv = DEBUG "
-        "(aorta-internal debug logs). Scope is the aorta.* logger "
-        "hierarchy; workload code in sibling packages "
-        "(aorta_internal.workloads.*, etc.) is unaffected. Default is "
-        "silent: only the final pass/fail summary prints."
+        "(aorta platform internals). Scope is the aorta.* logger "
+        "hierarchy; workload code in sibling packages is unaffected. "
+        "Default is silent: only the final pass/fail summary prints."
     ),
 )
 def run(
     workload: str,
     trials: int,
     environment: str,
+    buck_target: str | None,
     mitigations: str,
     mitigation_files: tuple[Path, ...],
     steps: int | None,
@@ -107,6 +119,7 @@ def run(
             workload=workload,
             trials=trials,
             environment=environment,
+            buck_target=buck_target,
             mitigations=parse_mitigations(mitigations),
             extra_env=parse_extra_env(extra_env),
             steps=steps,

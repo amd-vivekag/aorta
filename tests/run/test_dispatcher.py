@@ -98,6 +98,10 @@ class TestRunRequest:
         """RunRequest has sensible defaults."""
         req = RunRequest(workload="test", trials=1)
         assert req.environment == "local"
+        # ``buck_target`` defaults to ``None`` so omitting the new
+        # CLI flag keeps the resolved-environment's Buck-tier field
+        # untouched -- backward-compat with every pre-existing run.
+        assert req.buck_target is None
         assert req.mitigations == ("none",)
         assert req.extra_env == {}
         assert req.steps is None
@@ -906,9 +910,9 @@ class TestConfigOverrides:
         environment all the way through to ``config["_aorta_environment"]``
         and ``TrialResult.execution_env`` without losing the field.
 
-        This is the contract aorta-internal#36 (recom_repro Buck pilot) and
-        aorta-internal#37 (regression-gate Buck tier) will rely on -- a
-        regression here breaks both downstream workstreams silently.
+        This is the contract downstream Buck-aware workloads and
+        regression-gate consumers rely on -- a regression here breaks
+        both downstream workstreams silently.
         """
         from aorta.registry import Environment
 
@@ -961,6 +965,334 @@ class TestConfigOverrides:
             "venv": None,
             "buck_target": "//workloads/recom_repro:recom_repro",
             "source_package": "test",
+        }
+        assert captured_config["_aorta_environment"] == expected
+        assert results[0].execution_env == expected
+
+
+class TestBuckTargetIsKeywordOnly:
+    """``RunRequest.buck_target`` MUST be keyword-only.
+
+    Pins the backward-compat guarantee that adding ``buck_target``
+    to ``RunRequest`` does not shift the positional ``__init__``
+    signature. The field is declared BEFORE ``mitigations`` in the
+    source so the docstring "Attributes:" order matches the
+    conceptual grouping (env-tier overlay first, then mitigation
+    set); without ``kw_only=True`` that ordering would silently
+    move ``mitigations`` from positional slot 4 to slot 5, breaking
+    every external caller that constructed a ``RunRequest``
+    positionally as ``RunRequest("wl", 1, "env", ("mit",))``.
+
+    Single-purpose class -- if this trips, the regression is one
+    bit (the ``kw_only=True`` got dropped from the field()) and
+    the fix is one bit too.
+    """
+
+    def test_buck_target_signature_is_keyword_only(self):
+        """Inspect the dataclass's __init__ signature directly and
+        assert ``buck_target``'s ``kind`` is ``KEYWORD_ONLY``.
+
+        Direct signature inspection (rather than a "construct with
+        positional and expect TypeError" probe) is the right shape
+        of assertion here because ``RunRequest`` has many positional
+        fields AFTER ``buck_target``'s source position
+        (``extra_env``, ``steps``, ``config_overrides``, ...).
+        Removing ``buck_target`` from the positional list just
+        slides those down -- a string passed as the 5th positional
+        would land in ``extra_env`` and silently typecheck
+        (``deepcopy('a string')`` is fine), so a "construct +
+        TypeError" probe would false-pass.
+
+        Inspecting ``Parameter.kind`` is the single bit of truth:
+        if ``kw_only=True`` is dropped from the field(), this
+        assertion trips with a clear "POSITIONAL_OR_KEYWORD vs
+        KEYWORD_ONLY" diff in the failure message.
+        """
+        import inspect
+        sig = inspect.signature(RunRequest)
+        assert sig.parameters["buck_target"].kind == inspect.Parameter.KEYWORD_ONLY, (
+            f"buck_target must be KEYWORD_ONLY (so adding it before "
+            f"existing positional fields like ``mitigations`` doesn't "
+            f"shift those fields' positional slots and break external "
+            f"positional callers of ``RunRequest``). Got "
+            f"{sig.parameters['buck_target'].kind}."
+        )
+
+    def test_mitigations_is_still_positional_at_slot_4(self):
+        """Sanity: ``mitigations`` remains positionally addressable
+        as the 4th argument despite ``buck_target`` being declared
+        before it in the source. The whole point of ``kw_only=True``
+        on ``buck_target`` is to keep this true.
+
+        Behavior before the ``buck_target`` field was added:
+        ``RunRequest("wl", 1, "env", ("none",))`` constructed with
+        ``mitigations=("none",)``. Behavior after this field was
+        added (this PR, the #182 follow-up that introduced the
+        ``--buck-target`` overlay) MUST be identical; that's the
+        backward-compat contract ``kw_only=True`` exists to
+        enforce.
+        """
+        req = RunRequest("wl", 1, "env", ("none",))
+        assert req.mitigations == ("none",)
+        assert req.buck_target is None
+
+    def test_buck_target_works_as_keyword(self):
+        """Companion positive case: kwarg form is the only accepted
+        spelling, and it sets the field correctly. Cheap belt-and-
+        suspenders pin so a future ``kw_only=True`` typo can't pass
+        the failure-path test by simply rejecting both spellings.
+        """
+        req = RunRequest("wl", 1, "env", buck_target="//foo:bar")
+        assert req.buck_target == "//foo:bar"
+        assert req.mitigations == ("none",)
+
+
+class TestBuckTargetOverride:
+    """RunRequest.buck_target overlays the resolved environment's Buck pin.
+
+    These tests pin the four behavioral guarantees that
+    downstream regression-gate dispatchers rely on, all
+    asserted at the place the value is actually consumed
+    (``config["_aorta_environment"]["buck_target"]`` and
+    ``TrialResult.execution_env["buck_target"]``):
+
+    1. Override sets the value on a named env that had no buck_target.
+       (BUCK_ONLY gates pointing at ``--environment local
+       --buck-target //foo:bar``.)
+    2. Override replaces a value the named env already declared.
+       (A buck-aware named env can be overridden per-run.)
+    3. ``buck_target=None`` is a no-op: a named env's existing pin
+       survives. This is the backward-compat guarantee.
+    4. Override preserves the named env's other fields
+       (``docker``, ``venv``, ``source_package``). The override is a
+       single-axis pin, not a wholesale env replacement.
+
+    Together these pin the contract symmetric to
+    ``aorta env probe --buck-target`` -- the CLI flag overlays one
+    field, the rest of the recipe is preserved.
+    """
+
+    @staticmethod
+    def _build_capture_workload(captured_config):
+        class EnvCapturingWorkload(Workload):
+            launch_mode = "single_process"
+            min_world_size = 1
+
+            def __init__(self, config):
+                super().__init__(config)
+                captured_config.update(config)
+
+            def setup(self):
+                pass
+
+            def run(self):
+                return WorkloadResult(passed=True)
+
+            def cleanup(self):
+                pass
+        return EnvCapturingWorkload
+
+    @staticmethod
+    def _mock_workload_discovery(workload_cls):
+        mock_ep = MagicMock()
+        mock_ep.name = "envcapture"
+        mock_ep.load.return_value = workload_cls
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        return mock_eps
+
+    def test_override_sets_value_on_named_env_with_no_buck_target(self, tmp_path):
+        """Override populates a previously-empty Buck axis.
+
+        Scenario: an operator uses the built-in ``local`` env (which
+        has ``buck_target=None``) and adds ``--buck-target //:aorta``
+        to pin a buck-built binary for this run. The dispatcher must
+        thread ``//:aorta`` into ``config["_aorta_environment"]``;
+        otherwise a Buck-aware workload wrapper has no way to know
+        which target to ``buck2 run``.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="local",
+            docker=None, venv=None, buck_target=None,
+            source_package="aorta",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="local",
+                    buck_target="//:aorta",
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert captured_config["_aorta_environment"]["buck_target"] == "//:aorta"
+        assert results[0].execution_env["buck_target"] == "//:aorta"
+
+    def test_override_replaces_named_env_buck_target(self, tmp_path):
+        """Override wins when the named env ALSO declared buck_target.
+
+        Scenario: a registered buck-aware env declares
+        ``//workloads/recom_repro:recom_repro`` as its default
+        target; the operator overrides per-run to point at a custom
+        Buck-built CLI for an A/B test. Without the runtime
+        override, the operator would have to register a one-shot
+        named env per variant -- exactly the friction this flag is
+        meant to remove.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="recom-buck",
+            docker=None, venv=None,
+            buck_target="//workloads/recom_repro:recom_repro",
+            source_package="aorta",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="recom-buck",
+                    buck_target="//:aorta",
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert captured_config["_aorta_environment"]["buck_target"] == "//:aorta"
+        assert results[0].execution_env["buck_target"] == "//:aorta"
+
+    def test_none_override_preserves_named_env_buck_target(self, tmp_path):
+        """``buck_target=None`` (the default) is a no-op.
+
+        Backward-compat guarantee: a pre-existing invocation that
+        relied on a named env's declared ``buck_target`` must
+        continue to see that value flow into
+        ``_aorta_environment``. Otherwise this CLI addition would
+        silently break every existing buck-aware named env.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="recom-buck",
+            docker=None, venv=None,
+            buck_target="//workloads/recom_repro:recom_repro",
+            source_package="aorta",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="recom-buck",
+                    # buck_target omitted -- default is None
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert (captured_config["_aorta_environment"]["buck_target"]
+                == "//workloads/recom_repro:recom_repro")
+        assert (results[0].execution_env["buck_target"]
+                == "//workloads/recom_repro:recom_repro")
+
+    def test_empty_string_override_preserves_named_env_buck_target(self, tmp_path):
+        """``buck_target=""`` is treated as "no override" -- same as ``None``.
+
+        Empty string is never a valid Buck2 label, so an explicit
+        ``--buck-target ""`` (or a library caller passing ``""``)
+        should NOT silently overlay ``buck_target=""`` onto the
+        resolved env. The dispatcher uses a truthy check so both
+        ``None`` (the default) and ``""`` flow through without
+        touching the named env's existing pin -- otherwise an
+        operator who accidentally produced an empty value (shell
+        variable expansion, dispatcher emitting an unset
+        environment override) would land in a ``buck2 run ""``
+        style failure that's hard to attribute back to the flag.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="recom-buck",
+            docker=None, venv=None,
+            buck_target="//workloads/recom_repro:recom_repro",
+            source_package="aorta",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="recom-buck",
+                    buck_target="",
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert (captured_config["_aorta_environment"]["buck_target"]
+                == "//workloads/recom_repro:recom_repro")
+        assert (results[0].execution_env["buck_target"]
+                == "//workloads/recom_repro:recom_repro")
+
+    def test_override_preserves_other_env_fields(self, tmp_path):
+        """Override is a single-axis pin, not a wholesale env replacement.
+
+        Scenario: the named env declares ``docker=img@sha256:...``
+        (the gate's BUCK_IN_DOCKER tier needs the docker pin) AND a
+        default ``buck_target``. The operator overrides only the Buck
+        axis -- the docker pin, venv, source_package must survive.
+        Otherwise a BUCK_IN_DOCKER gate that overlays the Buck axis
+        would silently lose its docker pin and dispatch as
+        BUCK_ONLY -- exactly the mis-classification the gate
+        validator is meant to make impossible.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="buck-in-docker",
+            docker="img@sha256:" + "d" * 64,
+            venv="/opt/venv",
+            buck_target="//default:target",
+            source_package="custom_pkg",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="buck-in-docker",
+                    buck_target="//:aorta",
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        expected = {
+            "name": "buck-in-docker",
+            # docker survived the buck_target overlay
+            "docker": "img@sha256:" + "d" * 64,
+            # venv survived
+            "venv": "/opt/venv",
+            # buck_target was overridden
+            "buck_target": "//:aorta",
+            # source_package survived
+            "source_package": "custom_pkg",
         }
         assert captured_config["_aorta_environment"] == expected
         assert results[0].execution_env == expected

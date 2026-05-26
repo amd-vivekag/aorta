@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +47,37 @@ class RunRequest:
     request can never be mutated out from under the dispatcher.  This
     mirrors the same defensive pattern used by :class:`TrialResult`.
 
+    Note:
+        :class:`TrialResult.execution_env` records the *effective*
+        recipe (the declared environment plus any runtime overlays
+        from CLI flags such as ``--buck-target``).  Replays should
+        read ``execution_env`` field-by-field, not re-resolve the
+        named environment, when overlays were used -- otherwise the
+        replay silently drops the overlay and runs against a
+        different recipe than the original trial.
+
     Attributes:
         workload: Name of the workload to run (from entry-point group).
         trials: Number of trials to execute.
         environment: Environment name (default: local).
+        buck_target: Optional runtime overlay for the resolved
+            :class:`Environment`'s ``buck_target`` field (#182). When
+            set, takes effect AFTER :func:`get_environment` resolves
+            ``environment``, so the named environment's other fields
+            (``docker`` / ``venv`` / ``source_package``) are
+            preserved -- the override is a pin on the Buck axis only.
+            ``None`` (the default) means "no override": a named env
+            that already declares ``buck_target`` keeps its value,
+            and every pre-existing ``RunRequest`` invocation behaves
+            unchanged. Symmetric peer of ``aorta env probe
+            --buck-target`` (#163). Threaded into
+            ``config['_aorta_environment']['buck_target']`` for the
+            workload's wrapper to consume. **Keyword-only**: this
+            field is declared with ``kw_only=True`` so adding it
+            before existing positional fields like ``mitigations``
+            does NOT shift the positional ``__init__`` signature
+            (positional callers continue to interpret the 4th arg as
+            ``mitigations``).
         mitigations: Tuple of mitigation names to apply.
         extra_env: Additional environment variables (override mitigations).
         steps: Number of steps per trial (workload-specific).
@@ -110,6 +137,35 @@ class RunRequest:
     workload: str
     trials: int
     environment: str = "local"
+    # Runtime override for the resolved :class:`Environment`'s
+    # ``buck_target`` field (#182 made it a first-class peer of
+    # ``docker`` / ``venv``). When set, takes effect AFTER
+    # :func:`get_environment` resolves ``environment``, so the named
+    # environment's other fields (``docker``, ``venv``,
+    # ``source_package``) are preserved. ``None`` means "leave the
+    # resolved environment's ``buck_target`` untouched" -- a named env
+    # that already declares ``buck_target`` keeps its value. This is
+    # the symmetric peer of how ``aorta env probe --buck-target``
+    # enriches the env snapshot; here it overlays the runtime recipe
+    # the workload's ``run()`` reads via
+    # ``config["_aorta_environment"]["buck_target"]``. Enables the
+    # BUCK_ONLY / BUCK_IN_DOCKER tiers of downstream regression-gate
+    # dispatchers without forcing operators to register a one-shot
+    # named environment per gate.
+    #
+    # ``kw_only=True`` is the backward-compat guard: declaring this
+    # field BEFORE ``mitigations`` (so the docstring "Attributes:"
+    # order matches the conceptual "env-tier overlay then mitigations"
+    # grouping) would otherwise shift ``mitigations`` from the 4th
+    # positional slot to the 5th, silently breaking any external
+    # caller that constructed a ``RunRequest`` positionally. With
+    # ``kw_only=True``, Python places ``buck_target`` last in
+    # ``__init__``'s signature regardless of class-body order, so
+    # positional callers continue to receive ``mitigations`` at slot
+    # 4. (Caught at review on the symmetric --image PR; applied here
+    # too for symmetry and to address the same principle at its
+    # root.)
+    buck_target: str | None = field(default=None, kw_only=True)
     mitigations: tuple[str, ...] = ("none",)
     extra_env: dict[str, str] = field(default_factory=dict)
     steps: int | None = None
@@ -208,6 +264,23 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
     #    built-ins and entry-point plugins.
     sidecar_files = list(request.sidecar_files) or None
     env_descriptor = get_environment(request.environment, extra_files=sidecar_files)
+
+    # 7a. Apply the ``buck_target`` runtime override (if any) AFTER
+    #     resolving the named environment, so the named env's
+    #     ``docker`` / ``venv`` / ``source_package`` fields are
+    #     preserved.  Falsy values (``None`` -- the default -- and
+    #     ``""``) mean "no override": a named env that already
+    #     declares ``buck_target`` keeps its value.  Empty string is
+    #     never a valid Buck2 label, so treating it as a no-op rather
+    #     than silently overlaying ``buck_target=""`` onto the
+    #     resolved env avoids a downstream ``buck2 run ""`` style
+    #     failure that would be hard to attribute back to the flag.
+    #     This is the dispatcher side of the ``--buck-target`` CLI
+    #     flag symmetric to ``aorta env probe --buck-target``; see the
+    #     ``RunRequest.buck_target`` docstring for the cross-repo
+    #     motivation (downstream regression-gate dispatchers).
+    if request.buck_target:
+        env_descriptor = replace(env_descriptor, buck_target=request.buck_target)
 
     # 8. Resolve and union mitigations.  ``aorta.registry.get_mitigation``
     #    returns a defensive ``dict[str, str]`` per-call, so later
