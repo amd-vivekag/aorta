@@ -40,6 +40,19 @@ from aorta.run.dispatcher import RunRequest, run_trials
     "--environment", default="local", show_default=True, help="Registered environment name."
 )
 @click.option(
+    "--image",
+    type=str,
+    default=None,
+    help=(
+        "OCI image reference (typically digest-pinned, e.g. "
+        "'sha256:<64-hex>' or '<repo>@sha256:<digest>') to overlay "
+        "onto the resolved environment's docker field. Other axes "
+        "(buck_target, venv, source_package) of the named "
+        "--environment are preserved. When omitted, the named "
+        "environment's existing docker value (if any) is used as-is."
+    ),
+)
+@click.option(
     "--buck-target",
     type=str,
     default=None,
@@ -97,6 +110,7 @@ def run(
     workload: str,
     trials: int,
     environment: str,
+    image: str | None,
     buck_target: str | None,
     mitigations: str,
     mitigation_files: tuple[Path, ...],
@@ -119,6 +133,7 @@ def run(
             workload=workload,
             trials=trials,
             environment=environment,
+            image=image,
             buck_target=buck_target,
             mitigations=parse_mitigations(mitigations),
             extra_env=parse_extra_env(extra_env),

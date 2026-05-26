@@ -451,3 +451,128 @@ class TestBuckTargetOption:
             "requires an argument" in result.output.lower()
             or "expected" in result.output.lower()
         )
+
+
+class TestImageOption:
+    """``--image`` is the docker-tier runtime overlay -- symmetric peer of
+    ``--buck-target`` on the docker axis.
+
+    Same overlay contract as ``--buck-target``: pin one axis of the
+    resolved environment, preserve everything else. Together the two
+    flags unblock the full downstream regression-gate dispatch matrix
+    (DOCKER_ONLY, BUCK_ONLY, BUCK_IN_DOCKER). Naming asymmetry --
+    flag ``--image`` overlays field ``Environment.docker`` -- is
+    deliberate: the field names the recipe slot, the flag names
+    the value the operator provides (an OCI image reference).
+    """
+
+    def test_image_option_exists(self):
+        """``aorta run --help`` advertises ``--image``.
+
+        Same regression-guard role as
+        ``TestBuckTargetOption::test_buck_target_option_exists`` --
+        a CLI surface drop trips here at help-render rather than at
+        gate-dispatch time."""
+        runner = CliRunner()
+        result = runner.invoke(run, ["--help"])
+        assert result.exit_code == 0, result.output
+        assert "--image" in result.output
+
+    def test_image_default_is_none(self):
+        """Omitting ``--image`` must not change pre-existing behavior.
+
+        Backward-compat guard for every invocation that was working
+        before this flag existed. The named ``--environment``
+        resolves exactly as before; any ``docker`` it declares stays
+        in effect.
+        """
+        runner = CliRunner()
+        result = runner.invoke(run, ["--workload", "nonexistent_workload"])
+        assert "Unknown option" not in result.output
+        assert "not found" in result.output.lower()
+
+    def test_image_accepts_bare_sha256_digest(self):
+        """A bare digest pin parses cleanly. This is the form
+        downstream DOCKER_ONLY regression gates emit."""
+        runner = CliRunner()
+        result = runner.invoke(
+            run,
+            [
+                "--workload",
+                "nonexistent_workload",
+                "--image",
+                "sha256:" + "a" * 64,
+            ],
+        )
+        assert "Unknown option" not in result.output
+        assert "No such option" not in result.output
+        assert "not found" in result.output.lower()
+
+    def test_image_accepts_repo_at_digest_reference(self):
+        """The reference-with-digest form ('<repo>@sha256:<hex>')
+        parses too. Downstream gate validators accept both the
+        bare and reference forms; the CLI must accept whatever
+        the gate validator accepts.
+
+        Asserts the *positive* failure mode (workload-discovery)
+        rather than only the *negative* ("not rejected at parse")
+        signal: if the invocation false-paths into a usage error
+        or traceback that happens not to contain "Unknown option",
+        the negative-only check would silently pass. Mirrors the
+        belt-and-suspenders shape of
+        ``test_image_accepts_bare_sha256_digest`` above (and of
+        the equivalent ``TestBuckTargetOption`` tests on the buck
+        axis after PR #191's round-2 review fix).
+        """
+        runner = CliRunner()
+        result = runner.invoke(
+            run,
+            [
+                "--workload",
+                "nonexistent_workload",
+                "--image",
+                "rocm/pytorch@sha256:" + "c" * 64,
+            ],
+        )
+        # Flag itself must not be the failure cause.
+        assert "Unknown option" not in result.output
+        assert "No such option" not in result.output
+        # The expected workload-discovery failure path was reached
+        # (positive signal that arg-parse + the rest of the CLI
+        # plumbing actually ran).
+        assert result.exit_code != 0
+        assert "not found" in result.output.lower()
+
+    def test_image_no_argument_value_is_error(self):
+        """``--image`` requires a value. Same trap-guard as the
+        equivalent test on ``--buck-target``: an ``is_flag=True``
+        mistake would silently pass ``True`` as the image, then
+        explode inside ``replace(env, docker=True)``."""
+        runner = CliRunner()
+        result = runner.invoke(run, ["--workload", "x", "--image"])
+        assert result.exit_code != 0
+        assert (
+            "requires an argument" in result.output.lower()
+            or "expected" in result.output.lower()
+        )
+
+    def test_image_and_buck_target_are_independent(self):
+        """Both flags may be set simultaneously (BUCK_IN_DOCKER
+        gates). Each overlays its own axis; the dispatcher's
+        ``replace(...)`` calls compose without interference."""
+        runner = CliRunner()
+        result = runner.invoke(
+            run,
+            [
+                "--workload",
+                "nonexistent_workload",
+                "--image",
+                "sha256:" + "a" * 64,
+                "--buck-target",
+                "//:aorta",
+            ],
+        )
+        # Neither flag is rejected at CLI parse.
+        assert "Unknown option" not in result.output
+        assert "No such option" not in result.output
+        assert "not found" in result.output.lower()

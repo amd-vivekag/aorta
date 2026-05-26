@@ -98,9 +98,11 @@ class TestRunRequest:
         """RunRequest has sensible defaults."""
         req = RunRequest(workload="test", trials=1)
         assert req.environment == "local"
-        # ``buck_target`` defaults to ``None`` so omitting the new
-        # CLI flag keeps the resolved-environment's Buck-tier field
-        # untouched -- backward-compat with every pre-existing run.
+        # ``image`` and ``buck_target`` both default to ``None`` so
+        # omitting either new CLI flag keeps the resolved
+        # environment's corresponding field untouched -- backward-
+        # compat with every pre-existing run.
+        assert req.image is None
         assert req.buck_target is None
         assert req.mitigations == ("none",)
         assert req.extra_env == {}
@@ -1296,6 +1298,355 @@ class TestBuckTargetOverride:
         }
         assert captured_config["_aorta_environment"] == expected
         assert results[0].execution_env == expected
+
+
+class TestImageIsKeywordOnly:
+    """``RunRequest.image`` MUST be keyword-only.
+
+    Mirror of :class:`TestBuckTargetIsKeywordOnly` on the docker
+    axis. Same backward-compat reasoning: declaring ``image``
+    BEFORE ``mitigations`` in the source (to keep the docstring
+    "Attributes:" grouping of env-tier overlays together) would
+    otherwise shift ``mitigations`` from positional slot 4, silently
+    breaking any external caller that constructed a ``RunRequest``
+    positionally.
+
+    Three-test structure mirrors ``TestBuckTargetIsKeywordOnly``
+    exactly so a regression in one axis is locatable from the
+    test-class name alone.
+    """
+
+    def test_image_signature_is_keyword_only(self):
+        """Direct ``inspect.signature`` check on the ``image``
+        parameter's ``kind``. Single bit of truth: if
+        ``kw_only=True`` is dropped from the field() in a future
+        refactor, this trips with a clear "POSITIONAL_OR_KEYWORD vs
+        KEYWORD_ONLY" diff. See
+        ``TestBuckTargetIsKeywordOnly::test_buck_target_signature_is_keyword_only``
+        for why signature inspection beats a positional+TypeError
+        probe here (same reasoning: many positional fields after
+        ``image``'s source position).
+        """
+        import inspect
+        sig = inspect.signature(RunRequest)
+        assert sig.parameters["image"].kind == inspect.Parameter.KEYWORD_ONLY, (
+            f"image must be KEYWORD_ONLY (so adding it before "
+            f"existing positional fields like ``mitigations`` doesn't "
+            f"shift those fields' positional slots and break external "
+            f"positional callers of ``RunRequest``). Got "
+            f"{sig.parameters['image'].kind}."
+        )
+
+    def test_mitigations_is_still_positional_with_both_overlays_declared(self):
+        """Sanity: with BOTH ``image`` and ``buck_target`` declared
+        before ``mitigations`` (the post-#193 source order), the
+        pre-PR-#191 invocation ``RunRequest("wl", 1, "env",
+        ("none",))`` STILL binds ``mitigations`` correctly.
+
+        Stronger version of the matching test in
+        ``TestBuckTargetIsKeywordOnly`` because here we're checking
+        the composite: two kw_only fields declared before
+        ``mitigations``. If either field accidentally loses its
+        ``kw_only=True``, this test trips.
+        """
+        req = RunRequest("wl", 1, "env", ("none",))
+        assert req.mitigations == ("none",)
+        assert req.image is None
+        assert req.buck_target is None
+
+    def test_image_works_as_keyword(self):
+        """Belt-and-suspenders positive case (matches the structure
+        of ``TestBuckTargetIsKeywordOnly``). Catches a typo on
+        ``kw_only=True`` that would make the negative test
+        false-pass by rejecting both spellings."""
+        req = RunRequest("wl", 1, "env", image="sha256:" + "a" * 64)
+        assert req.image == "sha256:" + "a" * 64
+        assert req.mitigations == ("none",)
+
+
+class TestImageOverride:
+    """RunRequest.image overlays the resolved environment's docker pin.
+
+    Symmetric peer of :class:`TestBuckTargetOverride`. Same four
+    guarantees, same call sites checked
+    (``config["_aorta_environment"]`` and
+    ``TrialResult.execution_env``), same workload-capturing fixture
+    pattern. The mirroring is deliberate -- a regression that drops
+    one of the two override paths trips the corresponding test
+    class, so the fix is locatable from the test name alone.
+
+    Together these tests + :class:`TestBuckTargetOverride` pin the
+    full dispatch matrix that downstream regression-gate runners
+    rely on: DOCKER_ONLY (image only), BUCK_ONLY (buck only),
+    BUCK_IN_DOCKER (both, exercising the independence guarantee).
+    """
+
+    @staticmethod
+    def _build_capture_workload(captured_config):
+        class EnvCapturingWorkload(Workload):
+            launch_mode = "single_process"
+            min_world_size = 1
+
+            def __init__(self, config):
+                super().__init__(config)
+                captured_config.update(config)
+
+            def setup(self):
+                pass
+
+            def run(self):
+                return WorkloadResult(passed=True)
+
+            def cleanup(self):
+                pass
+        return EnvCapturingWorkload
+
+    @staticmethod
+    def _mock_workload_discovery(workload_cls):
+        mock_ep = MagicMock()
+        mock_ep.name = "envcapture"
+        mock_ep.load.return_value = workload_cls
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+        return mock_eps
+
+    def test_override_sets_value_on_named_env_with_no_docker(self, tmp_path):
+        """Override populates a previously-empty docker axis.
+
+        Scenario: an operator uses the built-in ``local`` env (which
+        has ``docker=None``) and adds ``--image sha256:...`` to pin
+        a docker image for this run. The dispatcher must thread the
+        image digest into ``config["_aorta_environment"]["docker"]``;
+        otherwise a docker-aware workload wrapper has no way to know
+        which image to ``docker run``.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="local",
+            docker=None, venv=None, buck_target=None,
+            source_package="aorta",
+        )
+        digest = "sha256:" + "a" * 64
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="local",
+                    image=digest,
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert captured_config["_aorta_environment"]["docker"] == digest
+        assert results[0].execution_env["docker"] == digest
+
+    def test_override_replaces_named_env_docker(self, tmp_path):
+        """Override wins when the named env ALSO declared docker.
+
+        Scenario: a registered docker-aware env declares
+        ``rocm/pytorch@sha256:OLD`` as its default image; the
+        operator overrides per-run to test a candidate fix image.
+        Without the runtime override the operator would have to
+        register a one-shot named env per image variant.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="docker-base",
+            docker="rocm/pytorch@sha256:" + "0" * 64,
+            venv=None,
+            buck_target=None,
+            source_package="aorta",
+        )
+        candidate = "rocm/pytorch@sha256:" + "f" * 64
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="docker-base",
+                    image=candidate,
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert captured_config["_aorta_environment"]["docker"] == candidate
+        assert results[0].execution_env["docker"] == candidate
+
+    def test_none_image_preserves_named_env_docker(self, tmp_path):
+        """``image=None`` (the default) is a no-op.
+
+        Backward-compat guarantee: pre-existing invocations that
+        relied on a named env's declared ``docker`` continue to see
+        that value flow into ``_aorta_environment``. Same role as
+        the equivalent ``test_none_override_preserves...`` test for
+        ``buck_target``.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        existing = "rocm/pytorch@sha256:" + "0" * 64
+        env = Environment(
+            name="docker-base",
+            docker=existing, venv=None, buck_target=None,
+            source_package="aorta",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="docker-base",
+                    # image omitted -- default is None
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert captured_config["_aorta_environment"]["docker"] == existing
+        assert results[0].execution_env["docker"] == existing
+
+    def test_empty_string_image_preserves_named_env_docker(self, tmp_path):
+        """``image=""`` is treated as "no override" -- same as ``None``.
+
+        Empty string is never a valid OCI image reference, so an
+        explicit ``--image ""`` (or a library caller passing ``""``)
+        should NOT silently overlay ``docker=""`` onto the resolved
+        env. The dispatcher uses a truthy check so both ``None``
+        (the default) and ``""`` flow through without touching the
+        named env's existing docker -- otherwise an operator who
+        accidentally produced an empty value (shell variable
+        expansion, dispatcher emitting an unset environment override)
+        would land in a ``docker run ""``-style failure that's hard
+        to attribute back to the flag. Mirrors the equivalent test
+        on the buck axis (``test_empty_string_override_preserves_
+        named_env_buck_target``).
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        existing = "rocm/pytorch@sha256:" + "0" * 64
+        env = Environment(
+            name="docker-base",
+            docker=existing, venv=None, buck_target=None,
+            source_package="aorta",
+        )
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="docker-base",
+                    image="",
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        assert captured_config["_aorta_environment"]["docker"] == existing
+        assert results[0].execution_env["docker"] == existing
+
+    def test_override_preserves_other_env_fields(self, tmp_path):
+        """Override is a single-axis pin, not a wholesale env
+        replacement.
+
+        Scenario: the named env declares a default buck_target AND
+        the operator overrides only the docker axis (e.g. to A/B-test
+        a candidate image while keeping the same buck-built binary).
+        The buck_target, venv, source_package fields must survive.
+        Otherwise an A/B docker test would silently drop the buck pin
+        and dispatch as DOCKER_ONLY instead of BUCK_IN_DOCKER --
+        exactly the mis-classification the gate validator prevents.
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="buck-in-docker",
+            docker="rocm/pytorch@sha256:" + "0" * 64,
+            venv="/opt/venv",
+            buck_target="//workloads/recom_repro:recom_repro",
+            source_package="custom_pkg",
+        )
+        candidate = "rocm/pytorch@sha256:" + "f" * 64
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="buck-in-docker",
+                    image=candidate,
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        expected = {
+            "name": "buck-in-docker",
+            # docker was overridden
+            "docker": candidate,
+            # venv survived
+            "venv": "/opt/venv",
+            # buck_target survived the docker overlay
+            "buck_target": "//workloads/recom_repro:recom_repro",
+            # source_package survived
+            "source_package": "custom_pkg",
+        }
+        assert captured_config["_aorta_environment"] == expected
+        assert results[0].execution_env == expected
+
+    def test_image_and_buck_target_overrides_are_independent(self, tmp_path):
+        """Both axes overridden simultaneously (BUCK_IN_DOCKER gate).
+
+        Asserts the two ``replace(...)`` calls in the dispatcher
+        compose: neither overlay clobbers the other. This is the
+        exact runtime shape a downstream BUCK_IN_DOCKER regression-
+        gate tier produces (an operator pin on BOTH the docker
+        image AND the buck target, for highest-assurance gates).
+        """
+        from aorta.registry import Environment
+
+        captured_config: dict = {}
+        workload_cls = self._build_capture_workload(captured_config)
+        env = Environment(
+            name="local",
+            docker=None, venv=None, buck_target=None,
+            source_package="aorta",
+        )
+        digest = "sha256:" + "e" * 64
+        target = "//:aorta"
+        with patch("importlib.metadata.entry_points",
+                   return_value=self._mock_workload_discovery(workload_cls)):
+            with patch("aorta.run.dispatcher.get_environment", return_value=env):
+                req = RunRequest(
+                    workload="envcapture",
+                    trials=1,
+                    environment="local",
+                    image=digest,
+                    buck_target=target,
+                    results_dir=tmp_path,
+                )
+                results = run_trials(req)
+
+        env_block = captured_config["_aorta_environment"]
+        assert env_block["docker"] == digest
+        assert env_block["buck_target"] == target
+        # No regression of the original 'local' env fields.
+        assert env_block["name"] == "local"
+        assert env_block["venv"] is None
+        assert env_block["source_package"] == "aorta"
+        assert results[0].execution_env == env_block
 
 
 class TestEnvironmentRestoration:
