@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -173,6 +174,57 @@ def test_resolve_run_dir_without_ticket_routes_to_no_ticket(tmp_path):
     r = _simple_recipe(ticket=None)
     run_dir = resolve_run_dir(tmp_path, r, timestamp="2026-01-01T00-00-00")
     assert run_dir.parts[-3] == NO_TICKET_SLUG
+
+
+# ---- layout="flat_resume" (issue #188 FR 1.13) ---------------------------
+
+
+def test_flat_resume_layout(tmp_path):
+    """`layout="flat_resume"` returns <output>/<ticket>/ (no timestamp, no workload)."""
+    r = _simple_recipe(ticket="PROBE-1")
+    run_dir = resolve_run_dir(tmp_path, r, layout="flat_resume")
+    assert run_dir == tmp_path / "PROBE-1"
+    assert run_dir.is_dir()
+
+
+def test_flat_resume_layout_is_idempotent(tmp_path):
+    """Re-invoking with the same args returns the same path (resume model)."""
+    r = _simple_recipe(ticket="PROBE-1")
+    a = resolve_run_dir(tmp_path, r, layout="flat_resume")
+    b = resolve_run_dir(tmp_path, r, layout="flat_resume")
+    assert a == b
+
+
+def test_flat_resume_layout_no_ticket(tmp_path):
+    r = _simple_recipe(ticket=None)
+    run_dir = resolve_run_dir(tmp_path, r, layout="flat_resume")
+    assert run_dir == tmp_path / NO_TICKET_SLUG
+
+
+def test_resolve_run_dir_rejects_unknown_layout(tmp_path):
+    """Regression for PR #194 review: an unknown ``layout`` value used
+    to silently land in the timestamped branch (the type guard fires only
+    under mypy --strict). The runtime check must reject misspellings so
+    probe-mode callers cannot accidentally produce a timestamped tree.
+    """
+    r = _simple_recipe(ticket="PROJ-1")
+    with pytest.raises(ValueError, match="layout must be"):
+        resolve_run_dir(tmp_path, r, layout="flatresume")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="layout must be"):
+        resolve_run_dir(tmp_path, r, layout="")  # type: ignore[arg-type]
+
+
+def test_default_layout_is_byte_equivalent_to_timestamped(tmp_path):
+    """Existing callers see no behaviour change -- the default is 'timestamped'."""
+    r = _simple_recipe(ticket="PROJ-1")
+    a = resolve_run_dir(tmp_path, r, timestamp="2026-01-01T00-00-00")
+    # Same call with explicit layout="timestamped" produces a sibling
+    # timestamped dir (a -2 suffix appended because parent path matches).
+    assert a == tmp_path / "PROJ-1" / "fsdp" / "2026-01-01T00-00-00"
+    b = resolve_run_dir(
+        tmp_path, r, timestamp="2026-01-01T00-00-00", layout="timestamped"
+    )
+    assert b == tmp_path / "PROJ-1" / "fsdp" / "2026-01-01T00-00-00-2"
 
 
 # ---- End-to-end via run_recipe -------------------------------------------
@@ -736,6 +788,55 @@ def test_collect_trial_paths_sorts_numerically_not_lexicographically(tmp_path):
     paths = runner._collect_trial_paths(cell_dir)
     indices = [int(p.rsplit("trial_", 1)[1].rsplit(".", 1)[0]) for p in paths]
     assert indices == [0, 1, 2, 3, 9, 10, 11, 100]
+
+
+def test_collect_trial_paths_sorts_dispatcher_naming_by_trial_index(tmp_path):
+    """Regression for PR #194 review: dispatcher writes
+    ``trial_d<dataset>_m<mitigation>_t<trial>.json`` and the sort key
+    must extract ``<trial>`` so ``..._t10.json`` doesn't lex-sort
+    before ``..._t2.json``. Previously the helper only matched
+    ``trial_<N>.json`` and fell into the alphabetical sentinel branch
+    for dispatcher-shape files, mis-ordering hydration for any
+    cell with >= 10 trials.
+    """
+    cell_dir = tmp_path / "cell"
+    work_dir = cell_dir / "_subprocess"
+    work_dir.mkdir(parents=True)
+    for i in [0, 1, 2, 3, 9, 10, 11, 100]:
+        (work_dir / f"trial_d0_m0_t{i}.json").write_text("{}")
+
+    paths = runner._collect_trial_paths(cell_dir)
+
+    def _t_index(p: str) -> int:
+        # 'trial_d0_m0_t10' -> '10'
+        return int(p.rsplit("_t", 1)[1].rsplit(".", 1)[0])
+
+    indices = [_t_index(p) for p in paths]
+    assert indices == [0, 1, 2, 3, 9, 10, 11, 100]
+
+
+def test_collect_trial_paths_mixed_naming_keeps_each_shape_natural_sorted(tmp_path):
+    """A directory that contains BOTH legacy ``trial_<N>.json`` and
+    dispatcher ``trial_d<d>_m<m>_t<N>.json`` files should sort by the
+    integer trial index across both, so resume-hydration order matches
+    execution order regardless of how the file was written.
+    """
+    cell_dir = tmp_path / "cell"
+    work_dir = cell_dir / "_subprocess"
+    work_dir.mkdir(parents=True)
+    (work_dir / "trial_d0_m0_t10.json").write_text("{}")
+    (work_dir / "trial_2.json").write_text("{}")
+    (work_dir / "trial_d0_m0_t1.json").write_text("{}")
+    (work_dir / "trial_11.json").write_text("{}")
+
+    paths = runner._collect_trial_paths(cell_dir)
+    # By integer trial index: 1, 2, 10, 11.
+    assert [Path(p).stem for p in paths] == [
+        "trial_d0_m0_t1",
+        "trial_2",
+        "trial_d0_m0_t10",
+        "trial_11",
+    ]
 
 
 # ---- Class B: --mitigations-file (sidecar) lifecycle ---------------------

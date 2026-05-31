@@ -27,12 +27,15 @@ Per the acceptance criteria in issue #151, this module MUST NOT use
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import click
 
@@ -54,6 +57,7 @@ from aorta.triage.matrix import (
     aggregate_cell,
 )
 from aorta.triage.output import (
+    acquire_flat_resume_lock,
     format_timestamp,
     resolve_run_dir,
     safe_slug,
@@ -323,37 +327,111 @@ def _cells_dir(run_dir: Path) -> Path:
     return d
 
 
-def _collect_trial_paths(results_dir: Path) -> list[str]:
-    """Return the trial_*.json paths B1 wrote, sorted by trial index.
+_DISPATCHER_TRIAL_RE = re.compile(r"^trial_d\d+_m\d+_t(\d+)$")
+_LEGACY_TRIAL_RE = re.compile(r"^trial_(\d+)$")
 
-    B1's dispatcher writes to ``<results_dir>/<workload>/trial_<N>.json``
-    (the dispatcher appends the workload subdir; that's a B1 contract B2
-    currently honours without surgery). We glob the workload subdir so the
-    matrix.json ``trial_paths`` field matches reality on disk.
+
+def _collect_trial_paths(results_dir: Path) -> list[str]:
+    """Return the per-trial JSON paths the dispatcher wrote, sorted by trial index.
+
+    The dispatcher writes to
+    ``<results_dir>/<workload>/trial_d<dataset>_m<mitigation>_t<trial>.json``
+    (the dispatcher appends the workload subdir; that's a B1 contract
+    B2 currently honours without surgery). Older fixtures and tests
+    use the simpler ``trial_<N>.json`` shape; both are supported here
+    so this helper is the single sorting authority across the matrix /
+    resume code paths.
 
     Sort by the integer ``N`` extracted from the filename, NOT
-    lexicographically -- a lex sort would put ``trial_10.json`` before
-    ``trial_2.json`` and the recorded order would diverge from execution
-    order once a cell has 10+ trials. Files whose names don't parse as
-    ``trial_<int>.json`` sort last (alphabetically), which keeps any future
-    sibling artifacts visible without breaking the contract for the common
+    lexicographically -- a lex sort would put ``..._t10.json`` before
+    ``..._t2.json`` and the recorded order would diverge from
+    execution order once a cell has 10+ trials. This silently broke
+    the resume short-circuit's hydration order for any
+    trials >= 10 because ``_hydrate_trials_from_paths`` walks the
+    list in order. Files whose names don't parse under either regex
+    sort last (alphabetically), which keeps any future sibling
+    artifacts visible without breaking the contract for the common
     case.
     """
     if not results_dir.exists():
         return []
 
     def _key(path: Path) -> tuple[int, str]:
-        stem = path.stem  # "trial_3"
-        if stem.startswith("trial_"):
-            try:
-                return (int(stem[len("trial_") :]), "")
-            except ValueError:
-                pass
+        stem = path.stem
+        m = _DISPATCHER_TRIAL_RE.match(stem) or _LEGACY_TRIAL_RE.match(stem)
+        if m is not None:
+            return (int(m.group(1)), "")
         # Sentinel: push non-conforming names after every trial_N entry.
         return (10**12, str(path))
 
     found = sorted(results_dir.rglob("trial_*.json"), key=_key)
     return [str(p) for p in found]
+
+
+@dataclass(frozen=True)
+class _HydratedTrial:
+    """One successfully hydrated dispatcher JSON, keyed by parsed trial index.
+
+    Carries the dispatcher's source path alongside the body so the
+    resume short-circuit can return ``trial_paths`` aligned with
+    ``hydrated`` (same index -> same position in both lists) without
+    re-walking the directory.
+    """
+
+    index: int
+    path: str
+    trial: TrialResult
+
+
+def _hydrate_trials_by_index(trial_paths: list[str]) -> dict[int, _HydratedTrial]:
+    """Hydrate dispatcher ``trial_*.json`` files into an index-keyed map.
+
+    Each entry appears in the returned dict iff ALL THREE of:
+
+    1. The filename's trial-index suffix parses under the dispatcher
+       regex (``trial_d<d>_m<m>_t<idx>``) or the legacy
+       ``trial_<idx>`` shape.
+    2. ``Path.read_text`` + ``json.loads`` succeed.
+    3. :meth:`TrialResult.from_dict` accepts the body.
+
+    Any failure at steps 2 or 3 logs at WARNING and the entry is
+    silently dropped -- the caller's
+    ``required_indices.issubset(hydrated_by_index.keys())`` check
+    then catches the missing index and falls back to a full re-run.
+
+    Index-keyed (rather than the previous "list + side-channel index
+    set" shape) so a corrupted required ``_t0.json`` co-existing with
+    a stale extra ``_t<N>.json`` cannot pass the resume validation.
+    The previous implementation validated indices via the *filename
+    set* (from :func:`_collect_trial_paths`) while hydration silently
+    skipped the unreadable required file; the count check then passed
+    on the stale extra and the slice returned the wrong trial bodies.
+    The fix lives in the key set of this dict: a body that does not
+    hydrate cannot be in the keys, so the subset check is the load-
+    bearing invariant rather than the filename walk.
+    """
+    by_index: dict[int, _HydratedTrial] = {}
+    for raw in trial_paths:
+        path = Path(raw)
+        m = _DISPATCHER_TRIAL_RE.match(path.stem) or _LEGACY_TRIAL_RE.match(path.stem)
+        if m is None:
+            # Filename doesn't parse; ignored just as
+            # ``_collect_trial_paths`` already shoves these to the
+            # end of the sorted list.
+            continue
+        index = int(m.group(1))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("resume: unreadable trial JSON %s (%s)", path, exc)
+            continue
+        try:
+            trial = TrialResult.from_dict(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("resume: trial JSON %s violates schema (%s)", path, exc)
+            continue
+        by_index[index] = _HydratedTrial(index=index, path=raw, trial=trial)
+    return by_index
 
 
 def _trial_passed_for_log(trial: Any) -> bool:
@@ -539,6 +617,10 @@ def _run_one_cell(
     recipe: Recipe,
     run_dir: Path,
     sidecar_files: tuple[Path, ...],
+    *,
+    layout: Literal["timestamped", "flat_resume"] = "timestamped",
+    resume_existing: bool = False,
+    subprocess_argv: tuple[str, ...] | None = None,
 ) -> tuple[list[TrialResult], str | None, dict[str, str], list[str]]:
     """Execute a single cell through B1 and return (trials, error, env_vars, trial_paths).
 
@@ -548,11 +630,105 @@ def _run_one_cell(
     errored without bringing down the whole matrix. The full traceback is
     logged at WARNING so operators can diagnose, but the returned ``error``
     string stays short -- it's the text shown in matrix.md.
+
+    ``layout`` / ``resume_existing`` / ``subprocess_argv`` activate the
+    ``aorta probe`` (issue #188) code paths:
+
+    * ``layout="flat_resume"`` puts the cell artifacts at
+      ``<run_dir>/<safe_slug(cell.name)>/`` (NO ``cells/`` segment) so
+      the artifact tree matches the rubric's
+      ``<output>/<ticket>/<cell>/trial_<n>/...`` layout exactly.
+    * ``resume_existing=True`` consults
+      :func:`aorta.probe.resume.is_trial_complete` for every trial
+      directory under the cell BEFORE invoking the dispatcher. When
+      every trial is complete, the dispatcher call is skipped and the
+      trial JSONs the dispatcher had written previously are surfaced
+      as the cell's trials.
+    * ``subprocess_argv`` (not None) flips the request to
+      ``save_logs=True`` and routes the opaque user argv to the
+      reserved ``_aorta_subprocess_argv`` slot -- the only legal
+      channel for delivering argv to :class:`SubprocessWorkload`.
     """
-    cell_dir = _cells_dir(run_dir) / safe_slug(cell.name)
+    if layout == "flat_resume":
+        cell_dir = run_dir / safe_slug(cell.name)
+    else:
+        cell_dir = _cells_dir(run_dir) / safe_slug(cell.name)
     cell_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_env_vars = _resolve_cell_env_vars(cell.mitigations, cell.extra_env, sidecar_files)
+    effective_trials = cell.effective_trials(recipe.trials)
+
+    # Resume short-circuit: if every trial directory under this cell
+    # carries a valid result.json + non-empty verdict, the cell is
+    # already done. Hydrate the dispatcher's per-trial JSONs into
+    # ``TrialResult`` objects so ``aggregate_cell`` sees the real
+    # trial bodies (counts, timings, exit_status). Returning ``[]``
+    # here would make matrix.md report ``trials=0/passed=0`` for a
+    # skipped-but-complete cell -- the resume contract is "no extra
+    # work, identical artifacts".
+    #
+    # Fall through to a full re-run when hydration cannot reconstruct
+    # the full trial set (dispatcher JSON missing because the prior
+    # run was killed between writing the probe ``result.json`` and
+    # the dispatcher's ``trial_<N>.json``; or schema drift). Re-running
+    # a complete cell is wasteful but preserves matrix correctness;
+    # silently returning [] would not.
+    if resume_existing and layout == "flat_resume":
+        from aorta.probe.resume import is_trial_complete
+
+        completed = sum(
+            1 for i in range(effective_trials) if is_trial_complete(cell_dir / f"trial_{i}")
+        )
+        if completed >= effective_trials:
+            trial_paths = _collect_trial_paths(cell_dir)
+            # Hydrate into an index-keyed map. The key set is the
+            # load-bearing invariant for the resume short-circuit: a
+            # dispatcher JSON that fails to read or schema-validate
+            # is absent from the keys, so a corrupted required
+            # ``_t0.json`` co-existing with a stale extra
+            # ``_t<N>.json`` (where N >= effective_trials) is caught
+            # by the subset check below -- the previous
+            # filename-set-based validation would have admitted it.
+            # See ``_hydrate_trials_by_index`` for the failure modes
+            # silently dropped on the floor.
+            hydrated_by_index = _hydrate_trials_by_index(trial_paths)
+            required_indices = set(range(effective_trials))
+            if required_indices.issubset(hydrated_by_index.keys()):
+                # Build the canonical (hydrated, trial_paths) pair from
+                # the dict so positions line up by index: position i
+                # carries the body and path for trial i. ``aggregate_cell``
+                # records the path list in matrix.json::cells[*].trial_paths
+                # in the same order as the trial bodies, so misalignment
+                # here would silently scramble downstream cross-references.
+                # Stale on-disk extras with index >= effective_trials are
+                # dropped here (not deleted) so manual inspection of the
+                # prior run is still possible; downstream aggregation
+                # only sees what the current recipe asked for.
+                hydrated = [hydrated_by_index[i].trial for i in range(effective_trials)]
+                trial_paths = [hydrated_by_index[i].path for i in range(effective_trials)]
+                log.info(
+                    "cell %r: all %d trial(s) already complete -- skipping per resume mode",
+                    cell.name,
+                    effective_trials,
+                )
+                return hydrated, None, resolved_env_vars, trial_paths
+            # Subset check failed -> at least one required index is missing.
+            # The single-branch log subsumes the previous two-branch shape
+            # (separate "indices missing" vs "count short" cases): with the
+            # index-keyed map, an index that didn't hydrate IS by definition
+            # both a missing index and a missing body, so distinguishing the
+            # two on the operator side adds no diagnostic value.
+            missing = sorted(required_indices - hydrated_by_index.keys())
+            log.info(
+                "cell %r: result.json marks %d trial(s) complete but "
+                "successful hydration is missing trial indices %s "
+                "(hydrated %s); re-running the cell so matrix counts "
+                "stay consistent",
+                cell.name,
+                completed,
+                missing,
+                sorted(hydrated_by_index.keys()),
+            )
 
     # Recipe-scope workload_config is the base; cell-scope merges over it so
     # the cell wins on key collision and non-collision keys union. Empty
@@ -561,9 +737,31 @@ def _run_one_cell(
     # workload_config from the recipe stays byte-equivalent to today.
     merged_workload_config = {**recipe.workload_config, **cell.workload_config}
 
+    # Probe-mode extras delivered to ``SubprocessWorkload`` via the
+    # typed ``RunRequest.probe_extras`` field. The runner is the only
+    # producer of this dict; ``SubprocessWorkload`` reads it from the
+    # ``_aorta_probe_extras`` slot the dispatcher injects.
+    probe_extras_payload: dict[str, Any] | None = None
+    probe_extras = recipe.probe_extras
+    if subprocess_argv is not None and probe_extras is not None:
+        probe_extras_payload = {
+            "cell_name": cell.name,
+            "env_passthrough_mode": probe_extras.env_passthrough_mode,
+            "timeout_per_trial": probe_extras.timeout_per_trial,
+            "cell_env_vars": dict(resolved_env_vars),
+            "step_time_regex": probe_extras.step_time_regex,
+            "collect_paths": list(probe_extras.collect_paths),
+        }
+
+    # save_logs is forced True for probe-mode cells because
+    # SubprocessWorkload reads ``_aorta_log_prefix`` to derive its
+    # per-trial directory; the dispatcher only injects that key when
+    # save_logs=True.
+    save_logs = recipe.save_logs or (subprocess_argv is not None)
+
     request = RunRequest(
         workload=recipe.workload,
-        trials=cell.effective_trials(recipe.trials),
+        trials=effective_trials,
         environment=cell.environment,
         mitigations=tuple(cell.mitigations),
         extra_env=dict(cell.extra_env),
@@ -571,7 +769,9 @@ def _run_one_cell(
         config_overrides=merged_workload_config,
         results_dir=cell_dir,
         sidecar_files=sidecar_files,
-        save_logs=recipe.save_logs,
+        save_logs=save_logs,
+        subprocess_argv=subprocess_argv,
+        probe_extras=probe_extras_payload,
     )
 
     try:
@@ -610,8 +810,33 @@ def _preflight_validate(recipe: Recipe) -> None:
     resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
 
 
-def _print_dry_run(recipe: Recipe) -> None:
-    """Write the resolved cell list to stdout without touching the filesystem."""
+def _print_dry_run(
+    recipe: Recipe,
+    subprocess_argv: tuple[str, ...] | None = None,
+) -> None:
+    """Write the resolved cell list to stdout without touching the filesystem.
+
+    For probe-mode (``recipe.probe_extras is not None``), each line shows
+    the cell's planned env-var bundle and the literal trailing argv -- the
+    rubric's FR 1.2 contract. Triage-mode dry-run shows the existing
+    cell summary (mitigations / environment / trials / steps) for back-compat.
+    """
+    if recipe.probe_extras is not None:
+        # Probe-mode dry-run: cell name, resolved env bundle, literal argv.
+        # No FS writes, no execution -- matches FR 1.2 byte-for-byte.
+        argv_display = list(subprocess_argv) if subprocess_argv is not None else []
+        click.echo(
+            f"Dry run (probe): ticket={recipe.ticket or '(none)'} "
+            f"cells={len(recipe.cells)} trials/cell={recipe.trials}"
+        )
+        click.echo(f"Argv (forwarded byte-for-byte): {argv_display}")
+        click.echo(f"Env-passthrough mode: {recipe.probe_extras.env_passthrough_mode}")
+        for cell in recipe.cells:
+            env_bundle = recipe.probe_extras.cell_envs.get(cell.name, {})
+            env_str = " ".join(f"{k}={v}" for k, v in sorted(env_bundle.items())) or "(no env)"
+            click.echo(f"  {cell.name}: env=[{env_str}] argv={argv_display}")
+        return
+
     click.echo(f"Dry run: {recipe.workload} / ticket={recipe.ticket or '(none)'}")
     if recipe.workload_config:
         click.echo(f"Recipe workload_config: {recipe.workload_config}")
@@ -627,11 +852,7 @@ def _print_dry_run(recipe: Recipe) -> None:
             f"trials={cell.effective_trials(recipe.trials)} "
             f"steps={cell.effective_steps(recipe.steps)}"
             + (f" extra_env={cell.extra_env}" if cell.extra_env else "")
-            + (
-                f" workload_config={effective_workload_config}"
-                if effective_workload_config
-                else ""
-            )
+            + (f" workload_config={effective_workload_config}" if effective_workload_config else "")
         )
     if recipe.inline_environments:
         click.echo("Inline docker environments:")
@@ -647,6 +868,10 @@ def run_recipe(
     dry_run: bool = False,
     extra_sidecar_files: tuple[Path, ...] = (),
     timestamp: str | None = None,
+    *,
+    layout: Literal["timestamped", "flat_resume"] = "timestamped",
+    resume_existing: bool = False,
+    subprocess_argv: tuple[str, ...] | None = None,
 ) -> Path:
     """Execute a recipe and write matrix.md / matrix.json / recipe.resolved.yaml.
 
@@ -668,9 +893,22 @@ def run_recipe(
             callers that build a ``Recipe`` directly (tests, in-process
             embedders) and want to add sidecars at execute time.
         timestamp: Override for the run-dir timestamp component (test hook).
+        layout: Output-tree layout (issue #188). ``"timestamped"`` (default)
+            preserves byte-equivalence with ``aorta triage run``;
+            ``"flat_resume"`` produces ``<output_dir>/<ticket>/`` (no
+            timestamp, no ``<workload>`` segment) for ``aorta probe``'s
+            resume semantics.
+        resume_existing: When True (probe-mode only), per-cell
+            invocations consult :func:`aorta.probe.resume.is_trial_complete`
+            and skip cells whose every trial is already complete.
+        subprocess_argv: Opaque argv forwarded byte-for-byte to every
+            cell's :class:`SubprocessWorkload` via the typed
+            ``RunRequest.subprocess_argv`` field. Required for probe-mode;
+            ignored in triage-mode.
 
     Returns:
-        The run directory path (``<output-dir>/<ticket>/<workload>/<timestamp>``).
+        The run directory path (``<output-dir>/<ticket>/<workload>/<timestamp>``
+        for triage-mode, ``<output-dir>/<ticket>/`` for probe-mode).
     """
     # Preflight first, BEFORE the dry-run early-return: dry-run is documented
     # as "validation without execution", so it must reject everything the
@@ -679,12 +917,53 @@ def run_recipe(
     _preflight_validate(recipe)
 
     if dry_run:
-        _print_dry_run(recipe)
+        _print_dry_run(recipe, subprocess_argv=subprocess_argv)
         return Path(".")
 
     ts = timestamp or format_timestamp()
-    run_dir = resolve_run_dir(output_dir, recipe, timestamp=ts)
+    run_dir = resolve_run_dir(output_dir, recipe, timestamp=ts, layout=layout)
 
+    # ``flat_resume`` reuses a stable ``<output>/<ticket>/`` directory across
+    # invocations so resume can detect per-trial ``result.json`` files as
+    # already complete. That same property means two concurrent ``aorta
+    # probe`` invocations against the same ``--output``/``--ticket`` would
+    # race on ``matrix.json``, ``matrix.md``, and per-cell artifacts. Take
+    # an advisory PID+host lock for the duration of the matrix run; the
+    # ``"timestamped"`` layout (``aorta triage run``) is unaffected because
+    # ``resolve_run_dir`` already gives each invocation a fresh leaf via the
+    # ``-N`` suffix loop. ``ExitStack`` keeps the lock optional without
+    # forcing a re-indent of the entire matrix loop.
+    with contextlib.ExitStack() as stack:
+        if layout == "flat_resume":
+            stack.enter_context(acquire_flat_resume_lock(run_dir))
+        return _run_recipe_locked(
+            recipe=recipe,
+            extra_sidecar_files=extra_sidecar_files,
+            ts=ts,
+            run_dir=run_dir,
+            layout=layout,
+            resume_existing=resume_existing,
+            subprocess_argv=subprocess_argv,
+        )
+
+
+def _run_recipe_locked(
+    *,
+    recipe: Recipe,
+    extra_sidecar_files: tuple[Path, ...],
+    ts: str,
+    run_dir: Path,
+    layout: Literal["timestamped", "flat_resume"],
+    resume_existing: bool,
+    subprocess_argv: tuple[str, ...] | None,
+) -> Path:
+    """Body of :func:`run_recipe` after the flat_resume lock is held.
+
+    Extracted so the lock-acquisition is a single
+    ``contextlib.ExitStack`` block at the top of :func:`run_recipe` and
+    the matrix-loop body doesn't need to be re-indented inside a ``with``.
+    Not part of the public API -- callers go through :func:`run_recipe`.
+    """
     # Operator sidecars come from two places: ones the Recipe was built
     # against (``recipe.sidecar_files``, populated by ``load_recipe`` /
     # ``build_recipe_from_flags``) and ones the caller hands in directly at
@@ -765,7 +1044,13 @@ def run_recipe(
         )
         cell_t0 = time.perf_counter()
         trials, error, resolved_env_vars, trial_paths = _run_one_cell(
-            cell, recipe, run_dir, sidecar_files
+            cell,
+            recipe,
+            run_dir,
+            sidecar_files,
+            layout=layout,
+            resume_existing=resume_existing,
+            subprocess_argv=subprocess_argv,
         )
         cell_elapsed = time.perf_counter() - cell_t0
         if error is not None:
@@ -858,9 +1143,7 @@ def run_recipe(
     if recipe.confound.baseline_cell is not None:
         baseline_cell = resolve_baseline(recipe.cells, recipe.confound.baseline_cell)
         if baseline_cell.name in disqualified_names:
-            baseline_stats_ref = next(
-                c for c in cell_stats if c.name == baseline_cell.name
-            )
+            baseline_stats_ref = next(c for c in cell_stats if c.name == baseline_cell.name)
             msg = (
                 f"explicit baseline_cell {baseline_cell.name!r} produced only "
                 f"did_not_run trials "
@@ -876,17 +1159,13 @@ def run_recipe(
             incomplete_reason = msg
     else:
         try:
-            baseline_cell = resolve_baseline(
-                recipe.cells, None, skip_names=disqualified_names
-            )
+            baseline_cell = resolve_baseline(recipe.cells, None, skip_names=disqualified_names)
         except RecipeCellError:
             # Every candidate was disqualified -- fall back to the original
             # auto-resolution (without the skip set) so matrix.json still
             # records WHO would have been the baseline, then warn loudly.
             baseline_cell = resolve_baseline(recipe.cells, None)
-            baseline_stats_ref = next(
-                c for c in cell_stats if c.name == baseline_cell.name
-            )
+            baseline_stats_ref = next(c for c in cell_stats if c.name == baseline_cell.name)
             msg = (
                 f"Auto-baseline {baseline_cell.name!r} had "
                 f"{baseline_stats_ref.outcome_counts.get(OUTCOME_DID_NOT_RUN, 0)}/"
