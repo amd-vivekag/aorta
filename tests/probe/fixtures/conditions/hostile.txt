@@ -1,0 +1,22 @@
+__import__('os').system('rm -rf /')
+(0).__class__.__bases__[0].__subclasses__()
+().__class__.__mro__[-1]
+open('/etc/passwd').read()
+exec("import os; os.system('id')")
+eval("1+1")
+lambda x: x
+[x for x in range(10)]
+{k: v for k, v in capture.items()}
+capture.update({'pwn': '1'})
+type(capture)
+getattr(capture, 'pop')('eval_loss')
+capture['x'].__class__
+math.__loader__.load_module('os')
+2 ** 1000000000  # forbidden-node: ast.Pow is no longer in the allow-list (would otherwise build a huge int via int.__pow__)
+'a' * 999999998  # forbidden-node: ast.Mult is no longer in the allow-list (string repetition would allocate ~1 GiB without crossing MAX_INT_CONSTANT)
+'%999999998s' % capture['x']  # forbidden-node: ast.Mod is no longer in the allow-list (printf-style %s would allocate the same billion-byte buffer)
+capture['x'] * 999999998  # forbidden-node: ast.Mult; the multiplier dodges the integer-literal cap because it's named
+'oom' in capture['msg']  # forbidden-node: ast.In is not in the allow-list (the docs explicitly point users at the regex field for substring matching)
+capture[exit_code]  # capture[...] index must be a string literal -- a Name index would land as KeyError at eval time (capture is dict[str, str]) and tier5 swallows the exception silently
+capture[0]  # capture[...] index must be a string literal -- a numeric index would land as KeyError at eval time and tier5 swallows the exception silently
+capture['x':]  # capture[...] index must be a string literal -- a slice would land as TypeError at eval time and tier5 swallows the exception silently

@@ -296,3 +296,298 @@ def test_timeout_kill_race_does_not_crash(tmp_path, monkeypatch):
     assert doc["timed_out"] is True
     assert doc["exit_code"] == -1
     assert result.passed is False
+
+
+# ---- FR 2.9 (Phase 2 result.json shape) ----------------------------------
+
+
+def test_result_json_phase_2_shape(tmp_path):
+    """Phase 2 ``result.json`` carries the rubric §2.B FR 2.9 fields.
+
+    The Phase 1 minimum shape is a subset; both shapes coexist (the
+    Phase 1 test above continues to pass). Phase 2 adds:
+
+    * ``failure_detectors_fired: list[str]``
+    * ``warn_detectors_fired: list[str]``
+    * ``capture: dict``
+    * ``tier_durations_ms: dict``
+    * ``peak_vram_mib: int | null``
+    """
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    # Phase 2 keys present on every trial.
+    assert isinstance(doc["failure_detectors_fired"], list)
+    assert isinstance(doc["warn_detectors_fired"], list)
+    assert isinstance(doc["capture"], dict)
+    assert isinstance(doc["tier_durations_ms"], dict)
+    # peak_vram_mib is int | null (null in env-less smoke runs).
+    assert doc["peak_vram_mib"] is None or isinstance(doc["peak_vram_mib"], int)
+    # tier_durations_ms records each tier's wall-clock contribution.
+    for tier_key in ("tier1", "tier2", "tier3", "tier4", "tier5"):
+        assert tier_key in doc["tier_durations_ms"]
+
+
+def test_phase_2_failure_path_lists_tier1_detector(tmp_path):
+    """A non-zero exit fires ``tier1:exit_nonzero`` in failure_detectors_fired."""
+    wl = _make_workload(tmp_path, ["false"])
+    wl.setup()
+    wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
+
+
+def test_phase_1_shape_still_present_in_phase_2_doc(tmp_path):
+    """Phase 1's minimum-shape keys remain (rubric §2.B FR 2.9 'subset' clause)."""
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    for key in ("verdict", "exit_code", "walltime_sec", "argv", "cell_name", "trial_index"):
+        assert key in doc
+
+
+def test_tier3_actually_runs_per_trial(tmp_path, monkeypatch):
+    """Regression for PR #197 review: Tier 3 used to be unreachable because
+    SubprocessWorkload constructed a fresh Tier3State per trial and hard-
+    coded ``dmesg_text=None`` + ``amd_smi_*=None``. Now the workload
+    invokes ``poll_amd_smi`` and ``scan_dmesg`` through the module-level
+    shared state, so a fake amd-smi snapshot is enough to make Tier 3
+    surface its detector ID end-to-end.
+    """
+    from aorta.probe.classifier.tier3_kernel import DETECTOR_VRAM_GROWTH
+    from aorta.workloads import _subprocess as workload_mod
+
+    monkeypatch.setenv("AORTA_PROBE_AMDSMI_FAKE", "vram=0,throttle=0")
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    pre_calls: dict[str, int] = {"n": 0}
+
+    real_poll = workload_mod.poll_amd_smi
+
+    def _toggle_snapshot(state):
+        # First call (pre) returns the env-supplied snapshot; the
+        # second call (post) returns a snapshot with VRAM jumped past
+        # the rubric's growth threshold so scan_amd_smi will fire.
+        from aorta.probe.classifier.tier3_kernel import (
+            VRAM_GROWTH_THRESHOLD_MIB,
+            AmdSmiSnapshot,
+        )
+
+        pre_calls["n"] += 1
+        if pre_calls["n"] == 1:
+            return real_poll(state)
+        return AmdSmiSnapshot(
+            vram_used_mib=VRAM_GROWTH_THRESHOLD_MIB + 1,
+            thermal_throttle_count=0,
+        )
+
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", _toggle_snapshot)
+    wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    fired = set(doc["failure_detectors_fired"]) | set(doc["warn_detectors_fired"])
+    assert DETECTOR_VRAM_GROWTH in fired, (
+        "Tier 3 vram-growth detector did not fire even though the workload "
+        "supplied pre/post snapshots crossing the growth threshold; the "
+        "SubprocessWorkload Tier-3 wiring is silently disabled"
+    )
+
+
+def test_hang_grace_zero_survives_runtime_extraction(tmp_path, monkeypatch):
+    """Regression for PR #197 review: ``probe_extras["hang_grace_period_at_start"]
+    == 0.0`` is a validated "no grace, fire as soon as the window
+    elapses" value (see ``test_hang_grace_period_zero_is_accepted``
+    in ``test_recipe.py``). The runtime extraction used to
+    short-circuit through ``... or DEFAULT_HANG_GRACE_SEC``, which
+    treats ``0.0`` as falsy and silently substitutes the default,
+    defeating the entire knob.
+
+    Pin the behavior by intercepting ``HangMonitor.__init__`` and
+    asserting it observed the configured ``0.0`` exactly.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    captured: dict[str, float] = {}
+    real_hang_monitor = workload_mod.HangMonitor
+
+    class _SpyHangMonitor(real_hang_monitor):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            captured["hang_grace_period_at_start"] = kwargs["hang_grace_period_at_start"]
+            captured["hang_window_sec"] = kwargs["hang_window_sec"]
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(workload_mod, "HangMonitor", _SpyHangMonitor)
+
+    wl = _make_workload(
+        tmp_path,
+        ["true"],
+        hang_grace_period_at_start=0.0,
+        hang_window_sec=30.0,
+    )
+    wl.setup()
+    wl.run()
+    assert captured["hang_grace_period_at_start"] == 0.0, (
+        "Configured hang_grace_period_at_start=0.0 was silently clobbered to "
+        f"{captured['hang_grace_period_at_start']!r} -- the `or DEFAULT` falsy "
+        "shortcut is back. Use an explicit `is None` check at the extraction."
+    )
+    assert captured["hang_window_sec"] == 30.0
+
+
+def test_classifier_crash_still_writes_result_json(tmp_path, monkeypatch):
+    """Regression for PR #197 round-3 review: if ``classify_trial``
+    raises (regex catastrophe, future refactor edge case, etc.),
+    the workload MUST still write a ``result.json`` so the trial
+    doesn't silently disappear from the matrix. Falls back to a
+    Tier-1-only verdict derived from the captured exit code, and
+    records the classifier exception under
+    ``capture['classifier_error']`` so the operator sees the
+    cause.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    boom = RuntimeError("synthetic classifier crash for PR #197 review")
+
+    def _exploding_classify(_ctx):
+        raise boom
+
+    monkeypatch.setattr(workload_mod, "classify_trial", _exploding_classify)
+
+    # Use ``false`` so Tier 1 fallback fires ``tier1:exit_nonzero``.
+    wl = _make_workload(tmp_path, ["false"])
+    wl.setup()
+    result = wl.run()
+
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["verdict"] == "fail"
+    assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
+    assert "classifier_error" in doc["capture"]
+    assert "synthetic classifier crash" in doc["capture"]["classifier_error"]
+    # The workload result still reports the failure (not a hang) so
+    # the dispatcher records a failed trial deterministically.
+    assert result.passed is False
+
+
+def test_classifier_crash_on_passing_trial_falls_back_to_pass(tmp_path, monkeypatch):
+    """A ``true`` exit + classifier crash -> Tier-1-only verdict is
+    ``pass`` (no Tier 1 detector fires for exit_code=0), but the
+    classifier_error still gets recorded so the operator knows the
+    full classifier didn't run.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    def _exploding_classify(_ctx):
+        raise ValueError("simulated tier-4 regex catastrophe")
+
+    monkeypatch.setattr(workload_mod, "classify_trial", _exploding_classify)
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    result = wl.run()
+
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["verdict"] == "pass"
+    assert doc["failure_detectors_fired"] == []
+    assert "classifier_error" in doc["capture"]
+    assert result.passed is True
+
+
+def test_peak_vram_mib_threaded_from_amd_smi_snapshots(tmp_path, monkeypatch):
+    """Regression for PR #197 round-6 review:
+    ``peak_vram_mib`` was hard-coded to ``None`` both in the
+    ``TrialContext`` handed to ``classify_trial`` and in the emitted
+    ``result.json``, which made Tier-5 sandbox conditions like
+    ``peak_vram_mib > 70000`` permanently unreachable on real hosts.
+
+    With the fix, the workload computes a coarse high-water mark
+    from the two amd-smi snapshots it already collects
+    (pre-Popen + post-Popen) and threads the value into BOTH the
+    classifier context and ``result.json``.
+    """
+    from aorta.probe.classifier.tier3_kernel import AmdSmiSnapshot
+    from aorta.workloads import _subprocess as workload_mod
+
+    pre = AmdSmiSnapshot(vram_used_mib=4000, thermal_throttle_count=0)
+    post = AmdSmiSnapshot(vram_used_mib=71234, thermal_throttle_count=0)
+
+    calls = {"n": 0}
+
+    def _two_snapshots(_state):
+        calls["n"] += 1
+        return pre if calls["n"] == 1 else post
+
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", _two_snapshots)
+
+    seen_ctx_peak: dict[str, int | None] = {}
+    real_classify = workload_mod.classify_trial
+
+    def _spy_classify(ctx):
+        seen_ctx_peak["value"] = ctx.peak_vram_mib
+        return real_classify(ctx)
+
+    monkeypatch.setattr(workload_mod, "classify_trial", _spy_classify)
+
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    wl.run()
+
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["peak_vram_mib"] == 71234, (
+        "peak_vram_mib in result.json should be max(pre.vram, post.vram); "
+        f"got {doc['peak_vram_mib']!r}"
+    )
+    assert seen_ctx_peak["value"] == 71234, (
+        "TrialContext.peak_vram_mib should match the result.json value so "
+        "Tier-5 sandbox conditions and the emitted doc agree"
+    )
+
+
+def test_peak_vram_mib_none_when_amd_smi_unavailable(tmp_path, monkeypatch):
+    """Both snapshots returning ``None`` -> ``peak_vram_mib`` stays
+    ``None`` (the sandbox's ``None -> 0`` shim then keeps Tier-5
+    conditions deterministic).
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", lambda _state: None)
+
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    wl.run()
+
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["peak_vram_mib"] is None
+
+
+def test_read_log_text_uses_replace_not_backslashreplace(tmp_path):
+    """Regression for PR #197 round-6 review: ``_read_log_text`` used
+    ``errors="backslashreplace"`` which expands each invalid byte
+    into up to four characters (``\\\\xff``). For a binary-heavy log,
+    that inflates the decoded string past ``MAX_LOG_BYTES``,
+    defeating the documented regex-DoS cap.
+
+    The fix decodes with ``errors="replace"`` so each invalid byte
+    becomes a single U+FFFD replacement char, holding the 1:1
+    byte->char invariant.
+    """
+    from aorta.probe.sandbox import MAX_LOG_BYTES
+    from aorta.workloads._subprocess import _read_log_text
+
+    # A blob of pure invalid bytes the size of the cap. ``replace``
+    # gives len == MAX_LOG_BYTES; ``backslashreplace`` would give
+    # 4 * MAX_LOG_BYTES.
+    binary = b"\xff" * MAX_LOG_BYTES
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_path.write_bytes(binary)
+    stderr_path.write_bytes(b"")
+
+    text = _read_log_text(stdout_path, stderr_path)
+    # Allow a small overhead for the ``\n`` joiner and the empty
+    # stderr piece; the load-bearing assertion is the 4x cap.
+    assert len(text) <= MAX_LOG_BYTES + 8, (
+        f"decoded log length {len(text)} exceeds the MAX_LOG_BYTES "
+        f"({MAX_LOG_BYTES}) cap -- the decode path is back on "
+        "backslashreplace and a binary-heavy log can quadruple the "
+        "regex-input size, defeating the cap."
+    )

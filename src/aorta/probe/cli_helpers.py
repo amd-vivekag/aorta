@@ -8,8 +8,12 @@ no subprocess.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from aorta.triage.recipe import Recipe
 
 VALID_ENV_PASSTHROUGH_MODES: tuple[Literal["inherit", "file"], ...] = ("inherit", "file")
 
@@ -50,12 +54,19 @@ def reject_flag_shaped_value(option_name: str, value: str | None) -> None:
         )
 
 
-def help_token_in_option_zone(args: Sequence[str], value_taking_options: frozenset[str]) -> bool:
-    """True iff ``--help`` / ``-h`` appears in the aorta-option zone.
+_DEFAULT_BYPASS_TOKENS: frozenset[str] = frozenset({"--help", "-h"})
+
+
+def help_token_in_option_zone(
+    args: Sequence[str],
+    value_taking_options: frozenset[str],
+    bypass_tokens: frozenset[str] = _DEFAULT_BYPASS_TOKENS,
+) -> bool:
+    """True iff a bypass token (default ``--help``/``-h``) appears in the aorta-option zone.
 
     The "aorta-option zone" is the prefix of ``args`` that comes BEFORE
     either the explicit ``--`` separator or the first non-option
-    positional argument (the user-command executable). Help tokens
+    positional argument (the user-command executable). Bypass tokens
     appearing AFTER the user command (``aorta probe --recipe r -- echo
     --help`` or ``aorta probe --recipe r echo --help`` with
     ``allow_interspersed_args=False``) are part of the user command and
@@ -67,8 +78,13 @@ def help_token_in_option_zone(args: Sequence[str], value_taking_options: frozens
     ``params``). ``--opt=value`` is consumed as a single token. Flag
     options (``-v``, ``--dry-run``) are single tokens. The first token
     that doesn't start with ``-`` (and isn't an option value) marks
-    the user-command boundary; ``--help`` at or after that boundary is
-    user-command content.
+    the user-command boundary; a bypass token at or after that boundary
+    is user-command content.
+
+    ``bypass_tokens`` defaults to ``{"--help", "-h"}`` for callers that
+    only need the help short-circuit. Phase 2 callers pass an extended
+    set to also include ``--list-patterns`` (a flag that prints the
+    Tier-4 catalogue and exits without consuming a user command).
 
     Defends against the bot-flagged misparse where ``aorta probe
     --recipe r --output o echo --help`` would silently skip the
@@ -77,7 +93,7 @@ def help_token_in_option_zone(args: Sequence[str], value_taking_options: frozens
     i = 0
     while i < len(args):
         token = args[i]
-        if token in ("--help", "-h"):
+        if token in bypass_tokens:
             return True
         if token == "--":
             return False
@@ -162,6 +178,40 @@ def validate_trailing_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
     return argv
 
 
+def apply_recipe_overrides(
+    recipe: Recipe,
+    *,
+    ticket: str | None,
+    cli_passthrough_mode: Literal["inherit", "file"] | None,
+) -> Recipe:
+    """Layer CLI flags on top of a loaded probe-mode ``Recipe``.
+
+    Two overlays today:
+
+    * ``--ticket`` -- when set, replaces ``recipe.ticket``;
+    * ``--env-passthrough-mode`` -- when set (i.e. the user actually
+      passed the flag), replaces ``recipe.probe_extras.env_passthrough_mode``.
+
+    The caller must verify ``recipe.probe_extras is not None`` before
+    invoking this helper (probe-mode discriminator is the CLI's
+    responsibility). Living in ``aorta.probe.cli_helpers`` so the
+    Click handler stays a thin shim per FR 1.15 (handler ≤ 60 lines,
+    enforced by ``tests/probe/test_cli_parsing.py::test_handler_is_thin_shim``).
+    """
+    probe_extras = recipe.probe_extras
+    assert probe_extras is not None, "apply_recipe_overrides: not a probe-mode recipe"
+    if ticket is not None:
+        recipe = dataclasses.replace(recipe, ticket=ticket)
+    if cli_passthrough_mode is not None:
+        recipe = dataclasses.replace(
+            recipe,
+            probe_extras=dataclasses.replace(
+                probe_extras, env_passthrough_mode=cli_passthrough_mode
+            ),
+        )
+    return recipe
+
+
 def format_dry_run_line(
     cell_name: str,
     env: dict[str, str],
@@ -180,6 +230,7 @@ def format_dry_run_line(
 __all__ = [
     "VALID_ENV_PASSTHROUGH_MODES",
     "ProbeUsageError",
+    "apply_recipe_overrides",
     "format_dry_run_line",
     "help_token_in_option_zone",
     "parse_env_passthrough_mode",

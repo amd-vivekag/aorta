@@ -28,9 +28,14 @@ Per-trial output layout (Phase 1):
 * ``<cell_dir>/trial_<N>/probe.env`` -- only when
   ``env_passthrough_mode == "file"`` (chmod 0600).
 
-Verdict rule (Phase 1, Tier 1 only): ``exit_code == 0`` -> pass, else
-fail. Pattern matching, hang detection, dmesg scanning, and the
-``custom_patterns`` runner are deferred to Phase 2.
+Verdict (Phase 2): the five-tier classifier in
+:mod:`aorta.probe.classifier` runs post-exit. A trial whose process
+exit is non-zero, timed out, hung, hit a dmesg / amd-smi signal, hit
+a built-in Tier-4 pattern, or hit a user ``custom_patterns`` entry
+with ``on_match: fail`` resolves to ``"fail"``; otherwise ``"pass"``.
+Phase 1's exit-code-only rule remains a strict subset (``exit_code
+== 0 and no detector fires`` -> pass), so any tooling that read the
+Phase-1 minimum shape keeps working.
 """
 
 from __future__ import annotations
@@ -44,7 +49,40 @@ import time
 from pathlib import Path
 from typing import Any
 
+from aorta.probe.classifier import TrialContext, classify_trial
+from aorta.probe.classifier.tier1_process import Tier1Context
+from aorta.probe.classifier.tier1_process import detect as tier1_detect
+from aorta.probe.classifier.tier2_hang import (
+    DEFAULT_HANG_GRACE_SEC,
+    DEFAULT_HANG_WINDOW_SEC,
+    HangMonitor,
+)
+from aorta.probe.classifier.tier3_kernel import (
+    Tier3State,
+    gpu_idle_probe_from_state,
+    poll_amd_smi,
+    scan_dmesg,
+)
+from aorta.probe.classifier.verdict import Verdict
 from aorta.workloads._base import Workload, WorkloadResult
+
+# Process-wide Tier 3 state. Shared across every SubprocessWorkload
+# instance the dispatcher constructs over one ``aorta probe`` invocation
+# so the rubric's "tier3 disabled: <reason>" warning is logged at most
+# ONCE per invocation (FR 2.11), regardless of how many cells x trials
+# the matrix produces. ``Tier3State`` is mutable and the dispatcher's
+# deep-copy semantics for ``probe_extras`` would defeat that guarantee
+# if we tried to plumb it through the config dict -- a module-level
+# singleton is the smallest correct alternative and lives only for the
+# lifetime of the ``aorta probe`` process (probe-mode is single-process
+# by design; the rubric forbids subprocess-launched workloads).
+_TIER3_STATE = Tier3State()
+
+# Pad added to the dmesg ``--since`` window to cover the small wall-
+# clock drift between ``time.perf_counter`` and the kernel's monotonic
+# clock and to catch messages logged a few seconds after the child
+# crashed (e.g. amdgpu reset messages often arrive on the next tick).
+_DMESG_SINCE_PAD_SEC = 5.0
 
 # Config key the dispatcher uses to deliver the opaque user argv. The
 # leading ``_aorta_`` prefix is reserved by the dispatcher and rejected
@@ -85,8 +123,10 @@ class SubprocessWorkload(Workload):
        under ``_subprocess/`` -- and serves as the "I-ran" marker for
        triage-mode tooling; the probe-mode ``result.json`` is the one
        resume / classifier code consults.
-    3. Verdict is Tier 1 only in Phase 1: ``exit_code == 0`` -> pass.
-       The full classifier and the sandbox land in Phase 2.
+    3. Verdict is the union of Tier 1-5 detectors (Phase 2). Phase 1's
+       ``exit_code == 0 -> pass`` rule is a strict subset: a trial
+       that exits zero AND fires no other tier still resolves to
+       ``"pass"``. See :mod:`aorta.probe.classifier`.
     """
 
     launch_mode = "single_process"
@@ -153,7 +193,18 @@ class SubprocessWorkload(Workload):
         self._trial_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self) -> WorkloadResult:
-        """Fork the user command and write the Tier-1 ``result.json``."""
+        """Fork the user command and write the Phase-2 ``result.json``.
+
+        Phase 2 hangs the five-tier classifier off this method
+        post-exit. The Tier 1 verdict (Phase 1 contract) is a
+        subset of the Phase 2 verdict — a trial that exits 0 with
+        no Tier 2/3/4/5 detector firing still resolves to
+        ``verdict = "pass"``, matching Phase 1 byte-for-byte. The
+        Phase 1 minimum-shape test in
+        ``tests/probe/test_subprocess_workload.py`` continues to
+        pass without modification because Phase 2 only ADDS keys
+        to ``result.json``.
+        """
         if self._argv is None or self._trial_dir is None or self._trial_index is None:
             raise RuntimeError("SubprocessWorkload.run() called before setup()")
 
@@ -166,6 +217,19 @@ class SubprocessWorkload(Workload):
         probe_extras = self.config.get(CONFIG_KEY_PROBE_EXTRAS) or {}
         env_mode = probe_extras.get("env_passthrough_mode", "inherit")
         timeout = probe_extras.get("timeout_per_trial")
+        custom_patterns = tuple(probe_extras.get("custom_patterns") or ())
+        # ``... or DEFAULT`` collapses a recipe-configured ``0.0`` (a
+        # legitimate "disable grace" / "disable window" value validated
+        # by the recipe-builder) into the default. Use explicit ``is
+        # None`` so an opt-in zero survives the runtime extraction.
+        _hang_window_raw = probe_extras.get("hang_window_sec")
+        hang_window_sec = (
+            DEFAULT_HANG_WINDOW_SEC if _hang_window_raw is None else float(_hang_window_raw)
+        )
+        _hang_grace_raw = probe_extras.get("hang_grace_period_at_start")
+        hang_grace_sec = (
+            DEFAULT_HANG_GRACE_SEC if _hang_grace_raw is None else float(_hang_grace_raw)
+        )
 
         # ``inherit`` mode: the dispatcher has already stamped the
         # cell's mitigation + diagnostic env vars onto os.environ in
@@ -229,6 +293,13 @@ class SubprocessWorkload(Workload):
             # contents.
             env_file_path.unlink(missing_ok=True)
 
+        # Tier 3 pre-snapshot. Fail-soft: returns None when ``amd-smi``
+        # is missing or polling fails; ``scan_amd_smi`` then accepts
+        # ``None`` and contributes nothing without aborting the trial.
+        # The shared ``_TIER3_STATE`` ensures the "amd-smi disabled"
+        # log fires at most once across the full probe invocation.
+        amd_smi_pre = poll_amd_smi(_TIER3_STATE)
+
         t0 = time.perf_counter()
         exit_code: int
         timed_out = False
@@ -242,6 +313,7 @@ class SubprocessWorkload(Workload):
         # below for the propagation into ``main_work_started`` /
         # ``executed_iterations``.
         launched = False
+        hang_monitor: HangMonitor | None = None
         try:
             with open(stdout_path, "wb") as out_fh, open(stderr_path, "wb") as err_fh:
                 proc = subprocess.Popen(
@@ -251,6 +323,24 @@ class SubprocessWorkload(Workload):
                     env=child_env,
                 )
                 launched = True
+                # Wire the third leg of the two-of-three Tier 2
+                # predicate. The closure spawns one ``amd-smi monitor``
+                # call per HangMonitor poll (~12/min at the default 5s
+                # poll cadence) and returns True iff the busiest GPU
+                # reports < GPU_IDLE_UTILIZATION_THRESHOLD_PCT. When
+                # amd-smi is missing or unparseable the closure returns
+                # False, so the predicate gracefully degrades to the
+                # 2-of-2 ``stdout_silent`` + ``io_idle`` shape that the
+                # round-1 wiring was already covering (rubric §2.B FR
+                # 2.11 fail-soft policy).
+                hang_monitor = HangMonitor(
+                    pid=proc.pid,
+                    stdout_path=stdout_path,
+                    hang_window_sec=hang_window_sec,
+                    hang_grace_period_at_start=hang_grace_sec,
+                    gpu_idle_probe=gpu_idle_probe_from_state(_TIER3_STATE),
+                )
+                hang_monitor.start()
                 try:
                     exit_code = proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -276,6 +366,9 @@ class SubprocessWorkload(Workload):
                     except ProcessLookupError:
                         pass
                     exit_code = -1
+                finally:
+                    if hang_monitor is not None:
+                        hang_monitor.stop()
         except (FileNotFoundError, PermissionError, OSError) as exc:
             # Exec-time ``Popen`` failures all become Tier-1 fails with
             # the artifact tree intact (stderr.log + result.json). The
@@ -311,15 +404,118 @@ class SubprocessWorkload(Workload):
                 pass
         walltime_sec = time.perf_counter() - t0
 
-        verdict = "pass" if exit_code == 0 and not timed_out else "fail"
+        # Tier 2-5 classifier post-exit. Reads the captured logs
+        # back from disk -- the file handles above are closed by
+        # the ``with`` block. Errors here MUST NOT propagate (the
+        # workload already succeeded or failed; classifier crashes
+        # are bugs, not trial outcomes).
+        log_text = _read_log_text(stdout_path, stderr_path)
+        hang_detected = bool(hang_monitor and hang_monitor.hang_detected)
+
+        # Best-effort ``peak_vram_mib`` from the Tier-3 amd-smi
+        # snapshots. We only have two samples (pre + post Popen) so
+        # this is a coarse high-water-mark, not a true peak -- a
+        # short-lived spike in the middle of the trial is invisible
+        # to a 2-point sampler. We surface it anyway because the
+        # alternative is leaving the field permanently ``None`` and
+        # rendering Tier-5 sandbox conditions like
+        # ``peak_vram_mib > 70000`` unusable on real hosts, which is
+        # the bot-flagged gap. Both snapshots are fail-soft (either
+        # can be ``None`` when amd-smi is missing / unparseable) --
+        # if neither is available we fall back to ``None`` and the
+        # sandbox's existing ``peak_vram_mib is None -> 0`` shim in
+        # :func:`aorta.probe.sandbox.build_sandbox_env` keeps
+        # conditions deterministic.
+
+        # Tier 3 post-snapshot + dmesg scan. ``since_seconds`` covers
+        # the trial walltime plus a small pad so kernel messages
+        # logged shortly after the child crashed (amdgpu reset etc.)
+        # still land in the window. Both helpers are fail-soft and
+        # share ``_TIER3_STATE`` with the pre-snapshot above so the
+        # one-warning-per-invocation contract holds.
+        amd_smi_post = poll_amd_smi(_TIER3_STATE)
+        dmesg_text: str | None
+        try:
+            fired_kernel_ids = scan_dmesg(
+                _TIER3_STATE,
+                since_seconds=walltime_sec + _DMESG_SINCE_PAD_SEC,
+            )
+            # ``scan_dmesg`` returns the fired detector IDs directly;
+            # rebuild a synthetic text blob so the classifier's
+            # ``scan_dmesg_text`` second pass is a no-op (it would
+            # otherwise re-scan ``None`` and emit []). The empty
+            # string here keeps Tier 3's text path inert; the
+            # already-fired IDs are surfaced via ``tier3_extra``.
+            dmesg_text = "" if fired_kernel_ids else None
+        except Exception:
+            fired_kernel_ids = []
+            dmesg_text = None
+
+        peak_vram_mib: int | None
+        if amd_smi_pre is not None and amd_smi_post is not None:
+            peak_vram_mib = max(amd_smi_pre.vram_used_mib, amd_smi_post.vram_used_mib)
+        elif amd_smi_pre is not None:
+            peak_vram_mib = amd_smi_pre.vram_used_mib
+        elif amd_smi_post is not None:
+            peak_vram_mib = amd_smi_post.vram_used_mib
+        else:
+            peak_vram_mib = None
+
+        # Classifier crash containment (rubric §2.B FR 2.11 fail-soft
+        # policy applied to the classifier itself). The trial has
+        # already run end-to-end -- we have its exit_code,
+        # walltime_sec, captured logs, and Tier 1 inputs all in hand.
+        # If a tier classifier raises (regex catastrophe, schema
+        # surprise from a future refactor, anything), we MUST still
+        # write a ``result.json`` so the trial doesn't silently
+        # disappear from the matrix. Fall back to a Tier-1-only
+        # verdict derived from the same Tier 1 inputs, record the
+        # classifier exception under ``capture['classifier_error']``
+        # for the operator, and continue.
+        try:
+            verdict_obj, tier_durations_ms = classify_trial(
+                TrialContext(
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                    walltime_sec=walltime_sec,
+                    trial_dir=trial_dir,
+                    log_text=log_text,
+                    custom_patterns=custom_patterns,
+                    hang_detected=hang_detected,
+                    peak_vram_mib=peak_vram_mib,
+                    dmesg_text=dmesg_text,
+                    amd_smi_pre=amd_smi_pre,
+                    amd_smi_post=amd_smi_post,
+                    tier3_extra=tuple(fired_kernel_ids),
+                    tier3_state=_TIER3_STATE,
+                )
+            )
+        except Exception as classifier_exc:  # noqa: BLE001 -- classifier crash containment
+            verdict_obj, tier_durations_ms = _tier1_only_fallback_verdict(
+                exit_code=exit_code,
+                timed_out=timed_out,
+                trial_dir=trial_dir,
+                classifier_exc=classifier_exc,
+            )
 
         result_doc: dict[str, Any] = {
-            "verdict": verdict,
+            "verdict": verdict_obj.verdict,
             "exit_code": exit_code,
             "walltime_sec": walltime_sec,
+            "peak_vram_mib": peak_vram_mib,
             "argv": list(argv),
             "cell_name": probe_extras.get("cell_name", "_unknown_"),
             "trial_index": self._trial_index,
+            "failure_detectors_fired": list(verdict_obj.failure_detectors_fired),
+            "warn_detectors_fired": list(verdict_obj.warn_detectors_fired),
+            "capture": dict(verdict_obj.capture),
+            "tier_durations_ms": dict(tier_durations_ms),
+            # Phase 1 keys preserved for back-compat with any
+            # downstream tool that already parses them. The Phase 1
+            # minimum-shape test in tests/probe/test_subprocess_workload.py
+            # asserts these continue to exist; the Phase 2 shape
+            # extends the doc by ADDING keys, never by removing
+            # them (rubric §2.B FR 2.9).
             "env_passthrough_mode": env_mode,
             "timed_out": timed_out,
         }
@@ -338,12 +534,13 @@ class SubprocessWorkload(Workload):
         # ``result.json`` is still written either way -- the artifact
         # contract from PR #194 round 4 is independent of the
         # matrix-side semantic.
+        passed = verdict_obj.verdict == "pass"
         return WorkloadResult(
-            passed=(verdict == "pass"),
-            failure_count=0 if verdict == "pass" else 1,
+            passed=passed,
+            failure_count=0 if passed else 1,
             failure_details=(
                 []
-                if verdict == "pass"
+                if passed
                 else [
                     {
                         "exit_code": exit_code,
@@ -351,6 +548,7 @@ class SubprocessWorkload(Workload):
                         "type": (
                             "subprocess_nonzero_exit" if launched else "subprocess_exec_failed"
                         ),
+                        "failure_detectors_fired": list(verdict_obj.failure_detectors_fired),
                     }
                 ]
             ),
@@ -359,9 +557,11 @@ class SubprocessWorkload(Workload):
             configured_iterations=1,
             elapsed_sec=walltime_sec,
             metrics={
-                "verdict": verdict,
+                "verdict": verdict_obj.verdict,
                 "exit_code": exit_code,
                 "result_json_path": str(result_path),
+                "failure_detectors_fired": list(verdict_obj.failure_detectors_fired),
+                "warn_detectors_fired": list(verdict_obj.warn_detectors_fired),
             },
         )
 
@@ -498,6 +698,94 @@ def _validate_env_file_entries(env: dict[str, str]) -> None:
                 "probe.env uses bare KEY=VALUE format and cannot "
                 "encode multi-line values"
             )
+
+
+def _read_log_text(stdout_path: Path, stderr_path: Path) -> str:
+    """Read stdout + stderr back as a single text blob for the classifier.
+
+    Reads are bounded to :data:`aorta.probe.sandbox.MAX_LOG_BYTES`
+    per stream as a hard regex-DoS cap; the per-tier scanners further
+    bound individual ``re.search`` invocations.
+
+    Errors decoded with ``errors="replace"`` (U+FFFD per invalid
+    byte, 1:1 byte→char) rather than ``backslashreplace`` (up to
+    4 chars per invalid byte for ``\\xff`` etc.). The cheaper
+    expansion matters because ``MAX_LOG_BYTES`` is meant to be the
+    upper bound on the regex-input length; with
+    ``backslashreplace`` a binary-heavy stdout could quadruple the
+    decoded string and let a runaway log inflate regex CPU/memory
+    past the documented cap. The replacement char loses the
+    underlying byte value but the classifier scanners don't depend
+    on the exact byte -- they pattern-match on textual error
+    messages, where invalid UTF-8 is noise that just needs a
+    placeholder so the surrounding text stays in line.
+    """
+    from aorta.probe.sandbox import MAX_LOG_BYTES
+
+    parts: list[str] = []
+    for path in (stdout_path, stderr_path):
+        try:
+            data = path.read_bytes()[:MAX_LOG_BYTES]
+            parts.append(data.decode("utf-8", errors="replace"))
+        except FileNotFoundError:
+            parts.append("")
+        except OSError:
+            parts.append("")
+    return "\n".join(parts)
+
+
+def _tier1_only_fallback_verdict(
+    *,
+    exit_code: int,
+    timed_out: bool,
+    trial_dir: Path,
+    classifier_exc: BaseException,
+) -> tuple[Verdict, dict[str, float]]:
+    """Build a deterministic verdict when :func:`classify_trial` raises.
+
+    Tier 1 alone is enough to give the trial a sensible verdict: it
+    is the only tier that's a pure function of the subprocess exit
+    state and the trial dir, so it can't itself crash on regex /
+    capture / dmesg edge cases. We re-run :func:`tier1_detect`
+    here (cheap, no FS work beyond a glob in ``trial_dir``) and
+    encode the original classifier exception under
+    ``capture['classifier_error']`` so operators see WHY the full
+    classifier was bypassed instead of a silent Tier-1-only
+    result. ``tier_durations_ms`` records the fallback in
+    ``capture`` rather than the per-tier breakdown -- the other
+    four tiers genuinely did not run.
+
+    Verdict rule: any Tier 1 detector fires -> ``fail``; else
+    ``pass``. Matches the existing Phase-1 fallback shape so
+    downstream tooling that already parses ``failure_detectors_fired``
+    keeps working.
+    """
+    fired = tier1_detect(
+        Tier1Context(
+            exit_code=exit_code,
+            timed_out=timed_out,
+            trial_dir=trial_dir,
+        )
+    )
+    verdict_str = "fail" if fired else "pass"
+    capture: dict[str, str | float | int] = {
+        "classifier_error": f"{type(classifier_exc).__name__}: {classifier_exc}",
+    }
+    verdict = Verdict(
+        verdict=verdict_str,
+        failure_detectors_fired=list(fired),
+        warn_detectors_fired=[],
+        capture=capture,
+    )
+    # Per-tier durations: Tier 1 ran, everything else was skipped.
+    tier_durations_ms = {
+        "tier1": 0.0,
+        "tier2": 0.0,
+        "tier3": 0.0,
+        "tier4": 0.0,
+        "tier5": 0.0,
+    }
+    return verdict, tier_durations_ms
 
 
 def _write_env_file(path: Path, env: dict[str, str]) -> None:
