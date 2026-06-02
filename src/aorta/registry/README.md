@@ -254,6 +254,37 @@ resolves it by renaming or removing one of the entries. This is intentional:
 silent overrides cause hours of "why does my mitigation behave wrong"
 debugging.
 
+## Runtime + diagnostic flag sweep set
+
+The built-in registry ships a set of ROCm / PyTorch / NCCL runtime knobs that
+are useful as named mitigations in `aorta probe` sweeps, alongside a workload-
+internal sidecar for stack-specific vars:
+
+| Surface | Location | Contents |
+|---|---|---|
+| Runtime mitigations | Built-in registry (`mitigations.py`) | `gpu_max_hw_queues_2`, `roc_aql_queue_size_1024`, `nccl_launch_order_implicit`, `hsa_no_scratch_reclaim`, `pytorch_no_cuda_memory_caching`, `fa_prefer_ck` / `fa_prefer_aotriton`, and others — see `aorta mitigations list` |
+| Workload-internal flags | [`examples/probe-flag-sidecar.json`](../../../examples/probe-flag-sidecar.json) | `FBGEMM_*`, `TORCHINDUCTOR_*`, `EVAL_DISABLE_PIPELINING` — only effective when the workload reads them |
+| Ready-made probe recipe | [`recipes/probe-flag-sweep.yaml`](../../../recipes/probe-flag-sweep.yaml) | `mitigation_axis` + `diagnostic_axis` covering the built-in set |
+
+```bash
+aorta probe \
+    --recipe recipes/probe-flag-sweep.yaml \
+    --mitigations-file examples/probe-flag-sidecar.json \
+    --output ./probe_results \
+    --ticket PROBE-FLAG-SWEEP \
+    --dry-run \
+    -- \
+    echo hi
+```
+
+`--mitigations-file` only makes the sidecar names *resolvable* — it does not
+add cells. To actually sweep `fbgemm_no_jk`, `torchinductor_max_autotune_pointwise`,
+etc., add them to `mitigation_axis:` in the recipe (see the header comment in
+`recipes/probe-flag-sweep.yaml`). Without that edit the command above runs only
+the built-in axis.
+
+Tracked in issue #195.
+
 ## Verifying what's registered
 
 ```bash

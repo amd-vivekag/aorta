@@ -13,7 +13,13 @@ orchestration). The CLI's whole job is:
 4. Call :func:`aorta.triage.runner.run_recipe` with the probe-mode
    knobs (``layout="flat_resume"``, ``resume_existing=True``,
    ``subprocess_argv=...``).
-5. Map runner exceptions to ``ClickException``.
+5. Map recipe-load and runner exceptions to ``ClickException``.
+   ``LookupError`` is in the catch list so that
+   ``UnknownMitigationError`` / ``UnknownEnvironmentError`` (KeyError
+   subclasses, not ``RegistryError``) bubble up as a clean
+   ClickException -- the most common failure path when an operator
+   forgets ``--mitigations-file`` for a recipe that references a
+   sidecar-only name. Mirrors ``aorta.cli.run``.
 
 The shared-engine test in ``tests/probe/test_shared_engine.py`` mocks
 ``run_recipe`` and invokes both ``aorta probe`` and ``aorta triage
@@ -274,6 +280,16 @@ class _ProbeCommand(click.Command):
     ),
 )
 @click.option(
+    "--mitigations-file",
+    "mitigation_files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help=(
+        "JSON sidecar file with ad-hoc mitigations and/or environments "
+        "(repeatable). Merged with built-ins at recipe load time."
+    ),
+)
+@click.option(
     "-v",
     "--verbose",
     count=True,
@@ -288,6 +304,7 @@ def probe(
     ticket: str | None,
     dry_run: bool,
     env_passthrough_mode: str | None,
+    mitigation_files: tuple[Path, ...],
     verbose: int,
     argv: tuple[str, ...],
 ) -> None:
@@ -321,14 +338,14 @@ def probe(
             else None
         )
         clean_argv = validate_trailing_argv(argv)
-        r = load_recipe(recipe)
+        r = load_recipe(recipe, sidecar_files=mitigation_files or None)
         if r.probe_extras is None:
             raise ProbeUsageError(
                 f"recipe {recipe} is not a probe-mode recipe; "
                 "set 'mode: probe' at the recipe top level"
             )
         r = apply_recipe_overrides(r, ticket=ticket, cli_passthrough_mode=cli_passthrough_mode)
-    except (ProbeUsageError, RecipeSchemaError, RecipeCellError, RegistryError) as exc:
+    except (ProbeUsageError, RecipeSchemaError, RecipeCellError, RegistryError, LookupError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     try:
@@ -346,7 +363,7 @@ def probe(
         # remove. Wrap into ClickException so click exits 1 with the
         # operator-visible message rather than a Python traceback.
         raise click.ClickException(str(exc)) from exc
-    except (RegistryError, RecipeCellError, RecipeSchemaError) as exc:
+    except (RegistryError, RecipeCellError, RecipeSchemaError, LookupError) as exc:
         raise click.ClickException(str(exc)) from exc
     if not dry_run:
         click.echo(f"Wrote probe artifacts to {run_dir}")
