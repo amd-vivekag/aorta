@@ -281,6 +281,41 @@ CANONICAL_ENV_VARS: tuple[str, ...] = (
     "NCCL_IB_HCA",
     "NCCL_SOCKET_IFNAME",
     "RCCL_MSCCL_ENABLE",
+    # AINIC (AMD-Pensando RoCE NIC) net-plugin + fabric tuning.
+    # Captured so an our-env vs customer-env diff surfaces RoCE/QoS
+    # mismatches (GID index, traffic class, DCQCN-adjacent flags) and
+    # which net plugin RCCL loads. Absent on non-AINIC nodes -> None.
+    "RCCL_AINIC_ROCE",
+    "NCCL_NET_PLUGIN",
+    "NCCL_NET",
+    "RCCL_CTS_OFFLOAD_ENABLED",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_IB_ROCE_VERSION_NUM",
+    "NCCL_IB_TC",
+    "NCCL_IB_FIFO_TC",
+    "NCCL_GDR_FLUSH_DISABLE",
+    "NCCL_GDRCOPY_ENABLE",
+    "NCCL_IB_USE_INLINE",
+    "NCCL_IB_PCI_RELAXED_ORDERING",
+    "NCCL_IB_QPS_PER_CONNECTION",
+    "NCCL_PXN_DISABLE",
+    "NCCL_IGNORE_CPU_AFFINITY",
+    "NCCL_NET_OPTIONAL_RECV_COMPLETION",
+    "RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING",
+    "NCCL_IB_TIMEOUT",
+    "NCCL_IB_SL",
+    "NCCL_IB_SPLIT_DATA_ON_QPS",
+    "NCCL_DMABUF_ENABLE",
+    "NCCL_CUMEM_ENABLE",
+    "IONIC_LOCKFREE",
+    "RCCL_DISABLE_RAIL_TREES",
+    "RCCL_LL128_FORCE_ENABLE",
+    "NCCL_WORK_FIFO_BYTES",
+    # gfx950 (MI350/MI355X) fence-ordering debug knob from the
+    # silent-data-corruption investigation. Captured so a per-rank env
+    # diff catches a launcher that exports the override on rank 0 but
+    # not the rest -- a half-applied "fix" the diff would otherwise miss.
+    "RCCL_GFX9_CHEAP_FENCE_OFF",
     # FBGEMM
     "FBGEMM_NO_JK",
     "FBGEMM_TBE_V2",
