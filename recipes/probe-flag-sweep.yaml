@@ -42,9 +42,13 @@ trials: 1
 mitigation_axis:
   - none
   - gpu_max_hw_queues_2          # caps hardware queue parallelism
+  - debug_hip_dynamic_queues_1   # DEBUG_HIP_DYNAMIC_QUEUES=1
+  - debug_hip_dynamic_queues_2   # DEBUG_HIP_DYNAMIC_QUEUES=2
   - roc_aql_queue_size_1024      # caps CPU-GPU AQL queue depth (backpressure)
   - nccl_launch_order_implicit   # serializes RCCL launches device-wide
   - hsa_no_scratch_reclaim
+  - hsa_disable_cache            # HSA_DISABLE_CACHE=1
+  - hsa_enable_cache             # HSA_DISABLE_CACHE=0
   - hsa_no_sdma
   - pytorch_no_cuda_memory_caching
   - pytorch_alloc_expandable_segments

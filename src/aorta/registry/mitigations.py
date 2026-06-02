@@ -39,6 +39,12 @@ BUILTIN_MITIGATIONS: dict[str, dict[str, str]] = {
     "gpu_max_hw_queues_2": {
         "GPU_MAX_HW_QUEUES": "2",
     },
+    "debug_hip_dynamic_queues_1": {
+        "DEBUG_HIP_DYNAMIC_QUEUES": "1",
+    },
+    "debug_hip_dynamic_queues_2": {
+        "DEBUG_HIP_DYNAMIC_QUEUES": "2",
+    },
     "roc_aql_queue_size_1024": {
         "ROC_AQL_QUEUE_SIZE": "1024",
     },
@@ -47,6 +53,12 @@ BUILTIN_MITIGATIONS: dict[str, dict[str, str]] = {
     },
     "hsa_no_scratch_reclaim": {
         "HSA_NO_SCRATCH_RECLAIM": "1",
+    },
+    "hsa_disable_cache": {
+        "HSA_DISABLE_CACHE": "1",
+    },
+    "hsa_enable_cache": {
+        "HSA_DISABLE_CACHE": "0",
     },
     "roc_signal_pool_16k": {
         "ROC_SIGNAL_POOL_SIZE": "16384",
