@@ -6,11 +6,18 @@
 # `LlmDeterminismWorkload(config)` verbatim — same keys the standalone
 # launcher in docs/llm-determinism.md uses.
 #
-# Run on a multi-GPU node:
-#   torchrun --standalone --nproc_per_node=8 -m aorta.triage.cli run \
+# Run on a multi-GPU node (the `aorta` console script is the entry point;
+# `python -m aorta.triage.cli` is NOT a runnable module):
+#   torchrun --standalone --nproc_per_node=8 $(which aorta) triage run \
 #     --recipe recipes/example-llm-determinism.yaml
 #
 # Each cell writes its own capture_dir, so results don't collide.
+#
+# Note on per-cell step times: cells run sequentially in one process and
+# the first cell absorbs FSDP2 / RCCL / hipBLAS warmup, so its step time
+# is typically much higher than later cells. Don't read warmup as a
+# determinism signal — the per-rank checksum compare is what proves
+# replayability.
 # `steps` is a first-class recipe field — the loader rejects it inside
 # workload_config (the dispatcher would silently clobber it otherwise).
 schema_version: 1

@@ -145,16 +145,22 @@ cells:
       capture_dir: ./llm_det_capture/moe4-bf16-12L
 ```
 
-Launch:
+Launch (use the `aorta` console script — `python -m aorta.triage.cli` is **not** a runnable module):
 
 ```bash
-torchrun --standalone --nproc_per_node=8 \
-  -m aorta.triage.cli run --recipe recipes/example-llm-determinism.yaml
+torchrun --standalone --nproc_per_node=8 $(which aorta) triage run \
+  --recipe recipes/example-llm-determinism.yaml
 ```
 
 Two schema gotchas the loader enforces:
 - `steps` is a first-class recipe field; putting it in `workload_config` is rejected (would be silently clobbered).
 - Keys starting with `_aorta_` are reserved and rejected.
+
+**Per-cell step times include warmup.** Cells run sequentially in one
+process; the first cell absorbs FSDP2 / RCCL / hipBLAS warmup, so its
+step time is typically much higher than later cells (in one 4-cell
+smoke we saw 2453 ms on the first cell vs 78–912 ms on later ones).
+That is not a determinism signal — the per-rank checksum compare is.
 
 ### If you see divergence — what to send back
 
