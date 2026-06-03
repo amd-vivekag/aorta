@@ -115,6 +115,47 @@ jq -s '[.[0].block_post, .[1].block_post] | transpose
    /tmp/llm_det_capture_fail/rank000.jsonl
 ```
 
+### Running via recipe (multi-cell sweep)
+
+The launcher script above runs one configuration. To sweep multiple
+configurations in one invocation, use the recipe at
+[`recipes/example-llm-determinism.yaml`](../recipes/example-llm-determinism.yaml).
+Pass workload knobs through `workload_config`:
+
+```yaml
+# Recipe-scope defaults applied to every cell:
+workload_config:
+  hidden_size: 2048
+  dtype: bf16
+  checksum_mode: per_rank
+
+cells:
+  - name: baseline-bf16-24L
+    mitigations: [none]
+    environment: local
+    workload_config:       # cell wins on key collision
+      num_layers: 24
+      capture_dir: ./llm_det_capture/baseline-bf16-24L
+  - name: moe4-bf16-12L
+    mitigations: [none]
+    environment: local
+    workload_config:
+      num_layers: 12
+      num_experts: 4
+      capture_dir: ./llm_det_capture/moe4-bf16-12L
+```
+
+Launch:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  -m aorta.triage.cli run --recipe recipes/example-llm-determinism.yaml
+```
+
+Two schema gotchas the loader enforces:
+- `steps` is a first-class recipe field; putting it in `workload_config` is rejected (would be silently clobbered).
+- Keys starting with `_aorta_` are reserved and rejected.
+
 ### If you see divergence — what to send back
 
 Tar up:
