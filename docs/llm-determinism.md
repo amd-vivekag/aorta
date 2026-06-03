@@ -1,62 +1,145 @@
 # LLM Determinism Recipe
 
-War-room helper for catching kernel-level nondeterminism / silent data
-corruption in a transformer training step. Runs the **same** forward+
-backward twice on the same inputs, with parameters and RNG restored
-between runs, and compares bit-exact checksums of:
-
-- every per-block boundary activation (entering and leaving each
-  repetition of the single repeated block — the FSDP2 comm boundary)
-- the final loss and logits
-- every grad and every param after backward
+Catch kernel-level nondeterminism / silent data corruption (SDC) in a
+transformer training step. Runs the **same** forward+backward twice on
+the same inputs, with parameters and RNG restored between runs, and
+compares bit-exact checksums of every per-block boundary activation,
+the loss, the logits, every grad, and every param.
 
 If any checksum drifts → some kernel (matmul, attention, reduction,
 collective) is producing different bits for the same inputs.
 
-## Why a single repeated block?
+---
 
-The war-room execution model is a chain of repeating
-`comm_kernel_i → compute_kernel_i` stages. One repetition of the same
-transformer block is one such stage, and under FSDP2 `fully_shard` the
-block boundary is also the all-gather / reduce-scatter boundary. So
-checksumming the activation at every block boundary checksums the
-tensor that actually crosses GPUs at every repetition.
+## Quick Start
 
-This is **not a faithful LLM**. Weights are random init, the specific
-architecture (LayerNorm + MHA + GLU FFN, optional top-1 MoE) is generic
-on purpose. The model and its size are knobs to control how much data
-crosses GPU boundaries, nothing more.
+### Prerequisites
 
-## What it doesn't do
+- A node with ≥1 AMD GPU (smoke verified on 8× MI350X, gfx950).
+- PyTorch built with ROCm/HIP (`torch.version.hip` non-empty,
+  `torch.cuda.is_available()` true). Verified on
+  `torch 2.10.0.dev+rocm7.0`.
+- `pip install -e .` from the repo root.
 
-- Not a quality benchmark.
-- Not a perf benchmark — manual attention, no `torch.compile`, no graphs.
-- Not a multi-step trainer by default; `steps` is configurable but each
-  step is a self-contained replay.
-- Does not intercept kernels directly. Module forward pre/post hooks are
-  the practical proxy for the comm boundary; documented limitation.
+### Smoke (≈5 s on 8 GPUs)
 
-## Running
+Create `/tmp/run_llm_det.py`:
 
-```bash
-# 40-GPU capture run (adjust to your cluster shape):
-torchrun --nproc_per_node=8 --nnodes=5 -m aorta.cli run \
-  --workload llm_determinism \
-  --recipe recipes/example-llm-determinism.yaml
+```python
+import os, sys
+from aorta.workloads.llm_determinism import LlmDeterminismWorkload
 
-# Single rank / local dev:
-python -m aorta.cli run --workload llm_determinism
+cfg = {
+    "num_layers": 24, "hidden_size": 2048, "ffn_size": 5632,
+    "num_heads": 16, "seq_len": 512, "batch_size": 1,
+    "dtype": "bf16", "seed": 1234, "steps": 1,
+    "checksum_mode": "per_rank",
+    "capture_dir": "/tmp/llm_det_capture",
+}
+w = LlmDeterminismWorkload(cfg)
+w.setup(); r = w.run(); w.cleanup()
+print(f"[rank {os.environ.get('RANK')}] passed={r.passed} "
+      f"failures={r.failure_count} elapsed={r.elapsed_sec:.2f}s "
+      f"ranks_with_divergence={r.metrics['ranks_with_divergence']}")
+sys.exit(0 if r.passed else 1)
 ```
 
-Pass → every per-rank per-block (and per-param) checksum matched.
-Fail → workload prints which checksums diverged on which rank and which
-block index.
+Run it:
+
+```bash
+rm -rf /tmp/llm_det_capture
+torchrun --standalone --nproc_per_node=8 /tmp/run_llm_det.py
+```
+
+**Expected on a healthy stack:**
+- Exit 0; every rank prints `passed=True failures=0 ranks_with_divergence=0`
+- `/tmp/llm_det_capture/rank000.jsonl` … `rank007.jsonl` exist, 2 lines each (`run=r1`, `run=r2`)
+- `loss_bits` is non-zero (~1.15e9 with defaults) and **equal between r1 and r2 on each rank**
+- `block_pre` / `block_post` lists are length `num_layers`
+
+### Validate the detector actually flags real divergence
+
+A green smoke alone doesn't prove the detector works in your environment.
+Inject a known difference between r1 and r2 by perturbing `_input_ids`
+(not snapshotted/restored, so survives only into r2):
+
+Save as `/tmp/run_llm_det_fail.py`:
+
+```python
+import os, sys, torch
+from aorta.workloads.llm_determinism import LlmDeterminismWorkload
+
+cfg = {"num_layers": 24, "hidden_size": 2048, "ffn_size": 5632,
+       "num_heads": 16, "seq_len": 512, "batch_size": 1,
+       "dtype": "bf16", "seed": 1234, "steps": 1,
+       "checksum_mode": "per_rank",
+       "capture_dir": "/tmp/llm_det_capture_fail"}
+w = LlmDeterminismWorkload(cfg); w.setup()
+_orig, n = w._run_once, [0]
+def patched():
+    n[0] += 1
+    if n[0] == 2:                              # perturb after r1, before r2
+        w._input_ids[0, 0] = (int(w._input_ids[0, 0]) + 1) % w._cfg.vocab_size
+    return _orig()
+w._run_once = patched
+r = w.run(); w.cleanup()
+print(f"[rank {os.environ.get('RANK')}] passed={r.passed} "
+      f"failures={r.failure_count}")
+for reason in r.metrics.get("divergence_reasons", [])[:5]:
+    print(f"[rank {os.environ.get('RANK')}] {reason}")
+sys.exit(0 if r.passed else 1)
+```
+
+```bash
+rm -rf /tmp/llm_det_capture_fail
+torchrun --standalone --nproc_per_node=8 /tmp/run_llm_det_fail.py
+echo "exit=$?"
+```
+
+**Expected:** non-zero exit; every rank prints `passed=False`; `divergence_reasons` lists `block[0..N].pre/post`, `loss_bits`, `output_bits`, and many `grad[*]` entries. Params should **not** appear in reasons (snapshot/restore unchanged).
+
+### Reading the capture
+
+```bash
+# r1 vs r2 equality, per rank — expect "true" on every line.
+for f in /tmp/llm_det_capture/rank*.jsonl; do
+  jq -s --arg f "$f" '$f + ": " + (.[0].block_post == .[1].block_post | tostring)' "$f"
+done
+
+# loss_bits across ranks (sanity-check non-zero, near each other):
+jq -c '{rank, run, loss_bits}' /tmp/llm_det_capture/rank*.jsonl
+
+# First divergent block index on rank 0 (after a failing run):
+jq -s '[.[0].block_post, .[1].block_post] | transpose
+        | map(.[0]==.[1]) | index(false)' \
+   /tmp/llm_det_capture_fail/rank000.jsonl
+```
+
+### If you see divergence — what to send back
+
+Tar up:
+- `/tmp/llm_det_capture/` (or your `capture_dir`) — every `rank*.jsonl`
+- Full torchrun stdout/stderr (all `divergence_reasons` lines)
+- `aorta env probe -o env.json` output (PyTorch / ROCm / HIP / RCCL versions, env vars, GPU arch)
+- The exact launcher script you used, the GPU count, and which knobs you changed from defaults
+
+### Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `RuntimeError: Expected all tensors to be on the same device` | Stale checkout — pull the branch; the fix is on `users/oyazdanb/llm-determinism-recipe`. |
+| Every rank hangs at `init_process_group` | Set `NCCL_DEBUG=INFO`; try `NCCL_P2P_DISABLE=1`. RCCL honours `NCCL_*` env vars. |
+| `loss_bits` reported as 0 | Stale checkout — the label shift fix (`torch.roll`) avoids the degenerate loss-collapse. |
+| OOM | Drop `num_layers: 12` first, then `hidden_size: 1024, ffn_size: 2816`, then `seq_len: 256`. One knob at a time. |
+| Determinism flagged but suspect false positive | Bump `checksum_mode: global` to also compare an all-reduced loss⊕output fingerprint; rerun. |
+
+---
 
 ## Knobs
 
 | Key | Default | Notes |
 |---|---|---|
-| `num_layers` | 24 | Block repetitions = comm/compute stages. Drop to scale down with rank count. |
+| `num_layers` | 24 | Block repetitions = comm/compute stages. Scale down with rank count. |
 | `hidden_size` | 2048 | Per-block hidden width. |
 | `ffn_size` | 5632 | GLU FFN width. |
 | `num_heads` | 16 | Must divide `hidden_size`. |
@@ -67,47 +150,88 @@ block index.
 | `dtype` | `bf16` | `bf16` / `fp16` / `fp32`. |
 | `seed` | 1234 | Synthetic batch + RNG seed. |
 | `steps` | 1 | Number of independent replay steps. |
-| `checksum_mode` | `per_rank` | `global` also all-reduces a fingerprint. |
+| `checksum_mode` | `per_rank` | `global` also all-reduces a fingerprint across ranks. |
 | `capture_dir` | unset | When set, every step writes `rank<NNN>.jsonl` for offline inspection. |
 | `model_label` | `generic-repeated-block` | Advisory only; recorded in metrics. |
 
-## Rule-#4 compliance
-
-By default (`checksum_mode: per_rank`) each rank only compares its own
-run-1 vs run-2 shards / block boundaries. Pass/fail is OR'd across ranks
-via a single all-reduced integer flag. `checksum_mode: global` opts in
-to additionally comparing an all-reduced loss⊕output fingerprint, which
-catches collective ordering drift but no longer satisfies the strict
-"single-rank only" guard.
-
-## Determinism caveats
-
-`torch.use_deterministic_algorithms(True, warn_only=True)` is enabled at
-setup. Some ops have no deterministic implementation; we tolerate that
-because the checksum compare is what actually proves replayability.
-`CUBLAS_WORKSPACE_CONFIG=:4096:8` is set if not already present —
-hipBLAS / cuBLAS require this for deterministic matmul.
-
 ## Capture-mode output
 
-When `capture_dir` is set, each rank writes one line per (run, step):
+Each rank writes one JSON line per (run, step):
 
 ```json
 {"rank": 7, "step": 0, "run": "r1", "loss_bits": 12345, "output_bits": 67890,
  "block_pre": [<int per block>], "block_post": [<int per block>]}
 ```
 
-This is the raw material for offline analysis on the 40-GPU capture run —
-e.g. `jq` for ranks whose `block_pre[i]` differs between `r1` and `r2`,
-or a comparison of the same rank's checksums across two whole captures
-collected on different nodes / dates.
-
 ## Metrics surface (stable for detector parsing)
 
 `WorkloadResult.metrics` includes:
 
-- `ranks_with_divergence`
+- `ranks_with_divergence` — count of ranks whose local compare flagged
 - `steps[*].loss_bits_r1`, `loss_bits_r2`, `num_blocks_checked`
-- `divergence_reasons` (first 32, when present)
-- `model_label`, `num_layers`, `num_experts`, `dtype`, `checksum_mode`,
-  `capture_dir`
+- `divergence_reasons` — first 32 reasons (when present)
+- `model_label`, `num_layers`, `num_experts`, `dtype`, `checksum_mode`, `capture_dir`
+
+---
+
+## Design notes
+
+### Why a single repeated block
+
+The execution model is a chain of repeating
+`comm_kernel_i → compute_kernel_i` stages. One repetition of the same
+transformer block is one such stage; under FSDP2 `fully_shard` the
+block boundary is also the all-gather / reduce-scatter boundary, so
+checksumming the activation at every block boundary checksums the
+tensor that actually crosses GPUs at every repetition.
+
+**This is not a faithful LLM.** Weights are random init, the architecture
+(LayerNorm + MHA + GLU FFN, optional top-1 MoE) is generic on purpose.
+The model and its size are knobs to control how much data crosses GPU
+boundaries — nothing more.
+
+### What it doesn't do
+
+- Not a quality benchmark.
+- Not a perf benchmark — manual attention, no `torch.compile`, no graphs.
+- Not a multi-step trainer by default; `steps` is configurable but each
+  step is a self-contained replay.
+- Does not intercept kernels directly. Module forward pre/post hooks are
+  the practical proxy for the comm boundary; documented limitation.
+
+### Checksum contract
+
+The checksum is a **bit-pattern** sum, not a numeric sum: tensor storage
+is re-interpreted (`view`, not `to`) as the signed integer of matching
+element size, then accumulated into `int64`.
+
+- bf16, fp16 (2-byte) → `int16` view
+- fp32 (4-byte) → `int32` view
+- fp64 (8-byte) → `int64` view
+
+Two tensors with identical bits → identical checksums. Two tensors that
+differ in a single bit (including NaN payload bits and the +0 vs -0
+distinction that a numeric sum would erase) → different checksums.
+Accumulator wraps mod 2^64 — fine, because we only ever compare two
+checksums for equality, never reason about magnitude.
+
+Note for cross-tool comparison: these numbers are **not** directly
+comparable to other tools' checksums unless they use the identical
+view-dtype mapping, the same hook points, and the same reduction.
+
+### Single-rank-only compare (default)
+
+`checksum_mode: per_rank` (default) compares each rank's run-1 vs run-2
+shards / block boundaries only. Pass/fail is OR'd across ranks via a
+single all-reduced integer flag, no checksum values cross ranks.
+`checksum_mode: global` opts in to additionally comparing an
+all-reduced loss⊕output fingerprint — catches collective ordering
+drift, but no longer satisfies the strict "single-rank only" guard.
+
+### Determinism caveats
+
+`torch.use_deterministic_algorithms(True, warn_only=True)` is enabled
+at setup. Some ops have no deterministic implementation; we tolerate
+that because the checksum compare is what actually proves replayability.
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` is set if not already present —
+hipBLAS / cuBLAS require this for deterministic matmul.
