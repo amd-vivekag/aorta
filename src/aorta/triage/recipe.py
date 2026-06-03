@@ -77,6 +77,8 @@ _PROBE_TOP_LEVEL = frozenset(
         "custom_patterns",
         "hang_window_sec",
         "hang_grace_period_at_start",
+        # Phase 3 (issue #188): redaction block for aorta bundle.
+        "redaction",
     }
 )
 # Phase 3 keys -- intercepted at load time BEFORE the unknown-keys
@@ -89,7 +91,7 @@ _PROBE_TOP_LEVEL = frozenset(
 # is reserved for a future Phase 3-style "fail-the-trial-by-condition"
 # block; rejected here so a typo'd indent of a custom_patterns
 # condition can't fall through to a silent no-op.
-_PHASE_3_KEYS = frozenset({"redaction", "condition"})
+_PHASE_3_KEYS = frozenset({"condition"})
 # Union of valid keys -- used for the unknown-key rejection. Phase 2 keys
 # (``custom_patterns``, ``hang_window_sec``, ``hang_grace_period_at_start``)
 # ARE included via ``_PROBE_TOP_LEVEL`` and parsed normally when
@@ -724,6 +726,26 @@ def load_recipe(
         UnknownMitigationError / UnknownEnvironmentError: A referenced
             registry name is not known. Bubbled up from B3's resolver.
     """
+    data, text = _read_recipe_document(path)
+    recipe = _build_recipe(
+        data,
+        sidecar_files=sidecar_files,
+        source_path=path,
+        source_sha256=_sha256_bytes(text),
+    )
+    return recipe
+
+
+def _read_recipe_document(path: Path) -> tuple[Any, str]:
+    """Read and YAML/JSON-parse a recipe file into ``(data, raw_text)``.
+
+    The read + parse step is split out from :func:`load_recipe` so callers
+    that need a single top-level block (e.g. ``aorta bundle`` resolving only
+    the ``redaction:`` block) can reuse it via :func:`load_recipe_mapping`
+    without running full axis/registry validation -- and without importing
+    a YAML parser themselves (the probe redaction modules are stdlib-only
+    by rubric §3.F; keeping the dependency here preserves that).
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -737,14 +759,25 @@ def load_recipe(
             data = yaml.safe_load(text)
     except (yaml.YAMLError, json.JSONDecodeError) as exc:
         raise RecipeSchemaError(f"recipe {path}: parse error ({exc})") from exc
+    return data, text
 
-    recipe = _build_recipe(
-        data,
-        sidecar_files=sidecar_files,
-        source_path=path,
-        source_sha256=_sha256_bytes(text),
-    )
-    return recipe
+
+def load_recipe_mapping(path: Path) -> Any:
+    """Return a recipe file's raw parsed top-level value with no validation.
+
+    The return type is whatever YAML/JSON yields for the document root -- a
+    ``dict`` for a well-formed recipe, but also ``None`` (empty file),
+    ``list``, or a scalar for a malformed one. Callers MUST check the shape
+    (e.g. ``isinstance(data, dict)``) and fail closed on a non-mapping rather
+    than assuming a ``dict``; see :func:`aorta.probe.bundle_hook.load_redaction_cfg`.
+
+    Used by callers that need one block out of a recipe (e.g. the bundle
+    redaction-only resolve) without resolving the mitigation / diagnostic
+    axes against the registry -- full :func:`load_recipe` would raise for a
+    valid probe run whose recipe referenced sidecar-defined names.
+    """
+    data, _ = _read_recipe_document(path)
+    return data
 
 
 def _build_recipe(

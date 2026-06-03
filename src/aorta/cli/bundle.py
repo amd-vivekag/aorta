@@ -26,6 +26,8 @@ from aorta.bundle import (
     Manifest,
     bundle_run_dir,
 )
+from aorta.probe.bundle_hook import build_redactor_from_recipe
+from aorta.triage.recipe import RecipeCellError, RecipeSchemaError
 
 
 def _render_review_summary(manifest: Manifest) -> str:
@@ -110,13 +112,9 @@ def _render_review_summary(manifest: Manifest) -> str:
     default=None,
     help=(
         "Recipe whose 'redaction:' block governs scrubber behaviour. "
-        "NOTE: until 'aorta probe' Phase 3 (issue #188) ships "
-        "'aorta.probe.redaction', this flag is logged but not yet "
-        "consumed -- bundles run with the IdentityRedactor (no "
-        "scrubbing, zero per-file counts). Phase 3 will also add "
-        "the auto-fallback to '<run-dir>/recipe.resolved.yaml' "
-        "when this flag is omitted; today an explicit path is "
-        "required to log a redaction-from line at all."
+        "When omitted, falls back to '<run-dir>/recipe.resolved.yaml' "
+        "when that file exists. If neither path yields a redaction: "
+        "block, the bundle runs with IdentityRedactor (no scrubbing)."
     ),
 )
 def bundle(
@@ -133,11 +131,12 @@ def bundle(
     """
     review_callback = (lambda manifest: _prompt_review(manifest)) if review else None
     try:
+        redactor = build_redactor_from_recipe(redaction_from, run_dir)
         path = bundle_run_dir(
             run_dir,
             ticket=ticket,
             output=output,
-            redaction_from=redaction_from,
+            redactor=redactor,
             review_callback=review_callback,
         )
     except BundleAbortedError as exc:
@@ -147,6 +146,12 @@ def bundle(
         # cluttering the abort message.
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(1) from exc
+    except (RecipeSchemaError, RecipeCellError) as exc:
+        # build_redactor_from_recipe parses the recipe's redaction: block;
+        # a malformed block raises a recipe error (a ValueError, not a
+        # BundleError). Render it as a clean CLI error rather than letting
+        # it escape as a traceback.
+        raise click.ClickException(f"aorta bundle: {exc}") from exc
     except BundleError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Wrote bundle to {path}")
