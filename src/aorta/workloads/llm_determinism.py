@@ -197,7 +197,12 @@ class LlmDeterminismWorkload(Workload):
         gen = torch.Generator(device="cpu").manual_seed(self._cfg.seed + self._rank)
         ids = torch.randint(0, self._cfg.vocab_size, (self._cfg.batch_size, self._cfg.seq_len), generator=gen)
         self._input_ids = ids.to(self._device)
-        self._labels = self._input_ids.clone()
+        # Next-token labels (shifted by one, last position wraps). Identity
+        # labels (`= self._input_ids.clone()`) collapse to loss=0 with the
+        # tied-embedding LM head: residual path lets the input token dominate
+        # its own logit, so the model trivially "predicts" itself. Shifting
+        # breaks that and gives a non-trivial loss signal to checksum.
+        self._labels = torch.roll(self._input_ids, shifts=-1, dims=-1)
 
         self._capture_path: Path | None = None
         if self._cfg.capture_dir:
