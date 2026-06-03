@@ -68,7 +68,9 @@ def global_checksum(local: int, group: object | None = None) -> int:
         return local
     buf = torch.tensor([local], dtype=torch.int64)
     if torch.cuda.is_available():
-        buf = buf.cuda()
+        # current_device() respects LOCAL_RANK; the default `.cuda()` would
+        # land on cuda:0 on every rank, which NCCL rejects on multi-GPU runs.
+        buf = buf.to(torch.device("cuda", torch.cuda.current_device()))
     dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=group)
     return int(buf.item())
 

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,7 +136,7 @@ class _BlockHookManager:
             # Resize to num_blocks on first record so out-of-order calls would surface.
             while len(self._current.pre) <= idx:
                 self._current.pre.append(0)
-            self._current.pre[idx] = tensor_checksum(args[0].detach())
+            self._current.pre[idx] = tensor_checksum(_local(args[0].detach()))
         return _hook
 
     def _make_post(self, idx: int):
@@ -144,7 +145,7 @@ class _BlockHookManager:
                 return
             while len(self._current.post) <= idx:
                 self._current.post.append(0)
-            self._current.post[idx] = tensor_checksum(output.detach())
+            self._current.post[idx] = tensor_checksum(_local(output.detach()))
         return _hook
 
     def start_capture(self) -> _BlockChecksums:
@@ -277,6 +278,11 @@ class LlmDeterminismWorkload(Workload):
         # Process group teardown left to the launcher.
 
     def _run_once(self) -> tuple[ChecksumSet, _BlockChecksums]:
+        # Re-seed CPU + CUDA-default + Python `random` so both replays enter
+        # forward with identical RNG. `random` covers anything (FSDP2,
+        # DataLoader, future MoE noise) that goes through stdlib RNG —
+        # _snapshot also captures torch RNG state for the same reason.
+        random.seed(self._cfg.seed + 1)
         torch.manual_seed(self._cfg.seed + 1)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self._cfg.seed + 1)
@@ -293,8 +299,12 @@ class LlmDeterminismWorkload(Workload):
 
         loss_bits = tensor_checksum(loss.detach())
         output_bits = tensor_checksum(logits.detach())
-        grads = {n: tensor_checksum(p.grad) for n, p in self._model.named_parameters() if p.grad is not None}
-        params = {n: tensor_checksum(p.detach()) for n, p in self._model.named_parameters()}
+        # Under FSDP2 `fully_shard`, params/grads are DTensors; `tensor_checksum`
+        # needs a plain tensor (bit-reinterpret + local sum, not a distributed
+        # reduction). `_local` returns the rank-local shard so the per-rank
+        # compare actually compares this rank's bytes.
+        grads = {n: tensor_checksum(_local(p.grad)) for n, p in self._model.named_parameters() if p.grad is not None}
+        params = {n: tensor_checksum(_local(p.detach())) for n, p in self._model.named_parameters()}
         gbits = global_checksum(loss_bits ^ output_bits) if self._cfg.checksum_mode == "global" else None
         return (
             ChecksumSet(loss_bits=loss_bits, output_bits=output_bits, grads=grads, params=params, global_bits=gbits),
@@ -319,6 +329,19 @@ class LlmDeterminismWorkload(Workload):
         }
         with self._capture_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
+
+
+def _local(t: torch.Tensor) -> torch.Tensor:
+    """Return the rank-local shard for DTensor params; passthrough otherwise.
+
+    FSDP2 `fully_shard` turns parameters into DTensors. Checksumming a DTensor
+    directly would trigger a distributed reduction (and `.view(int_dtype)`
+    isn't supported on DTensor). We want each rank to checksum *its* shard
+    so the per-rank replay compare actually catches a kernel that produced
+    different bits on this rank between the two runs.
+    """
+    to_local = getattr(t, "to_local", None)
+    return to_local() if callable(to_local) else t
 
 
 def _compare_block_lists(a: _BlockChecksums, b: _BlockChecksums) -> list[str]:
@@ -359,6 +382,7 @@ def _snapshot(model: nn.Module) -> dict[str, Any]:
         "params": {n: p.detach().clone() for n, p in model.named_parameters()},
         "cpu_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "py_rng": random.getstate(),
     }
 
 
@@ -369,6 +393,7 @@ def _restore(model: nn.Module, snap: dict[str, Any]) -> None:
     torch.set_rng_state(snap["cpu_rng"])
     if snap["cuda_rng"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(snap["cuda_rng"])
+    random.setstate(snap["py_rng"])
 
 
 __all__ = ["LlmDeterminismConfig", "LlmDeterminismWorkload"]
