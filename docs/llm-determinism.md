@@ -162,6 +162,24 @@ step time is typically much higher than later cells (in one 4-cell
 smoke we saw 2453 ms on the first cell vs 78–912 ms on later ones).
 That is not a determinism signal — the per-rank checksum compare is.
 
+**Where the checksum content lives.** The triage `matrix.md` table only
+reports pass/fail per cell (failure rate, failures count, mean step time,
+confound tag). It does **not** include checksum bits or
+`divergence_reasons`. To inspect the actual checksum stream:
+
+```bash
+# Per-trial WorkloadResult (loss_bits per step, ranks_with_divergence,
+# divergence_reasons when failing, model_label, etc.):
+find triage_results -name result.json -exec \
+  jq '{passed, rwd: .metrics.ranks_with_divergence,
+       loss_r1: .metrics.steps[0].loss_bits_r1,
+       reasons: .metrics.divergence_reasons}' {} \;
+
+# Per-block / per-rank fingerprints (the big artifact for offline
+# analysis) live wherever each cell's `workload_config.capture_dir`
+# pointed — NOT inside the triage output tree.
+```
+
 ### If you see divergence — what to send back
 
 Tar up:
