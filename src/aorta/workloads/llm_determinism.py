@@ -196,7 +196,7 @@ class LlmDeterminismWorkload(Workload):
         gen = torch.Generator(device="cpu").manual_seed(self._cfg.seed + self._rank)
         ids = torch.randint(0, self._cfg.vocab_size, (self._cfg.batch_size, self._cfg.seq_len), generator=gen)
         self._input_ids = ids.to(self._device)
-        self._labels = ids.clone()
+        self._labels = self._input_ids.clone()
 
         self._capture_path: Path | None = None
         if self._cfg.capture_dir:
