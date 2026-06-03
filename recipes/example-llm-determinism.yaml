@@ -1,0 +1,51 @@
+# Per-block deterministic-replay recipe for a single repeated transformer block.
+#
+# 40-GPU capture run (single node, adjust nproc / nnodes to your cluster):
+#   torchrun --nproc_per_node=8 --nnodes=5 -m aorta.cli run \
+#     --workload llm_determinism \
+#     --recipe recipes/example-llm-determinism.yaml
+#   # Sets capture_dir; per-rank JSONL lands in ./llm_det_capture/rank###.jsonl
+#
+# Local single-rank smoke (CPU works too if no GPUs are visible):
+#   python -m aorta.cli run --workload llm_determinism
+#
+# What it does: builds N repetitions of one transformer block (optionally
+# MoE), wraps each block in FSDP2, then runs the SAME forward+backward
+# twice on the same input with params+RNG restored between runs. Forward
+# hooks on every block checksum the activation entering and leaving each
+# block (the FSDP comm boundary). Fails the trial if any per-rank
+# per-block / loss / grad / param checksum drifts. No torch.compile,
+# no CUDA/HIP graphs, no optimizer step between replays.
+#
+# War-room knobs (override per-cell via extra_env once dispatcher supports
+# inline JSON, or edit the workload config block when invoking directly):
+#   num_layers      - repetition count == amount of cross-GPU traffic.
+#   hidden_size / ffn_size - per-block compute size.
+#   num_experts     - 1 == dense FFN; >1 == top-1 MoE router.
+#   dtype           - bf16 (default) | fp16 | fp32.
+#   checksum_mode   - per_rank (rule #4 safe) | global (all-reduced fingerprint).
+#   capture_dir     - directory for per-rank JSONL capture; omit to skip.
+#   seed            - bumping rotates the synthetic batch.
+schema_version: 1
+
+ticket: LLM-DET-001
+workload: llm_determinism
+
+trials: 1
+steps: 1
+
+confound:
+  threshold: 1.15
+
+cells:
+  - name: baseline-bf16-24L
+    mitigations: [none]
+    environment: local
+
+  - name: bf16-12L
+    mitigations: [none]
+    environment: local
+
+  - name: tf32_off-bf16-24L
+    mitigations: [tf32_off]
+    environment: local

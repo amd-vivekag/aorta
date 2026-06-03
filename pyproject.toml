@@ -47,6 +47,7 @@ aorta = "aorta.cli:main"
 # reserved argv config key is only injected by ``aorta probe``.
 [project.entry-points."aorta.workloads"]
 _subprocess = "aorta.workloads._subprocess:SubprocessWorkload"
+llm_determinism = "aorta.workloads.llm_determinism:LlmDeterminismWorkload"
 
 [project.optional-dependencies]
 # For analysis/visualization scripts
