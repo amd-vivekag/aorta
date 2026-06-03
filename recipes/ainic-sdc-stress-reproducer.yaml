@@ -1,0 +1,275 @@
+# AINIC / MI355X RCCL Silent Data Corruption -- Stress Reproducer Recipe
+#
+# Background
+# ----------
+# FSDP2 all_gather on cross-node process groups (1 rank / host, all traffic
+# over AMD AINIC / Pollara RoCEv2) produces silent zero corruption on received
+# tensors at iteration 0 only.  Root cause (path b, Jun 3 2026):
+#
+#   GPU kernel writes param shard -> lands in L2 cache
+#   CPU proxy posts WQE before L2->HBM writeback completes
+#   AINIC PCIe read fetches stale zeros from HBM
+#   iCRC passes (computed over zeros); all N-1 receivers get identical zeros
+#
+# Scale context
+# -------------
+# Confirmed reproduction threshold: ~1500 GPUs (1499 concurrent DMA reads
+# per all_gather).  At 40 GPUs you have only 39 concurrent reads -- ~38x fewer.
+# The per-DMA-read race probability is identical; the probability that *any* read
+# lands in the unflushed window scales with N-1.  To compensate:
+#
+#   1. Widen the L2->HBM writeback window as much as possible on every axis.
+#   2. Increase the number of independent trials (more all_gather calls per step).
+#   3. Replicate the multi-stream topology from the production training stack.
+#
+# Production training stream topology (confirmed Jun 3 2026):
+#   ~6-7 CUDA streams live per step.  All communication streams are created as
+#   HIGH-PRIORITY streams (cudaStreamNonBlocking with priority -1).  On AMD
+#   hardware, high-priority streams get preferential HW queue scheduling, which
+#   can starve pending L2->HBM writeback traffic and widen the race window beyond
+#   what a single-stream reproducer achieves.  We replicate this with:
+#     NCCL_NCHANNELS_PER_NET_PEER: "4"   (4 channels per peer = 4 streams/comms)
+#     NCCL_MAX_NCHANNELS: "8"             (cap; prevents runaway channel inflation)
+#   This gives 6-8 active comm streams per step, matching the production profile.
+#   IMPORTANT: do NOT set NCCL_MIN_NCHANNELS > 8; at small N it wastes slots.
+#
+# Stress axes applied in this recipe:
+#   - warmup_iterations=0: hit QP iter-0 immediately; no warm-up traffic to
+#     fill L2 or to let the NIC driver settle
+#   - reuse_buffers=false: every iteration allocates fresh tensors, forcing
+#     cold L2 state and preventing any accidental residual-data masking
+#   - h2d_prefetch=true: overlaps H2D DMA with the backward pass, maximising
+#     PCIe bus contention on the very interface the NIC reads from
+#   - h2d_tensor_size=10_000_000: 10M x 2 B = 20 MB per H2D transfer;
+#     saturates PCIe BAR and widens the L2->HBM writeback window
+#   - fsdp_shard_size=1_000_000: 1M x 2 B = 2 MB per shard -> 2 MB * (N-1)
+#     fan-out per layer; maximises NIC DMA read surface area
+#   - gemm_layers=48: 48 all_gather calls per forward pass -> 48 independent
+#     chances to hit iter-0 race on first few steps of each new QP lifetime
+#   - stop_on_first_corruption=false: collect all events; do not exit on first
+#     hit so the per-cell corruption rate is statistically meaningful
+#   - NCCL channel count: 4-8 active comm streams mirroring production topology;
+#     high-priority stream scheduling starves L2->HBM writeback on AMD HW queues
+#
+# Same-stream definitive test (cell 4):
+#   same_stream_mode=true places both H2D and datadist on the same new CUDA
+#   stream.  Same-stream ordering is GUARANTEED by the HIP/CUDA spec; if
+#   corruption still occurs, the bug is in the RCCL/HIP runtime below the
+#   stream abstraction.  This is the highest-priority mechanistic test.
+#
+# Usage
+# -----
+#   # Dry-run validation (no GPU required):
+#   aorta triage run --recipe recipes/ainic-sdc-stress-reproducer.yaml --dry-run
+#
+#   # Full matrix (10-40 MI355X nodes, all AINIC interconnect):
+#   aorta triage run --recipe recipes/ainic-sdc-stress-reproducer.yaml
+#
+# Required environment
+# --------------------
+#   - MI355X cluster, all cross-node traffic over AINIC (Pollara) RoCEv2
+#   - NCCL_PROTO=Simple  (Simple uses GDRDMA; LL suppresses the bug)
+#   - NCCL_DEBUG=INFO    (TRACE suppresses the bug via printf overhead)
+#   - 10-40 nodes; fewer nodes reduce the iter-0 simultaneous DMA fan-out count
+#     but all other stress axes remain active
+#   - All ranks on same cudaDev (1 rank per host, same device index)
+#   - GPU_MAX_HW_QUEUES set per-cell (see cells below)
+#
+# References
+# ----------
+#   Developer on the user team, brain dump (Jun 3 2026 onsite):
+#     Path b -- GPU HBM write -> CPU proxy signal -> AINIC PCIe read
+#   User team 2K GPU overnight confirmation: NCCL_GDR_FLUSH_DISABLE=0 cleans corruption
+#   Production training topology: ~6-7 streams/step, all comms on high-priority streams
+#   Companion recipe: recipes/ainic-gdr-flush-sdc.yaml (baseline, fix, controls)
+#   Aorta race workload: src/aorta/race/modes/fsdp.py
+#   Doc: sdc_writeup/executive_summary.md
+
+schema_version: 1
+
+ticket: AINIC-SDC-001
+workload: race
+
+# 24 trials: stressed config raises per-attempt rate above the baseline ~35%
+# (observed at the user team's scale); 24 trials gives >99.9% detection
+# probability if per-trial rate is >=25%.
+trials: 24
+
+# 50 steps sufficient: corruption only on iter-0; stressed config should show
+# events within the first 5 steps.  Shorter run = faster cell turnaround.
+steps: 50
+
+save_logs: true
+
+confound:
+  threshold: 1.15
+  baseline_cell: baseline-stressed
+
+# Stress workload config applied to all cells unless overridden per-cell.
+# These values are chosen to maximise L2->HBM writeback race window.
+workload_config:
+  mode: fsdp
+  mixed_precision: bf16
+
+  # warmup=0: do not run any "clean" iterations before verification.
+  # Every step uses fresh QPs in iter-0 state (via QP recycling in fsdp mode).
+  warmup_iterations: 0
+  verify_iterations: 50
+
+  # Collect all corruption events for statistical analysis.
+  stop_on_first_corruption: false
+  log_interval: 10
+
+  # 10M elements × 2 B (bf16) = 20 MB H2D transfer.
+  # Saturates PCIe BAR; widens the window during which NIC DMA reads stale HBM.
+  h2d_tensor_size: 10000000
+
+  # 1M elements × 2 B = 2 MB shard; 2 MB × (N-1) = 22 MB fan-out at 12 nodes.
+  fsdp_shard_size: 1000000
+
+  # Overlap H2D DMA with backward pass compute -> PCIe bus conflict during
+  # exactly the period when AINIC is also reading src HBM for the all_gather.
+  h2d_prefetch: true
+
+  # Fresh allocations each iteration: no warm L2, no residual data masking.
+  reuse_buffers: false
+  pin_memory: true
+
+  dtype: bfloat16
+
+  # 48 GEMM layers -> 48 all_gather calls per forward; 48 independent chances
+  # to hit iter-0 race per step.  Also ~700ms/step (matches production timing).
+  simulate_compute: true
+  compute_type: gemm
+  gemm_size: 5120
+  gemm_layers: 48
+  include_backward_compute: true
+
+  # Default: NOT same-stream (race is across streams); cell 4 overrides this.
+  same_stream_mode: false
+
+  distributed:
+    backend: nccl
+
+cells:
+  # ------------------------------------------------------------------
+  # Cell 1: baseline stressed -- bug fully exposed
+  # ------------------------------------------------------------------
+  # GDR flush disabled + GPU_MAX_HW_QUEUES=4 (true stream parallelism) +
+  # all stress axes engaged including multi-stream topology.
+  #
+  # NCCL_NCHANNELS_PER_NET_PEER=4 + NCCL_MAX_NCHANNELS=8:
+  #   Creates 6-8 active comm streams per step.  Matches the confirmed production
+  #   topology (~6-7 streams, all high-priority).  High-priority CUDA streams
+  #   on AMD MI355X get preferential HW queue scheduling, which competes with
+  #   L2->HBM writeback traffic and directly widens the race window at small N.
+  #   At 40 nodes this partially compensates for the 38x lower fan-out.
+  #
+  # Expected: corruption on iter-0 all_gather in most trials.
+  # NCCL_PROTO=Simple: GDRDMA send path active (LL suppresses bug).
+  # NCCL_DEBUG=INFO: proxy hot path not slowed by printf (TRACE suppresses).
+  - name: baseline-stressed
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      GPU_MAX_HW_QUEUES: "4"
+      NCCL_NCHANNELS_PER_NET_PEER: "4"
+      NCCL_MAX_NCHANNELS: "8"
+
+  # ------------------------------------------------------------------
+  # Cell 2: GDR flush stressed -- primary fix under maximum pressure
+  # ------------------------------------------------------------------
+  # Both GDR flags required (see ainic-gdr-flush-sdc.yaml for rationale).
+  # All stress axes engaged including multi-stream topology; GPU_MAX_HW_QUEUES=4.
+  # Expected: zero corruption despite maximum stress and high-priority stream
+  # scheduling pressure.
+  # ~18% allreduce throughput penalty vs baseline (330->270 GB/s at 2K scale).
+  # Confirmed clean: user team 2K GPU overnight run, multiple restarts (Jun 3 2026).
+  - name: gdr-flush-stressed
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "0"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      GPU_MAX_HW_QUEUES: "4"
+      NCCL_NCHANNELS_PER_NET_PEER: "4"
+      NCCL_MAX_NCHANNELS: "8"
+
+  # ------------------------------------------------------------------
+  # Cell 3: GPU_MAX_HW_QUEUES=2 workaround -- implicit serialization
+  # ------------------------------------------------------------------
+  # Known workaround: 2 HW queues forces all streams to share queues,
+  # introducing implicit ordering that closes the L2->HBM race window.
+  # Uses built-in mitigation (sets GPU_MAX_HW_QUEUES=2 automatically).
+  # GDR flush remains disabled to isolate the HW queue effect.
+  # Multi-stream topology retained: if serialization masks the bug even
+  # with 6-8 active high-priority streams, this confirms HW queue sharing
+  # as the masking mechanism (not stream count reduction).
+  # Expected: zero corruption.  NOT a production fix (throughput loss;
+  # non-deterministic behaviour across driver versions).
+  - name: hw-queues-2-masked
+    mitigations: [gpu_max_hw_queues_2]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_NCHANNELS_PER_NET_PEER: "4"
+      NCCL_MAX_NCHANNELS: "8"
+
+  # ------------------------------------------------------------------
+  # Cell 4: Same-stream definitive test
+  # ------------------------------------------------------------------
+  # same_stream_mode=true: H2D copy and datadist all_gather run on the
+  # SAME new CUDA stream.  Same-stream ordering is GUARANTEED by the HIP/CUDA
+  # spec -- the copy completes before the all_gather WQE is posted.
+  # If corruption still occurs, the root cause is below the stream abstraction
+  # (RCCL/HIP runtime bug), not a user-visible cross-stream ordering issue.
+  # This is the highest-value mechanistic data point at small cluster scale.
+  #
+  # Multi-stream vars omitted here intentionally: same_stream_mode collapses
+  # H2D + collective onto one stream regardless of channel count; adding more
+  # channels does not change the ordering guarantee under test.
+  #
+  # GDR flush disabled, GPU_MAX_HW_QUEUES=4: everything else is bug-exposed.
+  # Expected: IF clean -> confirms path b (cross-stream GPU fence issue).
+  #           IF corrupt -> bug is in RCCL/HIP runtime (deeper root cause).
+  - name: same-stream-definitive
+    mitigations: [none]
+    environment: local
+    workload_config:
+      same_stream_mode: true
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      GPU_MAX_HW_QUEUES: "4"
+
+  # ------------------------------------------------------------------
+  # Cell 5: LL protocol control -- GDRDMA send path disabled
+  # ------------------------------------------------------------------
+  # LL protocol: CPU reads GPU HBM into bounce buffer (implicit fence).
+  # GDRDMA is not used; NIC never reads src HBM directly -> race impossible.
+  # All stress axes engaged including multi-stream topology: confirms that
+  # 6-8 high-priority streams under PCIe + HBM pressure do not produce
+  # corruption via any path OTHER than the GDRDMA send path.
+  # Expected: zero corruption.  Establishes GDRDMA as the necessary condition.
+  # NOT a production fix (latency overhead of CPU bounce buffering).
+  - name: ll-protocol-control
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_PROTO: "LL"
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_DEBUG: "INFO"
+      GPU_MAX_HW_QUEUES: "4"
+      NCCL_NCHANNELS_PER_NET_PEER: "4"
+      NCCL_MAX_NCHANNELS: "8"
