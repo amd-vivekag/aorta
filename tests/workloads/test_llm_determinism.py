@@ -31,12 +31,20 @@ def _tiny_model() -> RepeatedBlockModel:
     )).to(torch.float32)
 
 
-def test_moe_path_runs_and_routes_all_tokens() -> None:
+def test_moe_path_routes_to_multiple_experts() -> None:
+    enable_deterministic(seed=11)
     cfg = BlockConfig(vocab_size=64, hidden_size=32, ffn_size=64, num_heads=4,
-                      num_layers=1, seq_len=8, num_experts=4)
+                      num_layers=1, seq_len=32, num_experts=4)
     m = RepeatedBlockModel(cfg).to(torch.float32)
-    y = m(torch.randint(0, 64, (1, 8)))
-    assert y.shape == (1, 8, 64) and torch.isfinite(y).all()
+    ids = torch.randint(0, 64, (1, 32))
+    y = m(ids)
+    # Route the same tokens through the router and confirm >1 expert is picked,
+    # otherwise the per-expert `if mask.any()` branches could be dead and the
+    # shape/finite assertions wouldn't catch it.
+    flat = m.embed(ids).reshape(-1, 32)
+    choice = m.blocks[0].ffn.router(flat).argmax(-1)
+    assert y.shape == (1, 32, 64) and torch.isfinite(y).all()
+    assert choice.unique().numel() > 1
 
 
 def test_per_block_replay_is_bit_identical_on_cpu() -> None:
@@ -73,3 +81,19 @@ def test_block_list_compare_flags_per_block_divergence() -> None:
     b = _BlockChecksums(pre=[1, 99, 3], post=[10, 20, 30])
     reasons = _compare_block_lists(a, b)
     assert len(reasons) == 1 and "block[1].pre" in reasons[0]
+
+
+def test_block_list_compare_flags_shape_mismatch() -> None:
+    from aorta.workloads.llm_determinism import _BlockChecksums
+    a = _BlockChecksums(pre=[1, 2], post=[10, 20])
+    b = _BlockChecksums(pre=[1], post=[10, 20])
+    reasons = _compare_block_lists(a, b)
+    assert len(reasons) == 1 and "shape mismatch" in reasons[0]
+
+
+def test_local_passes_plain_tensor_through() -> None:
+    # If `_local` ever assumes DTensor (e.g., `return t.to_local()`), CPU
+    # and single-rank paths would break silently.
+    from aorta.workloads.llm_determinism import _local
+    t = torch.zeros(3)
+    assert _local(t) is t

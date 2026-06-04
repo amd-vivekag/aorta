@@ -54,7 +54,7 @@ torchrun --standalone --nproc_per_node=8 /tmp/run_llm_det.py
 **Expected on a healthy stack:**
 - Exit 0; every rank prints `passed=True failures=0 ranks_with_divergence=0`
 - `/tmp/llm_det_capture/rank000.jsonl` … `rank007.jsonl` exist, 2 lines each (`run=r1`, `run=r2`)
-- `loss_bits` is non-zero (~1.15e9 with defaults) and **equal between r1 and r2 on each rank**
+- `loss_bits` is non-zero and **equal between r1 and r2 on each rank** (with the defaults this lands around ±1.1e9 — the loss is a single fp32 scalar viewed bit-for-bit as int32, so the value is an int near `loss.item()`'s fp32 bit pattern, not a numeric magnitude)
 - `block_pre` / `block_post` lists are length `num_layers`
 
 ### Validate the detector actually flags real divergence
@@ -214,7 +214,7 @@ Tar up:
 | `num_experts` | 1 | 1 = dense FFN; ≥2 = top-1 MoE router across N experts. |
 | `dtype` | `bf16` | `bf16` / `fp16` / `fp32`. |
 | `seed` | 1234 | Synthetic batch + RNG seed. |
-| `steps` | 1 | Number of independent replay steps. |
+| `steps` | 1 | Number of replay steps. Each step is a fresh snapshot → r1 → restore → r2 → compare. There is no optimizer step between steps, so on a healthy stack every step's checksums are bit-identical to step 0's — `steps > 1` is useful as a flake-detector / soak, not as training progress. |
 | `checksum_mode` | `per_rank` | `global` also all-reduces a fingerprint across ranks. |
 | `capture_dir` | unset | When set, every step writes `rank<NNN>.jsonl` for offline inspection. |
 | `model_label` | `generic-repeated-block` | Advisory only; recorded in metrics. |

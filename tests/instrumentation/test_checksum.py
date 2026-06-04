@@ -6,6 +6,7 @@ import torch
 from aorta.instrumentation.checksum import (
     ChecksumSet,
     compare,
+    global_checksum,
     state_checksum,
     tensor_checksum,
 )
@@ -46,3 +47,9 @@ def test_compare_reports_divergent_keys() -> None:
 def test_unsupported_dtype_raises() -> None:
     with pytest.raises(TypeError):
         tensor_checksum(torch.tensor([1 + 2j], dtype=torch.complex64))
+
+
+def test_global_checksum_returns_local_without_dist() -> None:
+    # When torch.distributed isn't initialised, global_checksum must be a
+    # pass-through so single-process callers don't trip a no-op all_reduce.
+    assert global_checksum(12345) == 12345
