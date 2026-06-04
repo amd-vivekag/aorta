@@ -30,7 +30,7 @@ candidate — it's a plugin candidate (Path 2).
 | Qualifies as built-in | Does NOT qualify (use Path 2) |
 |---|---|
 | `DISABLE_TF32` (hipBLASLt reads it) | `AMP_DTYPE` (only the workload's Python reads it) |
-| `HSA_XNACK` (ROCm runtime reads it) | `SHAMPOO_PRECONDITIONER_DTYPE` (only meta-recom reads it) |
+| `HSA_XNACK` (ROCm runtime reads it) | `SHAMPOO_PRECONDITIONER_DTYPE` (only recom_repro reads it) |
 | `CUDA_LAUNCH_BLOCKING` (PyTorch reads it) | Any custom flag your workload introspects |
 | `NCCL_DEBUG`, `OMP_NUM_THREADS`, `LD_PRELOAD` | Anything that's a silent no-op on workloads that don't read it |
 

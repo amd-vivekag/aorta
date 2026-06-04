@@ -38,7 +38,7 @@ RUN wget https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/r
     rpm -i /tmp/rocprof-trace-decoder.rpm || echo "rocprof-trace-decoder install failed, continuing..." && \
     rm -f /tmp/rocprof-trace-decoder.rpm
 
-# Install Facebook Distributed Shampoo optimizer
+# Install Distributed Shampoo optimizer (facebookresearch/optimizers, OSS)
 RUN cd /tmp && \
     git clone https://github.com/facebookresearch/optimizers.git && \
     cd optimizers && \
