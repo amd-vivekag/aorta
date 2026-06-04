@@ -755,3 +755,66 @@ cells:
     assert "Error:" in result.output
     assert "baseline" in result.output.lower()
     assert "Traceback" not in result.output
+
+
+# ---- Distributed rank-0 write gate ---------------------------------------
+
+
+def _simple_recipe():
+    from aorta.triage.recipe import Cell, ConfoundCfg, Recipe
+
+    return Recipe(
+        schema_version=1,
+        workload="fsdp",
+        trials=1,
+        steps=5,
+        cells=(Cell(name="a", mitigations=("none",), environment="local"),),
+        ticket="RANK-1",
+        confound=ConfoundCfg(baseline_cell="a"),
+    )
+
+
+def test_rank_zero_writes_matrix(tmp_path, patched_env, patched_run_trials, monkeypatch):
+    """RANK=0 (or unset) writes the matrix into the real output tree."""
+    monkeypatch.setenv("RANK", "0")
+    run_dir = runner.run_recipe(
+        _simple_recipe(), output_dir=tmp_path, timestamp="2026-01-01T00-00-00"
+    )
+    assert (run_dir / "matrix.json").exists()
+    assert (run_dir / "matrix.md").exists()
+    # The real run dir lives under the requested output tree.
+    assert tmp_path in run_dir.parents
+
+
+def test_nonzero_rank_writes_nothing_to_output_tree(
+    tmp_path, patched_env, patched_run_trials, monkeypatch
+):
+    """A non-zero rank still RUNS every cell (collectives must complete) but
+    writes no artifacts into the shared output tree -- preventing the
+    duplicate ``<timestamp>-2`` run dir torchrun produced before this gate."""
+    out = tmp_path / "out"
+    monkeypatch.setenv("RANK", "1")
+    runner.run_recipe(_simple_recipe(), output_dir=out, timestamp="2026-01-01T00-00-00")
+
+    # Trials still executed on this rank (the workload's collectives need it).
+    assert patched_run_trials.call_count == 1
+    # But nothing was written under the output dir -- the scratch run_dir was
+    # a TemporaryDirectory that is removed on exit.
+    assert not out.exists() or not any(out.rglob("matrix.json"))
+
+
+def test_nonzero_rank_does_not_collide_with_rank_zero(
+    tmp_path, patched_env, patched_run_trials, monkeypatch
+):
+    """Rank 0 and a non-zero rank pointed at the same output dir + timestamp
+    must NOT both create a leaf -- rank 0 owns the real dir, the other goes to
+    scratch. Before the gate this produced ``<ts>`` and ``<ts>-2``."""
+    out = tmp_path / "out"
+    monkeypatch.setenv("RANK", "0")
+    runner.run_recipe(_simple_recipe(), output_dir=out, timestamp="2026-01-01T00-00-00")
+    monkeypatch.setenv("RANK", "1")
+    runner.run_recipe(_simple_recipe(), output_dir=out, timestamp="2026-01-01T00-00-00")
+
+    leaves = list((out / "RANK-1" / "fsdp").iterdir())
+    assert len(leaves) == 1
+    assert leaves[0].name == "2026-01-01T00-00-00"

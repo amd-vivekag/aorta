@@ -30,8 +30,10 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +73,24 @@ log = logging.getLogger(__name__)
 
 _INLINE_SIDECAR_NAME = "inline_environments.sidecar.json"
 _OPERATOR_SIDECAR_DIR = "sidecars"
+
+
+def _is_rank_zero() -> bool:
+    """True if this process should write run artifacts.
+
+    Mirrors the dispatcher's per-trial write gate (``RANK == 0``): under a
+    distributed launcher every rank runs ``run_recipe`` so the workload's
+    collectives complete on all ranks, but only rank 0 owns the output tree.
+    ``RANK`` is unset for single-process ``aorta triage run`` (treated as
+    rank 0). A non-integer ``RANK`` is treated defensively as rank 0 so a
+    misconfigured launcher writes rather than silently dropping artifacts.
+    """
+    raw_rank = os.environ.get("RANK", "0")
+    try:
+        return int(raw_rank) == 0
+    except ValueError:
+        log.warning("Ignoring non-integer RANK=%r; treating this process as rank 0.", raw_rank)
+        return True
 
 
 class MatrixIncompleteError(Exception):
@@ -933,21 +953,40 @@ def run_recipe(
         return Path(".")
 
     ts = timestamp or format_timestamp()
-    run_dir = resolve_run_dir(output_dir, recipe, timestamp=ts, layout=layout)
 
-    # ``flat_resume`` reuses a stable ``<output>/<ticket>/`` directory across
-    # invocations so resume can detect per-trial ``result.json`` files as
-    # already complete. That same property means two concurrent ``aorta
-    # probe`` invocations against the same ``--output``/``--ticket`` would
-    # race on ``matrix.json``, ``matrix.md``, and per-cell artifacts. Take
-    # an advisory PID+host lock for the duration of the matrix run; the
-    # ``"timestamped"`` layout (``aorta triage run``) is unaffected because
-    # ``resolve_run_dir`` already gives each invocation a fresh leaf via the
-    # ``-N`` suffix loop. ``ExitStack`` keeps the lock optional without
-    # forcing a re-indent of the entire matrix loop.
+    # Under a distributed launcher (torchrun) EVERY rank runs this function:
+    # the cells must execute on all ranks so the collectives inside the
+    # workload actually complete. But only RANK 0 should write artifacts.
+    # The per-trial JSON is already rank-0-gated in the dispatcher; here we
+    # gate the matrix layer too. Without this, every non-zero rank calls
+    # ``resolve_run_dir`` (mkdir(exist_ok=False)) and collides into a
+    # redundant ``<timestamp>-2`` / ``-3`` / ... directory, then writes its
+    # own matrix.md / matrix.json there. Non-zero ranks get a throwaway temp
+    # run_dir (auto-removed) so every write in ``_run_recipe_locked`` lands
+    # in scratch and is discarded; rank 0 gets the real one. Every write site
+    # is rooted at ``run_dir``, so a scratch root is sufficient -- no
+    # per-site gating needed.
+    should_write = _is_rank_zero()
+
     with contextlib.ExitStack() as stack:
-        if layout == "flat_resume":
-            stack.enter_context(acquire_flat_resume_lock(run_dir))
+        if should_write:
+            run_dir = resolve_run_dir(output_dir, recipe, timestamp=ts, layout=layout)
+            # ``flat_resume`` reuses a stable ``<output>/<ticket>/`` directory
+            # across invocations so resume can detect per-trial ``result.json``
+            # files as already complete. That same property means two concurrent
+            # ``aorta probe`` invocations against the same ``--output``/
+            # ``--ticket`` would race on ``matrix.json``, ``matrix.md``, and
+            # per-cell artifacts. Take an advisory PID+host lock for the
+            # duration of the matrix run; the ``"timestamped"`` layout (``aorta
+            # triage run``) is unaffected because ``resolve_run_dir`` already
+            # gives each invocation a fresh leaf via the ``-N`` suffix loop.
+            if layout == "flat_resume":
+                stack.enter_context(acquire_flat_resume_lock(run_dir))
+        else:
+            # Non-rank-0: scratch root, removed on exit. No lock (we never
+            # touch the shared tree).
+            run_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="aorta-rank-")))
+
         return _run_recipe_locked(
             recipe=recipe,
             extra_sidecar_files=extra_sidecar_files,

@@ -30,7 +30,7 @@ from aorta.triage.recipe import (
     build_recipe_from_flags,
     load_recipe,
 )
-from aorta.triage.runner import MatrixIncompleteError, run_recipe
+from aorta.triage.runner import MatrixIncompleteError, _is_rank_zero, run_recipe
 
 
 @click.group()
@@ -250,12 +250,16 @@ def triage_run(
         # RecipeCellError below: that's pre-execution validation
         # failure (no artifacts), this is post-execution degradation
         # (matrix.md / matrix.json present but classification couldn't
-        # anchor).
-        click.echo(f"Wrote matrix to {exc.run_dir}")
+        # anchor). Only rank 0 wrote artifacts, so only rank 0 reports.
+        if _is_rank_zero():
+            click.echo(f"Wrote matrix to {exc.run_dir}")
         raise click.ClickException(str(exc)) from exc
     except (RegistryError, RecipeCellError, RecipeSchemaError) as exc:
         raise click.ClickException(str(exc)) from exc
-    if not dry_run:
+    # Under torchrun only rank 0 writes the matrix; non-zero ranks ran the
+    # trials into a scratch dir that no longer exists, so they must not claim
+    # to have written anything.
+    if not dry_run and _is_rank_zero():
         click.echo(f"Wrote matrix to {run_dir}")
 
 
