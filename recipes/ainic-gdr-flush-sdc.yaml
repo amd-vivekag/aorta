@@ -1,0 +1,203 @@
+# AINIC / MI355X RCCL Silent Data Corruption -- GDR Flush Triage Recipe
+#
+# Background
+# ----------
+# FSDP2 all_gather on 22-rank cross-node process groups (1 rank / host,
+# all traffic over AMD AINIC / Pollara RoCEv2) produces silent zero corruption
+# on received tensors at iteration 0 only.  Not observed with Thor 2.
+#
+# Root cause hypothesis (not confirmed):
+#   GPU kernel writes param shard to send buffer -> lands in L2 cache.
+#   CPU proxy posts WQE before L2->HBM writeback completes.
+#   AINIC DMA reads source HBM via PCIe BAR and fetches stale zeros.
+#   iCRC passes (computed over zeros). All N-1 receivers get identical zeros.
+#
+# This recipe runs the `race` workload (mode: fsdp -- the simulated-collective
+# FSDP harness in src/aorta/race/modes/fsdp.py) in five cells:
+#   baseline-no-gdr-flush     -- corruption-exposed config (GDR flush OFF)
+#   gdr-flush                 -- primary mitigation (GDR flush ON, both flags required)
+#   strict-pcie-ordering      -- secondary candidate (PCIe strict ordering, receive path)
+#   gdr-flush-and-strict-pcie -- both mitigations combined
+#   ll-protocol-control       -- LL protocol (GDRDMA disabled; suppression control)
+#
+# Usage
+# -----
+#   # Dry-run validation:
+#   aorta triage run --recipe recipes/ainic-gdr-flush-sdc.yaml --dry-run
+#
+#   # Full matrix (requires 10-12 MI355X nodes, all AINIC interconnect):
+#   aorta triage run --recipe recipes/ainic-gdr-flush-sdc.yaml
+#
+# Required environment
+# --------------------
+#   - MI355X cluster, all cross-node traffic over AINIC (Pollara) RoCEv2
+#   - NCCL_PROTO=Simple  (Simple protocol uses GDRDMA; LL suppresses the bug)
+#   - NCCL_DEBUG=INFO    (Simple/INFO keeps the proxy hot path fast; NCCL_DEBUG=TRACE
+#     suppresses the bug by widening the timing window via printf overhead)
+#   - 10-12 nodes minimum; 22 nodes matches the confirmed reproducer scale
+#   - All ranks on same cudaDev (1 rank per host, same device index)
+#
+# References
+# ----------
+#   Developer on the user team, brain dump (Jun 3 2026 onsite):
+#     Path b -- GPU HBM write -> CPU proxy signal -> AINIC PCIe read
+#   User team 2K GPU overnight confirmation: NCCL_GDR_FLUSH_DISABLE=0 cleans corruption
+#   Doc: sdc_writeup/executive_summary.md
+
+schema_version: 1
+
+ticket: AINIC-SDC-001
+workload: race
+
+# 16 trials per cell: corruption hits iter-0 on new QPs; 16 trials gives
+# statistical confidence given the ~35% per-attempt rate at the user team's scale.
+trials: 16
+
+# 200 steps: only iter-0 is vulnerable, but run 200 steps to confirm
+# iterations 1-199 are clean and to measure throughput overhead.
+steps: 200
+
+save_logs: true
+
+confound:
+  threshold: 1.15
+  baseline_cell: baseline-no-gdr-flush
+
+# Flattened to race ReproducerConfig fields (src/aorta/race/config.py). The
+# race `mode: fsdp` harness SIMULATES FSDP collectives (per-layer all_gather /
+# reduce_scatter) -- it is not torch.distributed.fsdp, so the native nested
+# fsdp:/model:/training:/distributed: blocks have no equivalent and were
+# dropped. What maps: model.model_dim -> model_dim, model.num_layers ->
+# num_layers, training.log_interval -> log_interval. What was dropped (no race
+# field): mixed_precision (dtype covers it), model.num_heads, training.max_steps,
+# training.batch_size, the fsdp: block, distributed: (reproducer inits dist).
+# The race workload drops + warns on unknown keys, so every key below is a real
+# ReproducerConfig field -- a clean run logs no "ignoring unknown" warnings.
+workload_config:
+  mode: fsdp
+
+  # iter-0 is the only vulnerable iteration: hit fresh QPs immediately with no
+  # warmup, then verify across the run. verify_iterations replaces the old
+  # training.max_steps=200 (steps: above is the trial count, not the per-trial
+  # reproducer iteration budget). 200 confirms iters 1-199 stay clean.
+  warmup_iterations: 0
+  verify_iterations: 200
+
+  stop_on_first_corruption: false
+  log_interval: 10
+
+  dtype: bfloat16
+
+  # 1M elements x 2 B = 2 MB shard; 2 MB x (N-1) all_gather fan-out per layer.
+  fsdp_shard_size: 1000000
+
+  # GEMM compute between collectives keeps the reproducer near production
+  # per-step timing (~500ms) so the L2->HBM writeback race window matches real
+  # training rather than running orders of magnitude faster. gemm_layers ~36 at
+  # gemm_size 5120 (~14ms/layer on MI300X) approximates the documented ~500ms.
+  # model_dim / num_layers carried over from the original model: block.
+  simulate_compute: true
+  compute_type: gemm
+  gemm_size: 5120
+  gemm_layers: 36
+  include_backward_compute: true
+  model_dim: 1024
+  num_layers: 24
+
+cells:
+  # ------------------------------------------------------------------
+  # Cell 1: baseline -- GDR flush disabled (default), bug exposed
+  # ------------------------------------------------------------------
+  # Expected: corruption on iter-0 all_gather in at least some trials.
+  # NCCL_PROTO=Simple ensures GDRDMA send path is used (LL suppresses bug).
+  # NCCL_DEBUG=INFO ensures proxy hot path is not slowed by printf (TRACE
+  # suppresses bug by widening the timing window).
+  - name: baseline-no-gdr-flush
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+
+  # ------------------------------------------------------------------
+  # Cell 2: GDR flush -- primary mitigation (path b fix)
+  # ------------------------------------------------------------------
+  # Both flags required together:
+  #   NCCL_GDR_FLUSH_DISABLE=0      -- enables the GDR flush code path
+  #   RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING=0 -- flush uses strict
+  #                                    ordering (relaxed ordering on the
+  #                                    flush itself would reintroduce the race)
+  #
+  # Expected: zero corruption. ~18% allreduce throughput penalty vs baseline
+  # (330->270 GB/s observed at the user team's 2K scale).
+  # Confirmed clean: user team 2K GPU overnight run, multiple restarts (Jun 3 2026).
+  - name: gdr-flush
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "0"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+
+  # ------------------------------------------------------------------
+  # Cell 3: PCIe strict ordering -- secondary candidate (path a fix)
+  # ------------------------------------------------------------------
+  # Targets the receive-side NIC write ordering issue (path a), NOT the
+  # send-side GPU HBM fence issue (path b) that causes iter-0 zeros.
+  # Included to characterize whether path a contributes independently,
+  # especially given the allreduce mismatch symptoms seen at 1K GPU scale
+  # which may involve a different mechanism.
+  #
+  # Open question: NCCL_IB_PCI_RELAXED_ORDERING=0 controls PCIe write
+  # ordering on the NIC's receive writes to destination HBM. It does NOT
+  # gate the NIC's PCIe reads from source HBM (path b). If this cell
+  # shows no improvement vs baseline, path a is not the dominant mechanism.
+  #
+  # Expected perf cost: significant (disables relaxed ordering device-wide).
+  - name: strict-pcie-ordering
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_IB_PCI_RELAXED_ORDERING: "0"
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+
+  # ------------------------------------------------------------------
+  # Cell 4: GDR flush + strict PCIe -- combined
+  # ------------------------------------------------------------------
+  # Tests whether stacking both mitigations changes anything vs gdr-flush
+  # alone. If combined == gdr-flush, path a is not contributing.
+  # If combined < gdr-flush failure rate (unlikely given gdr-flush is already
+  # clean), path a was adding residual risk.
+  - name: gdr-flush-and-strict-pcie
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "0"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_IB_PCI_RELAXED_ORDERING: "0"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+
+  # ------------------------------------------------------------------
+  # Cell 5: LL protocol control -- suppression confirmed
+  # ------------------------------------------------------------------
+  # LL protocol uses CPU-mediated transfers; GDRDMA is not used.
+  # CPU reads the data from GPU memory into a CPU-side bounce buffer,
+  # which acts as an implicit fence -- the read cannot complete until
+  # the data is visible in HBM, closing the race.
+  # Expected: zero corruption. Establishes that the GDRDMA send path
+  # is the necessary condition for the bug.
+  # NOT a production fix (latency overhead).
+  - name: ll-protocol-control
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_PROTO: "LL"
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_DEBUG: "INFO"
