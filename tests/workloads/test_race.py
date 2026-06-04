@@ -1,0 +1,120 @@
+"""Unit tests for the `race` workload adapter.
+
+These are unit-level: no real torch.distributed. The config filter is tested
+directly, and result mapping is tested by monkeypatching `create_reproducer`
+and stubbing the distributed init in `setup()`.
+"""
+
+import logging
+
+import pytest
+
+from aorta.race.config import ReproducerConfig, ReproducerResult
+from aorta.workloads.race import RaceWorkload
+
+
+class _StubReproducer:
+    def __init__(self, result: ReproducerResult) -> None:
+        self._result = result
+
+    def run(self) -> ReproducerResult:
+        return self._result
+
+
+def test_race_config_from_dict_filters_unknown(caplog):
+    """Unknown keys are dropped with a warning; known keys map onto the config."""
+    wl = RaceWorkload({})
+    cfg_in = {
+        "mode": "fsdp",
+        "warmup_iterations": 0,
+        "verify_iterations": 50,
+        "h2d_prefetch": True,
+        "fsdp_shard_size": 1_000_000,
+        "dtype": "bfloat16",
+        # unknown keys that must be dropped + warned:
+        "mixed_precision": "bf16",
+        "foo": 123,
+    }
+    with caplog.at_level(logging.WARNING, logger="aorta.workloads.race"):
+        cfg = wl._race_config_from_dict(cfg_in)
+
+    assert isinstance(cfg, ReproducerConfig)
+    assert cfg.mode == "fsdp"
+    assert cfg.warmup_iterations == 0
+    assert cfg.verify_iterations == 50
+    assert cfg.h2d_prefetch is True
+    assert cfg.fsdp_shard_size == 1_000_000
+    assert cfg.dtype == "bfloat16"
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("mixed_precision" in m for m in warned)
+    assert any("foo" in m for m in warned)
+    # Known keys must NOT be warned about.
+    assert not any("h2d_prefetch" in m for m in warned)
+    assert not any("fsdp_shard_size" in m for m in warned)
+
+
+def test_race_config_reserved_aorta_keys_not_warned(caplog):
+    """`_aorta_*` platform keys are reserved and silently ignored."""
+    wl = RaceWorkload({})
+    with caplog.at_level(logging.WARNING, logger="aorta.workloads.race"):
+        wl._race_config_from_dict({"mode": "default", "_aorta_trial_id": 7})
+    assert not any("_aorta_trial_id" in r.getMessage() for r in caplog.records)
+
+
+def test_race_config_from_dict_rejects_bad_mode():
+    wl = RaceWorkload({})
+    with pytest.raises(ValueError, match="mode must be one of"):
+        wl._race_config_from_dict({"mode": "nope"})
+
+
+def test_race_config_from_dict_rejects_bad_dtype():
+    wl = RaceWorkload({})
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        wl._race_config_from_dict({"dtype": "int8"})
+
+
+def test_race_workload_maps_result(monkeypatch):
+    """run() maps every ReproducerResult field onto WorkloadResult."""
+    stub_result = ReproducerResult(
+        passed=False,
+        total_iterations=42,
+        corruption_count=3,
+        first_corruption_iter=7,
+        corruption_details=[{"iter": 7, "rank": 0}],
+        elapsed_time_sec=1.5,
+        avg_step_time_ms=35.7,
+    )
+
+    captured = {}
+
+    def fake_create_reproducer(cfg, rank, world_size):
+        captured["cfg"] = cfg
+        captured["rank"] = rank
+        captured["world_size"] = world_size
+        return _StubReproducer(stub_result)
+
+    monkeypatch.setattr("aorta.workloads.race.create_reproducer", fake_create_reproducer)
+
+    wl = RaceWorkload({"mode": "default", "warmup_iterations": 2, "verify_iterations": 3})
+    # Bypass real distributed init.
+    wl._rank = 0
+    wl._world = 2
+    wl._cfg = wl._race_config_from_dict(wl.config)
+
+    res = wl.run()
+
+    assert res.passed is False
+    assert res.failure_count == 3
+    assert res.first_failure_iteration == 7
+    assert res.failure_details == [{"iter": 7, "rank": 0}]
+    assert res.total_iterations == 42
+    assert res.elapsed_sec == 1.5
+    assert res.executed_iterations == 42
+    assert res.configured_iterations == 5  # warmup 2 + verify 3
+    assert res.main_work_started is True
+    assert res.metrics["avg_step_time_ms"] == 35.7
+    assert res.metrics["mode"] == "default"
+    assert res.metrics["rank"] == 0
+    assert res.metrics["world_size"] == 2
+    assert captured["rank"] == 0 and captured["world_size"] == 2

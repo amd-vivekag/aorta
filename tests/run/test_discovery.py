@@ -56,6 +56,22 @@ class TestDiscoverWorkloads:
 
         assert workloads == {"registered_one": MockWorkload}
 
+    def test_race_entry_point_resolves(self):
+        """The `race` entry-point resolves to RaceWorkload."""
+        from aorta.workloads.race import RaceWorkload
+
+        mock_ep = MagicMock()
+        mock_ep.name = "race"
+        mock_ep.load.return_value = RaceWorkload
+
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [mock_ep]
+
+        with patch("importlib.metadata.entry_points", return_value=mock_eps):
+            workloads = discover_workloads()
+
+        assert workloads == {"race": RaceWorkload}
+
     def test_handles_load_failure_gracefully(self, caplog):
         """Failed workload loads are logged but don't crash discovery."""
         import logging

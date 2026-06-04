@@ -142,6 +142,44 @@ cells:
 Every validation error reports a path like `cells[2].mitigations` so the
 failure is localisable without reading the loader source.
 
+## Workloads
+
+The `workload:` name is resolved through the `aorta.workloads` entry-point
+group at **cell-execution time, not recipe-load time**. A recipe naming an
+unregistered workload loads and validates fine; it fails per-cell when the
+cell runs. So "the recipe is valid" does not imply "the workload exists" --
+confirm registration with a dry-run (or `pip install -e .` after adding a
+new entry-point).
+
+### `race`
+
+Wraps the in-tree RCCL race reproducer (`aorta.race`). `launch_mode:
+distributed`, `min_world_size: 2`. The communication pattern is selected by
+the `mode` config key, not by a separate workload name:
+
+```yaml
+workload: race
+workload_config:
+  mode: fsdp            # default | ddp | fsdp
+  warmup_iterations: 0
+  verify_iterations: 50
+  dtype: bfloat16       # bfloat16 | float16 | float32
+```
+
+`workload_config` accepts any field of
+`aorta.race.config.ReproducerConfig` (e.g. `h2d_tensor_size`,
+`fsdp_shard_size`, `gemm_layers`, `simulate_compute`, `h2d_prefetch`,
+`same_stream_mode`, `stop_on_first_corruption`, `log_interval`).
+
+> [!IMPORTANT]
+> Unknown `workload_config` keys are **dropped with a `WARNING`**, not
+> errors. A key that isn't a `ReproducerConfig` field is silently ignored
+> at runtime -- which for a stress recipe means a lever you thought you set
+> never applied (a false green). Watch the run log for
+> `race: ignoring unknown workload_config key ...` and fix the recipe.
+> Note `verify_iterations` defaults to `10000` and `simulate_compute` to
+> `True`; cap these for smoke runs or a trial takes hours.
+
 ## Output layout
 
 ```
