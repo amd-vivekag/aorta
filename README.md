@@ -19,6 +19,9 @@ Stress-test GPU queue scheduling with 8-64+ concurrent streams. Includes 15 work
 **Environment Snapshot for Reproducibility**
 Capture a versioned, schema-stable snapshot of the trial environment — ROCm / HIP / hipBLASLt / rocBLAS / MIOpen / RCCL identities, GPU arch, PyTorch build flags + cmake cache + per-target HIPCC defines, runtime SDPA backend state, ~30 numerics-relevant env vars — so cross-environment regressions become a `jq` diff instead of a multi-day investigation. Used standalone (`aorta env probe`) and embedded automatically into every trial result.
 
+**LLM Determinism Probe**
+Catch kernel-level nondeterminism / silent data corruption in a transformer training step. Runs the same forward+backward twice on the same inputs (params + RNG restored between runs) and compares bit-exact checksums of every per-block boundary activation, loss, logits, every grad, and every param. FSDP2-aware, RCCL-safe, optional MoE. See [`docs/llm-determinism.md`](docs/llm-determinism.md) for the quick start.
+
 
 ## Quick Start
 

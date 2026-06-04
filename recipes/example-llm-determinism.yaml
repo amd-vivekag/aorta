@@ -1,0 +1,78 @@
+# Per-block deterministic-replay recipe for a single repeated transformer block.
+#
+# Pass workload knobs through `workload_config` at recipe scope (every cell
+# inherits) and/or `workload_config` at cell scope (cell wins on key
+# collision). The dispatcher forwards the merged dict to
+# `LlmDeterminismWorkload(config)` verbatim — same keys the standalone
+# launcher in docs/llm-determinism.md uses.
+#
+# Run on a multi-GPU node (the `aorta` console script is the entry point;
+# `python -m aorta.triage.cli` is NOT a runnable module):
+#   torchrun --standalone --nproc_per_node=8 $(which aorta) triage run \
+#     --recipe recipes/example-llm-determinism.yaml
+#
+# Each cell writes its own capture_dir, so results don't collide.
+#
+# Note on per-cell step times: cells run sequentially in one process and
+# the first cell absorbs FSDP2 / RCCL / hipBLAS warmup, so its step time
+# is typically much higher than later cells. Don't read warmup as a
+# determinism signal — the per-rank checksum compare is what proves
+# replayability.
+# `steps` is a first-class recipe field — the loader rejects it inside
+# workload_config (the dispatcher would silently clobber it otherwise).
+schema_version: 1
+
+ticket: LLM-DET-001
+workload: llm_determinism
+
+trials: 1
+steps: 1
+
+confound:
+  threshold: 1.15
+
+# Recipe-scope defaults — applied to every cell, overridden per-cell below.
+workload_config:
+  hidden_size: 2048
+  ffn_size: 5632
+  num_heads: 16
+  seq_len: 512
+  batch_size: 1
+  dtype: bf16
+  seed: 1234
+  checksum_mode: per_rank
+
+cells:
+  # Baseline: 24-layer bf16, default everything else.
+  - name: baseline-bf16-24L
+    mitigations: [none]
+    environment: local
+    workload_config:
+      num_layers: 24
+      capture_dir: ./llm_det_capture/baseline-bf16-24L
+
+  # Half the comm/compute stages — useful for scaling down with rank count.
+  - name: bf16-12L
+    mitigations: [none]
+    environment: local
+    workload_config:
+      num_layers: 12
+      capture_dir: ./llm_det_capture/bf16-12L
+
+  # Same shape as baseline but with tf32_off mitigation. Catches matmul
+  # paths whose determinism depends on TF32 reduction ordering.
+  - name: tf32_off-bf16-24L
+    mitigations: [tf32_off]
+    environment: local
+    workload_config:
+      num_layers: 24
+      capture_dir: ./llm_det_capture/tf32_off-bf16-24L
+
+  # MoE variant — top-1 router over 4 GLU experts. Different kernel mix.
+  - name: moe4-bf16-12L
+    mitigations: [none]
+    environment: local
+    workload_config:
+      num_layers: 12
+      num_experts: 4
+      capture_dir: ./llm_det_capture/moe4-bf16-12L
