@@ -28,12 +28,15 @@ def enable_deterministic(seed: int) -> None:
     Sets ``CUBLAS_WORKSPACE_CONFIG`` if unset — cuBLAS/hipBLAS require it
     before the first CUDA context, otherwise ``use_deterministic_algorithms``
     raises at the first matmul.
+
+    Seeds only the CPU + Python RNGs here. The per-rank CUDA device must
+    be seeded by the caller AFTER ``torch.cuda.set_device(LOCAL_RANK)``,
+    using ``torch.cuda.manual_seed`` (NOT ``manual_seed_all``) so we don't
+    initialize CUDA contexts on every visible GPU in every torchrun rank.
     """
     os.environ.setdefault(CUBLAS_WORKSPACE_ENV, CUBLAS_WORKSPACE_VALUE)
     random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False

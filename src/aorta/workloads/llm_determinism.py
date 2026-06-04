@@ -170,16 +170,22 @@ class LlmDeterminismWorkload(Workload):
 
     def setup(self) -> None:
         self._cfg = LlmDeterminismConfig.from_dict(self.config)
-        enable_deterministic(self._cfg.seed)
         if not dist.is_initialized():
             backend = "nccl" if torch.cuda.is_available() else "gloo"
             dist.init_process_group(backend=backend)
         self._rank = dist.get_rank()
         self._world = dist.get_world_size()
+        # set_device BEFORE any CUDA work (incl. determinism setup) so we
+        # don't create an incidental cuda:0 context on every rank.
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", self._rank % max(1, torch.cuda.device_count()))))
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._dtype = _DTYPES[self._cfg.dtype]
+        # CPU + Python RNGs seeded here; per-rank CUDA seed goes through
+        # manual_seed (current device only) to avoid touching non-local GPUs.
+        enable_deterministic(self._cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self._cfg.seed)
 
         model_cfg = BlockConfig(
             vocab_size=self._cfg.vocab_size,
@@ -290,14 +296,13 @@ class LlmDeterminismWorkload(Workload):
         # Process group teardown left to the launcher.
 
     def _run_once(self) -> tuple[ChecksumSet, _BlockChecksums]:
-        # Re-seed CPU + CUDA-default + Python `random` so both replays enter
-        # forward with identical RNG. `random` covers anything (FSDP2,
-        # DataLoader, future MoE noise) that goes through stdlib RNG —
-        # _snapshot also captures torch RNG state for the same reason.
+        # Re-seed CPU + CUDA-current-device + Python `random` so both
+        # replays enter forward with identical RNG. `manual_seed` (not
+        # `_all`) keeps the reseed scoped to LOCAL_RANK's device.
         random.seed(self._cfg.seed + 1)
         torch.manual_seed(self._cfg.seed + 1)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self._cfg.seed + 1)
+            torch.cuda.manual_seed(self._cfg.seed + 1)
 
         self._model.zero_grad(set_to_none=True)
         block_cs = self._hooks.start_capture()
@@ -390,10 +395,13 @@ def _maybe_fsdp_shard(model: nn.Module) -> nn.Module:
 
 
 def _snapshot(model: nn.Module) -> dict[str, Any]:
+    # `get_rng_state()` defaults to the current CUDA device — does NOT
+    # touch every visible GPU like `get_rng_state_all()` would. Each
+    # torchrun rank owns one LOCAL_RANK device; that's all we need.
     return {
         "params": {n: p.detach().clone() for n, p in model.named_parameters()},
         "cpu_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "cuda_rng": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         "py_rng": random.getstate(),
     }
 
@@ -404,7 +412,7 @@ def _restore(model: nn.Module, snap: dict[str, Any]) -> None:
             p.copy_(snap["params"][n])
     torch.set_rng_state(snap["cpu_rng"])
     if snap["cuda_rng"] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(snap["cuda_rng"])
+        torch.cuda.set_rng_state(snap["cuda_rng"])
     random.setstate(snap["py_rng"])
 
 
