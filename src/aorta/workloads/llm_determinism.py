@@ -216,6 +216,7 @@ class LlmDeterminismWorkload(Workload):
         t0 = time.perf_counter()
         all_reasons: list[str] = []
         per_step_metrics: list[dict[str, Any]] = []
+        first_failure_step: int | None = None
 
         for step in range(self._cfg.steps):
             snapshot = _snapshot(self._model)
@@ -225,6 +226,8 @@ class LlmDeterminismWorkload(Workload):
 
             reasons = compare(r1, r2)
             reasons += _compare_block_lists(blocks1, blocks2)
+            if reasons and first_failure_step is None:
+                first_failure_step = step
             all_reasons.extend(f"step{step}: {r}" for r in reasons)
 
             if self._capture_path is not None:
@@ -263,17 +266,21 @@ class LlmDeterminismWorkload(Workload):
             metrics["divergence_reasons"] = all_reasons[:32]
             log.error("[rank %d] llm_determinism divergence:\n  %s", self._rank, "\n  ".join(all_reasons[:32]))
 
+        # One iteration = one replay PAIR (r1+r2), matching the recipe's
+        # `steps:` semantics. The earlier `steps * 2` accounting made the
+        # matrix.md "Iters" column disagree with the recipe and halved the
+        # elapsed-per-iter fallback timing.
         return WorkloadResult(
             passed=passed,
             failure_count=len(all_reasons),
-            first_failure_iteration=0 if all_reasons else None,
+            first_failure_iteration=first_failure_step,
             failure_details=[{"rank": self._rank, "reason": r} for r in all_reasons],
-            total_iterations=self._cfg.steps * 2,
+            total_iterations=self._cfg.steps,
             elapsed_sec=elapsed,
             metrics=metrics,
             main_work_started=True,
-            executed_iterations=self._cfg.steps * 2,
-            configured_iterations=self._cfg.steps * 2,
+            executed_iterations=self._cfg.steps,
+            configured_iterations=self._cfg.steps,
         )
 
     def cleanup(self) -> None:

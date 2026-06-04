@@ -192,9 +192,9 @@ Tar up:
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `RuntimeError: Expected all tensors to be on the same device` | Stale checkout — pull the branch; the fix is on `users/oyazdanb/llm-determinism-recipe`. |
+| `RuntimeError: Expected all tensors to be on the same device` | Stale checkout — `git pull` `main` and reinstall (`pip install -e .`). |
 | Every rank hangs at `init_process_group` | Set `NCCL_DEBUG=INFO`; try `NCCL_P2P_DISABLE=1`. RCCL honours `NCCL_*` env vars. |
-| `loss_bits` reported as 0 | Stale checkout — the label shift fix (`torch.roll`) avoids the degenerate loss-collapse. |
+| `loss_bits` reported as 0 | Stale checkout — `git pull` `main` and reinstall; labels are shifted by one (`torch.roll`) to avoid the degenerate loss-collapse. |
 | OOM | Drop `num_layers: 12` first, then `hidden_size: 1024, ffn_size: 2816`, then `seq_len: 256`. One knob at a time. |
 | Determinism flagged but suspect false positive | Bump `checksum_mode: global` to also compare an all-reduced loss⊕output fingerprint; rerun. |
 
