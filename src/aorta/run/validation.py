@@ -64,7 +64,9 @@ def validate_launch_mode(workload_cls: type[Workload]) -> None:
         raise RuntimeError(
             f"Workload '{workload_cls.__name__}' requires WORLD_SIZE >= {min_world_size} "
             f"(got {world_size}); launch with: "
-            f"torchrun --nproc_per_node={min_world_size} -m aorta run ..."
+            f"torchrun --standalone --nproc_per_node={min_world_size} "
+            f"$(which aorta) run --workload ... "
+            f"(use the 'aorta' console script; '-m aorta' is not a runnable module)"
         )
 
 

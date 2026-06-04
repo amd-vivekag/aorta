@@ -182,5 +182,7 @@ class TestErrorMessages:
                 validate_launch_mode(DistributedWorkload)
 
             error_msg = str(exc_info.value)
-            assert "torchrun --nproc_per_node=2" in error_msg
-            assert "-m aorta run" in error_msg
+            assert "torchrun --standalone --nproc_per_node=2" in error_msg
+            # Must steer users to the console script, not the non-runnable
+            # `-m aorta run` form the message previously suggested.
+            assert "$(which aorta) run" in error_msg
