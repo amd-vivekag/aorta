@@ -86,7 +86,7 @@ workload_config:
   stop_on_first_corruption: false
   log_interval: 10
 
-  dtype: bf16
+  dtype: bfloat16
 
   # 1M elements x 2 B = 2 MB shard; 2 MB x (N-1) all_gather fan-out per layer.
   fsdp_shard_size: 1000000
