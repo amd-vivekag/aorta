@@ -107,9 +107,10 @@ confound:
 
 # Stress workload config applied to all cells unless overridden per-cell.
 # These values are chosen to maximise L2->HBM writeback race window.
+# Every key here is a real ReproducerConfig field (src/aorta/race/config.py);
+# the race workload drops + warns on unknown keys, so keep this list clean.
 workload_config:
   mode: fsdp
-  mixed_precision: bf16
 
   # warmup=0: do not run any "clean" iterations before verification.
   # Every step uses fresh QPs in iter-0 state (via QP recycling in fsdp mode).
@@ -147,9 +148,6 @@ workload_config:
 
   # Default: NOT same-stream (race is across streams); cell 4 overrides this.
   same_stream_mode: false
-
-  distributed:
-    backend: nccl
 
 cells:
   # ------------------------------------------------------------------

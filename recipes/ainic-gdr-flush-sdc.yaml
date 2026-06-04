@@ -12,10 +12,13 @@
 #   AINIC DMA reads source HBM via PCIe BAR and fetches stale zeros.
 #   iCRC passes (computed over zeros). All N-1 receivers get identical zeros.
 #
-# This recipe runs the `fsdp` workload in three cells:
-#   baseline       -- corruption-exposed config (GDR flush OFF)
-#   gdr_flush      -- primary mitigation (GDR flush ON, both flags required)
-#   strict_pcie    -- secondary candidate (PCIe strict ordering, targets receive path)
+# This recipe runs the `race` workload (mode: fsdp -- the simulated-collective
+# FSDP harness in src/aorta/race/modes/fsdp.py) in five cells:
+#   baseline-no-gdr-flush     -- corruption-exposed config (GDR flush OFF)
+#   gdr-flush                 -- primary mitigation (GDR flush ON, both flags required)
+#   strict-pcie-ordering      -- secondary candidate (PCIe strict ordering, receive path)
+#   gdr-flush-and-strict-pcie -- both mitigations combined
+#   ll-protocol-control       -- LL protocol (GDRDMA disabled; suppression control)
 #
 # Usage
 # -----
@@ -29,7 +32,8 @@
 # --------------------
 #   - MI355X cluster, all cross-node traffic over AINIC (Pollara) RoCEv2
 #   - NCCL_PROTO=Simple  (Simple protocol uses GDRDMA; LL suppresses the bug)
-#   - NCCL_DEBUG=INFO    (TRACE suppresses the bug via printf overhead)
+#   - NCCL_DEBUG=INFO    (Simple/INFO keeps the proxy hot path fast; NCCL_DEBUG=TRACE
+#     suppresses the bug by widening the timing window via printf overhead)
 #   - 10-12 nodes minimum; 22 nodes matches the confirmed reproducer scale
 #   - All ranks on same cudaDev (1 rank per host, same device index)
 #
@@ -43,7 +47,7 @@
 schema_version: 1
 
 ticket: AINIC-SDC-001
-workload: fsdp
+workload: race
 
 # 16 trials per cell: corruption hits iter-0 on new QPs; 16 trials gives
 # statistical confidence given the ~35% per-attempt rate at the user team's scale.
@@ -59,32 +63,46 @@ confound:
   threshold: 1.15
   baseline_cell: baseline-no-gdr-flush
 
+# Flattened to race ReproducerConfig fields (src/aorta/race/config.py). The
+# race `mode: fsdp` harness SIMULATES FSDP collectives (per-layer all_gather /
+# reduce_scatter) -- it is not torch.distributed.fsdp, so the native nested
+# fsdp:/model:/training:/distributed: blocks have no equivalent and were
+# dropped. What maps: model.model_dim -> model_dim, model.num_layers ->
+# num_layers, training.log_interval -> log_interval. What was dropped (no race
+# field): mixed_precision (dtype covers it), model.num_heads, training.max_steps,
+# training.batch_size, the fsdp: block, distributed: (reproducer inits dist).
+# The race workload drops + warns on unknown keys, so every key below is a real
+# ReproducerConfig field -- a clean run logs no "ignoring unknown" warnings.
 workload_config:
-  # Match confirmed reproduction conditions exactly.
-  # All-cross-node PG: 1 rank per host, same cudaDev, all AINIC transport.
-  mixed_precision: bf16
-  fsdp:
-    sharding_strategy: full_shard
-    backward_prefetch: BACKWARD_PRE
-    use_orig_params: true
-    limit_all_gathers: false   # false matches production; true may mask timing
-    forward_prefetch: true
-    sync_module_states: true
-    param_init_device: meta
-  # Model sized to match ~500ms/step (comparable to production LLM per-layer
-  # timing). GEMM compute between collectives prevents the reproducer from
-  # running orders of magnitude faster than real training, which would change
-  # the L2->HBM writeback race window.
-  model:
-    model_dim: 1024
-    num_heads: 16
-    num_layers: 24
-  training:
-    max_steps: 200
-    batch_size: 8
-    log_interval: 10
-  distributed:
-    backend: nccl
+  mode: fsdp
+
+  # iter-0 is the only vulnerable iteration: hit fresh QPs immediately with no
+  # warmup, then verify across the run. verify_iterations replaces the old
+  # training.max_steps=200 (steps: above is the trial count, not the per-trial
+  # reproducer iteration budget). 200 confirms iters 1-199 stay clean.
+  warmup_iterations: 0
+  verify_iterations: 200
+
+  stop_on_first_corruption: false
+  log_interval: 10
+
+  dtype: bfloat16
+
+  # 1M elements x 2 B = 2 MB shard; 2 MB x (N-1) all_gather fan-out per layer.
+  fsdp_shard_size: 1000000
+
+  # GEMM compute between collectives keeps the reproducer near production
+  # per-step timing (~500ms) so the L2->HBM writeback race window matches real
+  # training rather than running orders of magnitude faster. gemm_layers ~36 at
+  # gemm_size 5120 (~14ms/layer on MI300X) approximates the documented ~500ms.
+  # model_dim / num_layers carried over from the original model: block.
+  simulate_compute: true
+  compute_type: gemm
+  gemm_size: 5120
+  gemm_layers: 36
+  include_backward_compute: true
+  model_dim: 1024
+  num_layers: 24
 
 cells:
   # ------------------------------------------------------------------
