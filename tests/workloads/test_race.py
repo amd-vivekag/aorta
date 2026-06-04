@@ -62,6 +62,17 @@ def test_race_config_reserved_aorta_keys_not_warned(caplog):
     assert not any("_aorta_trial_id" in r.getMessage() for r in caplog.records)
 
 
+def test_race_config_steps_key_not_warned(caplog):
+    """`steps` is injected into every workload config by the dispatcher; it is
+    a platform key (not a race field), so it must be dropped WITHOUT a warning
+    -- otherwise every real run logs a spurious unknown-key warning."""
+    wl = RaceWorkload({})
+    with caplog.at_level(logging.WARNING, logger="aorta.workloads.race"):
+        cfg = wl._race_config_from_dict({"mode": "default", "steps": 100})
+    assert not any("steps" in r.getMessage() for r in caplog.records)
+    assert not hasattr(cfg, "steps")  # not a ReproducerConfig field
+
+
 def test_race_config_from_dict_rejects_bad_mode():
     wl = RaceWorkload({})
     with pytest.raises(ValueError, match="mode must be one of"):

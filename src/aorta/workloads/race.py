@@ -32,6 +32,15 @@ log = logging.getLogger(__name__)
 _VALID_MODES = {"default", "ddp", "fsdp"}
 _VALID_DTYPES = {"bfloat16", "float16", "float32"}
 
+# Platform-injected config keys that are NOT ReproducerConfig fields but are
+# always present (the dispatcher writes `steps` into every workload config;
+# `_aorta_*` keys carry environment / probe metadata). These are expected, not
+# user typos, so the unknown-key guard must stay silent on them -- otherwise
+# every run logs a spurious "ignoring unknown ... key 'steps'" that dilutes the
+# real false-green warning. `steps` is consumed by the launcher, not by the
+# reproducer (race uses warmup_iterations + verify_iterations).
+_RESERVED_KEYS = {"steps"}
+
 
 class RaceWorkload(Workload):
     """Thin adapter over the `aorta.race` reproducer (modes: default|ddp|fsdp)."""
@@ -43,7 +52,7 @@ class RaceWorkload(Workload):
     def _race_config_from_dict(self, d: dict[str, Any]) -> ReproducerConfig:
         known = set(ReproducerConfig.__dataclass_fields__)
         for key in d:
-            if key in known or key.startswith("_aorta_"):
+            if key in known or key in _RESERVED_KEYS or key.startswith("_aorta_"):
                 continue
             log.warning("race: ignoring unknown workload_config key %r", key)
         cfg = ReproducerConfig(**{k: v for k, v in d.items() if k in known})
