@@ -1,6 +1,15 @@
 """
 FSDP mode reproducer (Fully Sharded Data Parallel pattern).
 
+NOTE: This *simulates* the FSDP communication pattern with EXPLICIT
+``all_gather`` / ``reduce_scatter`` calls. It does NOT use ``torch.distributed``
+FSDP (neither FSDP1 ``FullyShardedDataParallel`` nor FSDP2 ``fully_shard``).
+When ``compute_type=transformer``, ``RepeatedTransformerBlock`` is reused only as
+a compute kernel between the explicit collectives -- it is not wrapped in
+``fully_shard``. Explicit collectives are what give the clean rank-fill +
+shared-input checksum invariant. Real-FSDP coverage is a separate, deferred
+workload (PR D).
+
 This mode simulates an FSDP-style workload with:
 - H2D transfer for batch data (single- or double-buffered via --prefetch)
 - Per-layer all_gather to reconstruct full parameters before compute
