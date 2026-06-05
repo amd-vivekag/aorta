@@ -470,11 +470,20 @@ class BaseReproducer(ABC):
             f"{warmup_avg_ms:.1f}ms avg per step"
         )
 
-        # Warn if timing is too fast (may not trigger timing-sensitive bugs)
-        if cfg.simulate_compute and warmup_avg_ms < 400:
+        # Warn if timing is too fast (may not trigger timing-sensitive bugs).
+        # Only meaningful when we actually measured warmup steps; with
+        # warmup_iterations == 0 there is no warmup timing (warmup_avg_ms is a
+        # placeholder 0.0), so the old unconditional warning fired a misleading
+        # "Step time (0.0ms)..." on every run. Tune-hint matches the compute type.
+        if cfg.simulate_compute and cfg.warmup_iterations > 0 and warmup_avg_ms < 400:
+            knobs = (
+                "model_dim or num_layers"
+                if cfg.compute_type == "transformer"
+                else "gemm_size or gemm_layers"
+            )
             log.warning(
-                f"Step time ({warmup_avg_ms:.1f}ms) is faster than target (~500ms/step). "
-                f"Consider increasing gemm_size or gemm_layers to match timing profile."
+                f"Warmup step time ({warmup_avg_ms:.1f}ms) is faster than target "
+                f"(~500ms/step). Consider increasing {knobs} to match timing profile."
             )
 
         # ─────────────────────────────────────────────────────────────
