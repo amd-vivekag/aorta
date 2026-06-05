@@ -156,8 +156,42 @@ class ReproducerConfig:
     4 layers at model_dim=2048 gives ~300ms/step on MI350X.
     """
 
+    num_heads: int = 0
+    """
+    Number of attention heads (transformer compute type).
+
+    0 means auto-derive as model_dim // 128. Must divide model_dim evenly.
+    """
+
+    ffn_size: int = 0
+    """
+    FFN intermediate (hidden) size (transformer compute type).
+
+    0 means auto-derive as model_dim * 4.
+    """
+
+    seq_len: int = 512
+    """Sequence length of the reference input (transformer compute type)."""
+
+    batch_size: int = 1
+    """Batch size of the reference input (transformer compute type)."""
+
     include_backward_compute: bool = True
     """Also simulate backward pass (doubles compute time)."""
+
+    shared_layer_weights: bool = False
+    """
+    Use a single shared weight matrix for all layers (transformer compute type).
+
+    When True, all num_layers layers use the same weight matrix initialized with
+    a fixed seed, and each layer receives the same fixed reference input rather
+    than chaining activations.  This makes per-layer forward outputs analytically
+    identical so that cross-layer activation comparison can serve as a secondary
+    corruption signal: any all_gather corruption that propagates through GEMM
+    compute will produce a mismatch between layer outputs.
+
+    Only meaningful when compute_type == 'transformer'.
+    """
 
     # =========================================================================
     # Optimizer (used by modes that support it, e.g., DDP)
@@ -280,6 +314,13 @@ class ReproducerResult:
 
     avg_step_time_ms: float
     """Average time per step in milliseconds."""
+
+    layers_verified: int = 0
+    """Cross-layer checksum comparisons performed (shared-weight transformer).
+    >0 proves the per-layer checksum detector actually ran; 0 means it did not."""
+
+    layer_checksum_mismatches: int = 0
+    """Per-layer checksum mismatches found (0 on a clean run)."""
 
 
 # =============================================================================

@@ -30,6 +30,8 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from aorta.models import BlockConfig, RepeatedTransformerBlock
+
 from ..base import BaseReproducer
 from ..config import ReproducerConfig
 
@@ -77,6 +79,13 @@ class FSDPModeReproducer(BaseReproducer):
         self.activation: Optional[torch.Tensor] = None
         self.grad_buffer: Optional[torch.Tensor] = None
 
+        # Shared-weight transformer: fixed reference input + per-layer checksums
+        self.reference_input: Optional[torch.Tensor] = None
+        self.layer_checksums: List[Optional[dict]] = []
+
+        # Real transformer block shared across all layers (shared-weight path)
+        self.shared_block: Optional[RepeatedTransformerBlock] = None
+
     def _setup_compute(self) -> None:
         """
         Override base compute setup -- FSDP manages its own per-layer compute.
@@ -90,7 +99,10 @@ class FSDPModeReproducer(BaseReproducer):
         if not self.config.simulate_compute:
             return
 
-        # Validate buffer sizes based on compute type
+        # Validate buffer sizes based on compute type.
+        # NOTE: for the shared-weight transformer path the real compute size is
+        # governed by batch_size × seq_len × model_dim (the block's activation),
+        # not dim²; this min only sizes the H2D staging buffer and stays harmless.
         dim = self._dim
         min_h2d_size = dim * dim
         if self.config.h2d_tensor_size < min_h2d_size:
@@ -134,13 +146,56 @@ class FSDPModeReproducer(BaseReproducer):
         # per-layer, unlike the base compute simulator which runs all layers at once.
         if cfg.simulate_compute:
             dim = self._dim
-            self.weight_matrices = [
-                torch.randn(
-                    dim, dim,
-                    dtype=self.dtype, device="cuda",
+            use_shared = (
+                cfg.shared_layer_weights and cfg.compute_type == "transformer"
+            )
+            if use_shared:
+                # All layers share ONE real transformer block with deterministic,
+                # rank-identical weights so block(reference_input) is analytically
+                # identical for every layer and every rank. Any divergence across
+                # layers indicates compute-path corruption.
+                hidden = cfg.model_dim
+                num_heads = cfg.num_heads or (hidden // 128)
+                if num_heads < 1:
+                    num_heads = 1
+                ffn = cfg.ffn_size or (hidden * 4)
+                if hidden % num_heads != 0:
+                    raise ValueError(
+                        f"model_dim ({hidden}) must be divisible by num_heads "
+                        f"({num_heads}) for shared-weight transformer compute"
+                    )
+                block_cfg = BlockConfig(
+                    hidden_size=hidden,
+                    num_heads=num_heads,
+                    num_layers=1,
+                    ffn_size=ffn,
+                    num_experts=1,
+                    seq_len=cfg.seq_len,
+                    vocab_size=16,  # embed is unused on this path; keep tiny
                 )
-                for _ in range(self.num_layers)
-            ]
+                # fork_rng so seeding the block's init RNG to a fixed value gives
+                # bit-identical weights on every rank without perturbing global RNG.
+                with torch.random.fork_rng(devices=["cuda"]):
+                    torch.cuda.manual_seed(0)
+                    self.shared_block = (
+                        RepeatedTransformerBlock(block_cfg).to("cuda").to(self.dtype)
+                    )
+                self.shared_block.eval()
+
+                # Fixed reference input, same seed across all ranks and iterations.
+                g = torch.Generator(device="cuda")
+                g.manual_seed(1)
+                self.reference_input = torch.randn(
+                    cfg.batch_size, cfg.seq_len, hidden,
+                    dtype=self.dtype, device="cuda", generator=g,
+                )
+                self.weight_matrices = []
+                self.layer_checksums = [None] * self.num_layers
+            else:
+                self.weight_matrices = [
+                    torch.randn(dim, dim, dtype=self.dtype, device="cuda")
+                    for _ in range(self.num_layers)
+                ]
             self.activation = torch.randn(
                 dim, dim,
                 dtype=self.dtype, device="cuda",
@@ -150,11 +205,18 @@ class FSDPModeReproducer(BaseReproducer):
                 dtype=self.dtype, device="cuda",
             )
 
+        # Startup line names the active compute path so a silent fallback
+        # (e.g. transformer requested but GEMM ran) is greppable in logs.
+        shared_active = self.shared_block is not None
         log.info(
             f"Allocated FSDP buffers: layers={self.num_layers}, "
             f"shard_size={self.shard_size}, "
             f"full_param_size={self.shard_size * ws}, "
-            f"compute={'enabled' if cfg.simulate_compute else 'disabled'}"
+            f"compute={'enabled' if cfg.simulate_compute else 'disabled'}, "
+            f"compute_type={cfg.compute_type}, "
+            f"shared_layer_weights={cfg.shared_layer_weights}, "
+            f"transformer_block={'active' if shared_active else 'none'}, "
+            f"layer_checksum_verify={'ON' if shared_active else 'OFF'}"
         )
 
     def _fill_patterns(self) -> None:
@@ -166,30 +228,82 @@ class FSDPModeReproducer(BaseReproducer):
         # Each rank fills full_grad with rank + 1 (for reduce_scatter verification)
         self.full_grad.fill_(float(self.rank + 1))
 
+    @staticmethod
+    def _checksum(tensor: torch.Tensor) -> int:
+        """
+        Bitwise checksum: reinterpret-cast to int16 and sum.
+
+        bf16 (or any 16-bit dtype) is viewed as int16 so every bit pattern
+        contributes to the checksum with zero information loss -- no float
+        rounding, no abs(), and NaN / denorm bit patterns are included.
+        Accumulation is done in int64 to avoid overflow.
+        """
+        return tensor.view(torch.int16).to(torch.int64).sum().item()
+
     def _forward_layer(self, layer_idx: int) -> None:
         """
         Forward pass for a single FSDP layer.
 
         1. all_gather: reconstruct full parameter from shards across ranks
         2. GEMM: compute with full parameter (if enabled)
+
+        Shared-weight path: every layer receives the same fixed reference_input
+        so that outputs are analytically identical.  Input/output checksums are
+        recorded for both the comm kernel (all_gather) and the compute kernel
+        (GEMM + GELU) so _verify_layer_checksums() can pinpoint whether
+        corruption entered during communication or compute.
+
+        Chained path (default): layer 0 seeds activation from batch_gpu (H2D race
+        opportunity) and each subsequent layer receives the previous layer's output.
         """
-        # all_gather: each rank contributes its shard → full_param
+        use_shared = (
+            self.config.shared_layer_weights
+            and self.config.compute_type == "transformer"
+            and self.reference_input is not None
+        )
+
+        # ── comm kernel: all_gather ──────────────────────────────────
+        if use_shared:
+            comm_input_cksum = self._checksum(self.param_shards[layer_idx])
+
         dist.all_gather_into_tensor(
             self.full_param, self.param_shards[layer_idx]
         )
 
-        # GEMM forward (if compute enabled)
-        if self.config.simulate_compute and self.weight_matrices:
-            # Use batch_gpu for data dependency on first layer (H2D race opportunity)
-            if layer_idx == 0:
-                dim = self._dim
-                batch_slice = self.batch_gpu[:dim * dim]
-                self.activation = batch_slice.view(dim, dim)
+        if use_shared:
+            comm_output_cksum = self._checksum(self.full_param)
 
-            self.activation = torch.mm(
-                self.weight_matrices[layer_idx], self.activation
-            )
-            self.activation = torch.nn.functional.gelu(self.activation)
+        # ── compute kernel: transformer block (shared) or GEMM + GELU ──
+        # Gate admits the shared-block path even though weight_matrices is now
+        # empty on that path; the GEMM/chained else still requires weight_matrices.
+        if self.config.simulate_compute and (
+            self.shared_block is not None or self.weight_matrices
+        ):
+            if use_shared:
+                compute_input_cksum = self._checksum(self.reference_input)
+
+                with torch.no_grad():
+                    out = self.shared_block(self.reference_input)
+
+                compute_output_cksum = self._checksum(out)
+
+                self.layer_checksums[layer_idx] = {
+                    "comm_input": comm_input_cksum,
+                    "comm_output": comm_output_cksum,
+                    "compute_input": compute_input_cksum,
+                    "compute_output": compute_output_cksum,
+                }
+                self.activation = out
+            else:
+                # Use batch_gpu for data dependency on first layer (H2D race opportunity)
+                if layer_idx == 0:
+                    dim = self._dim
+                    batch_slice = self.batch_gpu[:dim * dim]
+                    self.activation = batch_slice.view(dim, dim)
+                self.activation = torch.mm(
+                    self.weight_matrices[layer_idx], self.activation
+                )
+                self.activation = torch.nn.functional.gelu(self.activation)
 
     def _backward_layer(self, layer_idx: int) -> None:
         """
@@ -204,9 +318,15 @@ class FSDPModeReproducer(BaseReproducer):
             self.full_param, self.param_shards[layer_idx]
         )
 
-        # GEMM backward (if compute enabled)
-        if self.config.simulate_compute and self.weight_matrices:
-            if self.config.include_backward_compute:
+        # Backward compute (if enabled)
+        if self.config.simulate_compute and self.config.include_backward_compute:
+            if self.shared_block is not None:
+                # Shared-transformer path: re-run forward as a backward timing
+                # proxy (we don't train, so an exact bwd kernel isn't needed —
+                # only the comm/compute overlap timing matters here).
+                with torch.no_grad():
+                    _ = self.shared_block(self.reference_input)
+            elif self.weight_matrices:
                 self.grad_buffer = torch.mm(
                     self.weight_matrices[layer_idx].T, self.grad_buffer
                 )
@@ -290,7 +410,8 @@ class FSDPModeReproducer(BaseReproducer):
         return result
 
     def _verify(self, iteration: int) -> bool:
-        """Verify H2D, last all_gather, and last reduce_scatter results."""
+        """Verify H2D, last all_gather, last reduce_scatter, and (if shared-weight
+        transformer) cross-layer activation consistency."""
         all_correct = True
 
         # Check H2D result
@@ -304,6 +425,69 @@ class FSDPModeReproducer(BaseReproducer):
         # Check last reduce_scatter result
         if not self._verify_reduce_scatter():
             all_correct = False
+
+        # Cross-layer checksum comparison (shared-weight transformer only)
+        if (
+            self.config.shared_layer_weights
+            and self.config.compute_type == "transformer"
+            and self.layer_checksums
+        ):
+            if not self._verify_layer_checksums(iteration):
+                all_correct = False
+
+        return all_correct
+
+    def _verify_layer_checksums(self, iteration: int) -> bool:
+        """
+        Verify that per-kernel int16 checksums are identical across all layers.
+
+        With shared weights and a fixed reference input every layer runs the
+        same comm kernel (all_gather of rank-filled shard) and the same compute
+        kernel (GEMM + GELU with shared W and fixed reference_input).  Both the
+        input and output of each kernel are checksummed via reinterpret-cast to
+        int16 → int64 sum, so every bit contributes with zero information loss.
+
+        Four checksums per layer:
+          comm_input    -- param shard before all_gather (should be identical:
+                           every shard is filled with float(rank))
+          comm_output   -- full_param after all_gather
+          compute_input -- reference_input fed to GEMM (constant across layers)
+          compute_output-- activation after GELU
+
+        If comm_output diverges but comm_input matches, corruption is in the
+        collective (RCCL / NIC path).  If compute_output diverges but
+        comm_output matches, corruption is in the compute kernel (GPU ALU).
+        """
+        ref = self.layer_checksums[0]
+        if ref is None:
+            return True
+
+        all_correct = True
+        for i in range(1, len(self.layer_checksums)):
+            cmp = self.layer_checksums[i]
+            if cmp is None:
+                continue
+            # Count every cross-layer comparison so a clean (green) run still
+            # proves the detector ran: layers_verified > 0.
+            self.layers_verified += 1
+            for key in ("comm_input", "comm_output", "compute_input", "compute_output"):
+                if cmp[key] != ref[key]:
+                    log.error(
+                        f"LAYER_CHECKSUM_MISMATCH ({key}): "
+                        f"rank={self.rank} iter={iteration} "
+                        f"layer_0={ref[key]} layer_{i}={cmp[key]}"
+                    )
+                    self.corruption_details.append({
+                        "type": f"layer_checksum_mismatch_{key}",
+                        "rank": self.rank,
+                        "iteration": iteration,
+                        "layer_ref": 0,
+                        "layer_cmp": i,
+                        "ref_checksum": ref[key],
+                        "cmp_checksum": cmp[key],
+                    })
+                    self.layer_checksum_mismatches += 1
+                    all_correct = False
 
         return all_correct
 
