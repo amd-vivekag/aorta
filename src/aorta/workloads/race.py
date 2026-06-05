@@ -30,7 +30,8 @@ from aorta.workloads._base import Workload, WorkloadResult
 log = logging.getLogger(__name__)
 
 _VALID_MODES = {"default", "ddp", "fsdp"}
-_VALID_DTYPES = {"bfloat16", "float16", "float32"}
+_VALID_DTYPES = {"bfloat16", "bf16", "float16", "fp16", "float32", "fp32"}
+_VALID_COMPUTE_TYPES = {"gemm", "transformer"}
 
 # Platform-injected config keys that are NOT ReproducerConfig fields but are
 # always present (the dispatcher writes `steps` into every workload config;
@@ -60,6 +61,18 @@ class RaceWorkload(Workload):
             raise ValueError(f"mode must be one of {sorted(_VALID_MODES)}, got {cfg.mode!r}")
         if cfg.dtype not in _VALID_DTYPES:
             raise ValueError(f"dtype must be one of {sorted(_VALID_DTYPES)}, got {cfg.dtype!r}")
+        if cfg.compute_type not in _VALID_COMPUTE_TYPES:
+            # Reject typos (e.g. "transfomer") that would silently fall back to
+            # the GEMM path and produce a false green.
+            raise ValueError(
+                f"compute_type must be one of {sorted(_VALID_COMPUTE_TYPES)}, got {cfg.compute_type!r}"
+            )
+        if cfg.shared_layer_weights and cfg.compute_type != "transformer":
+            log.warning(
+                "race: shared_layer_weights=True has no effect with compute_type=%r "
+                "(only applies to compute_type='transformer')",
+                cfg.compute_type,
+            )
         return cfg
 
     def setup(self) -> None:
@@ -90,6 +103,13 @@ class RaceWorkload(Workload):
             metrics={
                 "avg_step_time_ms": res.avg_step_time_ms,
                 "mode": self._cfg.mode,
+                "compute_type": self._cfg.compute_type,
+                "layers_verified": res.layers_verified,
+                "layer_checksum_mismatches": res.layer_checksum_mismatches,
+                "eff_num_heads": res.eff_num_heads,
+                "eff_ffn_size": res.eff_ffn_size,
+                "eff_seq_len": res.eff_seq_len,
+                "eff_batch_size": res.eff_batch_size,
                 "rank": self._rank,
                 "world_size": self._world,
             },

@@ -78,6 +78,12 @@ class BaseReproducer(ABC):
         self.in_verification_phase: bool = False
         self.corruption_details: List[Dict] = []
 
+        # Detector observability: a clean run is otherwise indistinguishable
+        # from a no-op. Subclasses that do per-layer checksum verification
+        # increment these so the result proves the detector executed.
+        self.layers_verified: int = 0
+        self.layer_checksum_mismatches: int = 0
+
         # Dtype
         self.dtype = self._get_dtype()
 
@@ -85,8 +91,11 @@ class BaseReproducer(ABC):
         """Get torch dtype from config string."""
         dtype_map = {
             "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
             "float16": torch.float16,
+            "fp16": torch.float16,
             "float32": torch.float32,
+            "fp32": torch.float32,
         }
         return dtype_map.get(self.config.dtype, torch.bfloat16)
 
@@ -528,6 +537,14 @@ class BaseReproducer(ABC):
             corruption_details=self.corruption_details,
             elapsed_time_sec=elapsed,
             avg_step_time_ms=avg_step_ms,
+            layers_verified=self.layers_verified,
+            layer_checksum_mismatches=self.layer_checksum_mismatches,
+            # Resolved transformer shape (FSDP shared-weight path only; getattr
+            # keeps this safe for modes that don't set these).
+            eff_num_heads=getattr(self, "eff_num_heads", None),
+            eff_ffn_size=getattr(self, "eff_ffn_size", None),
+            eff_seq_len=getattr(self, "eff_seq_len", None),
+            eff_batch_size=getattr(self, "eff_batch_size", None),
         )
 
 

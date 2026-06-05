@@ -156,8 +156,44 @@ class ReproducerConfig:
     4 layers at model_dim=2048 gives ~300ms/step on MI350X.
     """
 
+    num_heads: int = 0
+    """
+    Number of attention heads (transformer compute type).
+
+    0 means auto-derive as model_dim // 128. Must divide model_dim evenly.
+    """
+
+    ffn_size: int = 0
+    """
+    FFN intermediate (hidden) size (transformer compute type).
+
+    0 means auto-derive as model_dim * 4.
+    """
+
+    seq_len: int = 512
+    """Sequence length of the reference input (transformer compute type)."""
+
+    batch_size: int = 1
+    """Batch size of the reference input (transformer compute type)."""
+
     include_backward_compute: bool = True
     """Also simulate backward pass (doubles compute time)."""
+
+    shared_layer_weights: bool = False
+    """
+    Use a single shared transformer block for all layers (transformer compute type).
+
+    When True, all num_layers layers run the SAME RepeatedTransformerBlock
+    (one block built with a fixed seed) on the SAME fixed reference input, rather
+    than chaining activations.  This makes every layer's forward output
+    analytically identical, so cross-layer comparison of the per-kernel checksums
+    becomes a secondary corruption signal: if a layer's compute_output checksum
+    diverges from the others, that layer's compute path was corrupted.  (The
+    collective path is checked separately via the comm_input/comm_output
+    checksums on each layer's all_gather.)
+
+    Only meaningful when compute_type == 'transformer'.
+    """
 
     # =========================================================================
     # Optimizer (used by modes that support it, e.g., DDP)
@@ -255,6 +291,23 @@ class ReproducerConfig:
     - 4+: Full parallelism (exposes timing-sensitive bugs)
     """
 
+    def __post_init__(self) -> None:
+        # Validate here (not only in the RaceWorkload adapter) so EVERY entry
+        # point is covered -- the aorta.race CLI and any direct reproducer
+        # construction. A typo like "transfomer" must error, not silently fall
+        # back to the GEMM path (false green).
+        #
+        # Use the pluggable COMPUTE_REGISTRY as the single source of truth so
+        # custom backends registered via register_compute() remain valid (don't
+        # hard-code the list). Imported lazily to avoid a circular import.
+        from .compute import COMPUTE_REGISTRY
+        valid_compute = set(COMPUTE_REGISTRY)
+        if self.compute_type not in valid_compute:
+            raise ValueError(
+                f"compute_type must be one of {sorted(valid_compute)}, "
+                f"got {self.compute_type!r}"
+            )
+
 
 @dataclass
 class ReproducerResult:
@@ -280,6 +333,25 @@ class ReproducerResult:
 
     avg_step_time_ms: float
     """Average time per step in milliseconds."""
+
+    layers_verified: int = 0
+    """Cross-layer checksum comparisons performed (shared-weight transformer).
+    >0 proves the per-layer checksum detector actually ran; 0 means it did not."""
+
+    layer_checksum_mismatches: int = 0
+    """Per-layer checksum mismatches found (0 on a clean run)."""
+
+    eff_num_heads: Optional[int] = None
+    """Resolved attention heads actually used (auto-derived when config=0)."""
+
+    eff_ffn_size: Optional[int] = None
+    """Resolved FFN intermediate size actually used (auto-derived when config=0)."""
+
+    eff_seq_len: Optional[int] = None
+    """Resolved sequence length of the reference input (transformer compute)."""
+
+    eff_batch_size: Optional[int] = None
+    """Resolved batch size of the reference input (transformer compute)."""
 
 
 # =============================================================================
