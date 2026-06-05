@@ -53,12 +53,17 @@ Launch contract (read once):
   line via `srun` / `torchrun`).
 - Run the **same** command on every rank. Only rank 0 writes result artifacts;
   other ranks participate in the collectives.
-- A recipe's per-cell environment variables are applied by the runner, but note
-  that variables read by a library **at process startup** (notably `NCCL_*` /
-  `RCCL_*`, which the NCCL/RCCL worker reads when the process group initializes)
-  may not be picked up reliably from recipe `extra_env`. Set those in the
-  **launcher environment** (export them in the shell/script that runs
-  `torchrun`/`srun`) and verify they took effect in the run log.
+- A recipe's per-cell `extra_env` is applied by the runner (via
+  `os.environ.update`) *before* the workload's `setup()` calls
+  `init_process_group()`. That is in time for most vars — **but not for ones a
+  library caches at load time.** Some `NCCL_*` / `RCCL_*` vars are read once when
+  the library is first loaded (at `import torch`, which happens before the runner
+  applies `extra_env`), so setting them via `extra_env` is too late and they are
+  silently ignored. Set those in the **launcher environment** (export them in the
+  shell/script that runs `torchrun`/`srun`, before Python starts) and verify they
+  took effect in the run log. A second caveat: workloads like `race` do not
+  destroy/re-init the process group between cells, so a `NCCL_*` change in a later
+  cell will not take effect mid-run and can cause a confusing false-green.
 - Topology (rank count, ranks-per-host) is the launcher's responsibility.
 
 ## 5. Read results

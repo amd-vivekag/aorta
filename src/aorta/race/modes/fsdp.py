@@ -390,7 +390,10 @@ class FSDPModeReproducer(BaseReproducer):
                     # block params were built with requires_grad=False.
                     ri = self.reference_input.detach().requires_grad_(True)
                     out = self.shared_block(ri)
-                    loss = out.float().sum()
+                    # Accumulate the loss in fp32 (avoids bf16 underflow) WITHOUT
+                    # materializing a full fp32 copy of the activation: sum(dtype=)
+                    # casts inside the reduction.
+                    loss = out.sum(dtype=torch.float32)
                     loss.backward()
                     self.shared_block.zero_grad(set_to_none=True)
                     # free graph references promptly (per-layer, so peak memory
