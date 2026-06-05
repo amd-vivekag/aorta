@@ -92,6 +92,14 @@ def test_race_config_from_dict_rejects_bad_compute_type():
         wl._race_config_from_dict({"compute_type": "transfomer"})
 
 
+def test_reproducer_config_rejects_bad_compute_type_directly():
+    """Validation lives in ReproducerConfig.__post_init__, so even direct
+    construction (bypassing the RaceWorkload adapter, e.g. the aorta.race CLI)
+    rejects a typo instead of silently running GEMM (false green)."""
+    with pytest.raises(ValueError, match="compute_type must be one of"):
+        ReproducerConfig(compute_type="transfomer")
+
+
 def test_race_config_warns_shared_weights_without_transformer(caplog):
     wl = RaceWorkload({})
     with caplog.at_level("WARNING"):

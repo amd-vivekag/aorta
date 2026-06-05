@@ -95,6 +95,25 @@ def test_comm_corruption_detected():
     assert "compute" not in detail["type"]
 
 
+def test_mismatch_counter_is_per_layer_not_per_key():
+    """A single corrupted layer with MULTIPLE bad keys counts ONCE, not 4x.
+
+    layer_checksum_mismatches is a per-layer counter; a layer that diverges on
+    several checksum keys must not inflate it (was previously +1 per key).
+    """
+    bad_layer = 1
+    layers = [_checksums() for _ in range(3)]
+    # All four keys differ on the one bad layer.
+    layers[bad_layer] = _checksums(comm_in=1, comm_out=2, compute_in=3, compute_out=4)
+
+    r = _make_reproducer(layers)
+    assert r._verify_layer_checksums(iteration=0) is False
+    # corruption_details still records each key (full localization detail)...
+    assert len(r.corruption_details) == 4
+    # ...but the per-layer metric counts the layer ONCE.
+    assert r.layer_checksum_mismatches == 1
+
+
 def test_single_layer_or_empty():
     """1 layer or empty -> nothing to compare against -> pass, no false positive."""
     # Single layer: loop over range(1, 1) never runs.

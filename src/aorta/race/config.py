@@ -291,6 +291,18 @@ class ReproducerConfig:
     - 4+: Full parallelism (exposes timing-sensitive bugs)
     """
 
+    def __post_init__(self) -> None:
+        # Validate here (not only in the RaceWorkload adapter) so EVERY entry
+        # point is covered -- the aorta.race CLI and any direct reproducer
+        # construction. A typo like "transfomer" must error, not silently fall
+        # back to the GEMM path (false green).
+        valid_compute = {"gemm", "transformer"}
+        if self.compute_type not in valid_compute:
+            raise ValueError(
+                f"compute_type must be one of {sorted(valid_compute)}, "
+                f"got {self.compute_type!r}"
+            )
+
 
 @dataclass
 class ReproducerResult:

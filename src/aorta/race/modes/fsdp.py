@@ -219,19 +219,22 @@ class FSDPModeReproducer(BaseReproducer):
                 )
                 self.weight_matrices = []
                 self.layer_checksums = [None] * self.num_layers
+                # activation/grad_buffer below are unused on the shared path
+                # (forward sets activation to the block output; backward re-runs
+                # the block), so skip those dim x dim allocations.
             else:
                 self.weight_matrices = [
                     torch.randn(dim, dim, dtype=self.dtype, device="cuda")
                     for _ in range(self.num_layers)
                 ]
-            self.activation = torch.randn(
-                dim, dim,
-                dtype=self.dtype, device="cuda",
-            )
-            self.grad_buffer = torch.randn(
-                dim, dim,
-                dtype=self.dtype, device="cuda",
-            )
+                self.activation = torch.randn(
+                    dim, dim,
+                    dtype=self.dtype, device="cuda",
+                )
+                self.grad_buffer = torch.randn(
+                    dim, dim,
+                    dtype=self.dtype, device="cuda",
+                )
 
         # Startup line names the active compute path so a silent fallback
         # (e.g. transformer requested but GEMM ran) is greppable in logs.
@@ -278,16 +281,18 @@ class FSDPModeReproducer(BaseReproducer):
         Forward pass for a single FSDP layer.
 
         1. all_gather: reconstruct full parameter from shards across ranks
-        2. GEMM: compute with full parameter (if enabled)
+        2. compute with the reconstructed parameter (if enabled)
 
-        Shared-weight path: every layer receives the same fixed reference_input
-        so that outputs are analytically identical.  Input/output checksums are
-        recorded for both the comm kernel (all_gather) and the compute kernel
-        (GEMM + GELU) so _verify_layer_checksums() can pinpoint whether
-        corruption entered during communication or compute.
+        Shared-weight transformer path: every layer runs the same shared
+        RepeatedTransformerBlock on the same fixed reference_input, so outputs are
+        analytically identical.  Input/output checksums are recorded for both the
+        comm kernel (all_gather) and the compute kernel (the transformer block) so
+        _verify_layer_checksums() can pinpoint whether corruption entered during
+        communication or compute.
 
-        Chained path (default): layer 0 seeds activation from batch_gpu (H2D race
-        opportunity) and each subsequent layer receives the previous layer's output.
+        Chained path (default, GEMM): layer 0 seeds activation from batch_gpu (H2D
+        race opportunity) and each subsequent layer receives the previous layer's
+        output through a GEMM + GELU.
         """
         use_shared = (
             self.config.shared_layer_weights
@@ -505,6 +510,7 @@ class FSDPModeReproducer(BaseReproducer):
             # Count every cross-layer comparison so a clean (green) run still
             # proves the detector ran: layers_verified > 0.
             self.layers_verified += 1
+            layer_has_mismatch = False
             for key in ("comm_input", "comm_output", "compute_input", "compute_output"):
                 if cmp[key] != ref[key]:
                     log.error(
@@ -521,8 +527,12 @@ class FSDPModeReproducer(BaseReproducer):
                         "ref_checksum": ref[key],
                         "cmp_checksum": cmp[key],
                     })
-                    self.layer_checksum_mismatches += 1
+                    layer_has_mismatch = True
                     all_correct = False
+            # Count once per CORRUPTED LAYER, not once per key -- a single bad
+            # layer must not inflate the metric up to 4x (one per checksum key).
+            if layer_has_mismatch:
+                self.layer_checksum_mismatches += 1
 
         return all_correct
 
