@@ -59,3 +59,8 @@ cells:
     extra_env:
       NCCL_PROTO: "Simple"
       NCCL_DEBUG: "INFO"
+      # Force GPUDirect RDMA on so the smoke proves the real GDR path works on
+      # your cluster. Without these the banner shows "GDR 0" (host-bounce path).
+      # A good smoke shows "GDR 1" in the RCCL banner.
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
