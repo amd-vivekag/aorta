@@ -166,6 +166,15 @@ class FSDPModeReproducer(BaseReproducer):
             use_shared = (
                 cfg.shared_layer_weights and cfg.compute_type == "transformer"
             )
+            if cfg.compute_type == "transformer" and not cfg.shared_layer_weights:
+                # Only the shared-weight transformer path is implemented; without
+                # shared weights we fall back to GEMM. Warn loudly so this is not
+                # a silent transformer->GEMM fallback (the thing this PR fixes).
+                log.warning(
+                    "race: compute_type='transformer' but shared_layer_weights=False "
+                    "-- the non-shared transformer path is not implemented; running "
+                    "the GEMM compute path instead."
+                )
             if use_shared:
                 # All layers share ONE real transformer block with deterministic,
                 # rank-identical weights so block(reference_input) is analytically
@@ -267,14 +276,20 @@ class FSDPModeReproducer(BaseReproducer):
     @staticmethod
     def _checksum(tensor: torch.Tensor) -> int:
         """
-        Bitwise checksum: reinterpret-cast to int16 and sum.
+        Bitwise checksum: reinterpret-cast to an int of the SAME element size
+        and sum.
 
-        bf16 (or any 16-bit dtype) is viewed as int16 so every bit pattern
-        contributes to the checksum with zero information loss -- no float
-        rounding, no abs(), and NaN / denorm bit patterns are included.
-        Accumulation is done in int64 to avoid overflow.
+        Every bit pattern contributes to the checksum with zero information loss
+        -- no float rounding, no abs(), and NaN / denorm bit patterns are
+        included. The int view must match the dtype's byte width: 2-byte dtypes
+        (bf16/fp16) -> int16, 4-byte (fp32) -> int32, 1-byte -> int8. Accumulation
+        is done in int64 to avoid overflow.
         """
-        return tensor.view(torch.int16).to(torch.int64).sum().item()
+        itemsize = tensor.element_size()
+        int_view = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}.get(itemsize)
+        if int_view is None:
+            raise ValueError(f"_checksum: unsupported element size {itemsize} bytes")
+        return tensor.view(int_view).to(torch.int64).sum().item()
 
     def _forward_layer(self, layer_idx: int) -> None:
         """

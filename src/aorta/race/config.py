@@ -296,7 +296,12 @@ class ReproducerConfig:
         # point is covered -- the aorta.race CLI and any direct reproducer
         # construction. A typo like "transfomer" must error, not silently fall
         # back to the GEMM path (false green).
-        valid_compute = {"gemm", "transformer"}
+        #
+        # Use the pluggable COMPUTE_REGISTRY as the single source of truth so
+        # custom backends registered via register_compute() remain valid (don't
+        # hard-code the list). Imported lazily to avoid a circular import.
+        from .compute import COMPUTE_REGISTRY
+        valid_compute = set(COMPUTE_REGISTRY)
         if self.compute_type not in valid_compute:
             raise ValueError(
                 f"compute_type must be one of {sorted(valid_compute)}, "

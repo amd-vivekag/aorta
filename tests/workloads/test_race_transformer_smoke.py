@@ -50,12 +50,20 @@ def _build_shared_block_and_input():
     return block, reference_input
 
 
-def _run_layers(block, reference_input):
-    """Per-layer forward + 4 checksums, exactly like _forward_layer's shared path."""
+def _run_layers(block, reference_input, world_size=4, rank=0):
+    """Per-layer forward + 4 checksums, mirroring _forward_layer's shared path.
+
+    comm checksums use distinct buffers like the real code (NOT reference_input):
+    comm_input = rank-filled param shard, comm_output = the all_gather result
+    (here built deterministically as the concatenation of every rank's shard).
+    """
+    shard = torch.full((SEQ * HIDDEN,), float(rank), dtype=DTYPE)        # this rank's shard
+    full_param = torch.cat([torch.full((SEQ * HIDDEN,), float(r), dtype=DTYPE)
+                            for r in range(world_size)])                  # all_gather result
     layer_checksums = []
     for _ in range(NUM_LAYERS):
-        comm_input = FSDPModeReproducer._checksum(reference_input)
-        comm_output = comm_input  # no real all_gather on CPU; identical by construction
+        comm_input = FSDPModeReproducer._checksum(shard)
+        comm_output = FSDPModeReproducer._checksum(full_param)
         compute_input = FSDPModeReproducer._checksum(reference_input)
         with torch.no_grad():
             out = block(reference_input)
@@ -93,6 +101,20 @@ def test_num_heads_auto_derived_when_zero():
     cfg = BlockConfig(hidden_size=hidden, num_heads=resolved, num_layers=1,
                       ffn_size=hidden * 4, num_experts=1)
     assert cfg.hidden_size % cfg.num_heads == 0
+
+
+def test_checksum_handles_multiple_dtypes():
+    """_checksum must work for 2-byte AND 4-byte dtypes (fp32 is an allowed dtype).
+
+    Guards against the int16-only view crashing on float32.
+    """
+    for dt in (torch.bfloat16, torch.float16, torch.float32):
+        t = torch.randn(4, 4, dtype=dt)
+        # returns an int and is deterministic for identical data
+        c1 = FSDPModeReproducer._checksum(t)
+        c2 = FSDPModeReproducer._checksum(t.clone())
+        assert isinstance(c1, int)
+        assert c1 == c2
 
 
 def test_real_transformer_block_runs_on_cpu():
