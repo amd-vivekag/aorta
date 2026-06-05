@@ -195,9 +195,15 @@ class FSDPModeReproducer(BaseReproducer):
                     seq_len=cfg.seq_len,
                     vocab_size=16,  # embed is unused on this path; keep tiny
                 )
-                # fork_rng so seeding the block's init RNG to a fixed value gives
-                # bit-identical weights on every rank without perturbing global RNG.
+                # fork_rng so we can fix the seed without perturbing global RNG.
+                # RepeatedTransformerBlock initializes its params on CPU (nn.Linear
+                # / LayerNorm use the CPU RNG) BEFORE .to("cuda"), so we must seed
+                # the CPU RNG too -- seeding only CUDA would leave weights dependent
+                # on each rank's CPU RNG state and break the rank-identical invariant
+                # (every layer would still match within a rank, so the per-layer
+                # checksum would falsely pass while ranks silently diverged).
                 with torch.random.fork_rng(devices=["cuda"]):
+                    torch.manual_seed(0)
                     torch.cuda.manual_seed(0)
                     self.shared_block = (
                         RepeatedTransformerBlock(block_cfg).to("cuda").to(self.dtype)
@@ -468,18 +474,20 @@ class FSDPModeReproducer(BaseReproducer):
         """
         Verify that per-kernel int16 checksums are identical across all layers.
 
-        With shared weights and a fixed reference input every layer runs the
-        same comm kernel (all_gather of rank-filled shard) and the same compute
-        kernel (GEMM + GELU with shared W and fixed reference_input).  Both the
-        input and output of each kernel are checksummed via reinterpret-cast to
-        int16 → int64 sum, so every bit contributes with zero information loss.
+        With a shared transformer block and a fixed reference input every layer
+        runs the same comm kernel (all_gather of rank-filled shard) and the same
+        compute kernel (the shared RepeatedTransformerBlock on reference_input).
+        Both the input and output of each kernel are checksummed via
+        reinterpret-cast to int16 → int64 sum, so every bit contributes with zero
+        information loss.
 
         Four checksums per layer:
           comm_input    -- param shard before all_gather (should be identical:
                            every shard is filled with float(rank))
           comm_output   -- full_param after all_gather
-          compute_input -- reference_input fed to GEMM (constant across layers)
-          compute_output-- activation after GELU
+          compute_input -- reference_input fed to the transformer block
+                           (constant across layers)
+          compute_output-- transformer block output
 
         If comm_output diverges but comm_input matches, corruption is in the
         collective (RCCL / NIC path).  If compute_output diverges but

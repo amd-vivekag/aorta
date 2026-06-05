@@ -96,14 +96,14 @@ workload_config:
   # model_dim=1024, num_layers=24: attention + FFN per layer, forward + backward,
   # approximates ~500ms/step on MI355X.
   #
-  # shared_layer_weights=true: all 24 layers share one weight matrix (fixed seed=0)
-  # and each layer independently receives the same fixed reference input (seed=1)
-  # rather than chaining activations layer-to-layer.  This makes every layer's
-  # forward output analytically identical so _verify_layer_activations() can serve
-  # as a second independent corruption signal alongside the collective-buffer
-  # pattern check: a mismatch across layers means an all_gather corruption on that
-  # layer propagated through GEMM compute -- something the rank-fill pattern check
-  # on full_param alone cannot catch.
+  # shared_layer_weights=true: all 24 layers run one shared transformer block
+  # (fixed seed=0) on the same fixed reference input (seed=1) rather than chaining
+  # activations layer-to-layer.  This makes every layer's forward output
+  # analytically identical so _verify_layer_checksums() can serve as a second
+  # independent corruption signal alongside the collective-buffer pattern check:
+  # a per-layer compute_output checksum mismatch means that layer's compute path
+  # was corrupted -- something the rank-fill pattern check on full_param alone
+  # cannot catch.
   simulate_compute: true
   compute_type: transformer
   model_dim: 1024

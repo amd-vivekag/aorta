@@ -181,14 +181,16 @@ class ReproducerConfig:
 
     shared_layer_weights: bool = False
     """
-    Use a single shared weight matrix for all layers (transformer compute type).
+    Use a single shared transformer block for all layers (transformer compute type).
 
-    When True, all num_layers layers use the same weight matrix initialized with
-    a fixed seed, and each layer receives the same fixed reference input rather
-    than chaining activations.  This makes per-layer forward outputs analytically
-    identical so that cross-layer activation comparison can serve as a secondary
-    corruption signal: any all_gather corruption that propagates through GEMM
-    compute will produce a mismatch between layer outputs.
+    When True, all num_layers layers run the SAME RepeatedTransformerBlock
+    (one block built with a fixed seed) on the SAME fixed reference input, rather
+    than chaining activations.  This makes every layer's forward output
+    analytically identical, so cross-layer comparison of the per-kernel checksums
+    becomes a secondary corruption signal: if a layer's compute_output checksum
+    diverges from the others, that layer's compute path was corrupted.  (The
+    collective path is checked separately via the comm_input/comm_output
+    checksums on each layer's all_gather.)
 
     Only meaningful when compute_type == 'transformer'.
     """
