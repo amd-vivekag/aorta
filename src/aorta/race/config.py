@@ -179,6 +179,25 @@ class ReproducerConfig:
     include_backward_compute: bool = True
     """Also simulate backward pass (doubles compute time)."""
 
+    real_backward: bool = False
+    """
+    Run a REAL autograd backward on the shared transformer block instead of the
+    forward-rerun timing proxy (shared-weight transformer path only).
+
+    When True, _backward_layer runs a grad-enabled forward + loss.backward() so
+    genuine gradient kernels execute over the AINIC collectives (real backward
+    compute + memory traffic). Gradients are computed then discarded -- they are
+    NOT sent through reduce_scatter and no optimizer step is taken, so the
+    existing detector (deterministic forward checksums + rank-fill /
+    reduce_scatter-sum invariants) is fully preserved.
+
+    Future (tracked, not in this change): routing real grads through
+    reduce_scatter + an optimizer step with a per-layer gradient checksum
+    (Option 2), and a real torch.distributed.fsdp workload (PR D).
+
+    No effect unless compute_type == 'transformer' and shared_layer_weights.
+    """
+
     shared_layer_weights: bool = False
     """
     Use a single shared transformer block for all layers (transformer compute type).

@@ -111,6 +111,14 @@ workload_config:
   include_backward_compute: true
   shared_layer_weights: true
 
+  # real_backward: run a REAL autograd backward (genuine gradient kernels over
+  # the AINIC collectives) instead of the forward-rerun timing proxy. Grads are
+  # discarded -- not routed through reduce_scatter, no optimizer step -- so the
+  # per-layer checksum detector + rank-fill/reduce_scatter-sum invariants are
+  # preserved. The war room asked for real gradients; flip to false for the
+  # cheaper timing-proxy backward.
+  real_backward: true
+
 cells:
   # ------------------------------------------------------------------
   # Cell 1: baseline -- GDR flush disabled (default), bug exposed
@@ -127,6 +135,13 @@ cells:
       NCCL_PROTO: "Simple"
       NCCL_DEBUG: "INFO"
       RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      # Force GPUDirect RDMA on -- the bug lives in the GDR path. Without these
+      # the banner shows "GDR 0" (NIC goes via host bounce, race cannot occur)
+      # and a clean result is meaningless. SYS = allow GDR regardless of topo
+      # distance; DMABUF_ENABLE=1 because the banner showed dmabuf disabled.
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 2: GDR flush -- primary mitigation (path b fix)
@@ -148,6 +163,9 @@ cells:
       RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
       NCCL_PROTO: "Simple"
       NCCL_DEBUG: "INFO"
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 3: PCIe strict ordering -- secondary candidate (path a fix)
@@ -173,6 +191,9 @@ cells:
       NCCL_PROTO: "Simple"
       NCCL_DEBUG: "INFO"
       RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 4: GDR flush + strict PCIe -- combined
@@ -190,6 +211,9 @@ cells:
       NCCL_IB_PCI_RELAXED_ORDERING: "0"
       NCCL_PROTO: "Simple"
       NCCL_DEBUG: "INFO"
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 5: LL protocol control -- suppression confirmed

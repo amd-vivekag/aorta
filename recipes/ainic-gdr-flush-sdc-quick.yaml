@@ -1,0 +1,102 @@
+# AINIC GDR-flush SDC -- ~1-HOUR matrix (3 cells, full iters).
+#
+# Trimmed from ainic-gdr-flush-sdc.yaml to fit a ~1-hour allocation while
+# keeping the decisive signal AND real sustained pressure. SAME model,
+# real_backward, and 200 iters as the full recipe -- only cells and trials are
+# cut. ~4 trials x 3 cells x 200 iters x ~1s/step + startup ~= 45-50 min.
+#
+# What changed vs the full recipe:
+#   cells:   5 -> 3   (dropped strict-pcie-ordering + gdr-flush-and-strict-pcie,
+#                      the secondary-characterization cells; kept the repro, the
+#                      fix, and the GDRDMA control)
+#   trials: 16 -> 4   (each trial = a fresh process group = a fresh cold QP =
+#                      one shot at the bug; 4 shots per cell)
+#   iters: 200 KEPT   (deliberately NOT cut. "Only iter-0 is vulnerable" is a
+#                      hypothesis, not proven, and the race needs SUSTAINED
+#                      L2->HBM pressure to widen the writeback window -- the
+#                      customer's own confirmation was an overnight run. Low iters
+#                      would undercut the very pressure real_backward exists to
+#                      create. Time is bought by cutting cells + trials instead.)
+#   real_backward KEPT: full L2/HBM fidelity preserved.
+#
+# PREREQUISITE -- GPUDirect RDMA must be ON. Set these in the LAUNCHER env
+# (export before Python starts), NOT in extra_env: NCCL reads them at library
+# load time (import torch), before the runner applies extra_env, so extra_env is
+# too late for them.
+#   export NCCL_NET_GDR_LEVEL=SYS NCCL_DMABUF_ENABLE=1 NCCL_NET_GDR_READ=1
+# Verify after the run: grep "GDR [01]" <log>  -> want "GDR 1" on the IB cells.
+#
+# Run (one rank per GPU; same command on every rank under your launcher):
+#   torchrun --nnodes=<N> --nproc-per-node=<G> --rdzv-backend=c10d \
+#     --rdzv-endpoint=<HEAD>:<PORT> \
+#     $(command -v aorta) triage run --recipe recipes/ainic-gdr-flush-sdc-quick.yaml
+# See recipes/README-running-recipes.md for the full launch contract.
+# Verdict (want baseline FAIL, gdr-flush PASS, ll-control PASS):
+#   cat triage_results/AINIC-SDC-001/race/<timestamp>/matrix.md
+
+schema_version: 1
+
+ticket: AINIC-SDC-001
+workload: race
+
+trials: 4
+steps: 200
+
+save_logs: true
+
+confound:
+  threshold: 1.15
+  baseline_cell: baseline-no-gdr-flush
+
+workload_config:
+  mode: fsdp
+  warmup_iterations: 0
+  verify_iterations: 200
+  stop_on_first_corruption: false
+  log_interval: 1
+  dtype: bfloat16
+  fsdp_shard_size: 1000000
+  simulate_compute: true
+  compute_type: transformer
+  model_dim: 1024
+  num_layers: 24
+  include_backward_compute: true
+  shared_layer_weights: true
+  real_backward: true
+
+cells:
+  # Cell 1: baseline -- GDR flush disabled (default), bug exposed.
+  - name: baseline-no-gdr-flush
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
+
+  # Cell 2: GDR flush -- primary mitigation. Expected clean.
+  - name: gdr-flush
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_GDR_FLUSH_DISABLE: "0"
+      RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
+      NCCL_PROTO: "Simple"
+      NCCL_DEBUG: "INFO"
+      NCCL_NET_GDR_LEVEL: "SYS"
+      NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
+
+  # Cell 3: LL protocol control -- GDRDMA bypassed, expected clean. Confirms the
+  # GDRDMA send path is the necessary condition. (GDR 0 here is BY DESIGN.)
+  - name: ll-protocol-control
+    mitigations: [none]
+    environment: local
+    extra_env:
+      NCCL_PROTO: "LL"
+      NCCL_GDR_FLUSH_DISABLE: "1"
+      NCCL_DEBUG: "INFO"
