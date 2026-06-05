@@ -322,6 +322,18 @@ class ReproducerResult:
     layer_checksum_mismatches: int = 0
     """Per-layer checksum mismatches found (0 on a clean run)."""
 
+    eff_num_heads: Optional[int] = None
+    """Resolved attention heads actually used (auto-derived when config=0)."""
+
+    eff_ffn_size: Optional[int] = None
+    """Resolved FFN intermediate size actually used (auto-derived when config=0)."""
+
+    eff_seq_len: Optional[int] = None
+    """Resolved sequence length of the reference input (transformer compute)."""
+
+    eff_batch_size: Optional[int] = None
+    """Resolved batch size of the reference input (transformer compute)."""
+
 
 # =============================================================================
 # Race Injection Config (broader aorta system)

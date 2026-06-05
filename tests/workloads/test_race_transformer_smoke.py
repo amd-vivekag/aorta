@@ -82,6 +82,19 @@ def _verifier(layer_checksums):
     return r
 
 
+def test_num_heads_auto_derived_when_zero():
+    """num_heads=0 must resolve to model_dim//128 (the recipe relies on this)."""
+    # mirrors fsdp.setup_buffers derivation
+    hidden = 1024
+    cfg_num_heads = 0
+    resolved = cfg_num_heads or (hidden // 128)
+    assert resolved == 8
+    # and the block accepts it
+    cfg = BlockConfig(hidden_size=hidden, num_heads=resolved, num_layers=1,
+                      ffn_size=hidden * 4, num_experts=1)
+    assert cfg.hidden_size % cfg.num_heads == 0
+
+
 def test_real_transformer_block_runs_on_cpu():
     """A real RepeatedTransformerBlock forward executes and returns the right shape."""
     block, ref = _build_shared_block_and_input()

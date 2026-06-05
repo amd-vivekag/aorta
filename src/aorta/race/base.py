@@ -539,6 +539,12 @@ class BaseReproducer(ABC):
             avg_step_time_ms=avg_step_ms,
             layers_verified=self.layers_verified,
             layer_checksum_mismatches=self.layer_checksum_mismatches,
+            # Resolved transformer shape (FSDP shared-weight path only; getattr
+            # keeps this safe for modes that don't set these).
+            eff_num_heads=getattr(self, "eff_num_heads", None),
+            eff_ffn_size=getattr(self, "eff_ffn_size", None),
+            eff_seq_len=getattr(self, "eff_seq_len", None),
+            eff_batch_size=getattr(self, "eff_batch_size", None),
         )
 
 

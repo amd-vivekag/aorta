@@ -92,6 +92,14 @@ class FSDPModeReproducer(BaseReproducer):
         self.reference_input: Optional[torch.Tensor] = None
         self.layer_checksums: List[Optional[dict]] = []
 
+        # Effective (resolved) transformer block shape. num_heads/ffn_size are
+        # auto-derived when 0, so the config value alone doesn't record what
+        # actually ran -- store the resolved values for the startup log + metrics.
+        self.eff_num_heads: Optional[int] = None
+        self.eff_ffn_size: Optional[int] = None
+        self.eff_seq_len: Optional[int] = None
+        self.eff_batch_size: Optional[int] = None
+
         # Real transformer block shared across all layers (shared-weight path)
         self.shared_block: Optional[RepeatedTransformerBlock] = None
 
@@ -173,6 +181,11 @@ class FSDPModeReproducer(BaseReproducer):
                         f"model_dim ({hidden}) must be divisible by num_heads "
                         f"({num_heads}) for shared-weight transformer compute"
                     )
+                # Record the resolved shape (num_heads/ffn may be auto-derived).
+                self.eff_num_heads = num_heads
+                self.eff_ffn_size = ffn
+                self.eff_seq_len = cfg.seq_len
+                self.eff_batch_size = cfg.batch_size
                 block_cfg = BlockConfig(
                     hidden_size=hidden,
                     num_heads=num_heads,
@@ -226,6 +239,11 @@ class FSDPModeReproducer(BaseReproducer):
             f"shared_layer_weights={cfg.shared_layer_weights}, "
             f"transformer_block={'active' if shared_active else 'none'}, "
             f"layer_checksum_verify={'ON' if shared_active else 'OFF'}"
+            + (
+                f", resolved_shape=heads:{self.eff_num_heads} ffn:{self.eff_ffn_size} "
+                f"seq:{self.eff_seq_len} batch:{self.eff_batch_size}"
+                if shared_active else ""
+            )
         )
 
     def _fill_patterns(self) -> None:
