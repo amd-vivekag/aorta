@@ -64,3 +64,4 @@ cells:
       # A good smoke shows "GDR 1" in the RCCL banner.
       NCCL_NET_GDR_LEVEL: "SYS"
       NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"

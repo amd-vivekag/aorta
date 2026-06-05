@@ -141,6 +141,7 @@ cells:
       # distance; DMABUF_ENABLE=1 because the banner showed dmabuf disabled.
       NCCL_NET_GDR_LEVEL: "SYS"
       NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 2: GDR flush -- primary mitigation (path b fix)
@@ -164,6 +165,7 @@ cells:
       NCCL_DEBUG: "INFO"
       NCCL_NET_GDR_LEVEL: "SYS"
       NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 3: PCIe strict ordering -- secondary candidate (path a fix)
@@ -191,6 +193,7 @@ cells:
       RCCL_GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING: "0"
       NCCL_NET_GDR_LEVEL: "SYS"
       NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 4: GDR flush + strict PCIe -- combined
@@ -210,6 +213,7 @@ cells:
       NCCL_DEBUG: "INFO"
       NCCL_NET_GDR_LEVEL: "SYS"
       NCCL_DMABUF_ENABLE: "1"
+      NCCL_NET_GDR_READ: "1"
 
   # ------------------------------------------------------------------
   # Cell 5: LL protocol control -- suppression confirmed
