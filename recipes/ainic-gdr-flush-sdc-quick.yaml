@@ -1,18 +1,23 @@
-# AINIC GDR-flush SDC -- 1-HOUR QUICK matrix (3 cells).
+# AINIC GDR-flush SDC -- ~1-HOUR matrix (3 cells, full iters).
 #
 # Trimmed from ainic-gdr-flush-sdc.yaml to fit a ~1-hour allocation while
-# keeping the decisive signal. SAME model + real_backward as the full recipe
-# (full L2/HBM pressure preserved -- that is why real_backward stays on).
+# keeping the decisive signal AND real sustained pressure. SAME model,
+# real_backward, and 200 iters as the full recipe -- only cells and trials are
+# cut. ~4 trials x 3 cells x 200 iters x ~1s/step + startup ~= 45-50 min.
 #
 # What changed vs the full recipe:
 #   cells:   5 -> 3   (dropped strict-pcie-ordering + gdr-flush-and-strict-pcie,
 #                      the secondary-characterization cells; kept the repro, the
 #                      fix, and the GDRDMA control)
-#   trials: 16 -> 8   (each trial = a fresh process group = a fresh cold QP =
-#                      one shot at the iter-0 bug; 8 shots per cell)
-#   iters: 200 -> 5   (only iter-0 is vulnerable; 5 confirms iters 1-4 stay
-#                      clean. The 200-iter throughput-confirmation is a full-run
-#                      concern, not needed for the repro verdict.)
+#   trials: 16 -> 4   (each trial = a fresh process group = a fresh cold QP =
+#                      one shot at the bug; 4 shots per cell)
+#   iters: 200 KEPT   (deliberately NOT cut. "Only iter-0 is vulnerable" is a
+#                      hypothesis, not proven, and the race needs SUSTAINED
+#                      L2->HBM pressure to widen the writeback window -- the
+#                      customer's own confirmation was an overnight run. Low iters
+#                      would undercut the very pressure real_backward exists to
+#                      create. Time is bought by cutting cells + trials instead.)
+#   real_backward KEPT: full L2/HBM fidelity preserved.
 #
 # PREREQUISITE -- GPUDirect RDMA must be ON (set in the LAUNCHER env, not here;
 # recipe extra_env does not reach the NCCL worker for these). run-cell.sbatch
@@ -28,8 +33,8 @@ schema_version: 1
 ticket: AINIC-SDC-001
 workload: race
 
-trials: 8
-steps: 5
+trials: 4
+steps: 200
 
 save_logs: true
 
@@ -40,7 +45,7 @@ confound:
 workload_config:
   mode: fsdp
   warmup_iterations: 0
-  verify_iterations: 5
+  verify_iterations: 200
   stop_on_first_corruption: false
   log_interval: 1
   dtype: bfloat16
