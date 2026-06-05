@@ -53,8 +53,12 @@ Launch contract (read once):
   line via `srun` / `torchrun`).
 - Run the **same** command on every rank. Only rank 0 writes result artifacts;
   other ranks participate in the collectives.
-- A recipe's per-cell environment variables are applied by the runner
-  automatically — do **not** set them yourself.
+- A recipe's per-cell environment variables are applied by the runner, but note
+  that variables read by a library **at process startup** (notably `NCCL_*` /
+  `RCCL_*`, which the NCCL/RCCL worker reads when the process group initializes)
+  may not be picked up reliably from recipe `extra_env`. Set those in the
+  **launcher environment** (export them in the shell/script that runs
+  `torchrun`/`srun`) and verify they took effect in the run log.
 - Topology (rank count, ranks-per-host) is the launcher's responsibility.
 
 ## 5. Read results
