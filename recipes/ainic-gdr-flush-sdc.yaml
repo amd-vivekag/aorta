@@ -111,6 +111,14 @@ workload_config:
   include_backward_compute: true
   shared_layer_weights: true
 
+  # real_backward: run a REAL autograd backward (genuine gradient kernels over
+  # the AINIC collectives) instead of the forward-rerun timing proxy. Grads are
+  # discarded -- not routed through reduce_scatter, no optimizer step -- so the
+  # per-layer checksum detector + rank-fill/reduce_scatter-sum invariants are
+  # preserved. The war room asked for real gradients; flip to false for the
+  # cheaper timing-proxy backward.
+  real_backward: true
+
 cells:
   # ------------------------------------------------------------------
   # Cell 1: baseline -- GDR flush disabled (default), bug exposed

@@ -365,6 +365,11 @@ class FSDPModeReproducer(BaseReproducer):
         1. all_gather: reconstruct full parameter (freed after forward)
         2. GEMM backward: compute gradient (if enabled)
         3. reduce_scatter: shard gradients back across ranks
+
+        Shared-transformer path: with config.real_backward=True, runs a genuine
+        autograd backward (grad-enabled forward + loss.backward()) so real
+        gradient kernels execute; grads are discarded. Otherwise re-runs the
+        forward under no_grad as a backward timing proxy.
         """
         # all_gather: reconstruct full parameter for backward
         dist.all_gather_into_tensor(
@@ -374,11 +379,29 @@ class FSDPModeReproducer(BaseReproducer):
         # Backward compute (if enabled)
         if self.config.simulate_compute and self.config.include_backward_compute:
             if self.shared_block is not None:
-                # Shared-transformer path: re-run forward as a backward timing
-                # proxy (we don't train, so an exact bwd kernel isn't needed —
-                # only the comm/compute overlap timing matters here).
-                with torch.no_grad():
-                    _ = self.shared_block(self.reference_input)
+                if self.config.real_backward:
+                    # Real backward: grad-enabled forward + loss.backward() so
+                    # genuine gradient kernels run over the same shared block.
+                    # Loss in fp32 to avoid bf16 underflow. Grads are discarded
+                    # (not routed through reduce_scatter, no optimizer step) so
+                    # the deterministic forward checksums and the rank-fill /
+                    # reduce_scatter-sum invariants are untouched. requires_grad
+                    # on the INPUT guarantees a real backward graph even if the
+                    # block params were built with requires_grad=False.
+                    ri = self.reference_input.detach().requires_grad_(True)
+                    out = self.shared_block(ri)
+                    loss = out.float().sum()
+                    loss.backward()
+                    self.shared_block.zero_grad(set_to_none=True)
+                    # free graph references promptly (per-layer, so peak memory
+                    # stays flat)
+                    del out, loss, ri
+                else:
+                    # Shared-transformer path: re-run forward as a backward timing
+                    # proxy (we don't train, so an exact bwd kernel isn't needed —
+                    # only the comm/compute overlap timing matters here).
+                    with torch.no_grad():
+                        _ = self.shared_block(self.reference_input)
             elif self.weight_matrices:
                 self.grad_buffer = torch.mm(
                     self.weight_matrices[layer_idx].T, self.grad_buffer
