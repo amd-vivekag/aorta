@@ -95,7 +95,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.6) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.7) [PARTIAL]
   runtime:   baremetal / python=venv
   build_sys: none
   rocm:      7.2.1 (dev: None)
@@ -103,7 +103,8 @@ Wrote env probe to /tmp/env.json (schema_version=1.6) [PARTIAL]
   hipblaslt: 1.2.2 rocm_release_tweak=dabb6df2b9
   rocblas:   5.2.0 rocm_release_tweak=dabb6df2b9
   miopen:    3.5.1 rocm_release_tweak=dabb6df2b9
-  rccl:      2.27.7 (code=22707)
+  rccl:      2.27.7 (code=22707) net_plugin=external [librccl-net.so]
+  nics:      broadcom(fw=232.0.219.16/pkg 232.1.196.16 links=8/8)  cx7(fw=28.36.1010 (FB_0000000038) links=0/0)
   gpu_arch:  ['gfx942'] (counts={'gfx942': 8})
   host:      kernel=5.15.0-174-generic machine=x86_64  glibc=2.35
   ck:        system=1.2.0/23d531c8  ck_tile=yes  libtorch_hip=4067 ck:: syms
@@ -184,7 +185,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.6"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.7"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -194,8 +195,9 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `hipblaslt` | `dict` | header parse + `sha256(libhipblaslt.so)` + sorted-filenames hash of `lib/hipblaslt/library/*` | `rocm_release_tweak` (NOT a per-hipBLASLt commit -- it's the ROCm release identifier shared across every library in a release; see note below), `package_version`, `lib_hash`, `kernel_db_revision`, `applied_prs: {}` |
 | `rocblas` | `dict` | header parse + `sha256(librocblas.so)` + sorted-filenames hash of `lib/rocblas/library/*` | Same shape as `hipblaslt`. Header lives at `include/rocblas/internal/rocblas-version.h`. |
 | `miopen` | `dict` | header parse + `sha256(libMIOpen.so)` + sorted-filenames hash of `share/miopen/db/*.txt` | `rocm_release_tweak`, `package_version`, `lib_hash`, `kernel_db_revision`. MIOpen drives convolution kernels on ROCm; kernel-DB drift changes which conv kernel runs. |
-| `rccl` | `dict` | header parse for `NCCL_VERSION_CODE` + `sha256(librccl.so)` | `version_code` (raw int, e.g. `22707`), `version` (decoded `"2.27.7"`), `lib_hash`. RCCL is AMD's NCCL-compatible collectives library. |
+| `rccl` | `dict` | header parse for `NCCL_VERSION_CODE` + `sha256(librccl.so)` + resolve+hash of `NCCL_NET_PLUGIN` + best-effort `sha256` of `librccl-anp.so`/`librccl-net.so` in the lib dir | `version_code` (raw int, e.g. `22707`), `version` (decoded `"2.27.7"`), `lib_hash`, `net_plugin_mode` (`"external"`/`"internal"`/`"unknown"`), `plugin_path`, `plugin_lib_hash`, `anp_lib_hash`, `net_lib_hash`. RCCL is AMD's NCCL-compatible collectives library. **`plugin_path`/`plugin_lib_hash` are the authoritative net-plugin signal**: `NCCL_NET_PLUGIN` is resolved to a real `.so` (absolute path, or bare name found on `LD_LIBRARY_PATH` then the rccl lib dir) and *that* file is hashed -- this is how a real AMD-ANP deployment ships the plugin (`librccl-net.so` under a user-build tree, not `librccl-anp.so` in `/opt/rocm/lib`). `net_plugin_mode` is `"external"` when `NCCL_NET_PLUGIN` resolves, `"internal"` when it is unset/empty (built-in net-ib), and `"unknown"` when it is set but unresolvable (misconfigured launcher -- this records a `partial_reason`; the unset case does not). `anp_lib_hash`/`net_lib_hash` are a best-effort scan of the rccl lib dir for the packaged-install case; `null` when absent (documented absence, no `partial`). |
 | `gpu_arch` | `dict` | `rocm_agent_enumerator` subprocess (no `/dev/kfd` access typically required) | `agent_count`, `gfx_targets` (sorted unique), `agent_arch_counts` (per-arch distribution -- captures both homogeneous and mixed-arch boxes). |
+| `nics` | `dict` | `lspci` presence gate + `ethtool -i` + `ibv_devices` + `rdma link` (Tier-1, sudo-free); AINIC adds `nicctl` via `sudo -n` (Tier-2) | Multi-vendor RoCE NIC/fabric stack keyed by vendor (`ainic`/`broadcom`/`cx7`), schema 1.7 (issue #202). Each vendor: `present` (bool, from `lspci -d <id>`). When present: `driver_version`, `firmware`, `pkg_version` (Broadcom's `<fw>/pkg <pkg>` split out; `null` when absent or equal to `firmware`), `rdma_devices` (list), `links` (`[{device, state, netdev}]`). **RDMA devices and links are bound to a vendor by their kernel driver** (resolved via the sysfs `device/driver` symlink — `ionic`/`bnxt_en`/`mlx5_core`), NOT by device-name prefix, because device names vary by host (e.g. `ionic_0` vs `rdma3`). AINIC-only Tier-2: `nicctl_version`, `card` (`asic`/`host_sw`/`firmware`/`uuid`), `profile` (`device_config`/`sriov`), `dcqcn` (`enabled`/`token_bucket_size`/`ai_rate`/`hai_rate`/`cnp_dscp`; the DCQCN query targets the first resolved AINIC RDMA device). **Documented absence**: vendor absent from `lspci` -> `{"present": false}`, no `partial`; present with zero RDMA devices is valid. AINIC Tier-2 output layouts are tolerant-parsed and pending confirmation against real `nicctl` capture. |
 | `host` | `dict` | `os.uname()` + `os.confstr("CS_GNU_LIBC_VERSION")` | `kernel_release`, `kernel_version`, `machine`, `glibc_version`. Kernel + glibc drift is the #1 confound for compiled-against-vs-runtime issues with C++ extensions. |
 | `composable_kernel` | `dict` | header at `include/ck/version.h` + `nm -D` of `libtorch_hip.so` piped through `c++filt` + `torch.__config__.show()` flag scan | Two sub-blocks (`system: {version, commit, ck_tile_present}`, `pytorch_bundled: {present, symbol_count}`) plus top-level `pytorch_use_ck_sdpa` / `pytorch_use_ck_gemm` booleans (build-time flags baked into the wheel; NOT runtime env vars). System and bundled CK can drift independently. |
 | `tensile` | `dict` | optional `import Tensile` + sorted-filenames hash over the union of hipBLASLt + rocBLAS kernel DBs | `package_version` (usually `null` outside builders), `kernel_db_combined_hash` |
@@ -375,7 +377,50 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.6` (current)
+### `1.7` (current)
+
+RCCL net-plugin identity + multi-vendor NIC/RoCE fabric capture
+(issue #202). Both additive; the new top-level `nics` block is what
+drives the version bump.
+
+* New top-level **`nics`** block keyed by vendor (`ainic`, `broadcom`,
+  `cx7`). Each vendor has a Tier-0 `present` gate (`lspci -d
+  <vendor>:<device>`); when present, Tier-1 sudo-free fields
+  `driver_version` (sysfs `/sys/module/<drv>/version`, falling back to
+  `ethtool -i` `version:` -- the sysfs file does not exist for in-tree
+  `mlx5_core`/`bnxt_en` on modern kernels), `firmware` (`ethtool -i`
+  `firmware-version:`, with Broadcom's `<fw>/pkg <pkg>` form split into
+  `firmware` + `pkg_version`), `rdma_devices` (`ibv_devices`), and `links`
+  (`rdma link` -> `[{device, state, netdev}]`). RDMA devices/links are
+  bound to a vendor by their kernel driver (sysfs `device/driver`
+  symlink), not by device-name prefix, since names vary by host
+  (`ionic_0` vs `rdma3`). AINIC additionally gets
+  Tier-2 `nicctl` fields (`nicctl_version`, `card`, `profile`, `dcqcn`)
+  via `sudo -n`. **Documented absence**: a vendor not in `lspci` is
+  `{"present": false}` with no `partial`; a present vendor with zero RDMA
+  devices (observed on CX7) is valid, not partial. Only an
+  expected-but-failed capture (tool times out, sudo denied) records a
+  reason. `EnvSnapshot.nics` uses `field(default_factory=dict)` so a
+  <=1.6 snapshot round-trips via `from_dict()`.
+* `rccl` gained five nested keys: `net_plugin_mode`
+  (`"external"`/`"internal"`/`"unknown"`), `plugin_path`,
+  `plugin_lib_hash`, `anp_lib_hash`, and `net_lib_hash`. The
+  authoritative signal is `plugin_path`/`plugin_lib_hash`: the probe
+  resolves `NCCL_NET_PLUGIN` to a real `.so` (absolute path or bare name
+  on `LD_LIBRARY_PATH`/lib dir) and hashes it -- matching how real
+  AMD-ANP ships the plugin (`librccl-net.so` in a user-build tree).
+  `anp_lib_hash`/`net_lib_hash` remain a best-effort lib-dir scan for
+  packaged installs. All reuse `_hash_shared_library` (no new hashing
+  logic). `net_plugin_mode` is derived (see the field table); the
+  `"unknown"` case (env set but unresolvable) records a `partial_reason`,
+  every other case is silent. These are nested keys under the existing
+  `rccl` dict, so a reader loading an older snapshot must guard with
+  `.get(...)`.
+* Buck: `KNOWN_LIBRARY_PATTERNS` gained an `"ainic"` key matching
+  `:rccl-anp(-lib)` / `:rccl-net(-lib)` targets, so the ANP/net plugin
+  surfaces in `library_introspection` like `rccl`.
+
+### `1.6`
 
 Additive change to `library_introspection` (PR #187, issue #183):
 
@@ -816,6 +861,9 @@ sources are:
 | `miopen.kernel_db_revision` | sha256 of sorted filenames of `*.txt` under `/opt/rocm/share/miopen/db/` (changes when conv-kernel set changes; the `MIOPEN_SYSTEM_DB_PATH` env var overrides this directory at runtime) |
 | `rccl.version_code` / `rccl.version` | `NCCL_VERSION_CODE` define in `/opt/rocm/include/rccl/rccl.h`, decoded into `MAJOR.MINOR.PATCH` |
 | `rccl.lib_hash` | `sha256(/opt/rocm/lib/librccl.so)` resolved through symlinks |
+| `rccl.plugin_path` / `rccl.plugin_lib_hash` | `NCCL_NET_PLUGIN` resolved to a real regular file (absolute path, or bare name searched on `LD_LIBRARY_PATH` then `/opt/rocm/lib`) and `sha256`'d through symlinks. Both `null` when `NCCL_NET_PLUGIN` is unset or unresolvable. When it resolves but the file can't be read to hash, `plugin_path` is still populated while `plugin_lib_hash` is `null` (and a `partial_reason` is recorded). |
+| `rccl.anp_lib_hash` / `rccl.net_lib_hash` | best-effort `sha256(/opt/rocm/lib/librccl-anp.so)` / `sha256(/opt/rocm/lib/librccl-net.so)` for packaged installs; `null` when absent (documented absence, no `partial`) |
+| `rccl.net_plugin_mode` | derived: `"external"` when `NCCL_NET_PLUGIN` resolves to a real `.so`; `"internal"` when unset/empty; `"unknown"` when set but unresolvable (records a `partial_reason`) |
 | `gpu_arch.*` | `rocm_agent_enumerator` subprocess (one gfx-target per detected GPU on stdout); `gfx000` placeholder filtered out |
 | `host.kernel_release` / `kernel_version` / `machine` | `os.uname()` |
 | `host.glibc_version` | `os.confstr("CS_GNU_LIBC_VERSION")` with the redundant `"glibc "` prefix stripped (so the value is the bare version string, e.g. `"2.35"`); returns `null` on non-glibc systems like musl / macOS |

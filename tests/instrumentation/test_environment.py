@@ -164,6 +164,8 @@ class TestPathConstants:
             "MIOPEN_KERNEL_DB_DIR",
             "RCCL_VERSION_HEADER",
             "RCCL_LIB_DIR",
+            "SYS_CLASS_NET",
+            "SYS_CLASS_INFINIBAND",
             "DOCKERENV_MARKER",
             "PODMAN_CONTAINERENV_MARKER",
             "CGROUP_FILE",
@@ -207,6 +209,8 @@ class TestPathConstants:
             "MIOPEN_KERNEL_DB_DIR",
             "RCCL_VERSION_HEADER",
             "RCCL_LIB_DIR",
+            "SYS_CLASS_NET",
+            "SYS_CLASS_INFINIBAND",
             "DOCKERENV_MARKER",
             "PODMAN_CONTAINERENV_MARKER",
             "CGROUP_FILE",
@@ -262,6 +266,7 @@ REQUIRED_TOP_KEYS = {
     "library_introspection",
     "library_introspection_alternates",
     "pytorch_sdpa",
+    "nics",
 }
 
 
@@ -271,7 +276,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.6"
+        assert snapshot.schema_version == "1.7"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -397,6 +402,11 @@ def _example_snapshot(**overrides) -> object:
             "version_code": 22707,
             "version": "2.27.7",
             "lib_hash": "sha256:rcclhash",
+            "net_plugin_mode": "external",
+            "plugin_path": "/apps/build/amd-anp/build/librccl-net.so",
+            "plugin_lib_hash": "sha256:pluginhash",
+            "anp_lib_hash": None,
+            "net_lib_hash": None,
         },
         "gpu_arch": {
             "agent_count": 8,
@@ -465,6 +475,20 @@ def _example_snapshot(**overrides) -> object:
             "backends_enabled": {
                 name: None for name in env_mod._PYTORCH_SDPA_GETTERS
             }
+        },
+        "nics": {
+            "ainic": {"present": False},
+            "broadcom": {
+                "present": True,
+                "driver_version": "6.9.0-0_fbk10_brcmrdma13_141_g9",
+                "firmware": "232.0.219.16/pkg 232.1.196.16",
+                "rdma_devices": ["bnxt_re0"],
+                "links": [
+                    {"device": "bnxt_re0", "state": "ACTIVE", "netdev": "benic7p1"}
+                ],
+            },
+            "cx7": {"present": True, "driver_version": None, "firmware": None,
+                    "rdma_devices": [], "links": []},
         },
     }
     base.update(overrides)
@@ -942,6 +966,16 @@ class TestCollectEnvContract:
         assert "collect_env: boom" in snap.partial_reasons
         # JSON-native check (no default=str needed)
         json.dumps(d)
+
+    def test_disaster_snapshot_nics_block_is_fully_shaped(self):
+        """The disaster path shapes nics like every other block (all
+        vendor keys present, undeterminable presence) -- not an empty
+        dict -- so downstream diffs/parsers stay predictable."""
+        snap = env_mod._disaster_snapshot(
+            preceding_reasons=[], unexpected_reason="collect_env: boom"
+        )
+        assert set(snap.nics.keys()) == {"ainic", "broadcom", "cx7"}
+        assert all(snap.nics[v] == {"present": None} for v in snap.nics)
 
     def test_disaster_snapshot_populates_every_envsnapshot_field(self):
         """Hard guard against a future PR adding a field to EnvSnapshot
@@ -3541,6 +3575,11 @@ class TestRccl:
             "version_code",
             "version",
             "lib_hash",
+            "net_plugin_mode",
+            "plugin_path",
+            "plugin_lib_hash",
+            "anp_lib_hash",
+            "net_lib_hash",
         }
 
     def test_decode_modern_version_code(self):
@@ -3583,7 +3622,687 @@ class TestRccl:
         assert block["version_code"] == 22707
         assert block["version"] == "2.27.7"
         assert block["lib_hash"] is not None
+        # NCCL_NET_PLUGIN unset -> internal mode, no plugin path/hash.
+        assert block["net_plugin_mode"] == "internal"
+        assert block["plugin_path"] is None
+        assert block["plugin_lib_hash"] is None
+        assert block["anp_lib_hash"] is None
+        assert block["net_lib_hash"] is None
         assert reasons == []
+
+    def _rccl_dirs(self, tmp_path: Path, monkeypatch):
+        """Set up a librccl.so + header so the install reads as present.
+
+        Also clears LD_LIBRARY_PATH so plugin resolution is deterministic
+        (only the dirs the test sets up are searched).
+        """
+        header_dir = tmp_path / "include"
+        header_dir.mkdir()
+        (header_dir / "rccl.h").write_text("#define NCCL_VERSION_CODE 22707\n")
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "librccl.so").write_bytes(b"rccl-bytes")
+        monkeypatch.setattr(env_mod, "RCCL_VERSION_HEADER", header_dir / "rccl.h")
+        monkeypatch.setattr(env_mod, "RCCL_LIB_DIR", lib_dir)
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+        return lib_dir
+
+    def test_net_plugin_external_via_absolute_path(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # Real ANP deployment: NCCL_NET_PLUGIN points at an absolute path
+        # to librccl-net.so in a user-build tree (NOT /opt/rocm/lib).
+        self._rccl_dirs(tmp_path, monkeypatch)
+        anp_build = tmp_path / "apps" / "amd-anp" / "build"
+        anp_build.mkdir(parents=True)
+        plugin = anp_build / "librccl-net.so"
+        plugin.write_bytes(b"anp-net-bytes")
+        isolated_env.setenv("NCCL_NET_PLUGIN", str(plugin))
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "external"
+        assert block["plugin_path"] == str(plugin)
+        assert block["plugin_lib_hash"] is not None
+        assert reasons == []
+
+    def test_plugin_lib_hash_is_resolved_file_not_sibling(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # plugin_lib_hash must hash exactly the resolved plugin file, not
+        # a higher-versioned sibling in the same dir (the _hash_shared_library
+        # fallback risk). Place a sibling with different bytes alongside.
+        self._rccl_dirs(tmp_path, monkeypatch)
+        anp_build = tmp_path / "apps" / "amd-anp" / "build"
+        anp_build.mkdir(parents=True)
+        plugin = anp_build / "librccl-net.so"
+        plugin.write_bytes(b"the-real-resolved-plugin")
+        sibling = anp_build / "librccl-net.so.9.9.9"
+        sibling.write_bytes(b"a-different-sibling-build")
+        isolated_env.setenv("NCCL_NET_PLUGIN", str(plugin))
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "external"
+        assert block["plugin_lib_hash"] == env_mod._hash_file_path(plugin)
+        assert block["plugin_lib_hash"] != env_mod._hash_file_path(sibling)
+        assert reasons == []
+
+    def test_net_plugin_external_via_ld_library_path(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # Bare-name form: NCCL_NET_PLUGIN=librccl-net.so resolved through
+        # an LD_LIBRARY_PATH entry.
+        self._rccl_dirs(tmp_path, monkeypatch)
+        anp_build = tmp_path / "apps" / "amd-anp" / "build"
+        anp_build.mkdir(parents=True)
+        plugin = anp_build / "librccl-net.so"
+        plugin.write_bytes(b"anp-net-bytes")
+        monkeypatch.setenv("LD_LIBRARY_PATH", str(anp_build))
+        isolated_env.setenv("NCCL_NET_PLUGIN", "librccl-net.so")
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "external"
+        assert block["plugin_path"] == str(plugin)
+        assert block["plugin_lib_hash"] is not None
+        assert reasons == []
+
+    def test_net_plugin_external_bare_name_normalised(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # NCCL normalises a bare "ncclnet"-style name; we accept the
+        # common forms. Here the env value omits the lib prefix / .so.
+        self._rccl_dirs(tmp_path, monkeypatch)
+        anp_build = tmp_path / "anp"
+        anp_build.mkdir()
+        plugin = anp_build / "librccl-net.so"
+        plugin.write_bytes(b"anp-net-bytes")
+        monkeypatch.setenv("LD_LIBRARY_PATH", str(anp_build))
+        isolated_env.setenv("NCCL_NET_PLUGIN", "rccl-net")
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "external"
+        assert block["plugin_path"] == str(plugin)
+        assert reasons == []
+
+    def test_net_plugin_internal_when_env_unset(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # An ANP .so present in the rccl lib dir is still "internal" when
+        # the operator did not opt in via NCCL_NET_PLUGIN.
+        lib_dir = self._rccl_dirs(tmp_path, monkeypatch)
+        (lib_dir / "librccl-net.so").write_bytes(b"anp-bytes")
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "internal"
+        assert block["plugin_path"] is None
+        assert block["plugin_lib_hash"] is None
+        # Packaged-install best-effort scan still records the lib-dir hash.
+        assert block["net_lib_hash"] is not None
+        assert reasons == []
+
+    def test_net_plugin_internal_when_env_whitespace_only(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # NCCL_NET_PLUGIN exported as whitespace is equivalent to unset:
+        # the documented "internal" case, NOT an unresolvable "unknown".
+        self._rccl_dirs(tmp_path, monkeypatch)
+        isolated_env.setenv("NCCL_NET_PLUGIN", "   ")
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "internal"
+        assert block["plugin_path"] is None
+        assert block["plugin_lib_hash"] is None
+        assert not any(r.startswith("rccl.net_plugin_mode") for r in reasons)
+
+    def test_net_plugin_unknown_when_env_set_but_unresolvable(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # Launcher asked for a plugin but it can't be found anywhere ->
+        # expected-but-failed capture: unknown + a partial reason.
+        self._rccl_dirs(tmp_path, monkeypatch)
+        isolated_env.setenv("NCCL_NET_PLUGIN", "/nonexistent/librccl-net.so")
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "unknown"
+        assert block["plugin_path"] is None
+        assert block["plugin_lib_hash"] is None
+        assert any(r.startswith("rccl.net_plugin_mode") for r in reasons)
+
+    def test_resolve_net_plugin_empty_returns_none(self):
+        assert env_mod._resolve_net_plugin("") is None
+        assert env_mod._resolve_net_plugin("   ") is None
+
+    def test_net_plugin_directory_is_not_external(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # NCCL_NET_PLUGIN pointing at a directory (or any non-regular
+        # file) must NOT resolve -- the runtime can't dlopen a directory.
+        self._rccl_dirs(tmp_path, monkeypatch)
+        a_dir = tmp_path / "not-a-plugin-dir"
+        a_dir.mkdir()
+        isolated_env.setenv("NCCL_NET_PLUGIN", str(a_dir))
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "unknown"
+        assert block["plugin_path"] is None
+        assert block["plugin_lib_hash"] is None
+        assert any(r.startswith("rccl.net_plugin_mode") for r in reasons)
+
+    def test_resolve_net_plugin_oserror_on_explicit_path_is_failsoft(
+        self, monkeypatch
+    ):
+        # Path.is_file() can raise (e.g. PermissionError when a parent dir
+        # is not traversable -- and on CPython < 3.12 it does NOT swallow
+        # it). The resolver must treat that as "does not resolve" and
+        # return None rather than letting the exception escape and trip
+        # the disaster snapshot. Force the raise so the contract is
+        # verified on every Python version, not just <3.12.
+        def _boom(self):  # noqa: ANN001
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(env_mod.Path, "is_file", _boom)
+        assert env_mod._resolve_net_plugin("/restricted/dir/librccl-net.so") is None
+
+    def test_net_plugin_unknown_does_not_break_capture_on_oserror(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # End-to-end: an explicit NCCL_NET_PLUGIN whose existence check
+        # raises OSError must degrade to net_plugin_mode="unknown" + a
+        # reason, and _capture_rccl must NOT raise.
+        self._rccl_dirs(tmp_path, monkeypatch)
+        isolated_env.setenv("NCCL_NET_PLUGIN", "/restricted/dir/librccl-net.so")
+        real_is_file = env_mod.Path.is_file
+
+        def _maybe_boom(self):  # noqa: ANN001
+            if str(self) == "/restricted/dir/librccl-net.so":
+                raise PermissionError(13, "Permission denied")
+            return real_is_file(self)
+
+        monkeypatch.setattr(env_mod.Path, "is_file", _maybe_boom)
+        reasons: list[str] = []
+        block = env_mod._capture_rccl(reasons)
+        assert block["net_plugin_mode"] == "unknown"
+        assert block["plugin_path"] is None
+        assert block["plugin_lib_hash"] is None
+        assert any(r.startswith("rccl.net_plugin_mode") for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# Multi-vendor NIC / RoCE fabric capture (issue #202, schema 1.7)
+# ---------------------------------------------------------------------------
+
+
+# Real output captured from a live node: 8x BCM57608 (Broadcom) + 2x
+# ConnectX-7 (CX7), no AINIC. Used verbatim as parser fixtures.
+_REAL_LSPCI_CX7 = (
+    "31:00.0 Ethernet controller: Mellanox Technologies MT2910 Family [ConnectX-7]\n"
+    "31:00.1 Ethernet controller: Mellanox Technologies MT2910 Family [ConnectX-7]\n"
+)
+_REAL_LSPCI_BROADCOM = (
+    "03:00.0 Ethernet controller: Broadcom Inc. and subsidiaries BCM57608 "
+    "25Gb/50Gb/100Gb/200Gb/400Gb Ethernet (rev 11)\n"
+)
+_REAL_IBV_DEVICES = (
+    "    device                 node GUID\n"
+    "    ------              ----------------\n"
+    "    bnxt_re0            d604e6fffe3e3890\n"
+    "    bnxt_re1            d604e6fffe3e4348\n"
+)
+_REAL_RDMA_LINK = (
+    "link bnxt_re0/1 state ACTIVE physical_state LINK_UP netdev benic7p1 \n"
+    "link bnxt_re1/1 state ACTIVE physical_state LINK_UP netdev benic8p1 \n"
+)
+# ethtool -i output captured verbatim from the real node (benic1p1 /
+# fenic0). Note: driver "version:" is a kernel-ish build string (same for
+# both NICs); firmware-version carries the meaningful per-NIC value, and
+# the CX7 form has a parenthesised suffix that must survive parsing.
+_REAL_ETHTOOL_BNXT = (
+    "driver: bnxt_en\n"
+    "version: 6.9.0-0_fbk10_brcmrdma13_141_g9\n"
+    "firmware-version: 232.0.219.16/pkg 232.1.196.16\n"
+    "expansion-rom-version: \n"
+    "bus-info: 0000:f3:00.0\n"
+)
+_REAL_ETHTOOL_CX7 = (
+    "driver: mlx5_core\n"
+    "version: 6.9.0-0_fbk10_brcmrdma13_141_g9\n"
+    "firmware-version: 28.36.1010 (FB_0000000038)\n"
+    "expansion-rom-version: \n"
+    "bus-info: 0000:31:00.0\n"
+)
+# Real output captured from a live AINIC host (8x gfx950, PR #208 review):
+# the RoCE devices are named rdma0..rdma7 (NOT ionic_*) and the netdevs
+# tw-eth0..7 -- the case that broke name-prefix matching.
+_AINIC_IBV_DEVICES = (
+    "    device                 node GUID\n"
+    "    ------              ----------------\n"
+    "    rdma0            ba0a90fffe1c0a00\n"
+    "    rdma1            ba0a90fffe1c0a01\n"
+    "    rdma2            ba0a90fffe1c0a02\n"
+    "    rdma3            ba0a90fffe1c0a03\n"
+    "    rdma4            ba0a90fffe1c0a04\n"
+    "    rdma5            ba0a90fffe1c0a05\n"
+    "    rdma6            ba0a90fffe1c0a06\n"
+    "    rdma7            ba0a90fffe1c0a07\n"
+)
+_AINIC_RDMA_LINK = "".join(
+    f"link rdma{i}/1 state ACTIVE physical_state LINK_UP netdev tw-eth{i} \n"
+    for i in range(8)
+)
+_AINIC_DCQCN = (
+    "dcqcn-profile 1\n"
+    "  enabled true\n"
+    "  token-bucket-size 800000\n"
+    "  ai-rate 160\n"
+    "  hai-rate 300\n"
+    "  cnp-dscp 48\n"
+)
+
+
+class TestNicsParsers:
+    """Pure-parser unit tests against real captured output shapes."""
+
+    def test_parse_ibv_devices_all_names(self):
+        # Returns ALL device names (column 0); vendor binding is the
+        # caller's job via sysfs driver, not a name-prefix filter here.
+        assert env_mod._parse_ibv_devices(_REAL_IBV_DEVICES) == [
+            "bnxt_re0",
+            "bnxt_re1",
+        ]
+        # Generic rdma<N> naming is parsed identically (the AINIC case).
+        assert env_mod._parse_ibv_devices(_AINIC_IBV_DEVICES) == [
+            f"rdma{i}" for i in range(8)
+        ]
+
+    def test_parse_ibv_devices_empty(self):
+        assert env_mod._parse_ibv_devices("") == []
+        assert env_mod._parse_ibv_devices(None) == []
+
+    def test_parse_rdma_link_shape(self):
+        links = env_mod._parse_rdma_link(_REAL_RDMA_LINK)
+        assert links == [
+            {"device": "bnxt_re0", "state": "ACTIVE", "netdev": "benic7p1"},
+            {"device": "bnxt_re1", "state": "ACTIVE", "netdev": "benic8p1"},
+        ]
+
+    def test_parse_rdma_link_down_state(self):
+        text = (
+            "link ionic_2/1 state DOWN physical_state DISABLED netdev enp137s0\n"
+        )
+        links = env_mod._parse_rdma_link(text)
+        assert links == [
+            {"device": "ionic_2", "state": "DOWN", "netdev": "enp137s0"}
+        ]
+
+    def test_parse_rdma_link_truncated_line_is_failsoft(self):
+        # A malformed/truncated line where a key token is last (no value)
+        # must NOT raise IndexError -- the field degrades to None.
+        text = "link bnxt_re0/1 state\n"
+        links = env_mod._parse_rdma_link(text)
+        assert links == [
+            {"device": "bnxt_re0", "state": None, "netdev": None}
+        ]
+
+    def test_sysfs_device_driver_resolves_symlink(self, tmp_path):
+        # The authoritative vendor binding: read <name>/device/driver and
+        # return its basename. Naming-independent (rdma0 -> ionic).
+        root = tmp_path / "class"
+        dev = root / "rdma0" / "device"
+        dev.mkdir(parents=True)
+        os.symlink("../../../bus/pci/drivers/ionic", dev / "driver")
+        assert env_mod._sysfs_device_driver(root, "rdma0") == "ionic"
+        assert env_mod._sysfs_device_driver(root, "missing") is None
+        assert env_mod._sysfs_device_driver(root, "") is None
+
+    def test_split_firmware_version(self):
+        # Broadcom glued form -> split; de-dup when the halves are equal.
+        assert env_mod._split_firmware_version(
+            "232.0.219.16/pkg 232.1.196.16"
+        ) == ("232.0.219.16", "232.1.196.16")
+        assert env_mod._split_firmware_version(
+            "232.0.219.16/pkg 232.0.219.16"
+        ) == ("232.0.219.16", None)
+        # CX7 parenthesised form (no /pkg) passes through unchanged.
+        assert env_mod._split_firmware_version(
+            "28.36.1010 (FB_0000000038)"
+        ) == ("28.36.1010 (FB_0000000038)", None)
+        assert env_mod._split_firmware_version(None) == (None, None)
+
+    def test_parse_ethtool_fields(self):
+        assert (
+            env_mod._parse_ethtool_field(_REAL_ETHTOOL_BNXT, "firmware-version")
+            == "232.0.219.16/pkg 232.1.196.16"
+        )
+        assert (
+            env_mod._parse_ethtool_field(_REAL_ETHTOOL_BNXT, "version")
+            == "6.9.0-0_fbk10_brcmrdma13_141_g9"
+        )
+        assert env_mod._parse_ethtool_field(_REAL_ETHTOOL_BNXT, "driver") == "bnxt_en"
+        assert env_mod._parse_ethtool_field(None, "version") is None
+        # CX7 firmware carries a parenthesised suffix that must survive.
+        assert (
+            env_mod._parse_ethtool_field(_REAL_ETHTOOL_CX7, "firmware-version")
+            == "28.36.1010 (FB_0000000038)"
+        )
+        # Empty field value -> None (not "").
+        assert (
+            env_mod._parse_ethtool_field(_REAL_ETHTOOL_CX7, "expansion-rom-version")
+            is None
+        )
+
+    def test_parse_nicctl_version_json_and_text(self):
+        assert (
+            env_mod._parse_nicctl_version('{"firmware": {"version": "1.117.5-a-56"}}')
+            == "1.117.5-a-56"
+        )
+        assert (
+            env_mod._parse_nicctl_version("Firmware version 1.1.1-salinaainicbase-1")
+            == "1.1.1-salinaainicbase-1"
+        )
+        assert env_mod._parse_nicctl_version("") is None
+
+
+class TestNicsCapture:
+    """_capture_nics() fail-soft + documented-absence matrix."""
+
+    def _fake_tools(self, present_tools, outputs):
+        """Build (fake_which, fake_run) for the given tools + command map.
+
+        outputs maps a tuple-of-argv -> (returncode, stdout). A missing
+        key returns ("", rc=0) i.e. empty success (documented absence).
+        """
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in present_tools else None
+
+        def fake_run(cmd, **kwargs):
+            # Strip a leading sudo -n -E wrapper for lookup.
+            argv = cmd
+            if argv[:3] == ["sudo", "-n", "-E"]:
+                argv = argv[3:]
+            rc, out = outputs.get(tuple(argv), (0, ""))
+            return subprocess.CompletedProcess(args=cmd, returncode=rc, stdout=out, stderr="")
+
+        return fake_which, fake_run
+
+    def _build_sysfs(
+        self, tmp_path, monkeypatch, *, netdevs=None, ib_devs=None, net_vendor=None
+    ):
+        """Build fake /sys/class/{net,infiniband} trees + monkeypatch roots.
+
+        netdevs:    {netdev_name: driver}  -> device/driver symlink
+        ib_devs:    {ib_name: driver}      -> device/driver symlink
+        net_vendor: {netdev_name: "0x14e4"} -> device/vendor file
+        """
+        net_root = tmp_path / "class_net"
+        ib_root = tmp_path / "class_ib"
+        net_root.mkdir(parents=True, exist_ok=True)
+        ib_root.mkdir(parents=True, exist_ok=True)
+
+        def _mk(root, name, driver=None, vendor=None):
+            dev = root / name / "device"
+            dev.mkdir(parents=True, exist_ok=True)
+            if driver is not None:
+                os.symlink(f"../../../bus/pci/drivers/{driver}", dev / "driver")
+            if vendor is not None:
+                (dev / "vendor").write_text(vendor + "\n")
+
+        netdevs = netdevs or {}
+        ib_devs = ib_devs or {}
+        net_vendor = net_vendor or {}
+        for name in set(netdevs) | set(net_vendor):
+            _mk(net_root, name, driver=netdevs.get(name), vendor=net_vendor.get(name))
+        for name, driver in ib_devs.items():
+            _mk(ib_root, name, driver=driver)
+        monkeypatch.setattr(env_mod, "SYS_CLASS_NET", net_root)
+        monkeypatch.setattr(env_mod, "SYS_CLASS_INFINIBAND", ib_root)
+
+    def test_no_lspci_records_one_reason_all_unknown(
+        self, isolated_env, monkeypatch
+    ):
+        fake_which, fake_run = self._fake_tools(set(), {})
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        assert set(nics.keys()) == {"ainic", "broadcom", "cx7"}
+        assert all(nics[v] == {"present": None} for v in nics)
+        assert any("lspci not on PATH" in r for r in reasons)
+
+    def test_vendor_absent_is_documented_absence(
+        self, isolated_env, monkeypatch
+    ):
+        # Only lspci present, returns empty for every vendor id.
+        fake_which, fake_run = self._fake_tools({"lspci"}, {})
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        assert nics["ainic"] == {"present": False}
+        assert nics["broadcom"] == {"present": False}
+        assert nics["cx7"] == {"present": False}
+        # No vendor was present -> nothing fell back -> NO partial.
+        assert reasons == []
+
+    def test_lspci_failure_is_undeterminable_not_absent(
+        self, isolated_env, monkeypatch
+    ):
+        # lspci runs but FAILS (non-zero) for one vendor: presence is
+        # undeterminable -> present=None + a reason, NOT a documented
+        # absence. Other vendors (clean empty exit) stay present=False.
+        fake_which, fake_run = self._fake_tools(
+            {"lspci"}, {("lspci", "-d", "1dd8:1002"): (1, "")}
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        assert nics["ainic"] == {"present": None}
+        assert nics["broadcom"] == {"present": False}
+        assert nics["cx7"] == {"present": False}
+        assert any(r.startswith("nics.ainic") for r in reasons)
+
+    def test_broadcom_tier1_full_capture(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # lspci present for broadcom; Tier-1 tools return real shapes.
+        outputs = {
+            ("lspci", "-d", "14e4:1760"): (0, _REAL_LSPCI_BROADCOM),
+            ("lspci", "-d", "1dd8:1002"): (0, ""),
+            ("lspci", "-d", "15b3:1021"): (0, ""),
+            ("ethtool", "-i", "benic1p1"): (0, _REAL_ETHTOOL_BNXT),
+            ("ibv_devices",): (0, _REAL_IBV_DEVICES),
+            ("rdma", "link"): (0, _REAL_RDMA_LINK),
+        }
+        fake_which, fake_run = self._fake_tools(
+            {"lspci", "ethtool", "ibv_devices", "rdma"}, outputs
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        # sysfs: benic1p1 carries vendor 0x14e4 (for netdev->vendor iface
+        # discovery); all netdevs + ib devices bind to driver bnxt_en (for
+        # the driver-based vendor binding).
+        self._build_sysfs(
+            tmp_path, monkeypatch,
+            netdevs={"benic1p1": "bnxt_en", "benic7p1": "bnxt_en", "benic8p1": "bnxt_en"},
+            ib_devs={"bnxt_re0": "bnxt_en", "bnxt_re1": "bnxt_en"},
+            net_vendor={"benic1p1": "0x14e4"},
+        )
+
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        b = nics["broadcom"]
+        assert b["present"] is True
+        # Broadcom glued "<fw>/pkg <pkg>" is split into firmware + pkg_version.
+        assert b["firmware"] == "232.0.219.16"
+        assert b["pkg_version"] == "232.1.196.16"
+        # sysfs /sys/module/bnxt_en/version absent on the real node ->
+        # driver_version falls back to ethtool -i version:.
+        assert b["driver_version"] == "6.9.0-0_fbk10_brcmrdma13_141_g9"
+        assert b["rdma_devices"] == ["bnxt_re0", "bnxt_re1"]
+        assert b["links"][0] == {
+            "device": "bnxt_re0",
+            "state": "ACTIVE",
+            "netdev": "benic7p1",
+        }
+        assert reasons == []
+
+    def test_cx7_present_with_zero_rdma_is_not_partial(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # CX7 present in lspci but no mlx5_ devices in ibv/rdma (observed
+        # on the real node). Must be present:true with empty lists, NO
+        # partial reason.
+        outputs = {
+            ("lspci", "-d", "15b3:1021"): (0, _REAL_LSPCI_CX7),
+            ("lspci", "-d", "1dd8:1002"): (0, ""),
+            ("lspci", "-d", "14e4:1760"): (0, ""),
+            ("ibv_devices",): (0, _REAL_IBV_DEVICES),  # only bnxt_re*, no mlx5_
+            ("rdma", "link"): (0, _REAL_RDMA_LINK),
+        }
+        fake_which, fake_run = self._fake_tools(
+            {"lspci", "ibv_devices", "rdma"}, outputs
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        # bnxt_re* devices/netdevs bind to bnxt_en, so the driver-based
+        # filter correctly excludes them from cx7 (mlx5_core).
+        self._build_sysfs(
+            tmp_path, monkeypatch,
+            netdevs={"benic7p1": "bnxt_en", "benic8p1": "bnxt_en"},
+            ib_devs={"bnxt_re0": "bnxt_en", "bnxt_re1": "bnxt_en"},
+        )
+
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        c = nics["cx7"]
+        assert c["present"] is True
+        assert c["rdma_devices"] == []
+        assert c["links"] == []
+        assert reasons == []
+
+    def test_ainic_tier2_skipped_when_nicctl_absent(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # AINIC present but nicctl not installed -> Tier-2 is a documented
+        # absence: no nicctl_version/card keys, no partial.
+        outputs = {
+            ("lspci", "-d", "1dd8:1002"): (0, "c1:00.0 Ethernet controller: Pensando\n"),
+            ("lspci", "-d", "14e4:1760"): (0, ""),
+            ("lspci", "-d", "15b3:1021"): (0, ""),
+            ("ibv_devices",): (0, ""),
+            ("rdma", "link"): (0, ""),
+        }
+        fake_which, fake_run = self._fake_tools(
+            {"lspci", "ibv_devices", "rdma"}, outputs  # no nicctl
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        self._build_sysfs(tmp_path, monkeypatch)  # empty sysfs
+
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        a = nics["ainic"]
+        assert a["present"] is True
+        assert "nicctl_version" not in a  # Tier-2 not attempted
+        assert reasons == []
+
+    def test_ainic_tier2_sudo_denied_records_partial(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # AINIC + nicctl present, but sudo denied (rc!=0) -> fields None
+        # + partial reasons.
+        outputs = {
+            ("lspci", "-d", "1dd8:1002"): (0, "c1:00.0 Pensando\n"),
+            ("lspci", "-d", "14e4:1760"): (0, ""),
+            ("lspci", "-d", "15b3:1021"): (0, ""),
+            ("ibv_devices",): (0, ""),
+            ("rdma", "link"): (0, ""),
+            ("nicctl", "--version"): (0, "1.117.5-a-74"),
+            # all sudo nicctl calls fail (rc=1)
+            ("nicctl", "show", "version", "firmware", "--json"): (1, ""),
+            ("nicctl", "show", "version", "host-software", "--json"): (1, ""),
+            ("nicctl", "show", "card", "--detail"): (1, ""),
+            ("nicctl", "show", "dcqcn", "--roce-device", "ionic_0", "--profile-id", "1"): (1, ""),
+        }
+        fake_which, fake_run = self._fake_tools(
+            {"lspci", "ibv_devices", "rdma", "nicctl"}, outputs
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        self._build_sysfs(tmp_path, monkeypatch)  # empty sysfs
+
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        a = nics["ainic"]
+        assert a["nicctl_version"] == "1.117.5-a-74"  # --version succeeded
+        assert a["card"]["firmware"] is None
+        assert a["card"]["uuid"] is None
+        assert any(r.startswith("nics.ainic") for r in reasons)
+
+    def test_ainic_rdma_naming_recovered_via_sysfs_driver(
+        self, isolated_env, tmp_path: Path, monkeypatch
+    ):
+        # Regression for PR #208 review (AINIC host): RoCE devices named
+        # rdma0..rdma7 (not ionic_*) must still be bound to ainic via their
+        # kernel driver (ionic), and DCQCN must target the resolved device
+        # (rdma0), not a hardcoded ionic_0.
+        outputs = {
+            ("lspci", "-d", "1dd8:1002"): (0, "c1:00.0 Ethernet controller: Pensando\n"),
+            ("lspci", "-d", "14e4:1760"): (0, ""),
+            ("lspci", "-d", "15b3:1021"): (0, ""),
+            ("ibv_devices",): (0, _AINIC_IBV_DEVICES),
+            ("rdma", "link"): (0, _AINIC_RDMA_LINK),
+            ("nicctl", "--version"): (0, "nicctl version 1.117.5-a-74"),
+            # DCQCN keyed on the RESOLVED device (rdma0). If the code still
+            # hardcoded ionic_0 this key would miss and dcqcn would be None.
+            ("nicctl", "show", "dcqcn", "--roce-device", "rdma0", "--profile-id", "1"):
+                (0, _AINIC_DCQCN),
+        }
+        fake_which, fake_run = self._fake_tools(
+            {"lspci", "ibv_devices", "rdma", "nicctl"}, outputs
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        # All 8 rdma devices + netdevs bind to the ionic driver.
+        self._build_sysfs(
+            tmp_path, monkeypatch,
+            netdevs={f"tw-eth{i}": "ionic" for i in range(8)},
+            ib_devs={f"rdma{i}": "ionic" for i in range(8)},
+        )
+
+        reasons: list[str] = []
+        nics = env_mod._capture_nics(reasons)
+        a = nics["ainic"]
+        assert a["present"] is True
+        # All 8 RoCE devices recovered despite the rdma<N> naming.
+        assert a["rdma_devices"] == [f"rdma{i}" for i in range(8)]
+        assert len(a["links"]) == 8
+        assert all(ln["state"] == "ACTIVE" for ln in a["links"])
+        assert a["links"][0] == {
+            "device": "rdma0", "state": "ACTIVE", "netdev": "tw-eth0"
+        }
+        # DCQCN targeted the resolved device (rdma0) and parsed.
+        assert a["dcqcn"]["token_bucket_size"] == 800000
+        assert a["dcqcn"]["enabled"] is True
+        # No "no AINIC RDMA device resolved" reason (devices were found).
+        assert not any("no AINIC RDMA device" in r for r in reasons)
+
+    def test_run_nic_cmd_sudo_exec_failure_names_sudo(self, monkeypatch):
+        # When sudo=True and the exec itself raises (e.g. sudo missing),
+        # the reason must name the actual runner (sudo), not the wrapped
+        # tool, so partial_reasons are accurate.
+        monkeypatch.setattr(env_mod.shutil, "which", lambda name: "/usr/bin/nicctl")
+
+        def boom_run(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "sudo")
+
+        monkeypatch.setattr(env_mod.subprocess, "run", boom_run)
+        reasons: list[str] = []
+        out = env_mod._run_nic_cmd(
+            ["nicctl", "--version"], reasons, "nics.ainic.x", sudo=True
+        )
+        assert out is None
+        assert any("failed to invoke sudo" in r for r in reasons)
+        assert not any("failed to invoke nicctl" in r for r in reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -5926,6 +6645,45 @@ class TestSummaryNewBriefLines:
             if ln.lstrip().startswith(prefix):
                 return ln
         raise AssertionError(f"no `{prefix}` line in summary")
+
+    # ---- nics ----
+    def test_nics_undeterminable_presence_renders_question_mark(self):
+        # present=None (e.g. lspci missing/failed) must surface as
+        # "<vendor>(?)", never be silently dropped into "(none present)".
+        snap = _example_snapshot(nics={
+            "ainic": {"present": None},
+            "broadcom": {"present": False},
+            "cx7": {"present": None},
+        })
+        line = self._line(snap, "nics:")
+        assert "ainic(?)" in line
+        assert "cx7(?)" in line
+        assert "(none present)" not in line
+
+    def test_nics_all_absent_renders_none_present(self):
+        snap = _example_snapshot(nics={
+            "ainic": {"present": False},
+            "broadcom": {"present": False},
+            "cx7": {"present": False},
+        })
+        line = self._line(snap, "nics:")
+        assert "(none present)" in line
+
+    def test_nics_present_vendor_renders_fw_and_links(self):
+        snap = _example_snapshot(nics={
+            "ainic": {"present": False},
+            "broadcom": {
+                "present": True,
+                "firmware": "232.0.219.16",
+                "links": [
+                    {"device": "bnxt_re0", "state": "ACTIVE"},
+                    {"device": "bnxt_re1", "state": "DOWN"},
+                ],
+            },
+            "cx7": {"present": False},
+        })
+        line = self._line(snap, "nics:")
+        assert "broadcom(fw=232.0.219.16 links=1/2)" in line
 
     # ---- cmake cache ----
     def test_cmake_cache_unavailable_renders_explicit_message(self):
