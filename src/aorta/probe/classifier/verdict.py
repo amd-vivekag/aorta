@@ -8,9 +8,10 @@ Combines the per-tier detector outputs into the final
 
 (b) ``result.json::failure_detectors_fired`` lists ALL fired in a
     fixed encounter order: Tier 1, Tier 2, Tier 3, Tier 4, then
-    Tier 5 (``custom_patterns`` failures). The order is set by
-    :func:`resolve` (and the :class:`VerdictInputs` field order it
-    iterates), independent of when each tier physically fires
+    Tier 5 (``custom_patterns`` failures). The order is set
+    explicitly by :func:`resolve` as a fixed tier sequence (not by
+    the :class:`VerdictInputs` field order), independent of when each
+    tier physically fires
     relative to the workload exit. The in-flight Tier 2 hang monitor
     contributes its detector IDs to ``inputs.tier2`` before
     :func:`resolve` is called, so even though the predicate fires
@@ -48,11 +49,17 @@ DETECTOR_MISSING_PASS_SIGNAL = "meta:missing_pass_signal"
 class VerdictInputs:
     """Per-tier outputs the resolver merges.
 
-    Order MATTERS for ``failure_detectors_fired``: the resolver
-    walks the lists in the order they appear on this struct
-    (tier1, tier2, tier3, tier4, custom-fail, meta) and appends in
-    that order so the final list is reproducible across runs
-    given the same inputs.
+    Field order on this struct does NOT drive ``failure_detectors_fired``
+    ordering: :func:`resolve` appends the failure lists in a fixed tier
+    sequence (tier1, tier2, tier3, tier4, custom-fail, then the
+    synthesised ``meta:`` signal), so the serialised list is reproducible
+    across runs given the same inputs regardless of how the fields are
+    laid out here.
+
+    ``tier3_warn`` carries advisory Tier-3 detectors (e.g.
+    ``tier3:vram_growth``) that contribute ONLY to
+    ``warn_detectors_fired`` -- they never appear in
+    ``failure_detectors_fired`` and never flip the verdict to fail.
 
     ``custom_required_patterns`` is the list of ``CompiledPattern``
     objects with ``required_for_pass=True``, regardless of whether
@@ -65,6 +72,9 @@ class VerdictInputs:
     tier2: list[str] = field(default_factory=list)
     tier3: list[str] = field(default_factory=list)
     tier4: list[str] = field(default_factory=list)
+    # Advisory Tier-3 detectors (e.g. ``tier3:vram_growth``) that surface as
+    # warns rather than failures -- they never flip the verdict to fail.
+    tier3_warn: list[str] = field(default_factory=list)
     custom_result: CustomScanResult = field(default_factory=CustomScanResult)
     custom_required_patterns: tuple[CompiledPattern, ...] = ()
 
@@ -108,7 +118,10 @@ def resolve(inputs: VerdictInputs) -> Verdict:
     if required_ids and not (required_ids <= inputs.custom_result.fired_required_ids):
         failures.append(DETECTOR_MISSING_PASS_SIGNAL)
 
-    warns = list(inputs.custom_result.warn_detectors)
+    # Built-in advisory (warn) detectors precede user custom warns, mirroring
+    # the tier-before-custom ordering used for failures above.
+    warns = list(inputs.tier3_warn)
+    warns.extend(inputs.custom_result.warn_detectors)
     capture = dict(inputs.custom_result.capture)
 
     verdict = "fail" if failures else "pass"
