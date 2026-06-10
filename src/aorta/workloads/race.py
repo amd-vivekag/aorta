@@ -20,12 +20,32 @@ import logging
 import os
 from typing import Any, ClassVar, Literal
 
-import torch
-import torch.distributed as dist
-
-from aorta.race.config import ReproducerConfig
-from aorta.race.modes import create_reproducer
 from aorta.workloads._base import Workload, WorkloadResult
+
+# torch (and the ``aorta.race`` package, whose ``__init__`` eagerly pulls a
+# torch-dependent reproducer base) is imported lazily so this module can be
+# IMPORTED for workload discovery / registration in a lightweight environment
+# that has no torch (e.g. a CLI venv that only drives docker-based runs). The
+# class methods reference these names as module globals; they are bound for
+# real whenever torch is installed. setup() raises a clear error if torch is
+# unavailable when the workload actually runs.
+#
+# Only ``import torch`` is guarded, and it catches ``Exception`` (not just
+# ``ImportError``) because a broken install -- mismatched CUDA/ROCm runtime,
+# unloadable shared library -- surfaces as OSError/RuntimeError, and discovery
+# must stay clean for all of those. The ``aorta.race`` imports live in ``else``
+# so a genuine bug in that package raises loudly during discovery instead of
+# being misattributed to "torch not importable".
+try:
+    import torch
+    import torch.distributed as dist
+except Exception as exc:
+    _IMPORT_ERROR: Exception | None = exc
+else:
+    from aorta.race.config import ReproducerConfig
+    from aorta.race.modes import create_reproducer
+
+    _IMPORT_ERROR = None
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +96,12 @@ class RaceWorkload(Workload):
         return cfg
 
     def setup(self) -> None:
+        if _IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "race requires PyTorch, which is not importable in this "
+                f"environment: {_IMPORT_ERROR}. Install torch, or run this "
+                "workload inside the container/venv that provides it."
+            ) from _IMPORT_ERROR
         if not dist.is_initialized():
             backend = "nccl" if torch.cuda.is_available() else "gloo"
             dist.init_process_group(backend=backend)
