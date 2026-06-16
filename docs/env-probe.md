@@ -201,8 +201,8 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `host` | `dict` | `os.uname()` + `os.confstr("CS_GNU_LIBC_VERSION")` | `kernel_release`, `kernel_version`, `machine`, `glibc_version`. Kernel + glibc drift is the #1 confound for compiled-against-vs-runtime issues with C++ extensions. |
 | `composable_kernel` | `dict` | header at `include/ck/version.h` + `nm -D` of `libtorch_hip.so` piped through `c++filt` + `torch.__config__.show()` flag scan | Two sub-blocks (`system: {version, commit, ck_tile_present}`, `pytorch_bundled: {present, symbol_count}`) plus top-level `pytorch_use_ck_sdpa` / `pytorch_use_ck_gemm` booleans (build-time flags baked into the wheel; NOT runtime env vars). System and bundled CK can drift independently. |
 | `tensile` | `dict` | optional `import Tensile` + sorted-filenames hash over the union of hipBLASLt + rocBLAS kernel DBs | `package_version` (usually `null` outside builders), `kernel_db_combined_hash` |
-| `triton` | `dict` | `import triton; triton.__version__` | `package_version`. ROCm Triton fork bakes the source commit into `__version__`. |
-| `fbgemm` | `dict` | optional `import fbgemm_gpu` + parse of `torch.__config__.show()` for `-DUSE_FBGEMM*` defines | `package_version`, `pytorch_use_fbgemm`, `pytorch_use_fbgemm_genai`. The two booleans capture the build-time decision baked into the PyTorch wheel even when `fbgemm_gpu` isn't a separate pip package. |
+| `triton` | `dict` | `import triton; triton.__version__` (+ commit parse) | `package_version`, `commit` (schema 1.8). ROCm Triton fork bakes the source commit into `__version__` (e.g. `3.5.1+rocm7.2.1.gita272dfa8` -> `commit: "a272dfa8"`); fb builds versioned `+fb` carry no SHA -> `commit: null`. |
+| `fbgemm` | `dict` | optional `import fbgemm_gpu` (+ commit parse) + parse of `torch.__config__.show()` for `-DUSE_FBGEMM*` defines | `package_version`, `commit` (schema 1.8 -- best-effort git SHA from a setuptools_scm `+g<sha>` local-version segment or a `git_version`/`__commit__` module attr; `null` when fbgemm_gpu is vendored-in-torch rather than separately installed, or carries no SHA), `pytorch_use_fbgemm`, `pytorch_use_fbgemm_genai`. The two booleans capture the build-time decision baked into the PyTorch wheel even when `fbgemm_gpu` isn't a separate pip package. |
 | `aiter` | `dict` | `import aiter; aiter.__version__` + `importlib.metadata.version("amd_aiter" \| "aiter")` + scan of `aiter_meta/hsa/<gfx>/` (or `$AORTA_PYTORCH_SRC/third_party/aiter/hsa/`) | `package_version`, `package_dist_name` (which PyPI dist matched: `amd_aiter` is the canonical AMD-internal ROCm/PyTorch image dist; `aiter` is the upstream name), `commit` (parsed from the setuptools_scm `+g<sha>` local-version segment, matches the image tag's `aiter-<sha>` label), `hsa_tree` (issue #176 -- per-arch fingerprint of pre-built `.co` kernel binaries: file_count, co_count, deterministic combined_sha256). Most installs record `null` for everything; absence is silent. |
 | `aotriton` | `dict` | scan of `<torch>/lib/libaotriton_v2.so*` filenames + `sha256` of the resolved file + presence of `<torch>/lib/aotriton.images/` + `$AOTRITON_INSTALLED_PREFIX` | Default ROCm Flash Attention backend. Bundled in the wheel via `cmake/External/aotriton.cmake` (NOT a `third_party/` git submodule). Fields: `bundled_present`, `bundled_version`, `bundled_lib_hash`, `bundled_images_dir_present`, `installed_prefix`. CK is the alternative backend (toggled via `TORCH_ROCM_FA_PREFER_CK=1`). |
 | `runtime_context` | `dict` | `/.dockerenv`, `/run/.containerenv`, `$SINGULARITY_NAME`, `/proc/1/cgroup`, `sys.prefix`, `$CONDA_DEFAULT_ENV` | `type`, `python_env`, `venv_path`, `conda_env_name` |
@@ -215,6 +215,21 @@ unexpected failure. Callers always get back a valid, fully-shaped
 | `library_introspection` | `list[dict]` | `buck2 cquery 'deps(<target>)' --json` (only when `--buck-target` is supplied) | Always present. Empty `[]` outside Buck mode. In Buck mode, one entry per matched library: `{"name", "source": "buck", "revision", "target", "configured_target"}`. `target` is the canonical Buck label (stable across daemon restarts); `configured_target` preserves the raw cquery output including its per-run configuration suffix (`(prelude//platforms:default#<hash>)`) for forensics. The matched library set lives in `KNOWN_LIBRARY_PATTERNS` in `src/aorta/instrumentation/buck_introspect.py`. Added in schema 1.4 for issue #163 (A1.2b); migrated from `buck2 audit dependencies` to `buck2 cquery` and split `target` / `configured_target` in schema 1.6 (PR #187). |
 | `library_introspection_alternates` | `list[dict]` | synthesised from A1's per-library blocks when a Buck match overlaps | Always present. Empty `[]` outside Buck mode and when no Buck-matched library is also captured by A1. Each entry mirrors the unified shape with `source: "package"` and pulls `revision` / `package_version` / `lib_hash` from the matching A1 block (e.g. `hipblaslt`). Added in schema 1.4 for issue #163 (A1.2b). |
 | `pytorch_sdpa` | `dict` | `torch.backends.cuda.{flash,mem_efficient,math,cudnn}_sdp_enabled()` | `backends_enabled` dict, one bool per SDPA backend + per-getter `null` when missing on older torch. Runtime state, NOT compile-time -- combine with `pytorch_build.binary_introspection.libtorch_hip_symbol_counts` for the full "compiled in AND enabled" picture. Added in schema 1.5 for issue #176 (PR #177). |
+
+**Buck/monorepo native-lib recovery (schema 1.8).** The lib-on-disk
+probes (`composable_kernel.pytorch_bundled`, `aotriton`, and
+`pytorch_build.binary_introspection`) normally locate torch's native
+libraries at `<torch.__file__>/../lib`. When torch is a Buck target
+(e.g. `fbcode//caffe2:torch`) its Python package is materialised into a
+link-tree but the C++ runtime is `dlopen`'d from a separate
+build-artifact directory, so `<torch>/lib/libtorch_hip.so` does not
+exist and those fields previously came back `null`. Because the probe
+runs in-process with torch imported, the libraries ARE mapped into the
+process: the probe now falls back to `/proc/self/maps` to recover the
+real lib directory, populating the bundled-CK symbol count, the AOTriton
+bundle fields, and the `libtorch_hip_symbol_counts` / `torch_lib_bundled`
+facts for Buck builds. No field shapes change; the fallback is Linux-only
+and silently inert elsewhere.
 
 `runtime_context.type` is one of `"docker" | "podman" | "singularity" | "baremetal"`. Adding values is a schema change.
 

@@ -276,7 +276,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.7"
+        assert snapshot.schema_version == "1.8"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -373,9 +373,13 @@ def _example_snapshot(**overrides) -> object:
             "package_version": None,
             "kernel_db_combined_hash": "filenames-sha256:eee",
         },
-        "triton": {"package_version": "3.5.1+rocm7.2.1.gita272dfa8"},
+        "triton": {
+            "package_version": "3.5.1+rocm7.2.1.gita272dfa8",
+            "commit": "a272dfa8",
+        },
         "fbgemm": {
             "package_version": None,
+            "commit": None,
             "pytorch_use_fbgemm": True,
             "pytorch_use_fbgemm_genai": True,
         },
@@ -3125,7 +3129,7 @@ class TestTritonBlock:
         monkeypatch.setattr(builtins, "__import__", fake_import)
         reasons: list[str] = []
         block = env_mod._capture_triton(reasons)
-        assert block == {"package_version": None}
+        assert block == {"package_version": None, "commit": None}
         assert any("triton" in r for r in reasons)
 
     def test_triton_with_version_returns_string(self, isolated_env, monkeypatch):
@@ -3143,8 +3147,170 @@ class TestTritonBlock:
         monkeypatch.setattr(builtins, "__import__", fake_import)
         reasons: list[str] = []
         block = env_mod._capture_triton(reasons)
-        assert block == {"package_version": "3.5.1+rocm7.2.1.gita272dfa8"}
+        assert block == {
+            "package_version": "3.5.1+rocm7.2.1.gita272dfa8",
+            "commit": "a272dfa8",
+        }
         assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# Package commit extraction (schema 1.8)
+# ---------------------------------------------------------------------------
+
+
+class TestPackageCommitExtraction:
+    def test_setuptools_scm_plus_g_sha(self):
+        # +g<sha> and +<distance>.g<sha> setuptools_scm local segments.
+        assert env_mod._extract_commit_from_version("0.1.11.dev32+g9a469a608") == (
+            "9a469a608"
+        )
+        assert env_mod._extract_commit_from_version("1.2.0+5.g0123abc") == "0123abc"
+
+    def test_rocm_fork_dot_git_sha(self):
+        # ROCm triton: "3.5.1+rocm7.2.1.gita272dfa8" -> a272dfa8.
+        assert env_mod._extract_commit_from_version(
+            "3.5.1+rocm7.2.1.gita272dfa8"
+        ) == "a272dfa8"
+
+    def test_plain_local_segment_is_not_a_commit(self):
+        # +fb / +cpu / +rocm7.2.1 carry no SHA -> None (must not false-match).
+        for v in ("2.13.0a0+fb", "2.12.0+cpu", "2.10.0.dev+rocm7.0", None, ""):
+            assert env_mod._extract_commit_from_version(v) is None
+
+    def test_commit_from_version_string_wins(self):
+        assert env_mod._capture_python_package_commit(
+            "definitely_not_a_real_pkg_xyz", "1.0+g0123abcd"
+        ) == "0123abcd"
+
+    def test_commit_from_module_git_version_attr(self, monkeypatch):
+        import builtins
+        import types
+
+        real_import = builtins.__import__
+        fake = types.SimpleNamespace(
+            version=types.SimpleNamespace(git_version="deadbeef1234")
+        )
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fbgemm_gpu":
+                return fake
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        # version string has no SHA -> falls back to module attr.
+        assert env_mod._capture_python_package_commit(
+            "fbgemm_gpu", "1.4.0"
+        ) == "deadbeef1234"
+
+    def test_absent_package_yields_none(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fbgemm_gpu":
+                raise ImportError("absent")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        assert env_mod._capture_python_package_commit("fbgemm_gpu", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Torch native-lib location (/proc/self/maps fallback for Buck torch)
+# ---------------------------------------------------------------------------
+
+
+class TestTorchNativeLibDir:
+    def test_prefers_wheel_layout_when_present(self, tmp_path, monkeypatch):
+        import types
+
+        lib = tmp_path / "torch" / "lib"
+        lib.mkdir(parents=True)
+        fake_torch = types.SimpleNamespace(__file__=str(tmp_path / "torch" / "__init__.py"))
+        # Even if maps would resolve, the on-disk wheel layout wins.
+        monkeypatch.setattr(
+            env_mod, "_loaded_lib_path_from_maps", lambda sonames: Path("/should/not/win")
+        )
+        assert env_mod._torch_native_lib_dir(fake_torch) == lib
+
+    def test_falls_back_to_maps_when_no_wheel_lib_dir(self, tmp_path, monkeypatch):
+        import types
+
+        # Buck layout: torch.__file__ exists but there is no sibling lib/.
+        fake_torch = types.SimpleNamespace(
+            __file__=str(tmp_path / "linktree" / "torch" / "__init__.py")
+        )
+        buck_lib = tmp_path / "buck-out" / "lib" / "libtorch_hip.so"
+        buck_lib.parent.mkdir(parents=True)
+        buck_lib.write_bytes(b"x")
+        monkeypatch.setattr(
+            env_mod, "_loaded_lib_path_from_maps", lambda sonames: buck_lib
+        )
+        assert env_mod._torch_native_lib_dir(fake_torch) == buck_lib.parent
+
+    def test_returns_none_when_nothing_locatable(self, tmp_path, monkeypatch):
+        import types
+
+        fake_torch = types.SimpleNamespace(
+            __file__=str(tmp_path / "torch" / "__init__.py")
+        )
+        monkeypatch.setattr(
+            env_mod, "_loaded_lib_path_from_maps", lambda sonames: None
+        )
+        assert env_mod._torch_native_lib_dir(fake_torch) is None
+
+    def test_symbol_dump_recovers_via_maps_for_buck_torch(
+        self, isolated_env, tmp_path, monkeypatch
+    ):
+        """The key Buck recovery: no <torch>/lib/libtorch_hip.so on disk,
+        but the lib is mapped into the process -> the symbol dump finds it
+        via /proc/self/maps instead of recording a 'not found' reason.
+        """
+        import builtins
+        import types
+
+        # Fake torch with HIP claimed but NO sibling lib/ dir.
+        torch_dir = tmp_path / "linktree" / "torch"
+        torch_dir.mkdir(parents=True)
+        (torch_dir / "__init__.py").write_text("")
+        fake_torch = types.SimpleNamespace(
+            __file__=str(torch_dir / "__init__.py"),
+            version=types.SimpleNamespace(hip="7.0.0", cuda=None),
+        )
+        # The "real" lib lives in a Buck artifact dir, mapped into proc.
+        buck_lib = tmp_path / "buck-out" / "lib" / env_mod.PYTORCH_HIP_LIB_NAME
+        buck_lib.parent.mkdir(parents=True)
+        buck_lib.write_bytes(b"\x7fELF")
+        monkeypatch.setattr(
+            env_mod,
+            "_loaded_lib_path_from_maps",
+            lambda sonames: buck_lib if env_mod.PYTORCH_HIP_LIB_NAME in sonames else None,
+        )
+        monkeypatch.setattr(env_mod.shutil, "which", lambda name: "/usr/bin/" + name)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0].endswith("nm"):
+                # nm must have been pointed at the maps-recovered path.
+                assert str(buck_lib) in cmd
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="0 T mangled\n", stderr=""
+                )
+            if cmd[0].endswith("c++filt"):
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0,
+                    stdout="ck::tensor_operation::Foo\n", stderr="",
+                )
+            raise AssertionError(f"unexpected cmd {cmd}")
+
+        monkeypatch.setattr(env_mod.subprocess, "run", fake_run)
+        reasons: list[str] = []
+        out = env_mod._dump_pytorch_hip_demangled_symbols(
+            reasons, "composable_kernel.pytorch_bundled", torch_mod=fake_torch
+        )
+        assert out == "ck::tensor_operation::Foo\n"
+        assert not any("not found" in r for r in reasons), reasons
 
 
 # ---------------------------------------------------------------------------
@@ -3158,6 +3324,7 @@ class TestFbgemmBlock:
         block = env_mod._capture_fbgemm(reasons)
         assert set(block.keys()) == {
             "package_version",
+            "commit",
             "pytorch_use_fbgemm",
             "pytorch_use_fbgemm_genai",
         }
