@@ -95,7 +95,7 @@ operator can act on them without `jq`'ing the JSON. A closing
 end-of-output. Sample:
 
 ```text
-Wrote env probe to /tmp/env.json (schema_version=1.7) [PARTIAL]
+Wrote env probe to /tmp/env.json (schema_version=1.8) [PARTIAL]
   runtime:   baremetal / python=venv
   build_sys: none
   rocm:      7.2.1 (dev: None)
@@ -185,7 +185,7 @@ unexpected failure. Callers always get back a valid, fully-shaped
 
 | Top-level key | Type | Source | Notes |
 | --- | --- | --- | --- |
-| `schema_version` | `str` | constant | Currently `"1.7"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
+| `schema_version` | `str` | constant | Currently `"1.8"`. See the changelog comment in `src/aorta/instrumentation/environment.py` next to the `SCHEMA_VERSION` constant for the field-by-field history. |
 | `captured_at` | `str` | `datetime` | ISO-8601 UTC with trailing `Z` |
 | `partial` | `bool` | computed | `True` if any probe fell back |
 | `partial_reasons` | `list[str]` | per-probe | one human-readable line per fallback |
@@ -392,7 +392,29 @@ Mirrors the in-code comment at `SCHEMA_VERSION` in
 `src/aorta/instrumentation/environment.py`. Recorded here so consumers
 tracking schema evolution don't have to read source.
 
-### `1.7` (current)
+### `1.8` (current)
+
+Buck-target torch native-lib recovery + best-effort package commits.
+Additive nested keys only (`triton.commit`, `fbgemm.commit`); no
+top-level keys or dataclass fields change, so `EnvSnapshot.from_dict`
+still round-trips pre-1.8 snapshots.
+
+* Added a `commit` field under the `triton` and `fbgemm` blocks --
+  best-effort git SHA parsed from a setuptools_scm `+g<sha>`
+  local-version segment, a ROCm/fb fork `.git<sha>` segment, or a
+  `git_version`/`__commit__` module attribute that is itself a valid
+  7-40 char hex SHA. `null` when no SHA is recoverable (e.g. fb wheels
+  versioned `3.5.0+fb`, or `fbgemm_gpu` not separately installed).
+  Mirrors the existing `aiter.commit` field.
+* Behavioural (not schema-shape) change: the `libtorch_hip.so`-dependent
+  probes (`composable_kernel.pytorch_bundled` symbol count, `aotriton.*`,
+  `pytorch_build.binary_introspection` symbol counts / `torch_lib_bundled`)
+  now locate torch's native lib dir via `/proc/self/maps` when
+  `<torch>/lib` is absent, populating those fields for Buck/monorepo
+  torch targets (e.g. `fbcode//caffe2:torch`) whose C++ runtime is
+  `dlopen`'d from a build-artifact dir.
+
+### `1.7`
 
 RCCL net-plugin identity + multi-vendor NIC/RoCE fabric capture
 (issue #202). Both additive; the new top-level `nics` block is what

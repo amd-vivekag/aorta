@@ -2601,6 +2601,14 @@ _PACKAGE_COMMIT_ATTRS: tuple[str, ...] = (
 )
 
 
+# A bare git commit SHA: 7-40 hex chars, nothing else. Used to validate
+# the value of a module commit ATTRIBUTE (e.g. torch-style
+# ``version.git_version = "ff65f5bc..."``) before accepting it, so a
+# non-SHA attr like ``"unknown"`` / ``"dirty"`` / a tag never leaks into
+# the snapshot's ``commit`` field.
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{7,40}", re.IGNORECASE)
+
+
 def _extract_commit_from_version(version: str | None) -> str | None:
     """Best-effort parse of a git commit SHA from a PEP 440-ish version.
 
@@ -2618,6 +2626,28 @@ def _extract_commit_from_version(version: str | None) -> str | None:
     return None
 
 
+def _commit_from_attr_value(val: Any) -> str | None:
+    """Coerce a module commit-attribute value into a SHA, or ``None``.
+
+    Accepts a value that either embeds a SHA in a version-like string
+    (``+g<sha>`` / ``.git<sha>``) or *is* a bare 7-40 char hex SHA
+    (the common ``git_version`` shape). Any other string -- ``"unknown"``,
+    ``"dirty"``, a tag, a dirty-tree suffix -- yields ``None`` so the
+    snapshot's ``commit`` field only ever carries a real SHA or null.
+    """
+    if not isinstance(val, str):
+        return None
+    val = val.strip()
+    if not val:
+        return None
+    embedded = _extract_commit_from_version(val)
+    if embedded:
+        return embedded
+    if _COMMIT_SHA_RE.fullmatch(val):
+        return val.lower()
+    return None
+
+
 def _capture_python_package_commit(
     package_name: str,
     version: str | None,
@@ -2631,7 +2661,10 @@ def _capture_python_package_commit(
        by setuptools_scm.
     2. A dedicated commit attribute on the imported module
        (``__git_version__`` / ``git_version`` / ``__commit__`` /
-       ``__sha__``, or the nested ``module.version.git_version``).
+       ``__sha__``, or the nested ``module.version.git_version``). The
+       attribute value is accepted only if it embeds or *is* a valid
+       7-40 char hex SHA -- a non-SHA attr (``"unknown"``, ``"dirty"``,
+       a tag) is ignored so ``commit`` is always a real SHA or null.
 
     Never adds a partial reason (the sibling ``package_version`` probe
     already owns absence/import-failure reporting) and never raises --
@@ -2648,14 +2681,14 @@ def _capture_python_package_commit(
     except Exception:  # noqa: BLE001 -- absence/broken import => no commit
         return None
     for attr in _PACKAGE_COMMIT_ATTRS:
-        val = getattr(mod, attr, None)
-        if isinstance(val, str) and val.strip():
-            return _extract_commit_from_version(val) or val.strip()
+        commit = _commit_from_attr_value(getattr(mod, attr, None))
+        if commit:
+            return commit
     version_obj = getattr(mod, "version", None)
     if version_obj is not None:
-        gv = getattr(version_obj, "git_version", None)
-        if isinstance(gv, str) and gv.strip():
-            return _extract_commit_from_version(gv) or gv.strip()
+        commit = _commit_from_attr_value(getattr(version_obj, "git_version", None))
+        if commit:
+            return commit
     return None
 
 

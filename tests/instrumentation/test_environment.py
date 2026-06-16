@@ -3216,6 +3216,54 @@ class TestPackageCommitExtraction:
         monkeypatch.setattr(builtins, "__import__", fake_import)
         assert env_mod._capture_python_package_commit("fbgemm_gpu", None) is None
 
+    def test_non_sha_module_attr_is_rejected(self, monkeypatch):
+        # A git_version-style attr that is NOT a hex SHA ("unknown",
+        # "dirty", a tag) must not leak into the commit field.
+        import builtins
+        import types
+
+        real_import = builtins.__import__
+        for bad in ("unknown", "dirty", "v2.13.0-release", "N/A"):
+            fake = types.SimpleNamespace(
+                version=types.SimpleNamespace(git_version=bad)
+            )
+
+            def fake_import(name, *args, _fake=fake, **kwargs):
+                if name == "fbgemm_gpu":
+                    return _fake
+                return real_import(name, *args, **kwargs)
+
+            monkeypatch.setattr(builtins, "__import__", fake_import)
+            assert (
+                env_mod._capture_python_package_commit("fbgemm_gpu", "1.4.0") is None
+            ), bad
+
+    def test_bare_full_sha_attr_is_accepted_and_lowercased(self, monkeypatch):
+        import builtins
+        import types
+
+        real_import = builtins.__import__
+        sha = "FF65F5BC672795C5E5033900EA0A0C4F8566C8CF"
+        fake = types.SimpleNamespace(__git_version__=sha)
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fbgemm_gpu":
+                return fake
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        assert env_mod._capture_python_package_commit(
+            "fbgemm_gpu", "1.4.0"
+        ) == sha.lower()
+
+    def test_commit_from_attr_value_unit(self):
+        assert env_mod._commit_from_attr_value("ff65f5bc") == "ff65f5bc"
+        assert env_mod._commit_from_attr_value("0.1+g9a469a6") == "9a469a6"
+        assert env_mod._commit_from_attr_value("unknown") is None
+        assert env_mod._commit_from_attr_value("") is None
+        assert env_mod._commit_from_attr_value(None) is None
+        assert env_mod._commit_from_attr_value(12345) is None
+
 
 # ---------------------------------------------------------------------------
 # Torch native-lib location (/proc/self/maps fallback for Buck torch)
