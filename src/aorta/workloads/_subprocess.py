@@ -158,6 +158,18 @@ class SubprocessWorkload(Workload):
                 f"{CONFIG_KEY_SUBPROCESS_ARGV} entries must be str, got "
                 f"{[type(a).__name__ for a in argv]}"
             )
+
+        # GPU-emulation opt-in: when the dispatcher-threaded environment
+        # (``_aorta_environment``) targets the mirage emulator, transparently
+        # rewrite the opaque user argv to ``mirage run --profile <p> -- <argv>``
+        # so the probed command runs on an emulated GPU. Non-emulated
+        # environments leave argv byte-for-byte unchanged, so every existing
+        # probe behaves identically. A requested-but-unbuildable emulation
+        # (e.g. mirage not on PATH) raises here and is reported as a clean
+        # setup failure rather than silently running on real hardware.
+        from aorta.emulation.mirage_launch import wrap_argv_for_environment
+
+        argv = wrap_argv_for_environment(self.config, argv)
         self._argv = tuple(argv)
 
         log_prefix = self.config.get(CONFIG_KEY_LOG_PREFIX)
@@ -230,22 +242,6 @@ class SubprocessWorkload(Workload):
         hang_grace_sec = (
             DEFAULT_HANG_GRACE_SEC if _hang_grace_raw is None else float(_hang_grace_raw)
         )
-        # ``tier3_vram_growth`` is a validated boolean on the
-        # recipe-builder side (RecipeSchemaError on non-bool) and is
-        # serialized from a typed ``ProbeExtras`` field, so the payload
-        # is contractually a bool. Validate-and-fail-fast rather than
-        # ``bool(...)``: truthiness coercion would turn a malformed
-        # payload (e.g. the string ``"false"``) into ``True`` and
-        # silently re-enable the detector. This mirrors the sibling
-        # ``float(...)`` knobs above, which also surface a bad payload
-        # instead of swallowing it.
-        _vram_growth_raw = probe_extras.get("tier3_vram_growth", True)
-        if not isinstance(_vram_growth_raw, bool):
-            raise TypeError(
-                "probe_extras['tier3_vram_growth'] must be a bool, got "
-                f"{type(_vram_growth_raw).__name__} ({_vram_growth_raw!r})"
-            )
-        tier3_vram_growth = _vram_growth_raw
 
         # ``inherit`` mode: the dispatcher has already stamped the
         # cell's mitigation + diagnostic env vars onto os.environ in
@@ -505,7 +501,6 @@ class SubprocessWorkload(Workload):
                     amd_smi_post=amd_smi_post,
                     tier3_extra=tuple(fired_kernel_ids),
                     tier3_state=_TIER3_STATE,
-                    tier3_vram_growth=tier3_vram_growth,
                 )
             )
         except Exception as classifier_exc:  # noqa: BLE001 -- classifier crash containment

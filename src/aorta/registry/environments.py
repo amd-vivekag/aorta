@@ -24,8 +24,10 @@ from aorta.registry.types import Environment
 
 _GROUP = "aorta.environments"
 # `buck_target` joins `docker` / `venv` as a peer baseline-recipe key (#182).
-# Order in the frozenset is irrelevant; spelled this way for grep-ability.
-_VALID_ENV_KEYS = frozenset({"docker", "venv", "buck_target"})
+# `emulator` / `mirage_profile` add a GPU-emulated baseline axis (mirage +
+# rocjitsu) so workloads can run with no physical GPU. Order in the frozenset
+# is irrelevant; spelled this way for grep-ability.
+_VALID_ENV_KEYS = frozenset({"docker", "venv", "buck_target", "emulator", "mirage_profile"})
 
 # Built-in environments. `local` and `default` are both "current process, no
 # overrides" — `default` is reserved as a site-configurable alias. Customer
@@ -34,6 +36,17 @@ _VALID_ENV_KEYS = frozenset({"docker", "venv", "buck_target"})
 BUILTIN_ENVIRONMENTS: dict[str, dict[str, str | None]] = {
     "local":   {},
     "default": {},
+    # GPU-emulated baseline: run the workload under the mirage control plane +
+    # rocjitsu software emulator (no physical GPU). `mirage_profile` names the
+    # mirage built-in profile `rocjitsu-MI350X` (MI350X = gfx950, a single-GPU
+    # CDNA4 node), so this resolves out-of-box against a stock mirage install;
+    # `emulator` is a convenience hint. For multi-GPU, create a custom mirage
+    # profile and point a sidecar/plugin environment at it. Consumed by
+    # aorta.emulation.mirage_launch.
+    "emulated-rocjitsu": {
+        "emulator": "rocjitsu",
+        "mirage_profile": "rocjitsu-MI350X",
+    },
 }
 
 
@@ -60,6 +73,8 @@ def load_environments(
             docker=spec.get("docker"),
             venv=spec.get("venv"),
             buck_target=spec.get("buck_target"),
+            emulator=spec.get("emulator"),
+            mirage_profile=spec.get("mirage_profile"),
             source_package="aorta",
         )
         for name, spec in BUILTIN_ENVIRONMENTS.items()
@@ -104,6 +119,8 @@ def load_environments(
             docker=spec.get("docker"),
             venv=spec.get("venv"),
             buck_target=spec.get("buck_target"),
+            emulator=spec.get("emulator"),
+            mirage_profile=spec.get("mirage_profile"),
             source_package=plugin_name,
         )
 
