@@ -139,19 +139,28 @@ def test_env_file_failure_result_includes_env(tmp_path):
     wl.setup()
     wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    # Issue #230: a rejected probe.env is an infra/config error (no valid
+    # observation), not a fail.
+    assert doc["verdict"] == "error"
     assert doc["failure_type"] == "env_file_validation_failed"
     assert doc["env"] == {"BAD_VALUE": "line1\nline2"}
 
 
-def test_missing_executable_yields_fail(tmp_path):
-    """argv[0] not found surfaces as a Tier-1 fail with exit_code=127."""
+def test_missing_executable_yields_error(tmp_path):
+    """argv[0] not found surfaces as an ``error`` verdict (issue #230).
+
+    A command-not-found never launched, so it produced no valid
+    observation -- ``tier1:exec_failed`` -> ``error`` (not ``fail``). The
+    synthetic exit_code 127 is still recorded for the operator.
+    """
     wl = _make_workload(tmp_path, ["definitely-not-a-real-binary-9d8f7s6"])
     wl.setup()
     result = wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     assert doc["exit_code"] == 127
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
+    assert doc["failure_detectors_fired"] == []
     assert result.passed is False
 
 
@@ -205,10 +214,10 @@ def test_successful_trial_flags_main_work_started(tmp_path):
     assert result.failure_details[0]["type"] == "subprocess_nonzero_exit"
 
 
-def test_non_executable_script_yields_fail(tmp_path):
+def test_non_executable_script_yields_error(tmp_path):
     """A user command pointing at a file without the +x bit must land
-    as a Tier-1 fail (exit_code=126), NOT escape to the dispatcher as
-    ``infrastructure_failed``.
+    as an ``error`` verdict (exit_code=126; issue #230), NOT escape to
+    the dispatcher as ``infrastructure_failed``.
 
     Regression for PR #194 review: previously only ``FileNotFoundError``
     was caught. ``PermissionError`` (EACCES, raised by ``Popen`` when
@@ -228,8 +237,9 @@ def test_non_executable_script_yields_fail(tmp_path):
         "captured as a Tier-1 fail (regression of PR #194 review fix)"
     )
     doc = json.loads(result_path.read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     assert doc["exit_code"] == 126
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
     assert result.passed is False
     # stderr.log should carry the diagnostic so the operator knows
     # which exec-time error fired.
@@ -237,11 +247,11 @@ def test_non_executable_script_yields_fail(tmp_path):
     assert "Permission" in stderr_text or "permitted" in stderr_text.lower()
 
 
-def test_popen_oserror_yields_fail(tmp_path, monkeypatch):
+def test_popen_oserror_yields_error(tmp_path, monkeypatch):
     """A generic ``OSError`` from ``Popen`` (e.g. ENOEXEC "Exec format
-    error" for a shebang-less script) also lands as a Tier-1 fail
-    with the artifact tree intact, rather than escaping to the
-    dispatcher.
+    error" for a shebang-less script) also lands as an ``error`` verdict
+    (issue #230) with the artifact tree intact, rather than escaping to
+    the dispatcher.
 
     Regression for PR #194 review: only ``FileNotFoundError`` and
     ``PermissionError`` were named explicitly in the previous handler;
@@ -261,9 +271,10 @@ def test_popen_oserror_yields_fail(tmp_path, monkeypatch):
         "result.json missing: bare OSError escaped instead of being " "captured as a Tier-1 fail"
     )
     doc = json.loads(result_path.read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     # Exit code falls back to 1 for non-{FileNotFound,Permission} OSError.
     assert doc["exit_code"] == 1
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
     assert result.passed is False
     stderr_text = (tmp_path / "trial_0" / "stderr.log").read_text(encoding="utf-8")
     assert "Exec format error" in stderr_text
@@ -323,7 +334,12 @@ def test_timeout_kill_race_does_not_crash(tmp_path, monkeypatch):
     # proc.kill() would propagate ProcessLookupError out of run().
     result = wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    # Issue #230: a timeout with no recognised hang is an ``error`` (the
+    # trial never produced a valid observation), not a ``fail``. A timeout
+    # the hang monitor DOES latch co-fires tier2:hang and stays ``fail``
+    # (see test_timed_out_keeps_latched_hang_flag).
+    assert doc["verdict"] == "error"
+    assert "tier1:timeout" in doc["error_detectors_fired"]
     assert doc["timed_out"] is True
     assert doc["exit_code"] == -1
     assert result.passed is False

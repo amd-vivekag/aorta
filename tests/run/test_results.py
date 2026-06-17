@@ -1,8 +1,57 @@
 """Tests for TrialResult dataclass."""
 
+from types import SimpleNamespace
+
 import pytest
 
-from aorta.run.results import TrialResult
+from aorta.run.results import TrialResult, trial_verdict
+
+
+class TestTrialVerdict:
+    """Three-way shared verdict predicate (issue #230)."""
+
+    @staticmethod
+    def _trial(exit_status="ok", *, passed=None, metrics_verdict=None):
+        result = {}
+        if passed is not None:
+            result["passed"] = passed
+        if metrics_verdict is not None:
+            result["metrics"] = {"verdict": metrics_verdict}
+        return SimpleNamespace(exit_status=exit_status, result=result)
+
+    def test_probe_metric_verdict_is_authoritative(self):
+        # A probe ``error`` trial reports passed=False / workload_failed, but
+        # the metric carries the real three-way outcome.
+        t = self._trial(
+            exit_status="workload_failed", passed=False, metrics_verdict="error"
+        )
+        assert trial_verdict(t) == "error"
+
+    def test_probe_fail_metric(self):
+        t = self._trial(exit_status="workload_failed", passed=False, metrics_verdict="fail")
+        assert trial_verdict(t) == "fail"
+
+    def test_probe_pass_metric(self):
+        t = self._trial(exit_status="ok", passed=True, metrics_verdict="pass")
+        assert trial_verdict(t) == "pass"
+
+    def test_infra_failed_without_metric_is_error(self):
+        assert trial_verdict(self._trial("infrastructure_failed", passed=False)) == "error"
+
+    def test_setup_failed_without_metric_is_error(self):
+        assert trial_verdict(self._trial("workload_setup_failed", passed=False)) == "error"
+
+    def test_workload_failed_without_metric_is_fail(self):
+        assert trial_verdict(self._trial("workload_failed", passed=False)) == "fail"
+
+    def test_ok_passed_false_is_fail(self):
+        assert trial_verdict(self._trial("ok", passed=False)) == "fail"
+
+    def test_ok_is_pass(self):
+        assert trial_verdict(self._trial("ok", passed=True)) == "pass"
+
+    def test_missing_result_defaults_to_pass_on_ok(self):
+        assert trial_verdict(SimpleNamespace(exit_status="ok")) == "pass"
 
 
 class TestTrialResult:

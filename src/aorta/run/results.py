@@ -137,4 +137,46 @@ class TrialResult:
         )
 
 
-__all__ = ["TrialResult"]
+def trial_verdict(trial: Any) -> str:
+    """Three-way verdict (``"pass"`` / ``"fail"`` / ``"error"``) for a trial.
+
+    This is the single shared predicate (issue #230) used by the matrix
+    aggregator (pass / fail / error counts) and the ``stop_after`` event
+    counter (:mod:`aorta.run.dispatcher`) so the two can never disagree
+    about whether a trial reproduced the bug, failed for an infra reason,
+    or passed.
+
+    Accepts any object exposing ``exit_status`` and a ``result`` dict
+    (duck-typed -- callers pass :class:`TrialResult` or lightweight
+    stand-ins in tests). Resolution order:
+
+    1. **Probe trials** carry the classifier's three-way verdict in
+       ``result["metrics"]["verdict"]``; it is authoritative. (A probe
+       ``error`` trial reports ``passed=False`` and therefore
+       ``exit_status == "workload_failed"``, so the metric is the only
+       place the error/fail distinction survives.)
+    2. **Other trials** (triage workloads with no probe verdict) derive
+       it from ``exit_status``: an ``infrastructure_failed`` /
+       ``workload_setup_failed`` trial never validly ran the measurement
+       -> ``error``; any other non-``ok`` status, or a ``WorkloadResult``
+       reporting ``passed is False`` -> ``fail``; otherwise ``pass``.
+    """
+    result = getattr(trial, "result", None)
+    if isinstance(result, dict):
+        metrics = result.get("metrics")
+        if isinstance(metrics, dict):
+            v = metrics.get("verdict")
+            if v in ("pass", "fail", "error"):
+                return v
+
+    status = getattr(trial, "exit_status", None)
+    if status in ("infrastructure_failed", "workload_setup_failed"):
+        return "error"
+    if status is not None and status != "ok":
+        return "fail"
+    if isinstance(result, dict) and result.get("passed") is False:
+        return "fail"
+    return "pass"
+
+
+__all__ = ["TrialResult", "trial_verdict"]
