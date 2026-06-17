@@ -3609,7 +3609,7 @@ def _empty_tensile_catalog() -> dict[str, Any]:
         "hipblaslt": _empty_lib(),
         "rocblas": _empty_lib(),
         "combined": {
-            "tensile_pip_version": None,
+            "package_version": None,
             "kernel_db_combined_hash": None,
         },
     }
@@ -3665,7 +3665,7 @@ def _build_tensile_catalog(
             "menu": rocblas_menu,
         },
         "combined": {
-            "tensile_pip_version": tensile.get("package_version"),
+            "package_version": tensile.get("package_version"),
             "kernel_db_combined_hash": tensile.get("kernel_db_combined_hash"),
         },
     }
