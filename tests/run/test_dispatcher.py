@@ -1031,6 +1031,8 @@ class TestConfigOverrides:
             "docker": "img@sha256:deadbeef",
             "venv": None,
             "buck_target": None,
+            "emulator": None,
+            "mirage_profile": None,
             "source_package": "test",
         }
         assert captured_config["_aorta_environment"] == expected
@@ -1096,6 +1098,8 @@ class TestConfigOverrides:
             "docker": None,
             "venv": None,
             "buck_target": "//workloads/recom_repro:recom_repro",
+            "emulator": None,
+            "mirage_profile": None,
             "source_package": "test",
         }
         assert captured_config["_aorta_environment"] == expected
@@ -1423,6 +1427,8 @@ class TestBuckTargetOverride:
             "venv": "/opt/venv",
             # buck_target was overridden
             "buck_target": "//:aorta",
+            "emulator": None,
+            "mirage_profile": None,
             # source_package survived
             "source_package": "custom_pkg",
         }
@@ -1730,6 +1736,8 @@ class TestImageOverride:
             "venv": "/opt/venv",
             # buck_target survived the docker overlay
             "buck_target": "//workloads/recom_repro:recom_repro",
+            "emulator": None,
+            "mirage_profile": None,
             # source_package survived
             "source_package": "custom_pkg",
         }
