@@ -3800,6 +3800,11 @@ def _empty_rocfft_catalog() -> dict[str, Any]:
     return {
         "doc": ROCFFT_CATALOG_DOC,
         "status": "absent",
+        # Record the RTC-cache-path override even when no cache is found,
+        # so a host that configured ROCFFT_RTC_CACHE_PATH but ships no
+        # cache is distinguishable from one that never set it (mirrors
+        # miopen_catalog.env_overrides).
+        "env_overrides": {ROCFFT_RTC_CACHE_PATH_ENV: None},
         "kernel_cache": {
             "present": False,
             "path": None,
@@ -3820,6 +3825,11 @@ def _build_rocfft_catalog(reasons: list[str]) -> dict[str, Any]:
     hash" is distinguishable from "there is no cache".
     """
     block = _empty_rocfft_catalog()
+    # Capture the override value regardless of whether a cache is found,
+    # so cross-host diffs surface a configured-but-empty RTC cache path.
+    block["env_overrides"] = {
+        ROCFFT_RTC_CACHE_PATH_ENV: os.environ.get(ROCFFT_RTC_CACHE_PATH_ENV),
+    }
     for path, source in _rocfft_cache_candidates():
         try:
             is_file = path.is_file()

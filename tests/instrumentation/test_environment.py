@@ -3688,9 +3688,26 @@ class TestRocfftCatalogBlock:
         assert block["kernel_cache"]["path"] == str(cache)
         assert block["kernel_cache"]["source"] == env_mod.ROCFFT_RTC_CACHE_PATH_ENV
 
+    def test_override_recorded_even_when_cache_absent(self, tmp_path, monkeypatch):
+        """A configured RTC-cache path is captured even with no cache file.
+
+        Distinguishes "override set, but no cache shipped" from "override
+        never set" -- the case Copilot flagged on PR #228.
+        """
+        monkeypatch.setattr(env_mod, "ROCFFT_LIB_DIR", tmp_path / "nope")
+        monkeypatch.setenv(env_mod.ROCFFT_RTC_CACHE_PATH_ENV, "/some/configured/dir")
+        block = env_mod._build_rocfft_catalog([])
+        assert block["status"] == "absent"
+        assert block["kernel_cache"]["present"] is False
+        assert block["env_overrides"][env_mod.ROCFFT_RTC_CACHE_PATH_ENV] == (
+            "/some/configured/dir"
+        )
+
     def test_block_present_and_shaped_in_snapshot(self, all_disabled):
         d = collect_env().to_dict()
-        assert set(d["rocfft_catalog"].keys()) == {"doc", "status", "kernel_cache"}
+        assert set(d["rocfft_catalog"].keys()) == {
+            "doc", "status", "env_overrides", "kernel_cache",
+        }
 
 
 # ---------------------------------------------------------------------------
