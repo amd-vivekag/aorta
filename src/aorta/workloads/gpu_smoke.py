@@ -67,7 +67,11 @@ class GpuSmokeWorkload(Workload):
         import torch
 
         n = int(self.config.get("n", 8))
-        steps = int(self.config.get("steps") or 1)
+        # Explicit ``is None`` defaulting so an intentional ``steps: 0`` (a
+        # degenerate but valid "allocate + verify, no adds" config) is honored
+        # rather than silently treated as missing by a falsy-``0`` check.
+        steps_cfg = self.config.get("steps")
+        steps = 1 if steps_cfg is None else int(steps_cfg)
         t0 = time.perf_counter()
 
         x = torch.zeros(n, device=self._device, dtype=self._dtype)
