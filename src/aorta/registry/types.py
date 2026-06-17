@@ -23,7 +23,8 @@ class Environment:
 
     `docker`, `venv`, `buck_target`, and `mirage_profile` are independent ways
     of describing the baseline; any combination (or none) may be set — built-in
-    `local` has none (current process). No `rocm` field: ROCm version is
+    `local` has none (current process). `emulator` is an optional hint that
+    pairs with `mirage_profile` to name the GPU-emulation backend (see below). No `rocm` field: ROCm version is
     implicit in the docker image digest, the host the venv runs on, or the
     captured `revision` of the Buck checkout; capture it from `aorta env probe`
     at runtime.

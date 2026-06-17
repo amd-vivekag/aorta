@@ -90,6 +90,12 @@ class TestSetup:
         wl = GpuSmokeWorkload({"dtype": "bfloat16"})
         wl.setup()  # should not raise
 
+    def test_setup_raises_on_unknown_dtype(self, fake_torch):
+        fake_torch(cuda_available=True)
+        wl = GpuSmokeWorkload({"dtype": "flob16"})
+        with pytest.raises(RuntimeError, match="unknown dtype"):
+            wl.setup()
+
 
 class TestRun:
     def test_pass_path(self, fake_torch):

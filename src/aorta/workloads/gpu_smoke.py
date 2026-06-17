@@ -56,7 +56,15 @@ class GpuSmokeWorkload(Workload):
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
         }
-        self._dtype = dtype_map.get(str(self.config.get("dtype", "float32")), torch.float32)
+        # Validate rather than silently defaulting an unknown/typo'd dtype to
+        # float32 -- a silent fallback can mask a misconfigured run as green.
+        dtype_name = str(self.config.get("dtype", "float32"))
+        if dtype_name not in dtype_map:
+            raise RuntimeError(
+                f"gpu_smoke: unknown dtype {dtype_name!r}; "
+                f"allowed: {sorted(dtype_map)}"
+            )
+        self._dtype = dtype_map[dtype_name]
         log.info(
             "gpu_smoke setup: device=%s name=%s",
             self._device,
