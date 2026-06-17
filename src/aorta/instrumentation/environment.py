@@ -981,6 +981,26 @@ class EnvSnapshot:
             """
             return version if version else "(not installed)"
 
+        # Static kernel-catalog "recipe book" fingerprints (schema 1.9).
+        # Surface the per-menu content hash so the brief reflects the
+        # installed catalog identity without an operator having to jq.
+        tc = self.tensile_catalog or {}
+        mc = self.miopen_catalog or {}
+        rf = self.rocfft_catalog or {}
+        tc_hb = ((tc.get("hipblaslt") or {}).get("menu") or {}).get(
+            "combined_content_hash"
+        )
+        tc_rb = ((tc.get("rocblas") or {}).get("menu") or {}).get(
+            "combined_content_hash"
+        )
+        mc_hash = (mc.get("menu") or {}).get("combined_content_hash")
+        rf_cache = rf.get("kernel_cache") or {}
+        rf_cell = (
+            f"present {short_hash(rf_cache.get('sha256'))}"
+            if rf_cache.get("present")
+            else (rf.get("status") or "?")
+        )
+
         return "\n".join(
             (
                 f"  runtime:   {rt.get('type', '?')} / python={rt.get('python_env', '?')}",
@@ -1020,6 +1040,12 @@ class EnvSnapshot:
                 f"  tensile:   kernel_db={short_hash(tensile.get('kernel_db_combined_hash'))}  "
                 f"[Tensile pip pkg: {pkg_state(tensile.get('package_version'))}; "
                 f"build-time tool, normal]",
+                # Static "recipe book" identity (the installed kernel
+                # catalogs, NOT the runtime pick): per-menu content hash
+                # for hipBLASLt/rocBLAS Tensile + MIOpen, and the rocFFT
+                # AOT cache state. Full per-file detail lives in the JSON.
+                f"  catalog:   tensile[hb={short_hash(tc_hb)} rb={short_hash(tc_rb)}]  "
+                f"miopen={short_hash(mc_hash)}  rocfft={rf_cell}",
                 f"  triton:    {pkg_state(triton.get('package_version'))}",
                 # FBGEMM has TWO surfaces and they're different artifacts:
                 #   1) FBGEMM the C++ lib is vendored inside the PyTorch
