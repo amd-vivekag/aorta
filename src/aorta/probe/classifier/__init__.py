@@ -81,6 +81,17 @@ class TrialContext:
     # supply the source text without the IDs -- the two paths union.
     tier3_extra: tuple[str, ...] = ()
     tier3_vram_growth: bool = True
+    # Issue #229: operator-supplied detector-disable knobs. A disabled
+    # whole tier (``disabled_tiers``, e.g. ``"tier3"``) is not evaluated
+    # at all -- its scan is skipped so side-effecting probes (dmesg /
+    # amd-smi) don't run. A disabled detector id (``disabled_detectors``,
+    # e.g. ``"tier2:hang"``) is filtered out of the tier's result after
+    # the (cheap, side-effect-free) scan. Either way a disabled detector
+    # never reaches :func:`resolve`, so it cannot flip the verdict or
+    # appear in ``failure_detectors_fired`` / ``warn_detectors_fired``.
+    # Validated upstream by :mod:`aorta.probe.classifier.disables`.
+    disabled_tiers: frozenset[str] = frozenset()
+    disabled_detectors: frozenset[str] = frozenset()
 
 
 def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
@@ -101,24 +112,40 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
     import time
 
     tier_durations_ms: dict[str, float] = {}
+    disabled_tiers = ctx.disabled_tiers
+    disabled_detectors = ctx.disabled_detectors
+
+    def _keep(ids: list[str]) -> list[str]:
+        """Drop any operator-disabled detector ids, preserving order."""
+        if not disabled_detectors:
+            return ids
+        return [d for d in ids if d not in disabled_detectors]
 
     t0 = time.perf_counter()
-    tier1 = tier1_process.detect(
-        Tier1Context(
-            exit_code=ctx.exit_code,
-            timed_out=ctx.timed_out,
-            trial_dir=ctx.trial_dir,
+    if "tier1" in disabled_tiers:
+        tier1: list[str] = []
+    else:
+        tier1 = _keep(
+            tier1_process.detect(
+                Tier1Context(
+                    exit_code=ctx.exit_code,
+                    timed_out=ctx.timed_out,
+                    trial_dir=ctx.trial_dir,
+                )
+            )
         )
-    )
     tier_durations_ms["tier1"] = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
-    tier2 = [DETECTOR_HANG] if ctx.hang_detected else []
+    if "tier2" in disabled_tiers:
+        tier2: list[str] = []
+    else:
+        tier2 = _keep([DETECTOR_HANG] if ctx.hang_detected else [])
     tier_durations_ms["tier2"] = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
     tier3: list[str] = []
-    if ctx.tier3_state is not None:
+    if "tier3" not in disabled_tiers and ctx.tier3_state is not None:
         # Caller-pre-collected IDs come first so the call order in
         # ``failure_detectors_fired`` matches the chronological order
         # of detection (workload polls dmesg before classify_trial
@@ -138,20 +165,43 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
                     check_vram_growth=ctx.tier3_vram_growth,
                 )
             )
+    tier3 = _keep(tier3)
     tier_durations_ms["tier3"] = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
-    tier4 = tier4_patterns.scan(ctx.log_text)
+    if "tier4" in disabled_tiers:
+        tier4: list[str] = []
+    else:
+        tier4 = _keep(tier4_patterns.scan(ctx.log_text))
     tier_durations_ms["tier4"] = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
-    custom_result = tier5_custom.scan(
-        ctx.log_text,
-        ctx.custom_patterns,
-        exit_code=ctx.exit_code,
-        walltime_sec=ctx.walltime_sec,
-        peak_vram_mib=ctx.peak_vram_mib,
-    )
+    # ``tier5`` is the tier token for the custom-pattern scanner; when
+    # disabled, skip the scan entirely (an empty result is the no-op the
+    # resolver expects) so no ``custom:*`` id can fire.
+    if "tier5" in disabled_tiers:
+        custom_result = tier5_custom.CustomScanResult()
+        custom_required_patterns: tuple[CompiledPattern, ...] = ()
+    else:
+        custom_result = tier5_custom.scan(
+            ctx.log_text,
+            ctx.custom_patterns,
+            exit_code=ctx.exit_code,
+            walltime_sec=ctx.walltime_sec,
+            peak_vram_mib=ctx.peak_vram_mib,
+        )
+        custom_required_patterns = ctx.custom_patterns
+        if disabled_detectors:
+            # Filter disabled custom ids out of the fired lists so they
+            # neither flip the verdict nor surface as fired detectors.
+            custom_result.fail_detectors = _keep(custom_result.fail_detectors)
+            custom_result.warn_detectors = _keep(custom_result.warn_detectors)
+            custom_result.fired_required_ids = {
+                i for i in custom_result.fired_required_ids if i not in disabled_detectors
+            }
+            custom_required_patterns = tuple(
+                p for p in ctx.custom_patterns if p.detector_id not in disabled_detectors
+            )
     tier_durations_ms["tier5"] = (time.perf_counter() - t0) * 1000.0
 
     # Split Tier-3 IDs into hard failures vs. advisory warns. ``vram_growth``
@@ -168,7 +218,7 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
             tier4=tier4,
             tier3_warn=tier3_warn,
             custom_result=custom_result,
-            custom_required_patterns=ctx.custom_patterns,
+            custom_required_patterns=custom_required_patterns,
         )
     )
     return verdict, tier_durations_ms

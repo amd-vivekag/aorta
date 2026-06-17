@@ -383,6 +383,12 @@ class SubprocessWorkload(Workload):
             )
         tier3_vram_growth = _vram_growth_raw
 
+        # Issue #229: detector-disable knobs. Validated on the
+        # recipe-builder side; default to empty so non-probe / legacy
+        # payloads are the no-op (every detector active).
+        disabled_detectors = frozenset(probe_extras.get("disable_detectors") or ())
+        disabled_tiers = frozenset(probe_extras.get("disable_detector_tiers") or ())
+
         # ``inherit`` mode: the dispatcher has already stamped the
         # cell's mitigation + diagnostic env vars onto os.environ in
         # _run_single_trial's pre-run overlay (it restores them in the
@@ -689,6 +695,8 @@ class SubprocessWorkload(Workload):
                     tier3_extra=tuple(fired_kernel_ids),
                     tier3_state=_TIER3_STATE,
                     tier3_vram_growth=tier3_vram_growth,
+                    disabled_tiers=disabled_tiers,
+                    disabled_detectors=disabled_detectors,
                 )
             )
         except Exception as classifier_exc:  # noqa: BLE001 -- classifier crash containment
@@ -730,6 +738,13 @@ class SubprocessWorkload(Workload):
         # rather than only the log.info above.
         if hang_reconciled_away:
             result_doc["capture"]["tier2_hang_latched_but_reconciled"] = True
+        # Issue #229: surface the operator's disable knobs in the trial
+        # artifact so a reader knows a detector was intentionally silenced
+        # rather than simply not firing.
+        if disabled_detectors:
+            result_doc["capture"]["disabled_detectors"] = sorted(disabled_detectors)
+        if disabled_tiers:
+            result_doc["capture"]["disabled_detector_tiers"] = sorted(disabled_tiers)
         result_path.write_text(
             json.dumps(result_doc, indent=2, sort_keys=False),
             encoding="utf-8",

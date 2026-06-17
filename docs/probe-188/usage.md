@@ -85,6 +85,26 @@ custom_patterns:                   # Tier 5 user-defined patterns
     required_for_pass: false          # only valid with on_match: fail
 ```
 
+Detector-disable knobs (issue #229) silence detectors that fire on
+benign, workload-specific behaviour:
+
+```yaml
+disable_detector_tiers:            # skip whole tiers (not evaluated)
+  - tier3                          #   e.g. all kernel/GPU-counter checks
+disable_detectors:                 # skip individual detectors
+  - tier2:hang                     #   a repro that legitimately idles
+  - tier3:vram_growth              #   opaque docker wrapper allocates VRAM
+  - custom:my_pattern              #   a custom_patterns[*] id
+```
+
+A disabled detector is **not evaluated** and **never counts** toward the
+verdict or the `failure_detectors_fired` / `warn_detectors_fired` lists;
+the disabled set is echoed into `result.json::capture` for audit. Tokens
+are validated at load time (unknown tier or malformed `<tier>:<id>` ->
+`RecipeSchemaError`). The `--disable-detector TIER[:ID]` CLI flag
+(repeatable) is **unioned onto** the recipe's set, so an operator can
+silence one more detector without restating the recipe's list.
+
 Phase 3 keys (`redaction`, top-level `condition`) are still **rejected
 at load time** with a "deferred to Phase 3" error message.
 
