@@ -477,10 +477,10 @@ ROCBLAS_TENSILE_DIR = Path(
 # Tensile library dir and fingerprints each file individually. Suffixes
 # cover the frozen solution menu: ``.dat`` (modern binary logic),
 # ``.yaml`` (older text logic), and the ``.co`` / ``.hsaco`` code-object
-# blobs that ship alongside. ``TensileLibrary*`` / ``*Manifest*`` text
-# files (which carry no suffix in the set, e.g. ``TensileManifest.txt``)
-# are picked up by the ``.txt`` membership check below so the manifest's
-# identity is captured too.
+# blobs that ship alongside. The ``.txt`` entry captures manifest/index
+# text files (e.g. ``TensileManifest.txt``): they are neither logic nor
+# code-object files, but their identity still matters for a complete
+# catalog fingerprint, so they are included via ``.txt``.
 TENSILE_MENU_SUFFIXES: tuple[str, ...] = (".dat", ".yaml", ".co", ".hsaco", ".txt")
 # A file counts as a Tensile "logic" file (the actual solution menu, as
 # opposed to a raw code-object blob) when it carries one of these
