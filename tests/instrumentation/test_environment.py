@@ -3472,6 +3472,28 @@ class TestTensileMenuEnumeration:
         names = ["TensileLibrary_GFX90A.dat", "x_gfx90a.dat", "y_gfx942.co", "none.dat"]
         assert env_mod._extract_gfx_archs(names) == ["gfx90a", "gfx942"]
 
+    def test_combined_hash_is_none_when_a_file_hash_fails(self, tmp_path, monkeypatch):
+        """A combined hash over a missing per-file hash isn't a true
+        content fingerprint -- it must be None, not a content-sha256:
+        value (Copilot review on PR #228).
+        """
+        d = _make_tensile_install(tmp_path / "lib", archs=("gfx942",))
+        victim = "TensileLibrary_lazy_gfx942.dat"
+        real_hash = env_mod._hash_file_path
+
+        def flaky_hash(path):
+            if path.name == victim:
+                return None  # simulate an unreadable file
+            return real_hash(path)
+
+        monkeypatch.setattr(env_mod, "_hash_file_path", flaky_hash)
+        menu = env_mod._enumerate_tensile_menu(d)
+        assert menu["status"] == "partial"
+        assert menu["combined_content_hash"] is None
+        # The unreadable file is still listed (not dropped), with sha256 None.
+        victim_entry = [f for f in menu["files"] if f["name"] == victim][0]
+        assert victim_entry["sha256"] is None
+
 
 class TestTensileCatalogBlock:
     def test_default_and_disaster_shapes_match_built_block(self, tmp_path: Path):
@@ -3723,6 +3745,26 @@ class TestRocfftCatalogBlock:
         assert set(d["rocfft_catalog"].keys()) == {
             "doc", "status", "env_overrides", "kernel_cache",
         }
+
+    def test_summary_renders_present_unreadable_not_present_none(self, all_disabled):
+        """A present-but-unhashable cache must not render as "present None"
+        in the CLI brief (Copilot review on PR #228).
+        """
+        d = collect_env().to_dict()
+        d["rocfft_catalog"] = {
+            "doc": "x",
+            "status": "partial",
+            "env_overrides": {env_mod.ROCFFT_RTC_CACHE_PATH_ENV: None},
+            "kernel_cache": {
+                "present": True, "path": "/x", "source": "rocm_lib",
+                "size": 10, "sha256": None,
+                "reason": "cache file present but could not be hashed",
+            },
+        }
+        snap = env_mod.EnvSnapshot.from_dict(d)
+        catalog_line = [l for l in snap.summary().splitlines() if "catalog:" in l][0]
+        assert "rocfft=present (unreadable)" in catalog_line
+        assert "present None" not in catalog_line
 
 
 # ---------------------------------------------------------------------------

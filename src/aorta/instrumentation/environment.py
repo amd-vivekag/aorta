@@ -995,11 +995,13 @@ class EnvSnapshot:
         )
         mc_hash = (mc.get("menu") or {}).get("combined_content_hash")
         rf_cache = rf.get("kernel_cache") or {}
-        rf_cell = (
-            f"present {short_hash(rf_cache.get('sha256'))}"
-            if rf_cache.get("present")
-            else (rf.get("status") or "?")
-        )
+        if rf_cache.get("present"):
+            _rf_sha = rf_cache.get("sha256")
+            # present-but-unhashable (partial) -> avoid the ambiguous
+            # "present None"; show an explicit unreadable marker.
+            rf_cell = f"present {short_hash(_rf_sha)}" if _rf_sha else "present (unreadable)"
+        else:
+            rf_cell = rf.get("status") or "?"
 
         return "\n".join(
             (
@@ -3548,9 +3550,16 @@ def _enumerate_catalog_dir(
     logic_count = sum(1 for f in files if f["is_logic"])
     # Deterministic combined content fingerprint over (name, sha256)
     # pairs -- a single value to eyeball when diffing whole menus, while
-    # the per-file ``files`` list localizes the change.
-    pair_lines = [f"{f['name']}\t{f['sha256']}" for f in files]
-    combined = hashlib.sha256("\n".join(pair_lines).encode("utf-8")).hexdigest()
+    # the per-file ``files`` list localizes the change. Only emit it when
+    # EVERY file hashed cleanly: a value computed over a missing hash is
+    # not a true content fingerprint (it would hash the literal "None"),
+    # so it must be ``None`` rather than a misleading ``content-sha256:``.
+    if any_hash_failed:
+        combined_content_hash = None
+    else:
+        pair_lines = [f"{f['name']}\t{f['sha256']}" for f in files]
+        digest = hashlib.sha256("\n".join(pair_lines).encode("utf-8")).hexdigest()
+        combined_content_hash = f"content-sha256:{digest}"
 
     base.update(
         {
@@ -3564,7 +3573,7 @@ def _enumerate_catalog_dir(
             "file_count": len(files),
             "gfx_arch_coverage": _extract_gfx_archs(names),
             "files": files,
-            "combined_content_hash": f"content-sha256:{combined}",
+            "combined_content_hash": combined_content_hash,
         }
     )
     return base
