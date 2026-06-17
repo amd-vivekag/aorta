@@ -41,8 +41,10 @@ Phase-1 minimum shape keeps working.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import signal
 import stat
 import subprocess
 import time
@@ -65,6 +67,8 @@ from aorta.probe.classifier.tier3_kernel import (
 )
 from aorta.probe.classifier.verdict import Verdict
 from aorta.workloads._base import Workload, WorkloadResult
+
+log = logging.getLogger(__name__)
 
 # Process-wide Tier 3 state. Shared across every SubprocessWorkload
 # instance the dispatcher constructs over one ``aorta probe`` invocation
@@ -105,6 +109,138 @@ CONFIG_KEY_PROBE_EXTRAS = "_aorta_probe_extras"
 # ``_aorta_log_prefix``. Captured group is the trial index; we use it
 # to compute ``trial_<idx>/`` per the probe-mode artifact layout.
 _LOG_PREFIX_TRIAL_RE = re.compile(r"trial_d\d+_m\d+_t(\d+)$")
+
+
+# Grace period (seconds) between the SIGTERM and the SIGKILL escalation in
+# ``_terminate_process_tree``. Short enough that an interrupted operator isn't
+# left waiting, long enough that a foreground ``docker run`` can forward the
+# SIGTERM to the container's PID 1 and let it stop cleanly.
+_TERMINATE_GRACE_SEC = 10.0
+
+# Reap budget (seconds) for the ``proc.wait()`` *after* a SIGKILL has gone out.
+# SIGKILL is uncatchable, so the group is torn down by the kernel almost
+# immediately; this wait only exists to reap zombies, not to give the child a
+# chance to react. Capping it (rather than reusing the full SIGTERM grace) keeps
+# Ctrl-C aborts and timeout handling responsive instead of stalling up to
+# ``grace_sec`` on a process that is already dead.
+_REAP_AFTER_KILL_SEC = 1.0
+
+
+def _terminate_process_tree(
+    proc: subprocess.Popen, grace_sec: float = _TERMINATE_GRACE_SEC
+) -> None:
+    """Best-effort teardown of the child's *entire* process group.
+
+    The child is launched with ``start_new_session=True`` so it leads its own
+    process group; signalling that group (``os.killpg``) rather than just
+    ``proc.pid`` reaps grandchildren too -- e.g. a
+    ``sudo -> bash -> docker run -> python3`` tree that would otherwise survive
+    an interrupted or timed-out trial and keep its GPUs pinned (#220).
+
+    Escalation: ``SIGTERM`` first (a foreground ``docker run`` forwards it to
+    the container's PID 1, giving the container a chance to stop cleanly), then
+    ``SIGKILL`` after ``grace_sec`` for anything that ignored it. Note that a
+    *detached* ``docker run -d`` container is reparented to the docker daemon
+    and is not in this group; tearing it down needs an explicit ``docker kill``
+    in the workload wrapper.
+
+    A race where the group already exited (``ESRCH`` /
+    ``ProcessLookupError``) is the expected common case, not an error, and is
+    swallowed silently. Any *other* signal-delivery failure (e.g. ``EPERM``)
+    is logged at WARNING -- it means the group could not be torn down and the
+    tree may leak, which the operator needs to see. As a safety net it refuses
+    to signal the caller's own process group -- which can only happen if the
+    child was not started in a new session -- so a misconfiguration can never
+    take down the ``aorta`` process itself.
+
+    The only exception it propagates is ``KeyboardInterrupt``: a second
+    ``Ctrl-C`` landing while we wait out the grace period must not abandon the
+    teardown mid-escalation and re-orphan the tree (#220). In that case we
+    force ``SIGKILL`` on the group, reap best-effort, and *then* re-raise so
+    the operator's interrupt still aborts the run.
+    """
+    pgid: int | None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+    if pgid is not None and pgid == os.getpgrp():
+        # Defensive: child not in its own session (should never happen in
+        # production). Fall back to signalling just the direct child so we
+        # never nuke our own process group.
+        pgid = None
+
+    def _send(sig: int) -> None:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except ProcessLookupError:
+                # Expected ESRCH race: the group exited between the decision
+                # to signal and delivery. Not an error -- fall through to the
+                # direct-child attempt (also a likely ESRCH no-op).
+                pass
+            except OSError as exc:
+                # Non-ESRCH failure (e.g. EPERM): the group could NOT be
+                # signalled, so the child tree may survive and keep its GPUs
+                # pinned (#220). Surface it instead of leaking silently, then
+                # still try the direct child as a best-effort fallback.
+                log.warning(
+                    "killpg(%d, %s) failed: %s; the child process group may "
+                    "not be fully reaped (orphaned grandchildren can keep "
+                    "their GPUs pinned, #220)",
+                    pgid,
+                    signal.Signals(sig).name,
+                    exc,
+                )
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            log.warning(
+                "send_signal(%s) to child pid %s failed: %s; the child may "
+                "not be reaped (#220)",
+                signal.Signals(sig).name,
+                getattr(proc, "pid", "?"),
+                exc,
+            )
+
+    reap_sec = min(grace_sec, _REAP_AFTER_KILL_SEC)
+
+    def _reap_after_kill() -> None:
+        # The group has already been SIGKILLed; give it a brief, fully
+        # interrupt-tolerant chance to be reaped so we don't leave zombies.
+        try:
+            proc.wait(timeout=reap_sec)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+            pass
+        except KeyboardInterrupt:
+            pass
+
+    _send(signal.SIGTERM)
+    try:
+        proc.wait(timeout=grace_sec)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (ProcessLookupError, OSError):
+        return
+    except KeyboardInterrupt:
+        # Don't abandon teardown mid-escalation: force-kill the group and
+        # reap before propagating the operator's interrupt.
+        _send(signal.SIGKILL)
+        _reap_after_kill()
+        raise
+    _send(signal.SIGKILL)
+    try:
+        proc.wait(timeout=reap_sec)
+    except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+        pass
+    except KeyboardInterrupt:
+        # Group already got SIGKILL; reap what we can, then propagate.
+        _reap_after_kill()
+        raise
 
 
 class SubprocessWorkload(Workload):
@@ -162,14 +298,24 @@ class SubprocessWorkload(Workload):
         # GPU-emulation opt-in: when the dispatcher-threaded environment
         # (``_aorta_environment``) targets the mirage emulator, transparently
         # rewrite the opaque user argv to ``mirage run --profile <p> -- <argv>``
-        # so the probed command runs on an emulated GPU. Non-emulated
-        # environments leave argv byte-for-byte unchanged, so every existing
-        # probe behaves identically. A requested-but-unbuildable emulation
-        # (e.g. mirage not on PATH) raises here and is reported as a clean
-        # setup failure rather than silently running on real hardware.
-        from aorta.emulation.mirage_launch import wrap_argv_for_environment
+        # so the probed command runs on an emulated GPU. A
+        # requested-but-unbuildable emulation (e.g. mirage not on PATH) raises
+        # here and is reported as a clean setup failure rather than silently
+        # running on real hardware.
+        #
+        # Guarded so the non-emulated path is a true zero-cost no-op: we only
+        # import + invoke the emulation backend when the resolved environment
+        # actually carries an emulator. This keeps every existing (real-hardware)
+        # probe byte-for-byte and overhead-for-overhead identical -- no new
+        # import, no extra work in ``setup()``.
+        env = self.config.get("_aorta_environment")
+        if isinstance(env, dict) and (
+            env.get("mirage_profile")
+            or (env.get("emulator") and env.get("emulator") != "noop")
+        ):
+            from aorta.emulation.mirage_launch import wrap_argv_for_environment
 
-        argv = wrap_argv_for_environment(self.config, argv)
+            argv = list(wrap_argv_for_environment(self.config, argv))
         self._argv = tuple(argv)
 
         log_prefix = self.config.get(CONFIG_KEY_LOG_PREFIX)
@@ -242,6 +388,22 @@ class SubprocessWorkload(Workload):
         hang_grace_sec = (
             DEFAULT_HANG_GRACE_SEC if _hang_grace_raw is None else float(_hang_grace_raw)
         )
+        # ``tier3_vram_growth`` is a validated boolean on the
+        # recipe-builder side (RecipeSchemaError on non-bool) and is
+        # serialized from a typed ``ProbeExtras`` field, so the payload
+        # is contractually a bool. Validate-and-fail-fast rather than
+        # ``bool(...)``: truthiness coercion would turn a malformed
+        # payload (e.g. the string ``"false"``) into ``True`` and
+        # silently re-enable the detector. This mirrors the sibling
+        # ``float(...)`` knobs above, which also surface a bad payload
+        # instead of swallowing it.
+        _vram_growth_raw = probe_extras.get("tier3_vram_growth", True)
+        if not isinstance(_vram_growth_raw, bool):
+            raise TypeError(
+                "probe_extras['tier3_vram_growth'] must be a bool, got "
+                f"{type(_vram_growth_raw).__name__} ({_vram_growth_raw!r})"
+            )
+        tier3_vram_growth = _vram_growth_raw
 
         # ``inherit`` mode: the dispatcher has already stamped the
         # cell's mitigation + diagnostic env vars onto os.environ in
@@ -334,51 +496,66 @@ class SubprocessWorkload(Workload):
                     stdout=out_fh,
                     stderr=err_fh,
                     env=child_env,
+                    # Lead a new session/process group so the *whole* child
+                    # tree (sudo -> bash -> docker run -> python3, etc.) can
+                    # be reaped via os.killpg on timeout / interrupt instead
+                    # of orphaning grandchildren that keep their GPUs pinned
+                    # (#220). See _terminate_process_tree.
+                    start_new_session=True,
                 )
                 launched = True
-                # Wire the third leg of the two-of-three Tier 2
-                # predicate. The closure spawns one ``amd-smi monitor``
-                # call per HangMonitor poll (~12/min at the default 5s
-                # poll cadence) and returns True iff the busiest GPU
-                # reports < GPU_IDLE_UTILIZATION_THRESHOLD_PCT. When
-                # amd-smi is missing or unparseable the closure returns
-                # False, so the predicate gracefully degrades to the
-                # 2-of-2 ``stdout_silent`` + ``io_idle`` shape that the
-                # round-1 wiring was already covering (rubric §2.B FR
-                # 2.11 fail-soft policy).
-                hang_monitor = HangMonitor(
-                    pid=proc.pid,
-                    stdout_path=stdout_path,
-                    hang_window_sec=hang_window_sec,
-                    hang_grace_period_at_start=hang_grace_sec,
-                    gpu_idle_probe=gpu_idle_probe_from_state(_TIER3_STATE),
-                )
-                hang_monitor.start()
+                # Everything from the monitor wiring through proc.wait() is in
+                # one try so a Ctrl-C landing *anywhere* after Popen -- e.g.
+                # during HangMonitor.start() -- still reaches the
+                # ``except KeyboardInterrupt`` that reaps the child tree, and
+                # the ``finally`` always stops the monitor thread. Otherwise an
+                # interrupt between Popen and the wait would orphan the
+                # sudo/docker/python grandchildren this PR is meant to reap
+                # (#220) and leak the monitor thread.
                 try:
+                    # Wire the third leg of the two-of-three Tier 2
+                    # predicate. The closure spawns one ``amd-smi monitor``
+                    # call per HangMonitor poll (~12/min at the default 5s
+                    # poll cadence) and returns True iff the busiest GPU
+                    # reports < GPU_IDLE_UTILIZATION_THRESHOLD_PCT. When
+                    # amd-smi is missing or unparseable the closure returns
+                    # False, so the predicate gracefully degrades to the
+                    # 2-of-2 ``stdout_silent`` + ``io_idle`` shape that the
+                    # round-1 wiring was already covering (rubric §2.B FR
+                    # 2.11 fail-soft policy).
+                    hang_monitor = HangMonitor(
+                        pid=proc.pid,
+                        stdout_path=stdout_path,
+                        hang_window_sec=hang_window_sec,
+                        hang_grace_period_at_start=hang_grace_sec,
+                        gpu_idle_probe=gpu_idle_probe_from_state(_TIER3_STATE),
+                    )
+                    hang_monitor.start()
                     exit_code = proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    # Race-safe shutdown: the child can exit between
-                    # the ``wait()`` timeout and our ``kill()`` (e.g.
-                    # the workload finished while the kernel was
-                    # delivering the SIGALRM the timeout uses), which
-                    # makes ``Popen.kill()`` raise
-                    # ``ProcessLookupError`` (ESRCH) on Linux. Swallow
-                    # that one specific case so the trial deterministically
-                    # records ``timed_out=True`` and ``exit_code=-1``
-                    # rather than crashing the workload and leaving the
-                    # trial with no ``result.json``. Any other OSError
-                    # from kill() (EPERM etc.) re-raises so we don't
-                    # silently swallow a genuine bug.
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        proc.wait()
-                    except ProcessLookupError:
-                        pass
+                    # Tear down the whole child process group, not just the
+                    # direct child: a timed-out trial may have spawned a
+                    # sudo/docker/python grandchild tree that would otherwise
+                    # survive and keep its GPUs pinned (#220).
+                    # ``_terminate_process_tree`` is race-safe -- it swallows
+                    # the ESRCH that occurs when the child exits between the
+                    # timeout firing and the signal landing -- so the trial
+                    # deterministically records ``timed_out=True`` and
+                    # ``exit_code=-1`` with a ``result.json`` on disk.
+                    _terminate_process_tree(proc)
                     exit_code = -1
+                except KeyboardInterrupt:
+                    # Operator Ctrl-C (SIGINT delivered to the aorta parent;
+                    # the child is in its own session and does NOT receive the
+                    # terminal's SIGINT). Reap the whole child tree before the
+                    # interrupt unwinds the run, otherwise sudo/docker/python
+                    # grandchildren survive and exhaust the GPUs (#220), then
+                    # re-raise so the run aborts as the operator intended. We
+                    # do NOT set ``timed_out`` here: an operator abort isn't a
+                    # timeout, and the re-raise skips ``result.json`` anyway.
+                    _terminate_process_tree(proc)
+                    raise
                 finally:
                     if hang_monitor is not None:
                         hang_monitor.stop()
@@ -424,6 +601,38 @@ class SubprocessWorkload(Workload):
         # are bugs, not trial outcomes).
         log_text = _read_log_text(stdout_path, stderr_path)
         hang_detected = bool(hang_monitor and hang_monitor.hang_detected)
+        # Reconcile the latched hang flag against the actual exit.
+        #
+        # The in-flight HangMonitor watches three signals on the
+        # *wrapper* PID: stdout silence on this trial's stdout.log, I/O
+        # idleness on /proc/<wrapper_pid>/io, and GPU idleness. For a
+        # workload that delegates its real work to a child process tree
+        # the parent can't see (``sudo`` -> ``bash run.sh`` ->
+        # ``docker run`` -> container -> ``python3``), the wrapper goes
+        # quiet and does almost no I/O of its own while the descendants
+        # do all the work. That trips ``stdout_silent`` + ``io_idle``
+        # (two of three) and latches ``hang_detected`` even though the
+        # workload is alive and busy. Those two legs are structurally
+        # blind to delegated work, so a mid-run latch is advisory only.
+        #
+        # A process that voluntarily exited 0 within its timeout was, by
+        # definition, not hung -- a real hang would have either kept the
+        # process alive until ``proc.wait(timeout=...)`` fired
+        # (``timed_out=True``) or surfaced as a non-zero exit. Drop the
+        # latched flag in that case so a clean run is never classified
+        # ``tier2:hang``. Genuine hangs (``timed_out=True``) and crashes
+        # (``exit_code != 0``) keep the flag and still classify as fail.
+        hang_reconciled_away = False
+        if hang_detected and exit_code == 0 and not timed_out:
+            log.info(
+                "tier2:hang latched mid-run for argv[0]=%r but the process "
+                "exited 0 within the timeout; discarding the advisory flag "
+                "(the monitor's stdout/io legs are blind to work delegated "
+                "to a child process tree).",
+                argv[0] if argv else "<unknown>",
+            )
+            hang_detected = False
+            hang_reconciled_away = True
 
         # Best-effort ``peak_vram_mib`` from the Tier-3 amd-smi
         # snapshots. We only have two samples (pre + post Popen) so
@@ -501,6 +710,7 @@ class SubprocessWorkload(Workload):
                     amd_smi_post=amd_smi_post,
                     tier3_extra=tuple(fired_kernel_ids),
                     tier3_state=_TIER3_STATE,
+                    tier3_vram_growth=tier3_vram_growth,
                 )
             )
         except Exception as classifier_exc:  # noqa: BLE001 -- classifier crash containment
@@ -533,6 +743,15 @@ class SubprocessWorkload(Workload):
             "timed_out": timed_out,
             "env": dict(cell_env_snapshot),
         }
+        # Durable per-trial breadcrumb when a latched tier2:hang was
+        # reconciled away on a clean exit (exit 0, not timed out). Only the
+        # tier2:hang signal is dropped -- the final verdict still reflects the
+        # other tiers, so a clean exit can still fail on Tier-3/4/5. The #224
+        # follow-ups (descendant-tree-aware hang predicate) need to study these
+        # wrapper-delegated false positives, so leave a trace in result.json
+        # rather than only the log.info above.
+        if hang_reconciled_away:
+            result_doc["capture"]["tier2_hang_latched_but_reconciled"] = True
         result_path.write_text(
             json.dumps(result_doc, indent=2, sort_keys=False),
             encoding="utf-8",

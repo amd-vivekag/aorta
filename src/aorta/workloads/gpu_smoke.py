@@ -24,6 +24,7 @@ Config keys (all optional; ``steps`` is dispatcher-supplied):
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -76,7 +77,12 @@ class GpuSmokeWorkload(Workload):
 
         total = float(x.sum().item())
         expected = float(n * steps)
-        passed = total == expected
+        # Tolerance-based compare: reduced-precision dtypes (float16/bfloat16)
+        # and larger n*steps accumulate rounding error, so an exact ``==`` would
+        # produce false FAILs. A small relative tolerance is sufficient for a
+        # smoke test (we only care that the kernel ran and produced ~the right
+        # value, not bit-exactness).
+        passed = math.isclose(total, expected, rel_tol=1e-2, abs_tol=1e-3)
         elapsed = time.perf_counter() - t0
 
         if passed:
