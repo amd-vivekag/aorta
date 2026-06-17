@@ -3796,10 +3796,18 @@ def _rocfft_cache_candidates() -> list[tuple[Path, str]]:
 
 
 def _empty_rocfft_catalog() -> dict[str, Any]:
-    """All-null ``rocfft_catalog`` for the default / disaster snapshot."""
+    """Not-captured ``rocfft_catalog`` for the default / disaster snapshot.
+
+    Status is ``"partial"`` with a "not captured" reason -- deliberately
+    NOT ``"absent"``. ``"absent"`` is reserved for ``_build_rocfft_catalog``
+    after it has actually probed and found no cache; the default/backfill/
+    disaster shape must be distinguishable from that "we checked, nothing
+    there" outcome (mirrors the ``"X not captured"`` reason the Tensile/
+    MIOpen empty menus use).
+    """
     return {
         "doc": ROCFFT_CATALOG_DOC,
-        "status": "absent",
+        "status": "partial",
         # Record the RTC-cache-path override even when no cache is found,
         # so a host that configured ROCFFT_RTC_CACHE_PATH but ships no
         # cache is distinguishable from one that never set it (mirrors
@@ -3811,7 +3819,7 @@ def _empty_rocfft_catalog() -> dict[str, Any]:
             "source": None,
             "size": None,
             "sha256": None,
-            "reason": None,
+            "reason": "rocfft_catalog not captured",
         },
     }
 
@@ -3825,6 +3833,11 @@ def _build_rocfft_catalog(reasons: list[str]) -> dict[str, Any]:
     hash" is distinguishable from "there is no cache".
     """
     block = _empty_rocfft_catalog()
+    # We are now actually probing -- promote the "not captured" default to
+    # a clean "absent" (no reason). A real "checked, no cache" outcome
+    # must be distinguishable from the not-captured default/backfill.
+    block["status"] = "absent"
+    block["kernel_cache"]["reason"] = None
     # Capture the override value regardless of whether a cache is found,
     # so cross-host diffs surface a configured-but-empty RTC cache path.
     block["env_overrides"] = {

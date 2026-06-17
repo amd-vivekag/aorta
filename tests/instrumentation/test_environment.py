@@ -3703,6 +3703,21 @@ class TestRocfftCatalogBlock:
             "/some/configured/dir"
         )
 
+    def test_not_captured_default_distinct_from_probed_absent(self, tmp_path, monkeypatch):
+        """The default/backfill shape must be distinguishable from a probe
+        that ran and found no cache (Copilot review on PR #228).
+        """
+        # Default / disaster / from_dict backfill shape: "not captured".
+        default = env_mod._empty_rocfft_catalog()
+        assert default["status"] == "partial"
+        assert default["kernel_cache"]["reason"] == "rocfft_catalog not captured"
+        # A real probe that finds nothing: clean "absent", no reason.
+        monkeypatch.setattr(env_mod, "ROCFFT_LIB_DIR", tmp_path / "nope")
+        monkeypatch.delenv(env_mod.ROCFFT_RTC_CACHE_PATH_ENV, raising=False)
+        probed = env_mod._build_rocfft_catalog([])
+        assert probed["status"] == "absent"
+        assert probed["kernel_cache"]["reason"] is None
+
     def test_block_present_and_shaped_in_snapshot(self, all_disabled):
         d = collect_env().to_dict()
         assert set(d["rocfft_catalog"].keys()) == {
