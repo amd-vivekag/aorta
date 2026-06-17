@@ -107,6 +107,9 @@ def all_disabled(isolated_env, tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(env_mod, "MIOPEN_LIB_DIR", tmp_path / "no_miopen_libs")
     monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", tmp_path / "no_miopen_db")
+    monkeypatch.setattr(env_mod, "ROCFFT_LIB_DIR", tmp_path / "no_rocfft")
+    monkeypatch.delenv(env_mod.MIOPEN_SYSTEM_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv(env_mod.ROCFFT_RTC_CACHE_PATH_ENV, raising=False)
     monkeypatch.setattr(
         env_mod, "RCCL_VERSION_HEADER", tmp_path / "no_rccl.h"
     )
@@ -163,6 +166,7 @@ class TestPathConstants:
             "MIOPEN_VERSION_HEADER",
             "MIOPEN_LIB_DIR",
             "MIOPEN_KERNEL_DB_DIR",
+            "ROCFFT_LIB_DIR",
             "RCCL_VERSION_HEADER",
             "RCCL_LIB_DIR",
             "SYS_CLASS_NET",
@@ -208,6 +212,7 @@ class TestPathConstants:
             "MIOPEN_VERSION_HEADER",
             "MIOPEN_LIB_DIR",
             "MIOPEN_KERNEL_DB_DIR",
+            "ROCFFT_LIB_DIR",
             "RCCL_VERSION_HEADER",
             "RCCL_LIB_DIR",
             "SYS_CLASS_NET",
@@ -249,6 +254,9 @@ REQUIRED_TOP_KEYS = {
     "rocblas",
     "composable_kernel",
     "tensile",
+    "tensile_catalog",
+    "miopen_catalog",
+    "rocfft_catalog",
     "triton",
     "fbgemm",
     "aiter",
@@ -277,7 +285,7 @@ class TestSchemaCompleteness:
     ):
         snapshot = collect_env()
         assert set(snapshot.to_dict().keys()) == REQUIRED_TOP_KEYS
-        assert snapshot.schema_version == "1.7"
+        assert snapshot.schema_version == "1.9"
         assert snapshot.system_health is None
         assert snapshot.rocm == {
             "version": None,
@@ -3375,6 +3383,314 @@ class TestTensileBlock:
         assert any(
             r.startswith("tensile.kernel_db_combined_hash:") for r in reasons
         )
+
+
+# ---------------------------------------------------------------------------
+# Static Tensile catalog (issue #54)
+# ---------------------------------------------------------------------------
+
+
+def _make_tensile_install(directory: Path, *, archs=("gfx942",), content=b"menu"):
+    """Stand up a synthetic Tensile library dir and return it.
+
+    Mirrors a modern hipBLASLt/rocBLAS layout: per-arch ``.dat`` logic
+    files, a ``TensileManifest.txt``, and a ``.hsaco`` code object.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    for arch in archs:
+        (directory / f"TensileLibrary_lazy_{arch}.dat").write_bytes(
+            content + arch.encode()
+        )
+        (directory / f"Kernels.so-000-{arch}.hsaco").write_bytes(b"obj-" + arch.encode())
+    (directory / "TensileManifest.txt").write_text("\n".join(archs) + "\n")
+    return directory
+
+
+class TestTensileMenuEnumeration:
+    def test_missing_dir_is_partial_not_silent(self, tmp_path: Path):
+        menu = env_mod._enumerate_tensile_menu(tmp_path / "does_not_exist")
+        assert menu["status"] == "partial"
+        assert menu["reason"] is not None
+        assert menu["files"] is None
+        # A "couldn't read" probe must be distinguishable from an empty menu.
+        assert menu["logic_file_count"] is None
+
+    def test_present_but_empty_is_ok_with_zero_count(self, tmp_path: Path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        menu = env_mod._enumerate_tensile_menu(empty)
+        assert menu["status"] == "ok"
+        assert menu["logic_file_count"] == 0
+        assert menu["file_count"] == 0
+        assert menu["gfx_arch_coverage"] == []
+
+    def test_enumerates_count_archs_and_per_file_hashes(self, tmp_path: Path):
+        d = _make_tensile_install(tmp_path / "lib", archs=("gfx942", "gfx90a"))
+        menu = env_mod._enumerate_tensile_menu(d)
+        assert menu["status"] == "ok"
+        # Two .dat logic files (one per arch); .hsaco + .txt are not "logic".
+        assert menu["logic_file_count"] == 2
+        assert menu["file_count"] == 5  # 2 dat + 2 hsaco + 1 manifest
+        assert menu["gfx_arch_coverage"] == ["gfx90a", "gfx942"]
+        # Every file carries a content hash + size; logic flag set right.
+        for f in menu["files"]:
+            assert f["sha256"].startswith("sha256:")
+            assert isinstance(f["size"], int)
+        logic = [f for f in menu["files"] if f["is_logic"]]
+        assert {f["suffix"] for f in logic} == {".dat"}
+
+    def test_hashes_are_stable_across_calls(self, tmp_path: Path):
+        d = _make_tensile_install(tmp_path / "lib")
+        first = env_mod._enumerate_tensile_menu(d)
+        second = env_mod._enumerate_tensile_menu(d)
+        assert first == second
+        assert first["combined_content_hash"] == second["combined_content_hash"]
+
+    def test_two_install_diff_surfaces_changed_logic_file(self, tmp_path: Path):
+        """The core acceptance scenario: same filenames, changed bytes."""
+        host_a = _make_tensile_install(tmp_path / "a", content=b"menuA")
+        host_b = _make_tensile_install(tmp_path / "b", content=b"menuB")
+        menu_a = env_mod._enumerate_tensile_menu(host_a)
+        menu_b = env_mod._enumerate_tensile_menu(host_b)
+
+        # The shallow filename fingerprint can't tell these apart...
+        assert env_mod._kernel_db_filename_fingerprint(
+            host_a
+        ) == env_mod._kernel_db_filename_fingerprint(host_b)
+        # ...but the deepened per-file content enumeration does.
+        assert menu_a["combined_content_hash"] != menu_b["combined_content_hash"]
+
+        by_name_a = {f["name"]: f["sha256"] for f in menu_a["files"]}
+        by_name_b = {f["name"]: f["sha256"] for f in menu_b["files"]}
+        changed = [n for n in by_name_a if by_name_a[n] != by_name_b[n]]
+        # Diff localizes exactly the logic + code-object files (manifest
+        # content is identical), not just "something differs".
+        assert "TensileLibrary_lazy_gfx942.dat" in changed
+        assert "TensileManifest.txt" not in changed
+
+    def test_extract_gfx_archs_dedups_and_lowercases(self):
+        names = ["TensileLibrary_GFX90A.dat", "x_gfx90a.dat", "y_gfx942.co", "none.dat"]
+        assert env_mod._extract_gfx_archs(names) == ["gfx90a", "gfx942"]
+
+
+class TestTensileCatalogBlock:
+    def test_default_and_disaster_shapes_match_built_block(self, tmp_path: Path):
+        built = env_mod._build_tensile_catalog(
+            {"package_version": None, "lib_hash": None, "kernel_db_revision": None},
+            {"package_version": None, "lib_hash": None, "kernel_db_revision": None},
+            {"package_version": None, "kernel_db_combined_hash": None},
+            [],
+        )
+        empty = env_mod._empty_tensile_catalog()
+        assert set(built.keys()) == set(empty.keys())
+        assert set(built["hipblaslt"].keys()) == set(empty["hipblaslt"].keys())
+        assert set(built["hipblaslt"]["menu"].keys()) == set(
+            empty["hipblaslt"]["menu"].keys()
+        )
+
+    def test_preserves_existing_identity_fields_no_regression(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            env_mod, "HIPBLASLT_TENSILE_DIR", _make_tensile_install(tmp_path / "hb")
+        )
+        monkeypatch.setattr(
+            env_mod, "ROCBLAS_TENSILE_DIR", _make_tensile_install(tmp_path / "rb")
+        )
+        hipblaslt = {
+            "package_version": "1.2.0",
+            "lib_hash": "sha256:aa",
+            "kernel_db_revision": "filenames-sha256:bb",
+        }
+        rocblas = {
+            "package_version": "5.0.2",
+            "lib_hash": "sha256:cc",
+            "kernel_db_revision": "filenames-sha256:dd",
+        }
+        tensile = {
+            "package_version": None,
+            "kernel_db_combined_hash": "filenames-sha256:ee",
+        }
+        block = env_mod._build_tensile_catalog(hipblaslt, rocblas, tensile, [])
+        # Existing hashes flow through verbatim -- no regression.
+        assert block["hipblaslt"]["lib_hash"] == "sha256:aa"
+        assert block["hipblaslt"]["kernel_db_revision"] == "filenames-sha256:bb"
+        assert block["rocblas"]["lib_hash"] == "sha256:cc"
+        assert block["combined"]["kernel_db_combined_hash"] == "filenames-sha256:ee"
+        assert block["status"] == "ok"
+
+    def test_partial_threads_reason_into_partial_reasons(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            env_mod, "HIPBLASLT_TENSILE_DIR", _make_tensile_install(tmp_path / "hb")
+        )
+        monkeypatch.setattr(
+            env_mod, "ROCBLAS_TENSILE_DIR", tmp_path / "missing_rocblas"
+        )
+        reasons: list[str] = []
+        block = env_mod._build_tensile_catalog(
+            {"package_version": None, "lib_hash": None, "kernel_db_revision": None},
+            {"package_version": None, "lib_hash": None, "kernel_db_revision": None},
+            {"package_version": None, "kernel_db_combined_hash": None},
+            reasons,
+        )
+        assert block["status"] == "partial"
+        assert block["rocblas"]["menu"]["status"] == "partial"
+        assert block["hipblaslt"]["menu"]["status"] == "ok"
+        assert any(
+            r.startswith("tensile_catalog.rocblas.menu:") for r in reasons
+        )
+
+    def test_doc_is_labeled_as_installed_identity_not_runtime(self):
+        doc = env_mod._empty_tensile_catalog()["doc"]
+        assert "recipe book" in doc.lower()
+        assert "381881" in doc or "368xxx" in doc  # explicitly disclaims the runtime pick
+
+    def test_block_present_in_collect_env_snapshot(self, all_disabled):
+        snap = collect_env()
+        d = snap.to_dict()
+        assert "tensile_catalog" in d
+        assert set(d["tensile_catalog"].keys()) == {
+            "doc",
+            "status",
+            "hipblaslt",
+            "rocblas",
+            "combined",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Static MIOpen catalog (issue #54 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _make_miopen_db(directory: Path, *, archs=("gfx942_120",), content=b"db"):
+    """Stand up a synthetic MIOpen db dir (find-db, perf-db, model, kdb)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for arch in archs:
+        (directory / f"{arch}.HIP.fdb.txt").write_bytes(content + b"-fdb")
+        (directory / f"{arch}.db.txt").write_bytes(content + b"-perf")
+        (directory / f"{arch}.kdb").write_bytes(content + b"-kdb")
+    (directory / "gfx908.tn.model").write_bytes(b"heuristic-model")
+    return directory
+
+
+class TestMiopenCatalogBlock:
+    def test_enumerates_dbs_archs_and_logic_count(self, tmp_path, monkeypatch):
+        d = _make_miopen_db(tmp_path / "db", archs=("gfx942_120", "gfx90a_104"))
+        monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", d)
+        monkeypatch.delenv(env_mod.MIOPEN_SYSTEM_DB_PATH_ENV, raising=False)
+        block = env_mod._build_miopen_catalog(
+            {"package_version": "3.5.0", "lib_hash": "sha256:aa",
+             "kernel_db_revision": "filenames-sha256:bb"},
+            [],
+        )
+        assert block["status"] == "ok"
+        # 2 archs x (fdb + perf + kdb) = 6 logic dbs; +1 model = 7 files.
+        assert block["menu"]["logic_file_count"] == 6
+        assert block["menu"]["file_count"] == 7
+        assert block["menu"]["gfx_arch_coverage"] == ["gfx908", "gfx90a", "gfx942"]
+        # No regression: identity fields pass through verbatim.
+        assert block["lib_hash"] == "sha256:aa"
+        assert block["kernel_db_revision"] == "filenames-sha256:bb"
+        assert block["db_dir_source"] == "default"
+        # The .model file is catalog-but-not-logic.
+        model = [f for f in block["menu"]["files"] if f["name"].endswith(".model")][0]
+        assert model["is_logic"] is False
+        assert model["suffix"] == ".tn.model"
+
+    def test_multipart_suffix_labeled_correctly(self, tmp_path, monkeypatch):
+        d = _make_miopen_db(tmp_path / "db")
+        monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", d)
+        monkeypatch.delenv(env_mod.MIOPEN_SYSTEM_DB_PATH_ENV, raising=False)
+        block = env_mod._build_miopen_catalog({}, [])
+        suffixes = {f["name"]: f["suffix"] for f in block["menu"]["files"]}
+        # find-db keeps its full multi-part suffix, not pathlib's bare .txt
+        assert suffixes["gfx942_120.HIP.fdb.txt"] == ".fdb.txt"
+        assert suffixes["gfx942_120.db.txt"] == ".db.txt"
+        assert suffixes["gfx942_120.kdb"] == ".kdb"
+
+    def test_system_db_path_override_is_honored_and_recorded(self, tmp_path, monkeypatch):
+        override = _make_miopen_db(tmp_path / "override_db")
+        monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", tmp_path / "default_unused")
+        monkeypatch.setenv(env_mod.MIOPEN_SYSTEM_DB_PATH_ENV, str(override))
+        block = env_mod._build_miopen_catalog({}, [])
+        assert block["db_dir"] == str(override)
+        assert block["db_dir_source"] == env_mod.MIOPEN_SYSTEM_DB_PATH_ENV
+        assert block["status"] == "ok"
+        assert block["env_overrides"][env_mod.MIOPEN_SYSTEM_DB_PATH_ENV] == str(override)
+
+    def test_missing_dir_is_partial_and_threads_reason(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(env_mod, "MIOPEN_KERNEL_DB_DIR", tmp_path / "nope")
+        monkeypatch.delenv(env_mod.MIOPEN_SYSTEM_DB_PATH_ENV, raising=False)
+        reasons: list[str] = []
+        block = env_mod._build_miopen_catalog({}, reasons)
+        assert block["status"] == "partial"
+        assert any(r.startswith("miopen_catalog.menu:") for r in reasons)
+
+    def test_two_install_diff_localizes_changed_db(self, tmp_path, monkeypatch):
+        a = _make_miopen_db(tmp_path / "a", content=b"hostA")
+        b = _make_miopen_db(tmp_path / "b", content=b"hostB")
+        ma = env_mod._enumerate_catalog_dir(
+            a, env_mod._suffix_classifier(
+                env_mod.MIOPEN_CATALOG_SUFFIXES, env_mod.MIOPEN_LOGIC_SUFFIXES),
+            kind="MIOpen db")
+        mb = env_mod._enumerate_catalog_dir(
+            b, env_mod._suffix_classifier(
+                env_mod.MIOPEN_CATALOG_SUFFIXES, env_mod.MIOPEN_LOGIC_SUFFIXES),
+            kind="MIOpen db")
+        assert ma["combined_content_hash"] != mb["combined_content_hash"]
+
+    def test_block_present_and_shaped_in_snapshot(self, all_disabled):
+        d = collect_env().to_dict()
+        assert set(d["miopen_catalog"].keys()) == {
+            "doc", "status", "package_version", "lib_hash", "kernel_db_revision",
+            "db_dir", "db_dir_source", "env_overrides", "menu",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Static rocFFT catalog (issue #54 follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestRocfftCatalogBlock:
+    def test_absent_when_no_cache_is_silent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(env_mod, "ROCFFT_LIB_DIR", tmp_path / "nope")
+        monkeypatch.delenv(env_mod.ROCFFT_RTC_CACHE_PATH_ENV, raising=False)
+        reasons: list[str] = []
+        block = env_mod._build_rocfft_catalog(reasons)
+        assert block["status"] == "absent"
+        assert block["kernel_cache"]["present"] is False
+        # Absence is the documented common case -- NOT partial.
+        assert reasons == []
+
+    def test_present_cache_is_fingerprinted(self, tmp_path, monkeypatch):
+        (tmp_path / env_mod.ROCFFT_KERNEL_CACHE_NAME).write_bytes(b"sqlite-bytes")
+        monkeypatch.setattr(env_mod, "ROCFFT_LIB_DIR", tmp_path)
+        monkeypatch.delenv(env_mod.ROCFFT_RTC_CACHE_PATH_ENV, raising=False)
+        block = env_mod._build_rocfft_catalog([])
+        assert block["status"] == "ok"
+        assert block["kernel_cache"]["present"] is True
+        assert block["kernel_cache"]["sha256"].startswith("sha256:")
+        assert block["kernel_cache"]["source"] == "rocm_lib"
+        assert block["kernel_cache"]["size"] == len(b"sqlite-bytes")
+
+    def test_rtc_cache_path_env_override_wins(self, tmp_path, monkeypatch):
+        cache = tmp_path / "custom" / env_mod.ROCFFT_KERNEL_CACHE_NAME
+        cache.parent.mkdir(parents=True)
+        cache.write_bytes(b"override-cache")
+        monkeypatch.setattr(env_mod, "ROCFFT_LIB_DIR", tmp_path / "rocm_unused")
+        monkeypatch.setenv(env_mod.ROCFFT_RTC_CACHE_PATH_ENV, str(cache.parent))
+        block = env_mod._build_rocfft_catalog([])
+        assert block["status"] == "ok"
+        assert block["kernel_cache"]["path"] == str(cache)
+        assert block["kernel_cache"]["source"] == env_mod.ROCFFT_RTC_CACHE_PATH_ENV
+
+    def test_block_present_and_shaped_in_snapshot(self, all_disabled):
+        d = collect_env().to_dict()
+        assert set(d["rocfft_catalog"].keys()) == {"doc", "status", "kernel_cache"}
 
 
 # ---------------------------------------------------------------------------
