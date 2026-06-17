@@ -173,6 +173,12 @@ class CellStats:
     # NO cell carries data — so triage-mode runs stay byte-equivalent.
     top_failure_detector_id: str | None = None
     top_warn_detector_id: str | None = None
+    # Issue #232: human-readable stop_after outcome for the cell, e.g.
+    # "stopped early (3 fail in 24)" vs "cap reached (0 fail in 160)".
+    # ``None`` for cells with no stop_after rule -- the matrix renderer
+    # hides the column entirely when NO cell carries a note, so legacy
+    # runs stay byte-equivalent.
+    stop_after_note: str | None = None
 
     @property
     def failure_rate(self) -> float:
@@ -482,6 +488,7 @@ def aggregate_cell(
     trial_paths: list[str] | None = None,
     error: str | None = None,
     workload_config: dict[str, Any] | None = None,
+    stop_after_note: str | None = None,
 ) -> CellStats:
     """Aggregate a list of TrialResult-shaped objects into a :class:`CellStats`.
 
@@ -546,6 +553,7 @@ def aggregate_cell(
             workload_config=workload_config,
             top_failure_detector_id=None,
             top_warn_detector_id=None,
+            stop_after_note=stop_after_note,
         )
 
     trial_count = len(trials)
@@ -635,6 +643,7 @@ def aggregate_cell(
         workload_config=workload_config,
         top_failure_detector_id=top_failure_id,
         top_warn_detector_id=top_warn_id,
+        stop_after_note=stop_after_note,
     )
 
 

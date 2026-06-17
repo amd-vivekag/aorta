@@ -51,7 +51,7 @@ from aorta.probe.cli_helpers import (
     ProbeUsageError,
     apply_recipe_overrides,
     help_token_in_option_zone,
-    parse_env_passthrough_mode,
+    parse_env_passthrough_mode_opt,
     reject_flag_shaped_value,
     require_double_dash_separator,
     validate_trailing_argv,
@@ -290,6 +290,27 @@ class _ProbeCommand(click.Command):
     ),
 )
 @click.option(
+    "--stop-after-events",
+    type=int,
+    default=None,
+    metavar="K",
+    help=(
+        "Stop each cell once K trials match the event verdict (default "
+        "verdict: fail), instead of running a fixed count. Requires "
+        "--max-trials. Overlays the recipe's 'stop_after:' block (#232)."
+    ),
+)
+@click.option(
+    "--max-trials",
+    type=int,
+    default=None,
+    metavar="N",
+    help=(
+        "Hard cap on trials per cell when --stop-after-events is set "
+        "(always honored). Required whenever --stop-after-events is passed."
+    ),
+)
+@click.option(
     "-v",
     "--verbose",
     count=True,
@@ -304,6 +325,8 @@ def probe(
     ticket: str | None,
     dry_run: bool,
     env_passthrough_mode: str | None,
+    stop_after_events: int | None,
+    max_trials: int | None,
     mitigation_files: tuple[Path, ...],
     verbose: int,
     argv: tuple[str, ...],
@@ -332,11 +355,7 @@ def probe(
         # ``--env-passthrough-mode`` defaults to None so the handler can
         # distinguish "user passed the flag" from "user omitted it"; per
         # FR 1.10 the CLI wins only when present (see apply_recipe_overrides).
-        cli_passthrough_mode = (
-            parse_env_passthrough_mode(env_passthrough_mode)
-            if env_passthrough_mode is not None
-            else None
-        )
+        cli_passthrough_mode = parse_env_passthrough_mode_opt(env_passthrough_mode)
         clean_argv = validate_trailing_argv(argv)
         r = load_recipe(recipe, sidecar_files=mitigation_files or None)
         if r.probe_extras is None:
@@ -344,7 +363,10 @@ def probe(
                 f"recipe {recipe} is not a probe-mode recipe; "
                 "set 'mode: probe' at the recipe top level"
             )
-        r = apply_recipe_overrides(r, ticket=ticket, cli_passthrough_mode=cli_passthrough_mode)
+        r = apply_recipe_overrides(
+            r, ticket=ticket, cli_passthrough_mode=cli_passthrough_mode,
+            cli_stop_after_events=stop_after_events, cli_max_trials=max_trials,
+        )
     except (ProbeUsageError, RecipeSchemaError, RecipeCellError, RegistryError, LookupError) as exc:
         raise click.ClickException(str(exc)) from exc
 

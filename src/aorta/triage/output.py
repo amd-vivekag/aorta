@@ -577,6 +577,10 @@ def write_matrix_md(
     # matrix.md layout is byte-equivalent.
     show_top_failure = any(c.top_failure_detector_id for c in cell_stats)
     show_top_warn = any(c.top_warn_detector_id for c in cell_stats)
+    # Issue #232: the "Stop after" column appears only when at least one
+    # cell ran under a stop_after rule, so legacy / fixed-trials runs stay
+    # byte-equivalent. It distinguishes "stopped early" from "cap reached".
+    show_stop_after = any(c.stop_after_note for c in cell_stats)
     header_cells: list[str] = [
         "Cell",
         "Mitigations",
@@ -589,6 +593,8 @@ def write_matrix_md(
         header_cells.append("Top failure")
     if show_top_warn:
         header_cells.append("Top warn")
+    if show_stop_after:
+        header_cells.append("Stop after")
     if show_iters:
         header_cells.append("Iters")
     header_cells.extend(["Mean step (ms)", "Confound"])
@@ -608,6 +614,8 @@ def write_matrix_md(
             row.append(cell.top_failure_detector_id or "—")
         if show_top_warn:
             row.append(cell.top_warn_detector_id or "—")
+        if show_stop_after:
+            row.append(cell.stop_after_note or "—")
         if show_iters:
             row.append(cell.iters_display)
         row.extend([_format_step_ms(cell), _format_confound(tag)])
@@ -755,6 +763,18 @@ def write_matrix_json(
             "threshold": recipe.confound.threshold,
             "baseline_cell_configured": recipe.confound.baseline_cell,
         },
+        # Issue #232: the collect-until-N rule in force for this run (None
+        # for legacy fixed-trials runs). Per-cell realised outcomes live on
+        # each cell's ``stop_after_note`` / ``trials`` fields.
+        "stop_after": (
+            {
+                "events": recipe.stop_after.events,
+                "max_trials": recipe.stop_after.max_trials,
+                "event_verdict": recipe.stop_after.event_verdict,
+            }
+            if recipe.stop_after is not None
+            else None
+        ),
         "warnings": list(warnings),
         "recipe_source": {
             "path": str(recipe.source_path) if recipe.source_path else None,

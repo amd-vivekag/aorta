@@ -248,6 +248,14 @@ class RunRequest:
     save_logs: bool = False
     subprocess_argv: tuple[str, ...] | None = None
     probe_extras: dict[str, Any] | None = None
+    # Issue #232: collect-until-N stopping rule. When set (a
+    # :class:`aorta.triage.recipe.StopAfter`), ``trials`` is the hard cap
+    # (``max_trials``) and the loop breaks early once ``events``
+    # qualifying verdicts are observed. Typed as ``Any`` to keep this
+    # module's import graph cycle-free (same rationale as
+    # ``Recipe.probe_extras``); the loop only duck-types ``.events`` /
+    # ``.event_verdict``. ``kw_only`` so positional callers are unaffected.
+    stop_after: Any | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         # Defensively deep-copy mutable dict fields.  ``frozen=True``
@@ -414,6 +422,11 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
             request.steps if request.steps is not None else "(workload default)",
         )
     results: list[TrialResult] = []
+    # Issue #232: ``request.trials`` is the hard cap (``max_trials`` when a
+    # stop_after rule is attached). ``events_seen`` tracks qualifying
+    # verdicts so the loop can break early once the target is met.
+    stop_after = request.stop_after
+    events_seen = 0
     for trial_idx in range(request.trials):
         if should_write:
             logger.info("trial %d/%d: starting", trial_idx + 1, request.trials)
@@ -440,8 +453,43 @@ def run_trials(request: RunRequest) -> list[TrialResult]:
                 result.exit_status,
             )
         results.append(result)
+        if stop_after is not None and _trial_is_event(result, stop_after.event_verdict):
+            events_seen += 1
+            if events_seen >= stop_after.events:
+                if should_write:
+                    logger.info(
+                        "stop_after: %d %r event(s) observed in %d trial(s) "
+                        "(target %d, cap %d) -- stopping cell early",
+                        events_seen,
+                        stop_after.event_verdict,
+                        len(results),
+                        stop_after.events,
+                        request.trials,
+                    )
+                break
 
     return results
+
+
+def _trial_is_event(result: TrialResult, event_verdict: str) -> bool:
+    """Decide whether ``result`` counts as a ``stop_after`` event.
+
+    Aligned with :func:`aorta.run.cli_helpers.summarize_results`'s
+    pass/fail predicate (a trial passes iff ``exit_status == "ok"``) so
+    the stop-count and the matrix pass/fail columns can never disagree:
+
+    * ``event_verdict == "fail"`` -> any non-``ok`` exit (the bug
+      reproduced, infra flaked, setup died).
+    * ``event_verdict == "pass"`` -> a clean ``ok`` trial.
+
+    ``error`` is not yet a distinct outcome (binary verdict space until
+    the three-way verdict task #230); the recipe loader rejects it, so
+    it never reaches here.
+    """
+    passed = result.exit_status == "ok"
+    if event_verdict == "pass":
+        return passed
+    return not passed
 
 
 def _run_single_trial(

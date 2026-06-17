@@ -85,6 +85,28 @@ custom_patterns:                   # Tier 5 user-defined patterns
     required_for_pass: false          # only valid with on_match: fail
 ```
 
+Collect-until-N stopping rule (issue #232) replaces a fixed trial count
+with an event-count target plus a hard cap -- the right primitive for an
+intermittent bug:
+
+```yaml
+stop_after:
+  events: 3            # stop this cell once 3 trials match the event verdict
+  max_trials: 160      # hard cap -- always honored, required when events is set
+  event_verdict: fail  # which verdict counts (default: fail; 'pass' also valid)
+```
+
+A cell runs until `events` qualifying verdicts are observed **or**
+`max_trials` trials have run, whichever comes first. The matrix records
+both the realised event count and the trials actually run, so the rate is
+`events / trials_run`; `matrix.md` gains a **Stop after** column showing
+"stopped early" vs "cap reached", and `matrix.json` carries the rule plus
+each cell's `stop_after_note`. Resume is rule-aware: a cell whose on-disk
+prefix already satisfies the rule is skipped. CLI escape hatch:
+`--stop-after-events K --max-trials N` (unioned over the recipe's block).
+`event_verdict: error` arrives with the three-way verdict (#230); it is
+rejected at load until then.
+
 Phase 3 keys (`redaction`, top-level `condition`) are still **rejected
 at load time** with a "deferred to Phase 3" error message.
 

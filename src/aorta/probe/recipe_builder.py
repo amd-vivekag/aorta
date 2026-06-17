@@ -36,6 +36,7 @@ from aorta.triage.recipe import (
     Recipe,
     RecipeCellError,
     RecipeSchemaError,
+    _parse_stop_after,
 )
 
 # Fixed workload name for probe-mode cells. Leading underscore is
@@ -312,6 +313,7 @@ def build_probe_recipe_from_dict(
             f"{type(tier3_vram_growth_raw).__name__} ({tier3_vram_growth_raw!r})"
         )
     tier3_vram_growth = tier3_vram_growth_raw
+    stop_after = _parse_stop_after("recipe", data.get("stop_after"))
     # Use ``in`` rather than ``.get(...) is not None`` so an explicit
     # ``redaction: null`` is treated as present-but-invalid (parse_redaction
     # rejects None) instead of being silently conflated with "no redaction
@@ -463,6 +465,7 @@ def build_probe_recipe_from_dict(
         source_sha256=source_sha256,
         workload_config={},
         save_logs=False,
+        stop_after=stop_after,
         probe_extras=probe_extras,
     )
 

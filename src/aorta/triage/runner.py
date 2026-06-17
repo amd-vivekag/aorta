@@ -388,6 +388,81 @@ def _collect_trial_paths(results_dir: Path) -> list[str]:
     return [str(p) for p in found]
 
 
+def _stop_after_note(stop_after: Any, trials: list[TrialResult]) -> str:
+    """Render the matrix annotation for a ``stop_after`` cell (issue #232).
+
+    Distinguishes "cap reached" (ran the full ``max_trials`` budget) from
+    "stopped early" (hit the event target first) so a reader can tell a
+    confirmed-rare bug from an exhausted budget. ``cap reached`` is
+    checked first: a target hit on the very last allowed trial still ran
+    the whole budget, so it is not "early".
+    """
+    from aorta.run.dispatcher import _trial_is_event
+
+    events = sum(1 for t in trials if _trial_is_event(t, stop_after.event_verdict))
+    trials_run = len(trials)
+    verb = stop_after.event_verdict
+    if trials_run >= stop_after.max_trials:
+        return f"cap reached: {events} {verb} event(s) in {trials_run} trial(s)"
+    if events >= stop_after.events:
+        return f"stopped early: {events} {verb} event(s) in {trials_run} trial(s)"
+    return f"{events} {verb} event(s) in {trials_run} trial(s)"
+
+
+def _resume_stop_after_cell(
+    cell: Any,
+    cell_dir: Path,
+    cap: int,
+    stop_after: Any,
+    resolved_env_vars: dict[str, str],
+) -> tuple[list[TrialResult], None, dict[str, str], list[str]] | None:
+    """Resume short-circuit for a ``stop_after`` cell (issue #232).
+
+    Returns the hydrated ``(trials, error, env, paths)`` tuple iff the
+    on-disk trial prefix ALREADY satisfies the stopping rule -- i.e. the
+    contiguous run of complete ``trial_<i>`` directories from index 0
+    either hit the event target or reached the cap. Otherwise returns
+    ``None`` so the caller re-runs the cell from scratch (re-running is
+    bounded: the dispatcher applies the same early-stop).
+
+    Unlike the fixed-``trials`` resume path this never requires all of
+    ``range(cap)`` to be present, because a cell that stopped early has
+    fewer than ``cap`` trials on disk by design.
+    """
+    from aorta.probe.resume import is_trial_complete
+    from aorta.run.dispatcher import _trial_is_event
+
+    contiguous = 0
+    while contiguous < cap and is_trial_complete(cell_dir / f"trial_{contiguous}"):
+        contiguous += 1
+    if contiguous == 0:
+        return None
+
+    hydrated_by_index = _hydrate_trials_by_index(_collect_trial_paths(cell_dir))
+    required = set(range(contiguous))
+    if not required.issubset(hydrated_by_index.keys()):
+        # A complete-looking trial dir whose dispatcher JSON didn't
+        # hydrate -- treat the cell as not-resumable so matrix counts
+        # stay consistent (mirror the fixed-trials path's subset check).
+        return None
+    hydrated = [hydrated_by_index[i].trial for i in range(contiguous)]
+    trial_paths = [hydrated_by_index[i].path for i in range(contiguous)]
+    events = sum(1 for t in hydrated if _trial_is_event(t, stop_after.event_verdict))
+    if events >= stop_after.events or contiguous >= cap:
+        log.info(
+            "cell %r: stop_after already satisfied on resume -- %d %r event(s) "
+            "in %d trial(s) (target %d, cap %d); skipping",
+            cell.name,
+            events,
+            stop_after.event_verdict,
+            contiguous,
+            stop_after.events,
+            cap,
+        )
+        return hydrated, None, resolved_env_vars, trial_paths
+    return None
+
+
 @dataclass(frozen=True)
 class _HydratedTrial:
     """One successfully hydrated dispatcher JSON, keyed by parsed trial index.
@@ -677,6 +752,11 @@ def _run_one_cell(
 
     resolved_env_vars = _resolve_cell_env_vars(cell.mitigations, cell.extra_env, sidecar_files)
     effective_trials = cell.effective_trials(recipe.trials)
+    # Issue #232: a ``stop_after`` rule turns ``max_trials`` into the hard
+    # cap and lets the dispatcher break early once the event target is met.
+    # Without it, ``cap == effective_trials`` and behaviour is unchanged.
+    stop_after = recipe.stop_after
+    cap = stop_after.max_trials if stop_after is not None else effective_trials
 
     # Resume short-circuit: if every trial directory under this cell
     # carries a valid result.json + non-empty verdict, the cell is
@@ -693,7 +773,17 @@ def _run_one_cell(
     # the dispatcher's ``trial_<N>.json``; or schema drift). Re-running
     # a complete cell is wasteful but preserves matrix correctness;
     # silently returning [] would not.
-    if resume_existing and layout == "flat_resume":
+    if resume_existing and layout == "flat_resume" and stop_after is not None:
+        # stop_after cells legitimately run FEWER than ``cap`` trials (they
+        # stop early at the event target), so the "all of range(cap) must
+        # be present" check below cannot apply. Resume only when the
+        # on-disk prefix already satisfies the stopping rule; otherwise
+        # fall through to a full re-run (the dispatcher will itself stop
+        # early, so re-running is bounded by ``cap``).
+        resumed = _resume_stop_after_cell(cell, cell_dir, cap, stop_after, resolved_env_vars)
+        if resumed is not None:
+            return resumed
+    elif resume_existing and layout == "flat_resume":
         from aorta.probe.resume import is_trial_complete
 
         completed = sum(
@@ -794,7 +884,7 @@ def _run_one_cell(
 
     request = RunRequest(
         workload=recipe.workload,
-        trials=effective_trials,
+        trials=cap,
         environment=cell.environment,
         mitigations=tuple(cell.mitigations),
         extra_env=dict(cell.extra_env),
@@ -805,6 +895,7 @@ def _run_one_cell(
         save_logs=save_logs,
         subprocess_argv=subprocess_argv,
         probe_extras=probe_extras_payload,
+        stop_after=stop_after,
     )
 
     try:
@@ -1145,6 +1236,11 @@ def _run_recipe_locked(
         # ``_aorta_save_logs``) which are runtime/platform-supplied and
         # deliberately not surfaced in the matrix. Stays {} when neither
         # scope sets workload_config.
+        stop_after_note = (
+            _stop_after_note(recipe.stop_after, trials)
+            if recipe.stop_after is not None and error is None
+            else None
+        )
         stats = aggregate_cell(
             name=cell.name,
             mitigations=tuple(cell.mitigations),
@@ -1156,6 +1252,7 @@ def _run_recipe_locked(
             trial_paths=trial_paths,
             error=error,
             workload_config={**recipe.workload_config, **cell.workload_config},
+            stop_after_note=stop_after_note,
         )
         cell_stats.append(stats)
 

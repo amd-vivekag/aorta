@@ -151,6 +151,16 @@ def parse_env_passthrough_mode(value: str) -> Literal["inherit", "file"]:
     return value  # type: ignore[return-value]
 
 
+def parse_env_passthrough_mode_opt(value: str | None) -> Literal["inherit", "file"] | None:
+    """Parse ``--env-passthrough-mode`` preserving the "flag omitted" signal.
+
+    ``None`` in -> ``None`` out so :func:`apply_recipe_overrides` can tell
+    "user passed the flag" from "user omitted it" (FR 1.10 precedence).
+    Keeps the Click handler a thin shim by hosting the None-guard here.
+    """
+    return None if value is None else parse_env_passthrough_mode(value)
+
+
 def validate_trailing_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
     """Reject an empty / clearly-misparsed trailing-argv list.
 
@@ -183,14 +193,21 @@ def apply_recipe_overrides(
     *,
     ticket: str | None,
     cli_passthrough_mode: Literal["inherit", "file"] | None,
+    cli_stop_after_events: int | None = None,
+    cli_max_trials: int | None = None,
 ) -> Recipe:
     """Layer CLI flags on top of a loaded probe-mode ``Recipe``.
 
-    Two overlays today:
+    Overlays today:
 
     * ``--ticket`` -- when set, replaces ``recipe.ticket``;
     * ``--env-passthrough-mode`` -- when set (i.e. the user actually
-      passed the flag), replaces ``recipe.probe_extras.env_passthrough_mode``.
+      passed the flag), replaces ``recipe.probe_extras.env_passthrough_mode``;
+    * ``--stop-after-events`` / ``--max-trials`` -- when either is passed,
+      builds (or overlays) the recipe's ``stop_after`` rule (issue #232).
+      Missing halves fall back to the recipe's existing ``stop_after``;
+      a target with no cap (neither flag nor recipe supplies ``max_trials``)
+      is rejected so the loop is never unbounded.
 
     The caller must verify ``recipe.probe_extras is not None`` before
     invoking this helper (probe-mode discriminator is the CLI's
@@ -206,10 +223,47 @@ def apply_recipe_overrides(
         recipe = dataclasses.replace(
             recipe,
             probe_extras=dataclasses.replace(
-                probe_extras, env_passthrough_mode=cli_passthrough_mode
+                recipe.probe_extras, env_passthrough_mode=cli_passthrough_mode
             ),
         )
+    if cli_stop_after_events is not None or cli_max_trials is not None:
+        recipe = _overlay_stop_after(recipe, cli_stop_after_events, cli_max_trials)
     return recipe
+
+
+def _overlay_stop_after(
+    recipe: Recipe,
+    cli_events: int | None,
+    cli_max_trials: int | None,
+) -> Recipe:
+    """Build the ``stop_after`` overlay from the CLI flags (issue #232).
+
+    CLI halves win over the recipe's existing block; the other half (and
+    ``event_verdict``) fall back to the recipe. Validation mirrors the
+    recipe loader: positive ints, ``max_trials >= events``, and a
+    mandatory cap. Errors raise :class:`ProbeUsageError` for a friendly
+    CLI message.
+    """
+    from aorta.triage.recipe import StopAfter
+
+    base = recipe.stop_after
+    events = cli_events if cli_events is not None else (base.events if base else None)
+    max_trials = cli_max_trials if cli_max_trials is not None else (base.max_trials if base else None)
+    if events is None:
+        raise ProbeUsageError("--max-trials requires --stop-after-events")
+    if max_trials is None:
+        raise ProbeUsageError("--stop-after-events requires --max-trials (the loop needs a hard cap)")
+    if events < 1 or max_trials < 1:
+        raise ProbeUsageError("--stop-after-events and --max-trials must be >= 1")
+    if max_trials < events:
+        raise ProbeUsageError(
+            f"--max-trials ({max_trials}) must be >= --stop-after-events ({events})"
+        )
+    event_verdict = base.event_verdict if base else "fail"
+    return dataclasses.replace(
+        recipe,
+        stop_after=StopAfter(events=events, max_trials=max_trials, event_verdict=event_verdict),
+    )
 
 
 def format_dry_run_line(
@@ -234,6 +288,7 @@ __all__ = [
     "format_dry_run_line",
     "help_token_in_option_zone",
     "parse_env_passthrough_mode",
+    "parse_env_passthrough_mode_opt",
     "reject_flag_shaped_value",
     "require_double_dash_separator",
     "validate_trailing_argv",
