@@ -166,7 +166,16 @@ def trial_verdict(trial: Any) -> str:
         metrics = result.get("metrics")
         if isinstance(metrics, dict):
             v = metrics.get("verdict")
-            if v in ("pass", "fail", "error"):
+            # Use the classifier's canonical vocabulary so this can't drift
+            # from the producer. Imported locally to keep aorta.run free of a
+            # module-load dependency on aorta.probe (no cycle today, but the
+            # local import keeps it that way if probe ever needs this
+            # predicate). The isinstance guard ensures a non-string metric
+            # value can never match (and never reaches frozenset membership
+            # with an unhashable type).
+            from aorta.probe.classifier.verdict import VALID_VERDICTS
+
+            if isinstance(v, str) and v in VALID_VERDICTS:
                 return v
 
     status = getattr(trial, "exit_status", None)

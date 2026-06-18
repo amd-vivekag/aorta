@@ -53,6 +53,18 @@ class TestTrialVerdict:
     def test_missing_result_defaults_to_pass_on_ok(self):
         assert trial_verdict(SimpleNamespace(exit_status="ok")) == "pass"
 
+    def test_unknown_metric_verdict_falls_through_to_status(self):
+        # A verdict string outside the canonical VALID_VERDICTS set is
+        # ignored; resolution falls back to exit_status.
+        t = self._trial(exit_status="ok", passed=True, metrics_verdict="bogus")
+        assert trial_verdict(t) == "pass"
+
+    def test_non_string_metric_verdict_is_ignored(self):
+        # A non-string verdict metric must never match (or raise on
+        # frozenset membership) -- fall back to exit_status.
+        t = self._trial(exit_status="workload_failed", passed=False, metrics_verdict=1)
+        assert trial_verdict(t) == "fail"
+
 
 class TestTrialResult:
     """Tests for TrialResult serialization and deserialization."""
