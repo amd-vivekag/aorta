@@ -577,10 +577,16 @@ def write_matrix_md(
     # matrix.md layout is byte-equivalent.
     show_top_failure = any(c.top_failure_detector_id for c in cell_stats)
     show_top_warn = any(c.top_warn_detector_id for c in cell_stats)
-    # Issue #232: the "Stop after" column appears only when at least one
-    # cell ran under a stop_after rule, so legacy / fixed-trials runs stay
+    # Issue #232: the "Stop after" column appears whenever the recipe
+    # carries a stop_after rule, so legacy / fixed-trials runs stay
     # byte-equivalent. It distinguishes "stopped early" from "cap reached".
-    show_stop_after = any(c.stop_after_note for c in cell_stats)
+    # Gate on the recipe (configuration) rather than on any cell's
+    # ``stop_after_note``: the note is only populated for cells that ran
+    # cleanly (``error is None``), so an all-errored run would otherwise
+    # hide the column even though the rule was active (and matrix.json
+    # still carries ``stop_after``). Errored cells render "—" in the
+    # column.
+    show_stop_after = recipe.stop_after is not None
     header_cells: list[str] = [
         "Cell",
         "Mitigations",

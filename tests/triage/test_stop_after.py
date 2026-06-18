@@ -222,6 +222,34 @@ def test_stop_after_note_cap_reached():
     assert "0 fail event(s) in 3 trial(s)" in note
 
 
+def test_stop_after_column_shown_when_all_cells_error(tmp_path):
+    # The "Stop after" column must reflect the *configured* rule, not the
+    # success of individual cells: an all-errored run leaves every
+    # ``stop_after_note`` None, but the rule was still active and
+    # matrix.json still carries ``stop_after``. Gating on any cell's note
+    # would hide the column here. Errored cells render "—" in the column.
+    from aorta.triage.matrix import aggregate_cell
+    from aorta.triage.output import write_matrix_md
+
+    recipe = _probe_recipe(tmp_path, "stop_after:\n  events: 2\n  max_trials: 6\n")
+    errored = aggregate_cell(
+        name="none-none",
+        mitigations=("none",),
+        environment="local",
+        extra_env={},
+        resolved_env_vars={},
+        trials=[],
+        effective_steps=10,
+        error="infrastructure_failed: boom",
+    )
+    out = tmp_path / "matrix.md"
+    write_matrix_md(out, recipe, [errored], errored, {}, [], "2026-06-17T00:00:00Z")
+    md = out.read_text(encoding="utf-8")
+    assert "Stop after" in md
+    note_row = next(line for line in md.splitlines() if line.startswith("| none-none "))
+    assert "| — " in note_row
+
+
 # --------------------------------------------------------------------------
 # CLI overlay (apply_recipe_overrides)
 # --------------------------------------------------------------------------
