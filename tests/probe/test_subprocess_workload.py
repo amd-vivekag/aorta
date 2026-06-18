@@ -18,7 +18,39 @@ from aorta.workloads._subprocess import (
     CONFIG_KEY_PROBE_EXTRAS,
     CONFIG_KEY_SUBPROCESS_ARGV,
     SubprocessWorkload,
+    _tier1_only_fallback_verdict,
 )
+
+# ---- Issue #230: classifier-crash fallback honours exec_failed ----------
+
+
+def test_fallback_verdict_exec_failed_resolves_to_error(tmp_path):
+    # When the full classifier crashes AND the command never launched,
+    # the Tier-1-only fallback must emit tier1:exec_failed -> error
+    # (not exit_nonzero -> fail) from the synthetic 127 exit code.
+    verdict, _ = _tier1_only_fallback_verdict(
+        exit_code=127,
+        timed_out=False,
+        trial_dir=tmp_path,
+        exec_failed=True,
+        classifier_exc=RuntimeError("boom"),
+    )
+    assert verdict.verdict == "error"
+    assert "tier1:exec_failed" in verdict.error_detectors_fired
+    assert "tier1:exit_nonzero" not in verdict.failure_detectors_fired
+
+
+def test_fallback_verdict_nonzero_exit_resolves_to_fail(tmp_path):
+    # A genuine non-zero child exit (launched) still resolves to fail.
+    verdict, _ = _tier1_only_fallback_verdict(
+        exit_code=1,
+        timed_out=False,
+        trial_dir=tmp_path,
+        exec_failed=False,
+        classifier_exc=RuntimeError("boom"),
+    )
+    assert verdict.verdict == "fail"
+    assert "tier1:exit_nonzero" in verdict.failure_detectors_fired
 
 # ---- FR 1.17 (entry-point resolution) ------------------------------------
 

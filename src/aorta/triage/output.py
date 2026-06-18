@@ -409,10 +409,18 @@ def _format_failures(cell: CellStats) -> str:
     trials" -- the previous "Trials" header on this same value confused
     readers into reading 3/8 as a trial-count column (issue #160 review
     round 6).
+
+    When every trial errored (no whole-cell ``error`` but zero valid
+    trials), a bare ``0 / 0`` reads as a degenerate count, so the column
+    is annotated ``0 / 0 (no valid trials)`` to make clear there was no
+    valid observation to compute a failure rate over (issue #230 review).
     """
     if cell.error is not None:
         return "n/a"
-    return f"{cell.failed_count} / {cell.passed_count + cell.failed_count}"
+    valid = cell.passed_count + cell.failed_count
+    if valid == 0:
+        return "0 / 0 (no valid trials)"
+    return f"{cell.failed_count} / {valid}"
 
 
 def _format_errors(cell: CellStats) -> str:

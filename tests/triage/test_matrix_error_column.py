@@ -99,6 +99,15 @@ def test_errors_column_no_unreliable_below_threshold(tmp_path: Path):
     assert "1 / 20 (unreliable)" not in text
 
 
+def test_failures_column_flags_no_valid_trials(tmp_path: Path):
+    # Every trial errored (no whole-cell error, but zero valid trials):
+    # the Failures column must read "0 / 0 (no valid trials)" rather than
+    # a bare, degenerate "0 / 0" (issue #230 review).
+    stats = [_stats("c", trials=3, passed=0, failed=0, error=3)]
+    text = _write_md(tmp_path, stats)
+    assert "0 / 0 (no valid trials)" in text
+
+
 def test_matrix_json_carries_error_fields(tmp_path: Path):
     stats = [_stats("c", trials=4, passed=2, failed=1, error=1)]
     out = tmp_path / "matrix.json"

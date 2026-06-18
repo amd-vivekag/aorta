@@ -701,6 +701,7 @@ class SubprocessWorkload(Workload):
                 exit_code=exit_code,
                 timed_out=timed_out,
                 trial_dir=trial_dir,
+                exec_failed=not launched,
                 classifier_exc=classifier_exc,
             )
 
@@ -975,6 +976,7 @@ def _tier1_only_fallback_verdict(
     exit_code: int,
     timed_out: bool,
     trial_dir: Path,
+    exec_failed: bool,
     classifier_exc: BaseException,
 ) -> tuple[Verdict, dict[str, float]]:
     """Build a deterministic verdict when :func:`classify_trial` raises.
@@ -997,12 +999,19 @@ def _tier1_only_fallback_verdict(
     ``error``, a genuine Tier-1 signal to ``fail``, nothing to
     ``pass``. Matches the resolver so a classifier crash doesn't
     silently flip an infra error back into a fail.
+
+    ``exec_failed`` (the workload's ``not launched`` flag) is
+    forwarded into :class:`Tier1Context` so the fallback can still
+    emit ``tier1:exec_failed`` (and suppress the misleading
+    ``exit_nonzero`` from the synthetic 127/126/1 exit code) even
+    when the full classifier is the thing that crashed.
     """
     fired = tier1_detect(
         Tier1Context(
             exit_code=exit_code,
             timed_out=timed_out,
             trial_dir=trial_dir,
+            exec_failed=exec_failed,
         )
     )
     failures, errors = partition_detectors(list(fired))
