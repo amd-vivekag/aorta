@@ -837,6 +837,10 @@ def write_resolved_recipe(
     mitigation env-var bundle) live in ``matrix.json`` instead, where they
     belong as run-time state.
 
+    An active ``stop_after`` rule (issue #232) is re-emitted so a rerun from
+    the resolved YAML preserves the stopping behaviour rather than silently
+    reverting to fixed ``trials``.
+
     For runs that used ``--mitigations-file``, the resolved YAML still
     references those mitigation/environment names by name -- it is **not**
     self-contained on its own. The runner snapshots the operator-supplied
@@ -900,6 +904,15 @@ def write_resolved_recipe(
         "threshold": recipe.confound.threshold,
         "baseline_cell": recipe.confound.baseline_cell,
     }
+    if recipe.stop_after is not None:
+        # Re-emit the active stop_after rule so a rerun from this resolved
+        # YAML preserves the stopping behaviour. Without it the rerun would
+        # silently fall back to fixed ``trials`` (often 1 in probe mode).
+        doc["stop_after"] = {
+            "events": recipe.stop_after.events,
+            "max_trials": recipe.stop_after.max_trials,
+            "event_verdict": recipe.stop_after.event_verdict,
+        }
     doc["cells"] = resolved_cells
 
     path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
