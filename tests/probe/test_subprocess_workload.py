@@ -745,19 +745,27 @@ def test_disable_tier3_skips_probes(tmp_path, monkeypatch):
 
 def test_tier3_probes_run_when_not_disabled(tmp_path, monkeypatch):
     # Counterpart to the disable test: with tier3 active the probes run.
+    # Spy on BOTH probes so the test stays hermetic -- the real scan_dmesg()
+    # shells out to `dmesg` (host-permission dependent, flaky/slow).
     from aorta.workloads import _subprocess as workload_mod
 
-    calls = {"poll": 0}
+    calls = {"poll": 0, "dmesg": 0}
 
     def _spy_poll(_state):
         calls["poll"] += 1
         return None
 
+    def _spy_dmesg(_state, **_kw):
+        calls["dmesg"] += 1
+        return []
+
     monkeypatch.setattr(workload_mod, "poll_amd_smi", _spy_poll)
+    monkeypatch.setattr(workload_mod, "scan_dmesg", _spy_dmesg)
     wl = _make_workload(tmp_path, ["true"])
     wl.setup()
     wl.run()
     assert calls["poll"] >= 1
+    assert calls["dmesg"] >= 1
 
 
 def test_hang_grace_zero_survives_runtime_extraction(tmp_path, monkeypatch):
