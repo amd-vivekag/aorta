@@ -175,9 +175,12 @@ class CellStats:
     top_warn_detector_id: str | None = None
     # Issue #232: human-readable stop_after outcome for the cell, e.g.
     # "stopped early (3 fail in 24)" vs "cap reached (0 fail in 160)".
-    # ``None`` for cells with no stop_after rule -- the matrix renderer
-    # hides the column entirely when NO cell carries a note, so legacy
-    # runs stay byte-equivalent.
+    # ``None`` for cells with no stop_after rule, and also for cells that
+    # errored before a note could be computed. The matrix renderer shows
+    # the "Stop after" column whenever the recipe carries a stop_after
+    # rule (config-gated, not note-gated, so an all-errored run still
+    # surfaces it); cells without a note render "—". Legacy runs with no
+    # stop_after rule stay byte-equivalent.
     stop_after_note: str | None = None
 
     @property
