@@ -41,6 +41,15 @@ def test_coerce_disable_tokens_rejects_non_sequence(bad):
     with pytest.raises(TypeError, match="disable_detectors"):
         _coerce_disable_tokens(bad, "disable_detectors")
 
+
+@pytest.mark.parametrize("bad", [["tier3", 5], ("tier2:hang", None), [b"tier3"]])
+def test_coerce_disable_tokens_rejects_non_string_elements(bad):
+    # A non-string token would survive into the set and later crash
+    # sorted(disabled_detectors) (mixed types) or silently no-op against
+    # the string detector IDs -- reject per-entry, fail fast.
+    with pytest.raises(TypeError, match="must all be strings"):
+        _coerce_disable_tokens(bad, "disable_detectors")
+
 # ---- FR 1.17 (entry-point resolution) ------------------------------------
 
 

@@ -915,9 +915,12 @@ def _coerce_disable_tokens(raw: object, key: str) -> frozenset[str]:
     where the value is a bare string (e.g. ``"tier3"``) would otherwise
     iterate per-character and yield ``{'t','i','e','r','3'}``. Reject
     strings explicitly so a bad payload surfaces instead of silently
-    mis-disabling. ``None`` is the documented no-op (every detector
-    active). Mirrors the fail-fast posture of the sibling
-    ``tier3_vram_growth`` knob.
+    mis-disabling. Each element must itself be a ``str`` -- a non-string
+    token (e.g. ``["tier3", 5]``) would otherwise survive into the
+    set and later crash ``sorted(disabled_detectors)`` (TypeError on
+    mixed types) or silently no-op against the string detector IDs.
+    ``None`` is the documented no-op (every detector active). Mirrors
+    the fail-fast posture of the sibling ``tier3_vram_growth`` knob.
     """
     if raw is None:
         return frozenset()
@@ -926,7 +929,15 @@ def _coerce_disable_tokens(raw: object, key: str) -> frozenset[str]:
             f"probe_extras[{key!r}] must be a list/tuple of tokens, got "
             f"{type(raw).__name__} ({raw!r})"
         )
-    return frozenset(raw)
+    tokens: list[str] = []
+    for tok in raw:
+        if not isinstance(tok, str):
+            raise TypeError(
+                f"probe_extras[{key!r}] tokens must all be strings, got "
+                f"{type(tok).__name__} ({tok!r})"
+            )
+        tokens.append(tok)
+    return frozenset(tokens)
 
 
 def _validate_env_file_entries(env: dict[str, str]) -> None:
