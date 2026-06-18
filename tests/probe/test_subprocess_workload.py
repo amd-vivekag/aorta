@@ -176,6 +176,15 @@ def test_env_file_failure_result_includes_env(tmp_path):
     assert doc["verdict"] == "error"
     assert doc["failure_type"] == "env_file_validation_failed"
     assert doc["env"] == {"BAD_VALUE": "line1\nline2"}
+    # Schema parity with the normal probe path: the failure artifact carries
+    # the same detector/capture/tier-timing/vram keys (empty, but present) so
+    # downstream parsers never special-case env-file errors.
+    for key in ("warn_detectors_fired", "capture", "tier_durations_ms", "peak_vram_mib"):
+        assert key in doc, f"env-file failure result.json missing {key!r}"
+    assert doc["warn_detectors_fired"] == []
+    assert doc["capture"] == {}
+    assert doc["tier_durations_ms"] == {}
+    assert doc["peak_vram_mib"] is None
 
 
 def test_missing_executable_yields_error(tmp_path):

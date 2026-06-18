@@ -834,17 +834,28 @@ class SubprocessWorkload(Workload):
             # subprocess could start" -- distinct from 126/127 which we
             # reserve for chmod/PATH problems on argv[0].
             "exit_code": 2,
-            "failure_detectors_fired": [],
-            "error_detectors_fired": ["meta:env_file_validation_failed"],
             # Walltime is 0 because the subprocess never launched; we
             # spent only the env-file-validation pass which is bounded
             # to a few hundred microseconds. Reporting 0.0 keeps the
             # matrix's step-time aggregates from being polluted by a
             # cell that never produced step times.
             "walltime_sec": 0.0,
+            # No subprocess and no Tier-3 amd-smi probe ran, so VRAM was
+            # never measured -- ``None`` (the normal path's "unavailable"
+            # value), not 0.
+            "peak_vram_mib": None,
             "argv": list(argv),
             "cell_name": probe_extras.get("cell_name", "_unknown_"),
             "trial_index": self._trial_index,
+            "failure_detectors_fired": [],
+            "error_detectors_fired": ["meta:env_file_validation_failed"],
+            # The remaining detector / capture / tier-timing keys are empty
+            # here but PRESENT so this error artifact is schema-identical to
+            # the normal probe path -- downstream parsers (and the documented
+            # result.json schema) never have to special-case env-file errors.
+            "warn_detectors_fired": [],
+            "capture": {},
+            "tier_durations_ms": {},
             "env_passthrough_mode": env_mode,
             "timed_out": False,
             # Mirror the normal-path result.json so every trial's env is
@@ -882,6 +893,7 @@ class SubprocessWorkload(Workload):
                 "result_json_path": str(result_path),
                 "failure_detectors_fired": [],
                 "error_detectors_fired": ["meta:env_file_validation_failed"],
+                "warn_detectors_fired": [],
             },
         )
 
