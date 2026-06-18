@@ -203,6 +203,24 @@ def test_dispatcher_no_stop_after_runs_all(tmp_path):
     assert len(results) == 3
 
 
+def test_dispatcher_log_says_early_when_budget_remains(tmp_path, caplog):
+    sa = StopAfter(events=2, max_trials=10)
+    with caplog.at_level("INFO", logger="aorta.run.dispatcher"):
+        _run_trials_with(_FailWL, sa, tmp_path, trials=sa.max_trials)
+    stop_logs = [r.getMessage() for r in caplog.records if "stop_after:" in r.getMessage()]
+    assert stop_logs and "stopping cell early" in stop_logs[-1]
+
+
+def test_dispatcher_log_says_cap_reached_on_final_trial(tmp_path, caplog):
+    # Target met exactly on the last allowed trial -> not "early", it's a cap reach.
+    sa = StopAfter(events=3, max_trials=3)
+    with caplog.at_level("INFO", logger="aorta.run.dispatcher"):
+        _run_trials_with(_FailWL, sa, tmp_path, trials=sa.max_trials)
+    stop_logs = [r.getMessage() for r in caplog.records if "stop_after:" in r.getMessage()]
+    assert stop_logs and "cap reached" in stop_logs[-1]
+    assert "stopping cell early" not in stop_logs[-1]
+
+
 # --------------------------------------------------------------------------
 # Matrix annotation
 # --------------------------------------------------------------------------
@@ -330,6 +348,8 @@ def test_e2e_stops_early_on_failures(tmp_path):
     assert cell["failed_count"] == 2
     assert "stopped early" in (cell["stop_after_note"] or "")
     assert doc["stop_after"] == {"events": 2, "max_trials": 6, "event_verdict": "fail"}
+    # trials_per_cell reflects the cap (max_trials), not recipe.trials (1).
+    assert doc["trials_per_cell"] == 6
 
 
 def test_e2e_cap_reached_when_all_pass(tmp_path):
@@ -339,6 +359,7 @@ def test_e2e_cap_reached_when_all_pass(tmp_path):
     assert res.exit_code == 0, res.output
     _doc, cell = _matrix_cell(output)
     assert cell["trials"] == 3  # ran the full cap
+    assert _doc["trials_per_cell"] == 3  # cap, not recipe.trials (1)
     assert cell["passed_count"] == 3
     assert "cap reached" in (cell["stop_after_note"] or "")
     # matrix.md surfaces the column when a stop_after rule is active.

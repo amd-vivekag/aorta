@@ -761,7 +761,16 @@ def write_matrix_json(
         "schema_version": 1,
         "workload": recipe.workload,
         "ticket": recipe.ticket,
-        "trials_per_cell": recipe.trials,
+        # The per-cell trial budget. With a ``stop_after`` rule the budget is
+        # the cap (``max_trials``) -- which cells may stop short of -- not the
+        # fixed ``recipe.trials`` (often ``1`` on probe recipes), so report the
+        # cap to keep the summary truthful. Per-cell ``trials:`` overrides and
+        # realised counts live on each cell entry's ``trials`` field.
+        "trials_per_cell": (
+            recipe.stop_after.max_trials
+            if recipe.stop_after is not None
+            else recipe.trials
+        ),
         "steps_per_trial": recipe.steps,
         "run_timestamp": run_timestamp,
         "baseline_cell": baseline_name,
