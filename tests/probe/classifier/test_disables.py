@@ -63,6 +63,28 @@ def test_normalize_detector_id_rejects_malformed(tok: str) -> None:
         normalize_detector_id(tok)
 
 
+@pytest.mark.parametrize(
+    ("tok", "expected"),
+    [
+        ("tier2: hang", "tier2:hang"),
+        ("  tier2 : hang  ", "tier2:hang"),
+        ("custom:  My_Id ", "custom:My_Id"),
+    ],
+)
+def test_normalize_detector_id_strips_whitespace_around_id(tok: str, expected: str) -> None:
+    # A copy/paste token with a space after the colon must canonicalise to
+    # the bare id so it actually matches the fired detector id; case in the
+    # id half is still preserved.
+    assert normalize_detector_id(tok) == expected
+
+
+@pytest.mark.parametrize("tok", ["tier2:   ", "custom: \t "])
+def test_normalize_detector_id_rejects_whitespace_only_id(tok: str) -> None:
+    # An id that is empty after trimming counts as missing.
+    with pytest.raises(DetectorSpecError):
+        normalize_detector_id(tok)
+
+
 def test_normalize_lists_dedupe_preserve_order() -> None:
     assert normalize_tiers(["tier3", "tier2", "tier3"]) == ("tier3", "tier2")
     assert normalize_detector_ids(["tier2:hang", "tier2:hang"]) == ("tier2:hang",)

@@ -60,6 +60,7 @@ from aorta.probe.classifier.tier2_hang import (
     HangMonitor,
 )
 from aorta.probe.classifier.tier3_kernel import (
+    AmdSmiSnapshot,
     Tier3State,
     gpu_idle_probe_from_state,
     poll_amd_smi,
@@ -392,6 +393,11 @@ class SubprocessWorkload(Workload):
         disabled_tiers = _coerce_disable_tokens(
             probe_extras.get("disable_detector_tiers"), "disable_detector_tiers"
         )
+        # Disabling a whole tier means "not evaluated at all" -- for Tier 3
+        # that includes the side-effecting amd-smi / dmesg probes, not just
+        # their contribution to the verdict. Gate the collection itself so
+        # the knob actually avoids the probe overhead + permission noise.
+        tier3_enabled = "tier3" not in disabled_tiers
 
         # ``inherit`` mode: the dispatcher has already stamped the
         # cell's mitigation + diagnostic env vars onto os.environ in
@@ -461,7 +467,8 @@ class SubprocessWorkload(Workload):
         # ``None`` and contributes nothing without aborting the trial.
         # The shared ``_TIER3_STATE`` ensures the "amd-smi disabled"
         # log fires at most once across the full probe invocation.
-        amd_smi_pre = poll_amd_smi(_TIER3_STATE)
+        # Skipped entirely when Tier 3 is operator-disabled.
+        amd_smi_pre = poll_amd_smi(_TIER3_STATE) if tier3_enabled else None
 
         t0 = time.perf_counter()
         exit_code: int
@@ -643,23 +650,26 @@ class SubprocessWorkload(Workload):
         # still land in the window. Both helpers are fail-soft and
         # share ``_TIER3_STATE`` with the pre-snapshot above so the
         # one-warning-per-invocation contract holds.
-        amd_smi_post = poll_amd_smi(_TIER3_STATE)
-        dmesg_text: str | None
-        try:
-            fired_kernel_ids = scan_dmesg(
-                _TIER3_STATE,
-                since_seconds=walltime_sec + _DMESG_SINCE_PAD_SEC,
-            )
-            # ``scan_dmesg`` returns the fired detector IDs directly;
-            # rebuild a synthetic text blob so the classifier's
-            # ``scan_dmesg_text`` second pass is a no-op (it would
-            # otherwise re-scan ``None`` and emit []). The empty
-            # string here keeps Tier 3's text path inert; the
-            # already-fired IDs are surfaced via ``tier3_extra``.
-            dmesg_text = "" if fired_kernel_ids else None
-        except Exception:
-            fired_kernel_ids = []
-            dmesg_text = None
+        amd_smi_post: AmdSmiSnapshot | None = None
+        dmesg_text: str | None = None
+        fired_kernel_ids: list[str] = []
+        if tier3_enabled:
+            amd_smi_post = poll_amd_smi(_TIER3_STATE)
+            try:
+                fired_kernel_ids = scan_dmesg(
+                    _TIER3_STATE,
+                    since_seconds=walltime_sec + _DMESG_SINCE_PAD_SEC,
+                )
+                # ``scan_dmesg`` returns the fired detector IDs directly;
+                # rebuild a synthetic text blob so the classifier's
+                # ``scan_dmesg_text`` second pass is a no-op (it would
+                # otherwise re-scan ``None`` and emit []). The empty
+                # string here keeps Tier 3's text path inert; the
+                # already-fired IDs are surfaced via ``tier3_extra``.
+                dmesg_text = "" if fired_kernel_ids else None
+            except Exception:
+                fired_kernel_ids = []
+                dmesg_text = None
 
         peak_vram_mib: int | None
         if amd_smi_pre is not None and amd_smi_post is not None:

@@ -60,13 +60,19 @@ def normalize_detector_id(token: str) -> str:
     """Validate a ``<prefix>:<id>`` detector-id disable token.
 
     The prefix is lower-cased and checked against
-    :data:`KNOWN_DETECTOR_PREFIXES`; the id half is preserved verbatim
-    (custom-pattern ids are user-named and case-sensitive). Raises
-    :class:`DetectorSpecError` when the colon / id / prefix is missing
-    or unknown.
+    :data:`KNOWN_DETECTOR_PREFIXES`; the id half has surrounding
+    whitespace stripped but its case preserved (custom-pattern ids are
+    user-named and case-sensitive). Stripping the id matters: a
+    copy/paste token like ``'tier2: hang'`` would otherwise normalise to
+    ``'tier2: hang'`` and never match the fired id ``'tier2:hang'``,
+    silently disabling nothing. Raises :class:`DetectorSpecError` when
+    the colon / id / prefix is missing or unknown (an id that is empty
+    after trimming counts as missing).
     """
     cleaned = token.strip()
     prefix, sep, rest = cleaned.partition(":")
+    prefix = prefix.strip()
+    rest = rest.strip()
     if not sep or not rest:
         raise DetectorSpecError(
             f"malformed detector id {token!r}; expected '<tier>:<id>' "

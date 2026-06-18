@@ -705,6 +705,52 @@ def test_tier3_actually_runs_per_trial(tmp_path, monkeypatch):
     )
 
 
+def test_disable_tier3_skips_probes(tmp_path, monkeypatch):
+    """Issue #229 review: disabling the ``tier3`` tier must skip the
+    side-effecting amd-smi / dmesg probes in the workload, not merely
+    drop their verdict contribution. Spy on both and assert neither runs.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    calls = {"poll": 0, "dmesg": 0}
+
+    def _spy_poll(_state):
+        calls["poll"] += 1
+        return None
+
+    def _spy_dmesg(_state, **_kw):
+        calls["dmesg"] += 1
+        return []
+
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", _spy_poll)
+    monkeypatch.setattr(workload_mod, "scan_dmesg", _spy_dmesg)
+
+    wl = _make_workload(tmp_path, ["true"], disable_detector_tiers=["tier3"])
+    wl.setup()
+    wl.run()
+    assert calls == {"poll": 0, "dmesg": 0}, (
+        "disabling tier3 still ran the amd-smi/dmesg probes; the knob only "
+        "filtered the verdict instead of skipping the collection"
+    )
+
+
+def test_tier3_probes_run_when_not_disabled(tmp_path, monkeypatch):
+    # Counterpart to the disable test: with tier3 active the probes run.
+    from aorta.workloads import _subprocess as workload_mod
+
+    calls = {"poll": 0}
+
+    def _spy_poll(_state):
+        calls["poll"] += 1
+        return None
+
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", _spy_poll)
+    wl = _make_workload(tmp_path, ["true"])
+    wl.setup()
+    wl.run()
+    assert calls["poll"] >= 1
+
+
 def test_hang_grace_zero_survives_runtime_extraction(tmp_path, monkeypatch):
     """Regression for PR #197 review: ``probe_extras["hang_grace_period_at_start"]
     == 0.0`` is a validated "no grace, fire as soon as the window

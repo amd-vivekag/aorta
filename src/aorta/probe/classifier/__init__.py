@@ -83,8 +83,10 @@ class TrialContext:
     tier3_vram_growth: bool = True
     # Issue #229: operator-supplied detector-disable knobs. A disabled
     # whole tier (``disabled_tiers``, e.g. ``"tier3"``) is not evaluated
-    # at all -- its scan is skipped so side-effecting probes (dmesg /
-    # amd-smi) don't run. A disabled detector id (``disabled_detectors``,
+    # at all -- ``classify_trial`` skips its scan, and the workload
+    # (:meth:`SubprocessWorkload.run`) skips the Tier-3 collection too, so
+    # the side-effecting probes (dmesg / amd-smi) don't run. A disabled
+    # detector id (``disabled_detectors``,
     # e.g. ``"tier2:hang"``) is filtered out of the tier's result after
     # the (cheap, side-effect-free) Tier 1-4 scan. Disabled Tier 5
     # ``custom:*`` detectors are instead filtered *before* the scan,
