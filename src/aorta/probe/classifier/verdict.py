@@ -12,10 +12,15 @@ Combines the per-tier detector outputs into the final
     produced *no valid observation* of the thing under test: the
     command never launched (``tier1:exec_failed``) or it ran to the
     deadline without the hang monitor recognising a hang
-    (``tier1:timeout`` with no co-firing ``tier2:hang``). Error
-    detectors are listed in :data:`ERROR_DETECTOR_IDS`. ``error``
-    is excluded from the matrix event-rate denominator so an infra
-    flake doesn't inflate (or deflate) the reproduction rate.
+    (``tier1:timeout`` with no co-firing ``tier2:hang``). The
+    classifier's own error detectors are listed in
+    :data:`ERROR_DETECTOR_IDS`; this is *not* an exhaustive list of
+    what ``error_detectors_fired`` may contain -- a workload can inject
+    additional ``meta:`` infra-error IDs ahead of :func:`resolve` (e.g.
+    ``meta:env_file_validation_failed`` written by
+    :class:`aorta.workloads.SubprocessWorkload`). ``error`` is excluded
+    from the matrix event-rate denominator so an infra flake doesn't
+    inflate (or deflate) the reproduction rate.
 
 (c) ``pass`` -- nothing fired.
 

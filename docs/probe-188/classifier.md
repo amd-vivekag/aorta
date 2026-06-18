@@ -26,8 +26,10 @@ Source: `src/aorta/probe/classifier/tier1_process.py`.
 | `tier1:coredump` | Any `core.*` (or bare `core`) file exists directly under `<trial_dir>/` post-exit |
 | `tier1:exec_failed` | The wrapped command never launched — `Popen` raised ENOENT / EACCES / ENOEXEC |
 
-Encounter order: exec_failed (alone, suppresses everything else) →
-timeout > signal > exit_nonzero, then coredump appended regardless.
+Encounter order: when the command never launched, `exec_failed` fires
+alone and suppresses every other detector (including coredump).
+Otherwise (the command launched) the order is timeout > signal >
+exit_nonzero, with coredump appended after whichever of those fired.
 The verdict resolver preserves this order.
 
 `tier1:timeout` and `tier1:exec_failed` are **error detectors** (issue

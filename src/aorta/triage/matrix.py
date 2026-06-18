@@ -506,16 +506,6 @@ def _aggregate_failure_hints(trials: list[Any]) -> list[tuple[str, int]]:
     return [(hint, counts[hint]) for hint in order]
 
 
-def _trial_passed(trial: Any) -> bool:
-    """A trial passed iff its three-way verdict is ``"pass"`` (issue #230).
-
-    Thin wrapper over the shared :func:`aorta.run.results.trial_verdict`
-    so the matrix, the per-cell log line, and the stop_after event counter
-    all agree on what "passed" means.
-    """
-    return trial_verdict(trial) == "pass"
-
-
 def _percentile(samples: list[float], q: float) -> float:
     if not samples:
         return 0.0
