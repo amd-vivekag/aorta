@@ -1355,6 +1355,7 @@ def _run_recipe_locked(
         confound_tags=confound_tags,
         warnings=warnings,
         run_timestamp=ts,
+        layout=layout,
     )
     write_matrix_json(
         run_dir / "matrix.json",
