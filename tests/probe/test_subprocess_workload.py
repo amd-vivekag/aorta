@@ -18,7 +18,28 @@ from aorta.workloads._subprocess import (
     CONFIG_KEY_PROBE_EXTRAS,
     CONFIG_KEY_SUBPROCESS_ARGV,
     SubprocessWorkload,
+    _coerce_disable_tokens,
 )
+
+# ---- Issue #229: disable-token payload coercion --------------------------
+
+
+def test_coerce_disable_tokens_none_is_empty():
+    assert _coerce_disable_tokens(None, "disable_detectors") == frozenset()
+
+
+def test_coerce_disable_tokens_accepts_sequence():
+    assert _coerce_disable_tokens(["tier2:hang", "tier3"], "disable_detectors") == frozenset(
+        {"tier2:hang", "tier3"}
+    )
+
+
+@pytest.mark.parametrize("bad", ["tier3", 5, {"a": 1}])
+def test_coerce_disable_tokens_rejects_non_sequence(bad):
+    # A bare string would otherwise iterate per-character into a set of
+    # letters; fail fast like the sibling tier3_vram_growth knob.
+    with pytest.raises(TypeError, match="disable_detectors"):
+        _coerce_disable_tokens(bad, "disable_detectors")
 
 # ---- FR 1.17 (entry-point resolution) ------------------------------------
 

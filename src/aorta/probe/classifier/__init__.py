@@ -86,7 +86,11 @@ class TrialContext:
     # at all -- its scan is skipped so side-effecting probes (dmesg /
     # amd-smi) don't run. A disabled detector id (``disabled_detectors``,
     # e.g. ``"tier2:hang"``) is filtered out of the tier's result after
-    # the (cheap, side-effect-free) scan. Either way a disabled detector
+    # the (cheap, side-effect-free) Tier 1-4 scan. Disabled Tier 5
+    # ``custom:*`` detectors are instead filtered *before* the scan,
+    # because a custom scan runs sandbox ``condition``s and populates
+    # ``capture`` -- post-hoc filtering would let a silenced detector
+    # still leave observable side effects. Either way a disabled detector
     # never reaches :func:`resolve`, so it cannot flip the verdict or
     # appear in ``failure_detectors_fired`` / ``warn_detectors_fired``.
     # Validated upstream by :mod:`aorta.probe.classifier.disables`.
@@ -183,25 +187,27 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
         custom_result = tier5_custom.CustomScanResult()
         custom_required_patterns: tuple[CompiledPattern, ...] = ()
     else:
+        # Unlike Tiers 1-4 (cheap, side-effect-free scans we can filter
+        # post-hoc), a custom detector's scan runs its sandbox
+        # ``condition`` and populates ``capture``. Filtering disabled ids
+        # out *before* the scan keeps "disabled == not evaluated" honest:
+        # no condition runs and no capture surfaces for a silenced
+        # detector, and the same filtered tuple feeds the resolver so a
+        # disabled ``required_for_pass`` pattern can't synthesise
+        # ``meta:missing_pass_signal``.
+        if disabled_detectors:
+            custom_required_patterns = tuple(
+                p for p in ctx.custom_patterns if p.detector_id not in disabled_detectors
+            )
+        else:
+            custom_required_patterns = ctx.custom_patterns
         custom_result = tier5_custom.scan(
             ctx.log_text,
-            ctx.custom_patterns,
+            custom_required_patterns,
             exit_code=ctx.exit_code,
             walltime_sec=ctx.walltime_sec,
             peak_vram_mib=ctx.peak_vram_mib,
         )
-        custom_required_patterns = ctx.custom_patterns
-        if disabled_detectors:
-            # Filter disabled custom ids out of the fired lists so they
-            # neither flip the verdict nor surface as fired detectors.
-            custom_result.fail_detectors = _keep(custom_result.fail_detectors)
-            custom_result.warn_detectors = _keep(custom_result.warn_detectors)
-            custom_result.fired_required_ids = {
-                i for i in custom_result.fired_required_ids if i not in disabled_detectors
-            }
-            custom_required_patterns = tuple(
-                p for p in ctx.custom_patterns if p.detector_id not in disabled_detectors
-            )
     tier_durations_ms["tier5"] = (time.perf_counter() - t0) * 1000.0
 
     # Split Tier-3 IDs into hard failures vs. advisory warns. ``vram_growth``

@@ -386,8 +386,12 @@ class SubprocessWorkload(Workload):
         # Issue #229: detector-disable knobs. Validated on the
         # recipe-builder side; default to empty so non-probe / legacy
         # payloads are the no-op (every detector active).
-        disabled_detectors = frozenset(probe_extras.get("disable_detectors") or ())
-        disabled_tiers = frozenset(probe_extras.get("disable_detector_tiers") or ())
+        disabled_detectors = _coerce_disable_tokens(
+            probe_extras.get("disable_detectors"), "disable_detectors"
+        )
+        disabled_tiers = _coerce_disable_tokens(
+            probe_extras.get("disable_detector_tiers"), "disable_detector_tiers"
+        )
 
         # ``inherit`` mode: the dispatcher has already stamped the
         # cell's mitigation + diagnostic env vars onto os.environ in
@@ -892,6 +896,27 @@ class SubprocessWorkload(Workload):
         if not isinstance(bundle, dict):
             return {}
         return {str(k): str(v) for k, v in bundle.items()}
+
+
+def _coerce_disable_tokens(raw: object, key: str) -> frozenset[str]:
+    """Build a disable-token set from a ``probe_extras`` payload, fail-fast.
+
+    ``probe_extras`` is an untyped dict at runtime, so a malformed payload
+    where the value is a bare string (e.g. ``"tier3"``) would otherwise
+    iterate per-character and yield ``{'t','i','e','r','3'}``. Reject
+    strings explicitly so a bad payload surfaces instead of silently
+    mis-disabling. ``None`` is the documented no-op (every detector
+    active). Mirrors the fail-fast posture of the sibling
+    ``tier3_vram_growth`` knob.
+    """
+    if raw is None:
+        return frozenset()
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple, set, frozenset)):
+        raise TypeError(
+            f"probe_extras[{key!r}] must be a list/tuple of tokens, got "
+            f"{type(raw).__name__} ({raw!r})"
+        )
+    return frozenset(raw)
 
 
 def _validate_env_file_entries(env: dict[str, str]) -> None:

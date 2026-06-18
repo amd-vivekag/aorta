@@ -184,6 +184,34 @@ def test_disable_custom_pattern(tmp_path: Path) -> None:
     assert verdict.verdict == "pass"
 
 
+def test_disable_custom_pattern_leaves_no_capture_side_effect(tmp_path: Path) -> None:
+    # A disabled custom detector must be truly *not evaluated*: its
+    # ``capture`` named groups must not surface (and, by the same token,
+    # its sandbox ``condition`` must not run). Filtering happens before
+    # the Tier-5 scan, so the silenced detector leaves no trace.
+    pat = CompiledPattern(
+        detector_id="custom:metric",
+        regex=re.compile(r"loss=(?P<loss>[0-9.]+)"),
+        condition_code=None,
+        condition_source=None,
+        on_match="info",
+        required_for_pass=False,
+    )
+    log = "step 1 loss=3.14\n"
+    baseline, _ = classify_trial(_ctx(tmp_path, log_text=log, custom_patterns=(pat,)))
+    assert baseline.capture.get("loss") == "3.14"
+
+    verdict, _ = classify_trial(
+        _ctx(
+            tmp_path,
+            log_text=log,
+            custom_patterns=(pat,),
+            disabled_detectors=frozenset({"custom:metric"}),
+        )
+    )
+    assert "loss" not in verdict.capture
+
+
 def test_disable_required_custom_pattern_does_not_synthesize_missing_signal(
     tmp_path: Path,
 ) -> None:
