@@ -26,6 +26,22 @@ _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _VERSION_LINE_RE = re.compile(r'^(\s*version\s*=\s*")([^"]*)(".*)$')
 
 
+def _table_header(line: str) -> str | None:
+    """Return the bracketed TOML table name on ``line``, or ``None``.
+
+    Tolerates a trailing inline comment so a valid header like
+    ``[project]  # note`` is still recognized (TOML allows comments after a
+    table header). Only the comment is dropped; nothing else is rewritten.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("["):
+        return None
+    without_comment = stripped.split("#", 1)[0].strip()
+    if without_comment.endswith("]"):
+        return without_comment
+    return None
+
+
 def bump_version(current: str, level: str) -> str:
     """Return ``current`` bumped by ``level`` (``major``/``minor``/``patch``)."""
     match = _SEMVER_RE.match(current)
@@ -47,9 +63,9 @@ def read_version(text: str) -> str:
     """Return the version declared in the ``[project]`` table of ``text``."""
     in_project = False
     for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_project = stripped == "[project]"
+        header = _table_header(line)
+        if header is not None:
+            in_project = header == "[project]"
             continue
         if in_project:
             match = _VERSION_LINE_RE.match(line)
@@ -64,9 +80,9 @@ def set_version(text: str, new_version: str) -> str:
     in_project = False
     replaced = False
     for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_project = stripped == "[project]"
+        header = _table_header(line)
+        if header is not None:
+            in_project = header == "[project]"
             out.append(line)
             continue
         if in_project and not replaced:

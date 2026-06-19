@@ -57,6 +57,22 @@ def test_set_version_preserves_trailing_content():
     assert set_version(text, "0.2.1") == '[project]\nversion = "0.2.1"  # keep me\n'
 
 
+# A trailing inline comment on the table header is valid TOML; the bumper must
+# still recognize the [project] table (regression for the header parse).
+COMMENTED_HEADER = '[project]  # the package\nname = "aorta"\nversion = "0.2.0"\n'
+
+
+def test_read_version_handles_commented_table_header():
+    assert read_version(COMMENTED_HEADER) == "0.2.0"
+
+
+def test_set_version_handles_commented_table_header():
+    updated = set_version(COMMENTED_HEADER, "0.3.0")
+    assert read_version(updated) == "0.3.0"
+    # The header (comment and all) is preserved verbatim.
+    assert updated.startswith("[project]  # the package\n")
+
+
 def test_resolve_new_version_explicit_overrides_level():
     assert resolve_new_version("0.2.0", "patch", "5.6.7") == "5.6.7"
 
