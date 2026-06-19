@@ -1,0 +1,71 @@
+"""Tests for scripts/bump_version.py (the release version bumper)."""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+from bump_version import (  # noqa: E402
+    bump_version,
+    read_version,
+    resolve_new_version,
+    set_version,
+)
+
+SAMPLE = """\
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aorta"
+version = "0.2.0"
+requires-python = ">=3.10"
+"""
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [("patch", "0.2.1"), ("minor", "0.3.0"), ("major", "1.0.0")],
+)
+def test_bump_version_levels(level, expected):
+    assert bump_version("0.2.0", level) == expected
+
+
+def test_bump_version_rejects_non_semver():
+    with pytest.raises(ValueError):
+        bump_version("0.2", "patch")
+
+
+def test_read_version_reads_project_table():
+    assert read_version(SAMPLE) == "0.2.0"
+
+
+def test_set_version_replaces_only_project_version():
+    updated = set_version(SAMPLE, "0.3.0")
+    assert read_version(updated) == "0.3.0"
+    # Unrelated lines (including the build-system table) stay byte-for-byte intact.
+    assert 'requires = ["setuptools>=61.0", "wheel"]' in updated
+    assert 'build-backend = "setuptools.build_meta"' in updated
+    assert updated.count('version = "') == 1
+
+
+def test_set_version_preserves_trailing_content():
+    text = '[project]\nversion = "0.2.0"  # keep me\n'
+    assert set_version(text, "0.2.1") == '[project]\nversion = "0.2.1"  # keep me\n'
+
+
+def test_resolve_new_version_explicit_overrides_level():
+    assert resolve_new_version("0.2.0", "patch", "5.6.7") == "5.6.7"
+
+
+def test_resolve_new_version_rejects_bad_explicit():
+    with pytest.raises(ValueError):
+        resolve_new_version("0.2.0", None, "not-a-version")
+
+
+def test_resolve_new_version_requires_input():
+    with pytest.raises(ValueError):
+        resolve_new_version("0.2.0", None, None)

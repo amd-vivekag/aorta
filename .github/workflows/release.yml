@@ -2,26 +2,37 @@ name: Release
 
 # Build the wheel + sdist and publish them as GitHub Release assets so customers
 # can `pip install` AORTA straight from the release page. The release version is
-# always read from pyproject.toml (never hard-coded here), so cutting a new
-# version is just a version bump. See docs/releasing.md for the maintainer flow.
+# always read from pyproject.toml (never hard-coded here).
 #
-# Two ways to cut a release of the *current* pyproject.toml version:
+# Two ways to cut a release:
 #   * push a version tag:  git tag vX.Y.Z && git push origin vX.Y.Z
-#   * run this workflow manually (Actions tab -> Release -> Run workflow); it
-#     creates and pushes the vX.Y.Z tag for you.
+#     (releases the current pyproject.toml version; tag must match it)
+#   * run this workflow manually (Actions -> Release -> Run workflow):
+#       - bump = patch/minor/major (or an explicit version) -> the workflow
+#         bumps pyproject.toml, commits the bump back to the branch, then tags;
+#       - bump = none -> releases the current pyproject.toml version as-is.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Branch or commit to release from (defaults to the default branch)."
+      bump:
+        description: "Version bump for a manual release ('none' releases the current pyproject.toml version)."
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+        default: none
+      version:
+        description: "Explicit MAJOR.MINOR.PATCH to release (overrides 'bump'; leave blank to use 'bump')."
         required: false
         default: ""
 
 permissions:
-  contents: write  # required to create the tag, the release, and upload assets
+  contents: write  # required to push the version bump + tag and create the release
 
 jobs:
   build-and-release:
@@ -30,14 +41,34 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
         with:
-          # Full history so manual runs can create and push a new tag.
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0  # full history so a manual run can push the bump + tag
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"  # 3.11+ for stdlib tomllib to read the version
+
+      # Manual runs may bump pyproject.toml and commit the bump back to the
+      # branch before tagging, so the released version is never hard-coded.
+      - name: Bump version
+        if: github.event_name == 'workflow_dispatch' && (github.event.inputs.bump != 'none' || github.event.inputs.version != '')
+        env:
+          # Bind inputs to env vars rather than interpolating them straight into
+          # the shell, to avoid script injection (bump_version.py also validates).
+          BUMP: ${{ github.event.inputs.bump }}
+          EXPLICIT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ -n "${EXPLICIT_VERSION}" ]; then
+            new_version="$(python scripts/bump_version.py --set "${EXPLICIT_VERSION}")"
+          else
+            new_version="$(python scripts/bump_version.py "${BUMP}")"
+          fi
+          echo "Bumped version to ${new_version}."
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Release v${new_version}: bump version"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Resolve release version from pyproject.toml
         id: version
@@ -62,8 +93,8 @@ jobs:
             exit 1
           fi
 
-      # Manual runs create the tag from the current version. Refuse if it already
-      # exists so an already-released version is never silently re-released.
+      # Manual runs create the tag from the resolved version. Refuse if it
+      # already exists so an already-released version is never re-released.
       - name: Create and push tag for manual release
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -71,7 +102,7 @@ jobs:
         run: |
           tag="${{ steps.version.outputs.tag }}"
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
-            echo "::error::Tag ${tag} already exists. Bump 'version' in pyproject.toml before cutting a new release."
+            echo "::error::Tag ${tag} already exists. Bump the version before cutting a new release."
             exit 1
           fi
           git tag "${tag}"

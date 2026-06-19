@@ -13,34 +13,54 @@ bump plus a trigger.
 ## Maintainer release flow
 
 Releases are automated by [`.github/workflows/release.yml`](../.github/workflows/release.yml).
-Each run builds the artifacts for the current `pyproject.toml` version and
-publishes them as a new GitHub Release marked **Latest**.
+Each run builds the artifacts for the resolved `pyproject.toml` version and
+publishes them as a new GitHub Release marked **Latest**. A new release requires
+a new version: the workflow refuses to re-release a version whose tag already
+exists.
 
-1. **Bump the version.** Edit `version` in `pyproject.toml` (following
-   [semantic versioning](https://semver.org/)) and merge it to `main` through
-   the normal PR flow. A new release requires a new version: the workflow
-   refuses to re-release a version whose tag already exists.
-2. **Trigger the release**, either way:
-   - **Push a version tag** matching the new version:
+Pick whichever trigger fits:
 
-     ```bash
-     git checkout main && git pull
-     git tag vX.Y.Z      # X.Y.Z must equal the pyproject.toml version
-     git push origin vX.Y.Z
-     ```
+- **Manual run with a version bump (recommended).** From the GitHub UI
+  (*Actions -> Release -> Run workflow*), choose a `bump` of `patch`, `minor`,
+  or `major` (or type an explicit version in the `version` field). The workflow
+  bumps `version` in `pyproject.toml`, commits that bump back to the branch it
+  ran from, then tags and releases — so you never edit the version by hand. The
+  bump is computed by [`scripts/bump_version.py`](../scripts/bump_version.py),
+  which you can also run locally:
 
-   - **Run it manually** from the GitHub UI (*Actions -> Release -> Run
-     workflow*). The workflow reads the version from `pyproject.toml`, then
-     creates and pushes the matching `vX.Y.Z` tag for you.
+  ```bash
+  python scripts/bump_version.py patch        # 0.2.0 -> 0.2.1
+  python scripts/bump_version.py minor        # 0.2.0 -> 0.3.0
+  python scripts/bump_version.py --set 1.4.2  # set an explicit version
+  ```
+
+- **Manual run without a bump.** Choose `bump = none` to release the current
+  `pyproject.toml` version as-is (the workflow creates and pushes the matching
+  `vX.Y.Z` tag for you).
+
+- **Push a version tag** matching the current version, for a fully manual flow:
+
+  ```bash
+  git checkout main && git pull
+  git tag vX.Y.Z      # X.Y.Z must equal the pyproject.toml version
+  git push origin vX.Y.Z
+  ```
 
 The workflow then:
 
+- (manual bump only) bumps `pyproject.toml` and pushes the bump commit,
 - reads the version from `pyproject.toml`,
 - **before building**, fails fast if a pushed tag does not match that version
   (so a release can never disagree with the package metadata),
 - builds the wheel + sdist with `python -m build`,
 - creates the GitHub Release named `AORTA X.Y.Z`, marks it **Latest**, and
   uploads the wheel + sdist as release assets with auto-generated notes.
+
+> **Branch protection note.** A manual bump run pushes the version-bump commit
+> to the branch it ran from. If you run it against a protected branch (e.g.
+> `main`) whose rules block the `GITHUB_TOKEN`, either allow the
+> `github-actions` bot to push, or bump the version in a normal PR and use the
+> tag-push trigger instead.
 
 After the workflow finishes, confirm the [latest release](https://github.com/ROCm/aorta/releases/latest)
 shows `aorta-X.Y.Z-py3-none-any.whl` plus the sdist, and run the customer
