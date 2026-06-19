@@ -58,6 +58,13 @@ jobs:
           BUMP: ${{ github.event.inputs.bump }}
           EXPLICIT_VERSION: ${{ github.event.inputs.version }}
         run: |
+          # The bump path commits + pushes back to a branch. If a manual run is
+          # launched against a tag ref, GITHUB_REF_NAME is the tag, so the push
+          # below would create a stray branch named after the tag. Reject it.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::A manual release with a version bump must run on a branch, not a tag ref (${GITHUB_REF_NAME}). Re-run from the default branch."
+            exit 1
+          fi
           if [ -n "${EXPLICIT_VERSION}" ]; then
             new_version="$(python scripts/bump_version.py --set "${EXPLICIT_VERSION}")" \
               || { echo "::error::Version bump failed for explicit version '${EXPLICIT_VERSION}' (see log)."; exit 1; }
