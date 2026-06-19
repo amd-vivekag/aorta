@@ -72,6 +72,13 @@ def test_apply_suffix_rejects_non_semver():
         apply_suffix("not-a-version", "rc20260619")
 
 
+def test_apply_suffix_rejects_four_segment_version():
+    # A malformed 4-segment value must not be silently truncated to its
+    # MAJOR.MINOR.PATCH prefix (which would mint a misleading suffixed version).
+    with pytest.raises(ValueError):
+        apply_suffix("0.2.0.1", "rc20260619")
+
+
 def test_resolve_new_version_explicit_overrides_level():
     assert resolve_new_version("0.2.0", "patch", "5.6.7") == "5.6.7"
 

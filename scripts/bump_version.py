@@ -24,7 +24,11 @@ import sys
 from pathlib import Path
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-_SEMVER_PREFIX_RE = re.compile(r"^(\d+\.\d+\.\d+)")
+# Match a MAJOR.MINOR.PATCH base, but only when the patch is not followed by
+# another dot or digit -- so a malformed 4-segment value like "0.2.0.1" is
+# rejected instead of being silently truncated to "0.2.0". A trailing
+# pre-release part (e.g. "0.2.0rc20260101") is still allowed for re-stamping.
+_SEMVER_PREFIX_RE = re.compile(r"^(\d+\.\d+\.\d+)(?![\d.])")
 _VERSION_LINE_RE = re.compile(r'^(\s*version\s*=\s*")([^"]*)(".*)$')
 
 
