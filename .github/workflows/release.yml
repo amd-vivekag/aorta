@@ -69,6 +69,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml
+          # A manual run with `version` set to the current value (or a bump that
+          # resolves to it) leaves pyproject.toml unchanged; commit then fails
+          # with a confusing "nothing to commit". Fail early with a clear hint.
+          if git diff --cached --quiet; then
+            echo "::error::pyproject.toml is already at ${new_version}; nothing to bump. Use bump='none' to release the current version, or pick a different version."
+            exit 1
+          fi
           git commit -m "Release v${new_version}: bump version"
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
