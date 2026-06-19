@@ -1,15 +1,27 @@
 name: Release
 
-# Build the wheel + sdist and publish them as GitHub Release assets whenever a
-# version tag (vX.Y.Z) is pushed. Customers then `pip install` the wheel
-# straight from the release page. See docs/releasing.md for the maintainer flow.
+# Build the wheel + sdist and publish them as GitHub Release assets so customers
+# can `pip install` AORTA straight from the release page. The release version is
+# always read from pyproject.toml (never hard-coded here), so cutting a new
+# version is just a version bump. See docs/releasing.md for the maintainer flow.
+#
+# Two ways to cut a release of the *current* pyproject.toml version:
+#   * push a version tag:  git tag vX.Y.Z && git push origin vX.Y.Z
+#   * run this workflow manually (Actions tab -> Release -> Run workflow); it
+#     creates and pushes the vX.Y.Z tag for you.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or commit to release from (defaults to the default branch)."
+        required: false
+        default: ""
 
 permissions:
-  contents: write  # required to create the release and upload assets
+  contents: write  # required to create the tag, the release, and upload assets
 
 jobs:
   build-and-release:
@@ -17,30 +29,66 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          # Full history so manual runs can create and push a new tag.
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"  # 3.11+ for stdlib tomllib in the version check
+          python-version: "3.11"  # 3.11+ for stdlib tomllib to read the version
+
+      - name: Resolve release version from pyproject.toml
+        id: version
+        run: |
+          pkg_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ -z "${pkg_version}" ]; then
+            echo "::error::Could not read project.version from pyproject.toml."
+            exit 1
+          fi
+          echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${pkg_version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version ${pkg_version} (tag v${pkg_version})."
+
+      # Fail fast BEFORE building: a pushed tag must match the package version so
+      # a release can never disagree with the metadata customers install.
+      - name: Verify pushed tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "${{ steps.version.outputs.version }}" != "${tag_version}" ]; then
+            echo "::error::Pushed tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${{ steps.version.outputs.version }}. Bump 'version' in pyproject.toml and retag."
+            exit 1
+          fi
+
+      # Manual runs create the tag from the current version. Refuse if it already
+      # exists so an already-released version is never silently re-released.
+      - name: Create and push tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Tag ${tag} already exists. Bump 'version' in pyproject.toml before cutting a new release."
+            exit 1
+          fi
+          git tag "${tag}"
+          git push origin "${tag}"
 
       - name: Build wheel and sdist
         run: |
           python -m pip install --upgrade build
           python -m build
 
-      - name: Verify tag matches pyproject version
-        run: |
-          pkg_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          tag_version="${GITHUB_REF_NAME#v}"
-          echo "pyproject version: ${pkg_version}"
-          echo "tag version:       ${tag_version}"
-          if [ "${pkg_version}" != "${tag_version}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${pkg_version}. Bump 'version' in pyproject.toml and retag."
-            exit 1
-          fi
-
       - name: Create GitHub Release with artifacts
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "AORTA ${{ steps.version.outputs.version }}"
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          make_latest: "true"  # mark this the "Latest" release
           generate_release_notes: true

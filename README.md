@@ -100,17 +100,19 @@ analysis/              # Overlap report generation
 
 Tagged [releases](https://github.com/ROCm/aorta/releases) ship a prebuilt wheel
 you can `pip install` directly. PyTorch is installed separately from the ROCm
-index (it is not bundled in the wheel):
+index (it is not bundled in the wheel). Replace `X.Y.Z` below with the release
+version you want — the newest is tagged **Latest** on the
+[releases page](https://github.com/ROCm/aorta/releases):
 
 ```bash
 # Install PyTorch for your ROCm version (adjust the index URL accordingly)
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
 
 # Install AORTA from the release (pin the version you want)
-pip install "aorta @ https://github.com/ROCm/aorta/releases/download/v0.2.0/aorta-0.2.0-py3-none-any.whl"
+pip install "aorta @ https://github.com/ROCm/aorta/releases/download/vX.Y.Z/aorta-X.Y.Z-py3-none-any.whl"
 
 # With optional extras, e.g. the hardware-queue tools
-pip install "aorta[hw-queue] @ https://github.com/ROCm/aorta/releases/download/v0.2.0/aorta-0.2.0-py3-none-any.whl"
+pip install "aorta[hw-queue] @ https://github.com/ROCm/aorta/releases/download/vX.Y.Z/aorta-X.Y.Z-py3-none-any.whl"
 ```
 
 Maintainers: see [docs/releasing.md](docs/releasing.md) for how releases are cut.
