@@ -27,13 +27,19 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      RETENTION_DAYS: ${{ inputs.retention_days || 90 }}
+      # Pass the raw input (don't `|| 90` here): a GHA expression treats an
+      # explicit 0 as falsy, which would silently become 90 and make a
+      # "delete everything older than now" run impossible. Default in bash below.
+      RETENTION_DAYS: ${{ inputs.retention_days }}
       # Scheduled runs (no inputs) delete for real; manual runs honor the toggle.
       DRY_RUN: ${{ inputs.dry_run || 'false' }}
     steps:
       - name: Prune aged dev-wheels assets
         run: |
           set -euo pipefail
+          # Default here (not in the GHA expression) so an explicit 0 survives;
+          # scheduled runs pass no input, so RETENTION_DAYS is empty -> 90.
+          RETENTION_DAYS="${RETENTION_DAYS:-90}"
           cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%s)"
           echo "Retention: ${RETENTION_DAYS} days (cutoff $(date -u -d "@${cutoff}")). Dry run: ${DRY_RUN}."
 
