@@ -73,6 +73,7 @@ AORTA generates comprehensive performance reports comparing ROCm versions across
 | [`aorta agent`](docs/agent/agentic-testing-guide.md) | Closed-loop mitigation search (optional LLM proposer) |
 | [`aorta bundle`](docs/probe-188/bundle.md) | Package probe artifacts with recipe-driven redaction |
 | [Buck2](docs/buck2.md) | Build / run the AORTA CLI via Buck2; hermetic Python, `env probe` + `triage` walkthroughs |
+| [Releasing](docs/releasing.md) | Cut a customer-installable release; maintainer + customer install flow |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues |
 
 ## Repository Layout
@@ -94,6 +95,27 @@ analysis/              # Overlap report generation
 ```
 
 ## Installation
+
+### From a release (recommended for users)
+
+Tagged [releases](https://github.com/ROCm/aorta/releases) ship a prebuilt wheel
+you can `pip install` directly. PyTorch is installed separately from the ROCm
+index (it is not bundled in the wheel):
+
+```bash
+# Install PyTorch for your ROCm version (adjust the index URL accordingly)
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+
+# Install AORTA from the release (pin the version you want)
+pip install "aorta @ https://github.com/ROCm/aorta/releases/download/v0.2.0/aorta-0.2.0-py3-none-any.whl"
+
+# With optional extras, e.g. the hardware-queue tools
+pip install "aorta[hw-queue] @ https://github.com/ROCm/aorta/releases/download/v0.2.0/aorta-0.2.0-py3-none-any.whl"
+```
+
+Maintainers: see [docs/releasing.md](docs/releasing.md) for how releases are cut.
+
+### From source (for development)
 
 We recommend using [uv](https://github.com/astral-sh/uv) for fast, reliable Python environment management.
 
