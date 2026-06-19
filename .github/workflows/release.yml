@@ -59,9 +59,11 @@ jobs:
           EXPLICIT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [ -n "${EXPLICIT_VERSION}" ]; then
-            new_version="$(python scripts/bump_version.py --set "${EXPLICIT_VERSION}")"
+            new_version="$(python scripts/bump_version.py --set "${EXPLICIT_VERSION}")" \
+              || { echo "::error::Version bump failed for explicit version '${EXPLICIT_VERSION}' (see log)."; exit 1; }
           else
-            new_version="$(python scripts/bump_version.py "${BUMP}")"
+            new_version="$(python scripts/bump_version.py "${BUMP}")" \
+              || { echo "::error::Version bump failed for bump '${BUMP}' (see log)."; exit 1; }
           fi
           echo "Bumped version to ${new_version}."
           git config user.name "github-actions[bot]"
@@ -73,9 +75,14 @@ jobs:
       - name: Resolve release version from pyproject.toml
         id: version
         run: |
-          pkg_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          # Capture the parse failure (invalid TOML / missing project.version)
+          # so it surfaces as a clean annotation instead of a raw traceback.
+          if ! pkg_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"; then
+            echo "::error::Could not read project.version from pyproject.toml (invalid TOML or missing project.version)."
+            exit 1
+          fi
           if [ -z "${pkg_version}" ]; then
-            echo "::error::Could not read project.version from pyproject.toml."
+            echo "::error::project.version in pyproject.toml is empty."
             exit 1
           fi
           echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"

@@ -14,9 +14,10 @@ bump plus a trigger.
 
 Releases are automated by [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 Each run builds the artifacts for the resolved `pyproject.toml` version and
-publishes them as a new GitHub Release marked **Latest**. A new release requires
-a new version: the workflow refuses to re-release a version whose tag already
-exists.
+publishes them as a new GitHub Release marked **Latest**. Each release needs a
+new version: on a **manual run** the workflow refuses to release a version whose
+tag already exists, and on a **tag push** Git itself rejects a tag that already
+exists (force-updating an existing tag would re-release it).
 
 Pick whichever trigger fits:
 
