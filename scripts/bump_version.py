@@ -8,9 +8,10 @@ only the single ``version = "..."`` line inside the ``[project]`` table so the
 rest of the file is left byte-for-byte untouched.
 
 Examples:
-    python scripts/bump_version.py patch        # 0.2.0 -> 0.2.1
-    python scripts/bump_version.py minor        # 0.2.0 -> 0.3.0
-    python scripts/bump_version.py --set 1.4.2  # set an explicit version
+    python scripts/bump_version.py patch                 # 0.2.0 -> 0.2.1
+    python scripts/bump_version.py minor                 # 0.2.0 -> 0.3.0
+    python scripts/bump_version.py --set 1.4.2           # set an explicit version
+    python scripts/bump_version.py --suffix rc20260619   # 0.2.0 -> 0.2.0rc20260619
 
 Prints the new version to stdout so callers (e.g. CI) can capture it.
 """
@@ -23,6 +24,7 @@ import sys
 from pathlib import Path
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_SEMVER_PREFIX_RE = re.compile(r"^(\d+\.\d+\.\d+)")
 _VERSION_LINE_RE = re.compile(r'^(\s*version\s*=\s*")([^"]*)(".*)$')
 
 
@@ -41,6 +43,22 @@ def bump_version(current: str, level: str) -> str:
     if level == "patch":
         return f"{major}.{minor}.{patch + 1}"
     raise ValueError(f"unknown bump level {level!r}; expected major/minor/patch")
+
+
+def apply_suffix(current: str, suffix: str) -> str:
+    """Return the ``MAJOR.MINOR.PATCH`` base of ``current`` with ``suffix`` appended.
+
+    Any existing pre-release/local part on ``current`` is dropped first, so
+    re-stamping (e.g. ``0.2.0rc20260101`` -> ``0.2.0rc20260619``) is idempotent
+    on the base version. Used to mint nightly release-candidate versions such as
+    ``0.2.0rc20260619``.
+    """
+    match = _SEMVER_PREFIX_RE.match(current)
+    if match is None:
+        raise ValueError(
+            f"cannot suffix non-semver version {current!r}; expected a MAJOR.MINOR.PATCH prefix"
+        )
+    return f"{match.group(1)}{suffix}"
 
 
 def read_version(text: str) -> str:
@@ -82,15 +100,27 @@ def set_version(text: str, new_version: str) -> str:
     return "".join(out)
 
 
-def resolve_new_version(current: str, level: str | None, explicit: str | None) -> str:
-    """Resolve the target version from a bump ``level`` or an ``explicit`` value."""
+def resolve_new_version(
+    current: str,
+    level: str | None,
+    explicit: str | None,
+    suffix: str | None = None,
+) -> str:
+    """Resolve the target version from an ``explicit`` value, a ``suffix``, or a bump ``level``.
+
+    Precedence: ``explicit`` (``--set``) > ``suffix`` > ``level``.
+    """
     if explicit is not None:
         if _SEMVER_RE.match(explicit) is None:
             raise ValueError(f"explicit version {explicit!r} is not MAJOR.MINOR.PATCH")
         return explicit
+    if suffix is not None:
+        return apply_suffix(current, suffix)
     if level is not None:
         return bump_version(current, level)
-    raise ValueError("either a bump level (major/minor/patch) or --set VERSION is required")
+    raise ValueError(
+        "one of a bump level (major/minor/patch), --set VERSION, or --suffix SUFFIX is required"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,6 +137,11 @@ def main(argv: list[str] | None = None) -> int:
         help="set an explicit MAJOR.MINOR.PATCH version (overrides the bump level)",
     )
     parser.add_argument(
+        "--suffix",
+        help="append SUFFIX to the base MAJOR.MINOR.PATCH version, e.g. 'rc20260619' "
+        "(used for nightly release candidates; overrides the bump level)",
+    )
+    parser.add_argument(
         "--pyproject",
         type=Path,
         default=Path("pyproject.toml"),
@@ -116,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
 
     text = args.pyproject.read_text()
     current = read_version(text)
-    new_version = resolve_new_version(current, args.level, args.explicit)
+    new_version = resolve_new_version(current, args.level, args.explicit, args.suffix)
     args.pyproject.write_text(set_version(text, new_version))
     print(new_version)
     return 0

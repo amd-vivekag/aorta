@@ -1,0 +1,64 @@
+name: Nightly wheels
+
+# Build a release-candidate wheel + sdist from the current main every night and
+# publish them to a single rolling "dev-wheels" pre-release, so customers can
+# install pre-release fixes between stable releases:
+#
+#   pip install "aorta==X.Y.ZrcYYYYMMDD" \
+#     -f https://github.com/ROCm/aorta/releases/expanded_assets/dev-wheels
+#
+# The rc version is stamped at build time (scripts/bump_version.py --suffix) and
+# is NOT committed back to the repo. Old assets are pruned by cleanup_releases.yml.
+on:
+  schedule:
+    - cron: "0 11 * * *"  # 11:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required to create/update the dev-wheels release + assets
+
+jobs:
+  nightly:
+    # Run the nightly cron only on the canonical repo, but still allow manual
+    # runs (e.g. on a fork) for testing.
+    if: github.event_name != 'schedule' || github.repository == 'ROCm/aorta'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Stamp release-candidate version
+        run: |
+          suffix="rc$(date -u +%Y%m%d)"
+          rc_version="$(python scripts/bump_version.py --suffix "${suffix}")" \
+            || { echo "::error::Failed to stamp release-candidate version."; exit 1; }
+          echo "Building nightly ${rc_version}."
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to rolling dev-wheels pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-wheels
+          name: "Nightly dev wheels"
+          body: |
+            Rolling pre-release wheels built nightly from `main`. These are
+            release candidates, not stable releases. Install a specific build:
+
+            ```
+            pip install "aorta==X.Y.ZrcYYYYMMDD" \
+              -f https://github.com/ROCm/aorta/releases/expanded_assets/dev-wheels
+            ```
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          prerelease: true
+          make_latest: "false"  # never overtake the stable "Latest" release

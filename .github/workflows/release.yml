@@ -1,8 +1,8 @@
 name: Release
 
-# Build the wheel + sdist and publish them as GitHub Release assets so customers
-# can `pip install` AORTA straight from the release page. The release version is
-# always read from pyproject.toml (never hard-coded here).
+# Build the wheel + sdist once, attach them to a GitHub Release, and publish the
+# same artifacts to PyPI (so customers can `pip install aorta`). The release
+# version is always read from pyproject.toml (never hard-coded here).
 #
 # Two ways to cut a release:
 #   * push a version tag:  git tag vX.Y.Z && git push origin vX.Y.Z
@@ -120,6 +120,15 @@ jobs:
           python -m pip install --upgrade build
           python -m build
 
+      # Share the built artifacts with the publish job so PyPI gets the exact
+      # same wheel + sdist that were attached to the GitHub Release (build once).
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
       - name: Create GitHub Release with artifacts
         uses: softprops/action-gh-release@v2
         with:
@@ -130,3 +139,26 @@ jobs:
             dist/*.tar.gz
           make_latest: "true"  # mark this the "Latest" release
           generate_release_notes: true
+
+  # Publish the same artifacts to PyPI via Trusted Publishing (OIDC) so customers
+  # can `pip install aorta`. Requires a one-time PyPI trusted-publisher setup for
+  # this repo + workflow + the `pypi` environment (see docs/releasing.md).
+  publish-pypi:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/aorta
+    permissions:
+      id-token: write  # OIDC token for Trusted Publishing; no API token stored
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

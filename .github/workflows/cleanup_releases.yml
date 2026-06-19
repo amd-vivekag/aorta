@@ -1,0 +1,68 @@
+name: Cleanup old dev-wheels assets
+
+# The rolling "dev-wheels" pre-release (see nightly.yml) accumulates a wheel +
+# sdist every night. This prunes assets older than the retention window so the
+# release stays bounded. Scheduled runs delete for real; manual runs default to
+# a dry run.
+on:
+  schedule:
+    - cron: "0 2 * * 1"  # 02:00 UTC every Monday
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: "Delete dev-wheels assets older than this many days."
+        type: number
+        default: 90
+      dry_run:
+        description: "List what would be deleted without deleting."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write  # required to delete release assets
+
+jobs:
+  cleanup:
+    if: github.repository == 'ROCm/aorta'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RETENTION_DAYS: ${{ inputs.retention_days || 90 }}
+      # Scheduled runs (no inputs) delete for real; manual runs honor the toggle.
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - name: Prune aged dev-wheels assets
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%s)"
+          echo "Retention: ${RETENTION_DAYS} days (cutoff $(date -u -d "@${cutoff}")). Dry run: ${DRY_RUN}."
+
+          if ! release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/dev-wheels" --jq '.id' 2>/dev/null)"; then
+            echo "No dev-wheels release yet; nothing to clean."
+            exit 0
+          fi
+
+          deleted=0
+          kept=0
+          while IFS=$'\t' read -r asset_id name created; do
+            [ -z "${asset_id}" ] && continue
+            created_s="$(date -u -d "${created}" +%s)"
+            if [ "${created_s}" -lt "${cutoff}" ]; then
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "[dry-run] would delete ${name} (created ${created})"
+              else
+                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+                echo "deleted ${name} (created ${created})"
+              fi
+              deleted=$((deleted + 1))
+            else
+              kept=$((kept + 1))
+            fi
+          done < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+                     --jq '.[] | [(.id|tostring), .name, .created_at] | @tsv')
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Summary (dry run): ${deleted} asset(s) would be deleted, ${kept} kept."
+          else
+            echo "Summary: ${deleted} asset(s) deleted, ${kept} kept."
+          fi

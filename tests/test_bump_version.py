@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from bump_version import (  # noqa: E402
+    apply_suffix,
     bump_version,
     read_version,
     resolve_new_version,
@@ -57,8 +58,30 @@ def test_set_version_preserves_trailing_content():
     assert set_version(text, "0.2.1") == '[project]\nversion = "0.2.1"  # keep me\n'
 
 
+def test_apply_suffix_appends_to_base():
+    assert apply_suffix("0.2.0", "rc20260619") == "0.2.0rc20260619"
+
+
+def test_apply_suffix_is_idempotent_on_base():
+    # Re-stamping an already-suffixed version uses the base, not the old suffix.
+    assert apply_suffix("0.2.0rc20260101", "rc20260619") == "0.2.0rc20260619"
+
+
+def test_apply_suffix_rejects_non_semver():
+    with pytest.raises(ValueError):
+        apply_suffix("not-a-version", "rc20260619")
+
+
 def test_resolve_new_version_explicit_overrides_level():
     assert resolve_new_version("0.2.0", "patch", "5.6.7") == "5.6.7"
+
+
+def test_resolve_new_version_suffix_overrides_level():
+    assert resolve_new_version("0.2.0", "patch", None, "rc20260619") == "0.2.0rc20260619"
+
+
+def test_resolve_new_version_explicit_overrides_suffix():
+    assert resolve_new_version("0.2.0", None, "5.6.7", "rc20260619") == "5.6.7"
 
 
 def test_resolve_new_version_rejects_bad_explicit():
