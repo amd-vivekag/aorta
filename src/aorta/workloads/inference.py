@@ -169,7 +169,7 @@ class ContinuousBatchSpec:
         d = dict(d or {})
         known = set(cls.__dataclass_fields__)
         spec = cls(**{k: v for k, v in d.items() if k in known})
-        spec.enabled = bool(spec.enabled)
+        spec.enabled = _require_bool(spec.enabled, "serving.continuous_batch.enabled")
         spec.max_active_requests = int(spec.max_active_requests)
         if spec.max_active_requests < 1:
             raise ValueError(
@@ -195,8 +195,8 @@ class ServingSpec:
     def from_dict(cls, d: dict[str, Any]) -> "ServingSpec":
         d = dict(d or {})
         cb = ContinuousBatchSpec.from_dict(d.get("continuous_batch", {}))
-        kv = d.get("kv_cache", True)
-        return cls(kv_cache=bool(kv), continuous_batch=cb)
+        kv = _require_bool(d.get("kv_cache", True), "serving.kv_cache")
+        return cls(kv_cache=kv, continuous_batch=cb)
 
 
 @dataclass
@@ -209,7 +209,7 @@ class ChecksSpec:
     def from_dict(cls, d: dict[str, Any]) -> "ChecksSpec":
         d = dict(d or {})
         known = set(cls.__dataclass_fields__)
-        return cls(**{k: bool(v) for k, v in d.items() if k in known})
+        return cls(**{k: _require_bool(v, f"checks.{k}") for k, v in d.items() if k in known})
 
 
 @dataclass
@@ -276,6 +276,19 @@ class InferenceConfig:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _require_bool(value: Any, field: str) -> bool:
+    """Validate that a recipe field is a real ``bool`` and fail fast otherwise.
+
+    ``bool(...)`` coercion would turn a malformed value (e.g. the string
+    ``"false"``) into ``True`` and silently flip behavior/safety checks. This
+    mirrors the validate-and-fail-fast boolean handling in
+    :mod:`aorta.workloads._subprocess`.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a bool, got {type(value).__name__}: {value!r}")
+    return value
+
+
 def _percentile(values: list[float], pct: float) -> float:
     """Linear-interpolation percentile (no numpy dependency at the base layer)."""
     if not values:

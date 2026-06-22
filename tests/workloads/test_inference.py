@@ -93,6 +93,10 @@ def test_config_ignores_unknown_keys() -> None:
         {"serving": {"continuous_batch": {"arrival_pattern": "poisson"}}},
         # continuous_batch requires at least one decode step per request.
         {"mode": "continuous_batch", "request": {"generate_tokens": 0}},
+        # boolean fields must be real bools, not coercible strings.
+        {"serving": {"kv_cache": "false"}},
+        {"serving": {"continuous_batch": {"enabled": "false"}}},
+        {"checks": {"fail_on_nan_logits": "false"}},
     ],
 )
 def test_config_rejects_garbage(bad: dict) -> None:
