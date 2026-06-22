@@ -43,8 +43,9 @@ workload_config:
 
   serving:
     kv_cache: true   # simulated only — RepeatedBlockModel has no real paged KV
-                     # cache; the workload re-uses past hidden states via tensor
-                     # slicing to exercise the prefill/decode timing split.
+                     # cache; the workload decodes from only the newest token
+                     # (shorter input_ids slices) to exercise the prefill/decode
+                     # timing split, not real KV/hidden-state reuse.
     continuous_batch:
       enabled: false
       max_active_requests: 8

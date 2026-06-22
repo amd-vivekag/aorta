@@ -50,7 +50,6 @@ Serving modes
 from __future__ import annotations
 
 import logging
-import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -486,8 +485,9 @@ class InferenceWorkload(Workload):
                 "checksum": None,
             }
             step_t0 = time.perf_counter()
+            # _offline_batch already synchronizes after every forward, so no
+            # extra self._sync() is needed here (it would just double the sync).
             logits_finite, has_nan, has_inf = self._offline_batch(req, record=rec)
-            self._sync()
             step_times.append((time.perf_counter() - step_t0) * 1000.0)
             executed += 1
 
@@ -684,8 +684,9 @@ class InferenceWorkload(Workload):
 
             rec: dict[str, Any] = {"decode_ms": [], "checksum": None, "retired": 0, "tokens": 0}
             step_t0 = time.perf_counter()
+            # _continuous_tick already synchronizes after the forward, so an
+            # extra self._sync() here would just add a redundant device sync.
             all_finite, has_nan, has_inf = self._continuous_tick(active, queue, cap, record=rec)
-            self._sync()
             step_times.append((time.perf_counter() - step_t0) * 1000.0)
             executed += 1
             decode_token_times.extend(rec["decode_ms"])

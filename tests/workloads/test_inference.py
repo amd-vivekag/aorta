@@ -11,13 +11,9 @@ from __future__ import annotations
 import pytest
 
 from aorta.workloads.inference import (
-    ChecksSpec,
-    ContinuousBatchSpec,
     InferenceConfig,
     InferenceWorkload,
     ModelSpec,
-    RequestSpec,
-    ServingSpec,
     _percentile,
 )
 
