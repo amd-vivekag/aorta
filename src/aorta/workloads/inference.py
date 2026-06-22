@@ -266,6 +266,14 @@ class InferenceConfig:
                 "request.generate_tokens must be >= 1 for mode=continuous_batch, "
                 f"got {cfg.request.generate_tokens}"
             )
+        # The continuous scheduler is a decode loop; it only makes sense for
+        # autoregressive topologies (the non-autoregressive encoder has no decode
+        # phase). Reject the mismatch rather than silently running decode ticks.
+        if cfg.mode == "continuous_batch" and not cfg.is_autoregressive:
+            raise ValueError(
+                "mode=continuous_batch requires an autoregressive model.kind "
+                f"(mlp|decoder_transformer), got {cfg.model.kind!r}"
+            )
         return cfg
 
     @property
@@ -753,7 +761,13 @@ class InferenceWorkload(Workload):
         if not active:
             return True, False, False
 
-        batch = torch.cat([r.ctx for r in active], dim=0)
+        # Honor the kv_cache knob (mirrors offline): with simulated KV enabled,
+        # decode from only the newest token; otherwise feed the full rolling
+        # context window. The window is updated either way for the next tick.
+        if self._cfg.serving.kv_cache:
+            batch = torch.cat([r.ctx[:, -1:] for r in active], dim=0)
+        else:
+            batch = torch.cat([r.ctx for r in active], dim=0)
         d0 = time.perf_counter()
         with torch.inference_mode():
             logits = self._model(batch)

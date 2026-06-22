@@ -97,6 +97,8 @@ def test_config_ignores_unknown_keys() -> None:
         {"serving": {"kv_cache": "false"}},
         {"serving": {"continuous_batch": {"enabled": "false"}}},
         {"checks": {"fail_on_nan_logits": "false"}},
+        # continuous_batch is a decode loop; encoder (non-autoregressive) is invalid.
+        {"mode": "continuous_batch", "model": {"kind": "encoder_transformer"}},
     ],
 )
 def test_config_rejects_garbage(bad: dict) -> None:
@@ -339,6 +341,32 @@ def test_continuous_batch_smoke() -> None:
     assert m["max_active_requests"] == 2
     # All 4 requests (2 tokens each) should retire within 6 ticks.
     assert m["requests_completed"] == 4
+
+
+@requires_torch
+def test_continuous_batch_kv_cache_disabled() -> None:
+    # kv_cache=False feeds the full context window each tick; should still run.
+    wl = InferenceWorkload(
+        {
+            "mode": "continuous_batch",
+            "device": "cpu",
+            "dtype": "float32",
+            "warmup_steps": 0,
+            "steps": 6,
+            "request": {"batch_size": 4, "prompt_len": 8, "generate_tokens": 2},
+            "serving": {"kv_cache": False, "continuous_batch": {"enabled": True, "max_active_requests": 2}},
+            "model": {"kind": "decoder_transformer", "hidden_size": 32, "num_heads": 4,
+                      "num_layers": 1, "ffn_size": 64, "vocab_size": 48},
+        }
+    )
+    try:
+        wl.setup()
+        result = wl.run()
+    finally:
+        wl.cleanup()
+    assert result.passed is True
+    assert result.metrics["kv_cache"] is False
+    assert result.metrics["requests_completed"] == 4
 
 
 @requires_torch
