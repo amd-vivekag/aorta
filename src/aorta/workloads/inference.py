@@ -493,7 +493,11 @@ class InferenceWorkload(Workload):
 
             prefill_times.extend(rec["prefill_ms"])  # type: ignore[arg-type]
             decode_token_times.extend(rec["decode_ms"])  # type: ignore[arg-type]
-            decoded_tokens += req.batch_size * (req.generate_tokens if cfg.is_autoregressive else 0)
+            # Count only decode-covered tokens (the first token came from prefill
+            # and is not part of decode timing), so tokens_per_sec aligns with
+            # decode_ms.
+            decode_tokens_per_step = max(req.generate_tokens - 1, 0) if cfg.is_autoregressive else 0
+            decoded_tokens += req.batch_size * decode_tokens_per_step
             last_checksum = rec["checksum"]  # type: ignore[assignment]
 
             problems = self._numeric_problems(cfg.checks, has_nan, has_inf, logits_finite)
@@ -598,7 +602,10 @@ class InferenceWorkload(Workload):
             if cfg.is_autoregressive and req.generate_tokens > 0:
                 seq = prompt
                 next_tok = logits[:, -1:, :].argmax(dim=-1)
-                for _ in range(req.generate_tokens):
+                # Prefill already produced the first generated token (next_tok),
+                # so only generate_tokens-1 decode forwards remain. The non-kv
+                # path is seeded with that first token on the initial iteration.
+                for _ in range(req.generate_tokens - 1):
                     if cfg.serving.kv_cache:
                         # Simulated KV cache: feed only the newest token (the
                         # "shorter input" prefill/decode split). RepeatedBlockModel
