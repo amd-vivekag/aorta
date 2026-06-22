@@ -82,6 +82,8 @@ def test_config_ignores_unknown_keys() -> None:
         {"model": {"kind": "rnn"}},
         {"model": {"num_layers": 0}},
         {"model": {"kind": "decoder_transformer", "hidden_size": 100, "num_heads": 3}},
+        # num_heads=0 must fail cleanly (ValueError), not raise ZeroDivisionError.
+        {"model": {"kind": "decoder_transformer", "num_heads": 0}},
         {"request": {"batch_size": 0}},
         {"request": {"prompt_len": 0}},
         {"request": {"generate_tokens": -1}},

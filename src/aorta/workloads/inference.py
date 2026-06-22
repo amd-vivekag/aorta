@@ -149,6 +149,10 @@ class ModelSpec:
         if spec.num_experts < 1:
             raise ValueError(f"model.num_experts must be >= 1, got {spec.num_experts}")
         if spec.kind in ("encoder_transformer", "decoder_transformer"):
+            # Validate num_heads >= 1 before the modulo so a 0 fails cleanly as a
+            # ValueError instead of raising ZeroDivisionError.
+            if spec.num_heads < 1:
+                raise ValueError(f"model.num_heads must be >= 1, got {spec.num_heads}")
             if spec.hidden_size % spec.num_heads != 0:
                 raise ValueError(
                     f"model.hidden_size ({spec.hidden_size}) must be divisible by "
