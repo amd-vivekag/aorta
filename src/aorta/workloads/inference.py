@@ -484,7 +484,9 @@ class InferenceWorkload(Workload):
 
         elapsed = time.perf_counter() - t0
         passed = not failures
-        timed = step_times[cfg.warmup_steps:] or step_times
+        # Warmup batches ran in a separate (unrecorded) loop, so every entry in
+        # step_times is already a measured step — don't slice off warmup_steps.
+        timed = step_times
 
         prefill_latency_ms = sum(prefill_times) / len(prefill_times) if prefill_times else 0.0
         decode_latency_ms = (
