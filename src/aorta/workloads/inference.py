@@ -259,6 +259,13 @@ class InferenceConfig:
             raise ValueError(f"steps must be >= 1, got {cfg.steps}")
         if cfg.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {cfg.warmup_steps}")
+        # The continuous-batch scheduler requires at least one decode step per
+        # request; reject generate_tokens=0 here rather than silently bumping it.
+        if cfg.mode == "continuous_batch" and cfg.request.generate_tokens < 1:
+            raise ValueError(
+                "request.generate_tokens must be >= 1 for mode=continuous_batch, "
+                f"got {cfg.request.generate_tokens}"
+            )
         return cfg
 
     @property
@@ -329,6 +336,21 @@ def _build_model(spec: ModelSpec, seq_len: int) -> "torch.nn.Module":
         num_experts=spec.num_experts,
     )
     return RepeatedBlockModel(block)
+
+
+class _ContinuousRequest:
+    """One in-flight request for the continuous-batch scheduler.
+
+    ``ctx`` is a fixed-width rolling context window so active requests can be
+    stacked into a single batched decode forward regardless of how many tokens
+    they have generated; ``remaining`` decrements once per decoded token.
+    """
+
+    __slots__ = ("ctx", "remaining")
+
+    def __init__(self, ctx: "torch.Tensor", remaining: int) -> None:
+        self.ctx = ctx
+        self.remaining = remaining
 
 
 # --------------------------------------------------------------------------- #
@@ -584,22 +606,30 @@ class InferenceWorkload(Workload):
         req = cfg.request
         cap = cfg.serving.continuous_batch.max_active_requests
 
-        # Each request keeps a fixed-width rolling context window so active
-        # requests can be stacked into one batched decode forward regardless of
-        # how many tokens they've generated. ``remaining`` decrements per token.
-        class _Req:
-            __slots__ = ("ctx", "remaining")
+        # Build the full configured request set. ``generate_tokens`` is the
+        # per-request decode budget (validated >= 1 for this mode).
+        def _fresh_queue() -> list[_ContinuousRequest]:
+            return [
+                _ContinuousRequest(
+                    self._make_prompt(RequestSpec(1, req.prompt_len, req.generate_tokens)),
+                    req.generate_tokens,
+                )
+                for _ in range(req.batch_size)
+            ]
 
-            def __init__(self, ctx, remaining):
-                self.ctx = ctx
-                self.remaining = remaining
+        # Warmup runs on a SEPARATE scheduler state so it can't drain/retire
+        # requests that the measured ticks need (which would corrupt
+        # requests_completed / decoded_tokens / timings).
+        if cfg.warmup_steps > 0:
+            w_queue = _fresh_queue()
+            w_active: list[_ContinuousRequest] = []
+            for _ in range(cfg.warmup_steps):
+                if not w_queue and not w_active:
+                    break
+                self._continuous_tick(w_active, w_queue, cap, record=None)
 
-        queue: list[_Req] = [
-            _Req(self._make_prompt(RequestSpec(1, req.prompt_len, req.generate_tokens)),
-                 max(1, req.generate_tokens))
-            for _ in range(req.batch_size)
-        ]
-        active: list[_Req] = []
+        queue: list[_ContinuousRequest] = _fresh_queue()
+        active: list[_ContinuousRequest] = []
 
         t0 = time.perf_counter()
         step_times: list[float] = []
@@ -611,10 +641,6 @@ class InferenceWorkload(Workload):
         completed = 0
         decoded_tokens = 0
         last_checksum: int | None = None
-
-        for _ in range(cfg.warmup_steps):
-            if queue or active:
-                self._continuous_tick(active, queue, cap, record=None)
 
         for step in range(cfg.steps):
             main_work_started = True
@@ -645,7 +671,8 @@ class InferenceWorkload(Workload):
 
         elapsed = time.perf_counter() - t0
         passed = not failures
-        timed = step_times[cfg.warmup_steps:] or step_times
+        # Warmup ran on separate state, so every recorded tick is measured.
+        timed = step_times
         decode_latency_ms = (
             sum(decode_token_times) / len(decode_token_times) if decode_token_times else None
         )
@@ -695,8 +722,9 @@ class InferenceWorkload(Workload):
 
     def _continuous_tick(self, active, queue, cap, *, record) -> tuple[bool, bool, bool]:
         """One scheduler tick: admit arrivals, batched decode, retire finished."""
-        # Fixed arrival: admit one queued request per tick until at capacity.
-        while queue and len(active) < cap:
+        # Fixed arrival: admit AT MOST one queued request per tick (when below
+        # capacity), matching arrival_pattern="fixed" in the recipe/docs.
+        if queue and len(active) < cap:
             active.append(queue.pop(0))
 
         if not active:
@@ -763,8 +791,13 @@ class InferenceWorkload(Workload):
         checks: ChecksSpec, has_nan: bool, has_inf: bool, all_finite: bool
     ) -> list[str]:
         problems: list[str] = []
+        # ``fail_on_nan_logits`` covers both NaN and inf logits (the documented
+        # "NaN/inf logit checks"); inf is reported explicitly so it is not
+        # silently dropped when ``fail_on_nonfinite_output`` is disabled.
         if checks.fail_on_nan_logits and has_nan:
             problems.append("nan_logits")
+        if checks.fail_on_nan_logits and has_inf:
+            problems.append("inf_logits")
         if checks.fail_on_nonfinite_output and not all_finite:
             problems.append("non_finite_output")
         return problems

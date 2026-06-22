@@ -91,11 +91,19 @@ def test_config_ignores_unknown_keys() -> None:
         {"request": {"generate_tokens": -1}},
         {"serving": {"continuous_batch": {"max_active_requests": 0}}},
         {"serving": {"continuous_batch": {"arrival_pattern": "poisson"}}},
+        # continuous_batch requires at least one decode step per request.
+        {"mode": "continuous_batch", "request": {"generate_tokens": 0}},
     ],
 )
 def test_config_rejects_garbage(bad: dict) -> None:
     with pytest.raises(ValueError):
         InferenceConfig.from_dict(bad)
+
+
+def test_offline_allows_zero_generate_tokens() -> None:
+    # generate_tokens=0 is valid for offline/encoder-style inference.
+    cfg = InferenceConfig.from_dict({"mode": "offline_batch", "request": {"generate_tokens": 0}})
+    assert cfg.request.generate_tokens == 0
 
 
 def test_encoder_is_not_autoregressive() -> None:
@@ -333,3 +341,38 @@ def test_nan_logits_fail_the_trial(monkeypatch) -> None:
     assert result.failure_count >= 1
     assert result.first_failure_iteration == 0
     assert any("nan_logits" in d["problems"] for d in result.failure_details)
+
+
+@requires_torch
+def test_inf_logits_caught_under_nan_flag(monkeypatch) -> None:
+    """inf logits must be reported even when fail_on_nonfinite_output is off."""
+    wl = InferenceWorkload(
+        {
+            "mode": "offline_batch",
+            "device": "cpu",
+            "dtype": "float32",
+            "warmup_steps": 0,
+            "steps": 1,
+            "request": {"batch_size": 1, "prompt_len": 4, "generate_tokens": 0},
+            "model": {"kind": "mlp", "hidden_size": 16, "num_layers": 1, "vocab_size": 32},
+            "checks": {
+                "fail_on_nan_logits": True,
+                "fail_on_nonfinite_output": False,
+                "compare_logits_checksum": False,
+            },
+        }
+    )
+    wl.setup()
+    try:
+        real_model = wl._model
+
+        def _inf_forward(input_ids):
+            return real_model(input_ids) + float("inf")
+
+        monkeypatch.setattr(wl, "_model", _inf_forward)
+        result = wl.run()
+    finally:
+        wl.cleanup()
+
+    assert result.passed is False
+    assert any("inf_logits" in d["problems"] for d in result.failure_details)
