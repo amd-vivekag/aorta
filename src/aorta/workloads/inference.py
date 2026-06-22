@@ -493,10 +493,12 @@ class InferenceWorkload(Workload):
             sum(decode_token_times) / len(decode_token_times) if decode_token_times else None
         )
         total_decode_sec = sum(decode_token_times) / 1000.0
-        if cfg.is_autoregressive and total_decode_sec > 0:
+        if decode_token_times and total_decode_sec > 0:
+            # Decode throughput: generated tokens per decode second.
             tokens_per_sec = decoded_tokens / total_decode_sec
-        elif not cfg.is_autoregressive and prefill_times:
-            # Encoder: throughput is prompt tokens processed per prefill second.
+        elif prefill_times:
+            # No decode phase (encoder, or generate_tokens=0): report prefill
+            # throughput as prompt tokens processed per prefill second.
             tokens_per_sec = (req.batch_size * req.prompt_len * len(prefill_times)) / (
                 sum(prefill_times) / 1000.0
             )
@@ -597,7 +599,13 @@ class InferenceWorkload(Workload):
                     next_tok = step_logits[:, -1:, :].argmax(dim=-1)
                     last_logits = step_logits
 
-        if record is not None and last_logits is not None:
+        # Only checksum when explicitly enabled — it forces a device sync and is
+        # pure overhead when compare_logits_checksum is off.
+        if (
+            record is not None
+            and last_logits is not None
+            and cfg.checks.compare_logits_checksum
+        ):
             record["checksum"] = tensor_checksum(last_logits)
         return all_finite, any_nan, any_inf
 
@@ -740,7 +748,8 @@ class InferenceWorkload(Workload):
         if record is not None:
             record["decode_ms"].append((time.perf_counter() - d0) * 1000.0)
             record["tokens"] += len(active)
-            record["checksum"] = tensor_checksum(logits)
+            if self._cfg.checks.compare_logits_checksum:
+                record["checksum"] = tensor_checksum(logits)
 
         fin, nan, inf = self._finite_flags(logits)
 

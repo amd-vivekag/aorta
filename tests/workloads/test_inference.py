@@ -262,6 +262,33 @@ def test_encoder_has_no_decode_latency() -> None:
 
 
 @requires_torch
+def test_checksum_disabled_omits_metric_and_throughput_for_zero_decode() -> None:
+    # compare_logits_checksum off -> no logits_checksum metric.
+    # autoregressive + generate_tokens=0 -> prefill-based throughput (> 0).
+    wl = InferenceWorkload(
+        {
+            "mode": "offline_batch",
+            "device": "cpu",
+            "dtype": "float32",
+            "warmup_steps": 0,
+            "steps": 2,
+            "request": {"batch_size": 1, "prompt_len": 6, "generate_tokens": 0},
+            "model": {"kind": "decoder_transformer", "hidden_size": 32, "num_heads": 4,
+                      "num_layers": 1, "ffn_size": 64, "vocab_size": 48},
+            "checks": {"compare_logits_checksum": False},
+        }
+    )
+    try:
+        wl.setup()
+        result = wl.run()
+    finally:
+        wl.cleanup()
+    assert "logits_checksum" not in result.metrics
+    assert result.metrics["decode_latency_ms"] is None
+    assert result.metrics["tokens_per_sec"] > 0.0
+
+
+@requires_torch
 def test_steps_override_from_dispatcher() -> None:
     wl = InferenceWorkload(
         {
