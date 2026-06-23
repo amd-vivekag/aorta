@@ -52,7 +52,10 @@ from pathlib import Path
 from typing import Any
 
 from aorta.probe.classifier import TrialContext, classify_trial
-from aorta.probe.classifier.tier1_process import Tier1Context
+from aorta.probe.classifier.tier1_process import (
+    DETECTOR_EXIT_NONZERO,
+    Tier1Context,
+)
 from aorta.probe.classifier.tier1_process import detect as tier1_detect
 from aorta.probe.classifier.tier2_hang import (
     DEFAULT_HANG_GRACE_SEC,
@@ -692,6 +695,19 @@ class SubprocessWorkload(Workload):
         # verdict derived from the same Tier 1 inputs, record the
         # classifier exception under ``capture['classifier_error']``
         # for the operator, and continue.
+        # A subprocess that never launched (exec-time Popen failure --
+        # ENOENT / EACCES / ENOEXEC) has only Tier 1 to speak to its
+        # outcome. Honouring a Tier-1 disable on that path would let a
+        # command-not-found resolve to a green verdict -- a run that did
+        # no real work yet looks like a pass. Force Tier 1 (and its
+        # ``exit_nonzero`` detector) back on for the exec-failure path so
+        # the failure always surfaces; the disable still applies on every
+        # launched trial. (oyazdanb review)
+        effective_disabled_tiers = disabled_tiers
+        effective_disabled_detectors = disabled_detectors
+        if not launched:
+            effective_disabled_tiers = disabled_tiers - {"tier1"}
+            effective_disabled_detectors = disabled_detectors - {DETECTOR_EXIT_NONZERO}
         try:
             verdict_obj, tier_durations_ms = classify_trial(
                 TrialContext(
@@ -709,8 +725,8 @@ class SubprocessWorkload(Workload):
                     tier3_extra=tuple(fired_kernel_ids),
                     tier3_state=_TIER3_STATE,
                     tier3_vram_growth=tier3_vram_growth,
-                    disabled_tiers=disabled_tiers,
-                    disabled_detectors=disabled_detectors,
+                    disabled_tiers=effective_disabled_tiers,
+                    disabled_detectors=effective_disabled_detectors,
                 )
             )
         except Exception as classifier_exc:  # noqa: BLE001 -- classifier crash containment
@@ -719,6 +735,8 @@ class SubprocessWorkload(Workload):
                 timed_out=timed_out,
                 trial_dir=trial_dir,
                 classifier_exc=classifier_exc,
+                disabled_tiers=effective_disabled_tiers,
+                disabled_detectors=effective_disabled_detectors,
             )
 
         result_doc: dict[str, Any] = {
@@ -1017,6 +1035,8 @@ def _tier1_only_fallback_verdict(
     timed_out: bool,
     trial_dir: Path,
     classifier_exc: BaseException,
+    disabled_tiers: frozenset[str] = frozenset(),
+    disabled_detectors: frozenset[str] = frozenset(),
 ) -> tuple[Verdict, dict[str, float]]:
     """Build a deterministic verdict when :func:`classify_trial` raises.
 
@@ -1032,18 +1052,31 @@ def _tier1_only_fallback_verdict(
     ``capture`` rather than the per-tier breakdown -- the other
     four tiers genuinely did not run.
 
-    Verdict rule: any Tier 1 detector fires -> ``fail``; else
-    ``pass``. Matches the existing Phase-1 fallback shape so
+    The operator's detector-disable knobs apply here too, so this
+    fallback honours the same contract as :func:`classify_trial`: a
+    silenced ``tier1`` / ``tier1:<id>`` doesn't fire. The caller passes
+    the *effective* set (Tier 1 forced back on for an exec-failure trial)
+    so a command-not-found still fails even with Tier 1 disabled.
+
+    Verdict rule: any (non-disabled) Tier 1 detector fires -> ``fail``;
+    else ``pass``. Matches the existing Phase-1 fallback shape so
     downstream tooling that already parses ``failure_detectors_fired``
     keeps working.
     """
-    fired = tier1_detect(
-        Tier1Context(
-            exit_code=exit_code,
-            timed_out=timed_out,
-            trial_dir=trial_dir,
-        )
-    )
+    if "tier1" in disabled_tiers:
+        fired: list[str] = []
+    else:
+        fired = [
+            d
+            for d in tier1_detect(
+                Tier1Context(
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                    trial_dir=trial_dir,
+                )
+            )
+            if d not in disabled_detectors
+        ]
     verdict_str = "fail" if fired else "pass"
     capture: dict[str, str | float | int] = {
         "classifier_error": f"{type(classifier_exc).__name__}: {classifier_exc}",

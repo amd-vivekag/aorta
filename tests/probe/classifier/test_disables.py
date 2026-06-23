@@ -21,7 +21,11 @@ from aorta.probe.classifier.disables import (
     normalize_tier,
     normalize_tiers,
 )
-from aorta.probe.classifier.tier3_kernel import Tier3State
+from aorta.probe.classifier.tier3_kernel import (
+    DETECTOR_VRAM_GROWTH,
+    AmdSmiSnapshot,
+    Tier3State,
+)
 from aorta.probe.classifier.tier5_custom import CompiledPattern
 
 
@@ -53,8 +57,47 @@ def test_normalize_detector_id_accepts_known_prefixes(tok: str) -> None:
 
 def test_normalize_detector_id_lowercases_prefix_only() -> None:
     # Prefix canonicalised; the id half is preserved verbatim because
-    # custom-pattern ids are user-named and case-sensitive.
-    assert normalize_detector_id("TIER2:Hang") == "tier2:Hang"
+    # custom-pattern ids are user-named and case-sensitive. (Built-in
+    # ids are validated against the catalogue below, so a custom id is
+    # the right vehicle for the case-preservation contract.)
+    assert normalize_detector_id("CUSTOM:My_Id") == "custom:My_Id"
+
+
+@pytest.mark.parametrize(
+    "tok",
+    [
+        "tier1:exit_nonzero",
+        "tier2:hang",
+        "tier3:vram_growth",
+        "tier4:nan_signature",
+    ],
+)
+def test_normalize_detector_id_accepts_known_builtin_ids(tok: str) -> None:
+    # Built-in ids that exist in their tier's ALL_DETECTOR_IDS catalogue
+    # pass validation unchanged.
+    assert normalize_detector_id(tok) == tok
+
+
+@pytest.mark.parametrize(
+    "tok",
+    [
+        "tier1:nope",
+        "tier3:vram_growht",  # typo
+        "tier4:python_tracback",  # typo
+        "tier2:Hang",  # built-in id is case-sensitive against catalogue
+    ],
+)
+def test_normalize_detector_id_rejects_unknown_builtin_id(tok: str) -> None:
+    # A built-in (tier1-4) id that is not in its tier's catalogue is a
+    # typo and must fail at parse time instead of silently disabling
+    # nothing.
+    with pytest.raises(DetectorSpecError):
+        normalize_detector_id(tok)
+
+
+def test_normalize_detector_id_custom_stays_free_form() -> None:
+    # custom:* ids are user-named -- any non-empty id is accepted.
+    assert normalize_detector_id("custom:anything_goes") == "custom:anything_goes"
 
 
 @pytest.mark.parametrize("tok", ["hang", "tier2:", ":hang", "tier9:foo", "tierX:y"])
@@ -178,6 +221,31 @@ def test_disable_tier3_skips_dmesg_scan(tmp_path: Path) -> None:
     )
     assert "tier3:amdgpu_reset" not in verdict.failure_detectors_fired
     assert verdict.verdict == "pass"
+
+
+def test_disable_tier3_vram_growth_id_suppresses_warn(tmp_path: Path) -> None:
+    # Disabling the warn-level ``tier3:vram_growth`` detector by id must
+    # keep it out of the fired lists -- the classifier gates the VRAM
+    # delta check on the disabled set before the scan, not only via the
+    # post-hoc filter.
+    pre = AmdSmiSnapshot(vram_used_mib=4000, thermal_throttle_count=0)
+    post = AmdSmiSnapshot(vram_used_mib=71234, thermal_throttle_count=0)
+    baseline, _ = classify_trial(
+        _ctx(tmp_path, tier3_state=Tier3State(), amd_smi_pre=pre, amd_smi_post=post)
+    )
+    assert DETECTOR_VRAM_GROWTH in baseline.warn_detectors_fired
+
+    verdict, _ = classify_trial(
+        _ctx(
+            tmp_path,
+            tier3_state=Tier3State(),
+            amd_smi_pre=pre,
+            amd_smi_post=post,
+            disabled_detectors=frozenset({DETECTOR_VRAM_GROWTH}),
+        )
+    )
+    assert DETECTOR_VRAM_GROWTH not in verdict.warn_detectors_fired
+    assert DETECTOR_VRAM_GROWTH not in verdict.failure_detectors_fired
 
 
 def test_disable_custom_pattern(tmp_path: Path) -> None:

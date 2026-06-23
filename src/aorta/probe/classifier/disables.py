@@ -18,9 +18,13 @@ Two token shapes:
   Disables the whole tier; ``tier5`` is the custom-pattern tier.
 * detector-id token -- ``<prefix>:<id>`` where ``prefix`` is in
   :data:`KNOWN_DETECTOR_PREFIXES` (e.g. ``tier2:hang``,
-  ``tier3:vram_growth``, ``custom:my_pattern``). The ``id`` half is
-  free-form (custom patterns are user-named) so we validate the
-  prefix and the presence of an id, not the full catalogue.
+  ``tier3:vram_growth``, ``custom:my_pattern``). A built-in
+  (``tier1`` .. ``tier4``) id is validated against that tier's
+  exported ``ALL_DETECTOR_IDS`` catalogue, so a typo like
+  ``tier3:vram_growht`` fails at recipe/CLI parse time instead of
+  silently disabling nothing. A ``custom:<id>`` id stays free-form
+  (custom patterns are user-named) -- only its prefix and the
+  presence of an id are checked.
 """
 
 from __future__ import annotations
@@ -56,6 +60,24 @@ def normalize_tier(token: str) -> str:
     return cleaned
 
 
+def _known_builtin_detector_ids() -> dict[str, frozenset[str]]:
+    """Map each built-in tier prefix to its exported detector-id catalogue.
+
+    Imported lazily so this module (loaded by the recipe-builder and the
+    CLI) stays cheap and free of an import cycle through the classifier
+    package.
+    """
+    from aorta.probe.classifier import tier1_process, tier3_kernel, tier4_patterns
+    from aorta.probe.classifier.tier2_hang import ALL_DETECTOR_IDS as TIER2_IDS
+
+    return {
+        "tier1": frozenset(tier1_process.ALL_DETECTOR_IDS),
+        "tier2": frozenset(TIER2_IDS),
+        "tier3": frozenset(tier3_kernel.ALL_DETECTOR_IDS),
+        "tier4": frozenset(tier4_patterns.ALL_DETECTOR_IDS),
+    }
+
+
 def normalize_detector_id(token: str) -> str:
     """Validate a ``<prefix>:<id>`` detector-id disable token.
 
@@ -65,9 +87,12 @@ def normalize_detector_id(token: str) -> str:
     user-named and case-sensitive). Stripping the id matters: a
     copy/paste token like ``'tier2: hang'`` would otherwise normalise to
     ``'tier2: hang'`` and never match the fired id ``'tier2:hang'``,
-    silently disabling nothing. Raises :class:`DetectorSpecError` when
-    the colon / id / prefix is missing or unknown (an id that is empty
-    after trimming counts as missing).
+    silently disabling nothing. A built-in (``tier1`` .. ``tier4``) id is
+    additionally checked against that tier's exported
+    ``ALL_DETECTOR_IDS`` catalogue so a typo fails here rather than
+    silently disabling nothing; ``custom:*`` ids stay free-form. Raises
+    :class:`DetectorSpecError` when the colon / id / prefix is missing or
+    unknown (an id that is empty after trimming counts as missing).
     """
     cleaned = token.strip()
     prefix, sep, rest = cleaned.partition(":")
@@ -78,12 +103,23 @@ def normalize_detector_id(token: str) -> str:
             f"malformed detector id {token!r}; expected '<tier>:<id>' "
             f"(e.g. 'tier2:hang')"
         )
-    if prefix.lower() not in KNOWN_DETECTOR_PREFIXES:
+    prefix_lower = prefix.lower()
+    if prefix_lower not in KNOWN_DETECTOR_PREFIXES:
         raise DetectorSpecError(
             f"unknown detector prefix {prefix!r} in {token!r}; expected one "
             f"of {', '.join(KNOWN_DETECTOR_PREFIXES)}"
         )
-    return f"{prefix.lower()}:{rest}"
+    normalized = f"{prefix_lower}:{rest}"
+    # ``custom:*`` ids are user-named and stay free-form; built-in tiers
+    # are a fixed catalogue, so validate against it to catch typos.
+    if prefix_lower != "custom":
+        known = _known_builtin_detector_ids()[prefix_lower]
+        if normalized not in known:
+            raise DetectorSpecError(
+                f"unknown detector id {normalized!r}; expected one of "
+                f"{', '.join(sorted(known))}"
+            )
+    return normalized
 
 
 def normalize_tiers(tokens: object) -> tuple[str, ...]:

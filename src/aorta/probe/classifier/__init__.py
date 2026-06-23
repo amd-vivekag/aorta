@@ -163,12 +163,21 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
             # signal and shouldn't redundantly re-run the regex set.
             tier3.extend(tier3_kernel.scan_dmesg_text(ctx.dmesg_text))
         if ctx.amd_smi_pre is not None and ctx.amd_smi_post is not None:
+            # ``tier3:vram_growth`` is an operator-disable-able warn
+            # detector. Honour the disable *before* the scan -- not only
+            # via the post-hoc ``_keep`` filter below -- so a silenced
+            # detector never runs its VRAM delta check, mirroring the
+            # ``tier3_vram_growth`` recipe knob. (oyazdanb review)
+            check_vram_growth = (
+                ctx.tier3_vram_growth
+                and tier3_kernel.DETECTOR_VRAM_GROWTH not in disabled_detectors
+            )
             tier3.extend(
                 tier3_kernel.scan_amd_smi(
                     ctx.tier3_state,
                     ctx.amd_smi_pre,
                     ctx.amd_smi_post,
-                    check_vram_growth=ctx.tier3_vram_growth,
+                    check_vram_growth=check_vram_growth,
                 )
             )
     tier3 = _keep(tier3)

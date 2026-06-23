@@ -185,6 +185,55 @@ def test_missing_executable_yields_fail(tmp_path):
     assert result.passed is False
 
 
+@pytest.mark.parametrize(
+    "extras",
+    [
+        {"disable_detector_tiers": ["tier1"]},
+        {"disable_detectors": ["tier1:exit_nonzero"]},
+    ],
+)
+def test_disabled_tier1_does_not_pass_unlaunched_command(tmp_path, extras):
+    """A command that never launches must fail even if Tier 1 is disabled.
+
+    Regression for oyazdanb's #234 review: honouring a Tier-1 disable on
+    the exec-failure path would let a command-not-found resolve to a green
+    verdict -- a run that did no real work yet looks like a pass. The
+    workload forces Tier 1 back on for the unlaunched path; the disable
+    still applies to launched trials (asserted in the sibling test).
+    """
+    wl = _make_workload(tmp_path, ["definitely-not-a-real-binary-9d8f7s6"], **extras)
+    wl.setup()
+    result = wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["verdict"] == "fail"
+    assert doc["exit_code"] == 127
+    assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
+    assert result.passed is False
+
+
+@pytest.mark.parametrize(
+    "extras",
+    [
+        {"disable_detector_tiers": ["tier1"]},
+        {"disable_detectors": ["tier1:exit_nonzero"]},
+    ],
+)
+def test_disabled_tier1_still_passes_launched_nonzero_exit(tmp_path, extras):
+    """The Tier-1 disable still applies on a launched trial.
+
+    Pins the lower bound of the unlaunched-path guard above: a child that
+    actually ran and exited non-zero is silenced by the disable as the
+    operator intended (the override is scoped to the exec-failure path).
+    """
+    wl = _make_workload(tmp_path, ["false"], **extras)  # launches, exits 1
+    wl.setup()
+    result = wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["verdict"] == "pass"
+    assert "tier1:exit_nonzero" not in doc["failure_detectors_fired"]
+    assert result.passed is True
+
+
 def test_exec_time_failure_flags_main_work_not_started(tmp_path):
     """Exec-time ``Popen`` failures must report
     ``main_work_started=False`` / ``executed_iterations=0`` so the
@@ -880,6 +929,60 @@ def test_classifier_crash_still_writes_result_json(tmp_path, monkeypatch):
     assert "synthetic classifier crash" in doc["capture"]["classifier_error"]
     # The workload result still reports the failure (not a hang) so
     # the dispatcher records a failed trial deterministically.
+    assert result.passed is False
+
+
+def test_classifier_crash_fallback_honours_tier1_disable(tmp_path, monkeypatch):
+    """The Tier-1-only crash fallback must honour the disable knob too.
+
+    Bugbot #234 follow-up: a launched trial with Tier 1 silenced should
+    stay ``pass`` even when ``classify_trial`` crashes -- the fallback
+    applies the same disabled set, so a disabled ``tier1:exit_nonzero``
+    is not re-fired behind the operator's back.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    def _exploding_classify(_ctx):
+        raise RuntimeError("synthetic classifier crash")
+
+    monkeypatch.setattr(workload_mod, "classify_trial", _exploding_classify)
+    wl = _make_workload(tmp_path, ["false"], disable_detectors=["tier1:exit_nonzero"])
+    wl.setup()
+    result = wl.run()
+
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["verdict"] == "pass"
+    assert "tier1:exit_nonzero" not in doc["failure_detectors_fired"]
+    assert "classifier_error" in doc["capture"]
+    assert result.passed is True
+
+
+def test_classifier_crash_fallback_still_fails_unlaunched_with_tier1_disabled(
+    tmp_path, monkeypatch
+):
+    """A command that never launches must fail in the crash fallback too.
+
+    The exec-failure path forces Tier 1 back on (the ``effective_*`` set),
+    and that same set feeds the fallback, so a command-not-found can't
+    resolve green even when Tier 1 is disabled and the classifier crashed.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    def _exploding_classify(_ctx):
+        raise RuntimeError("synthetic classifier crash")
+
+    monkeypatch.setattr(workload_mod, "classify_trial", _exploding_classify)
+    wl = _make_workload(
+        tmp_path,
+        ["definitely-not-a-real-binary-9d8f7s6"],
+        disable_detector_tiers=["tier1"],
+    )
+    wl.setup()
+    result = wl.run()
+
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["verdict"] == "fail"
+    assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
     assert result.passed is False
 
 
