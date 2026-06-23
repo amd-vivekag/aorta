@@ -772,11 +772,19 @@ class SubprocessWorkload(Workload):
             result_doc["capture"]["tier2_hang_latched_but_reconciled"] = True
         # Issue #229: surface the operator's disable knobs in the trial
         # artifact so a reader knows a detector was intentionally silenced
-        # rather than simply not firing.
-        if disabled_detectors:
-            result_doc["capture"]["disabled_detectors"] = sorted(disabled_detectors)
-        if disabled_tiers:
-            result_doc["capture"]["disabled_detector_tiers"] = sorted(disabled_tiers)
+        # rather than simply not firing. Record the *effective* set the
+        # classifier actually honoured -- on the exec-failure path Tier 1
+        # is forced back on, so echoing the requested set here would make
+        # the artifact self-contradictory (claim ``tier1`` disabled while
+        # ``tier1:exit_nonzero`` shows as fired). (Copilot review)
+        if effective_disabled_detectors:
+            result_doc["capture"]["disabled_detectors"] = sorted(
+                effective_disabled_detectors
+            )
+        if effective_disabled_tiers:
+            result_doc["capture"]["disabled_detector_tiers"] = sorted(
+                effective_disabled_tiers
+            )
         result_path.write_text(
             json.dumps(result_doc, indent=2, sort_keys=False),
             encoding="utf-8",

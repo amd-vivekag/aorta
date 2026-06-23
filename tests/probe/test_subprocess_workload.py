@@ -209,6 +209,12 @@ def test_disabled_tier1_does_not_pass_unlaunched_command(tmp_path, extras):
     assert doc["exit_code"] == 127
     assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
     assert result.passed is False
+    # Capture must echo the *effective* disabled set the classifier honoured,
+    # not the requested one -- else the artifact would claim tier1 was
+    # disabled while tier1:exit_nonzero shows as fired (Copilot #234 review).
+    capture = doc["capture"]
+    assert "tier1" not in capture.get("disabled_detector_tiers", [])
+    assert "tier1:exit_nonzero" not in capture.get("disabled_detectors", [])
 
 
 @pytest.mark.parametrize(
@@ -232,6 +238,13 @@ def test_disabled_tier1_still_passes_launched_nonzero_exit(tmp_path, extras):
     assert doc["verdict"] == "pass"
     assert "tier1:exit_nonzero" not in doc["failure_detectors_fired"]
     assert result.passed is True
+    # On a launched trial the disable is honoured, so the effective set
+    # equals the requested set and is recorded in capture for audit.
+    capture = doc["capture"]
+    recorded = capture.get("disabled_detector_tiers", []) + capture.get(
+        "disabled_detectors", []
+    )
+    assert recorded == list(extras.values())[0]
 
 
 def test_exec_time_failure_flags_main_work_not_started(tmp_path):
