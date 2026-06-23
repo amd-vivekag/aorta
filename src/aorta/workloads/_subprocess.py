@@ -653,10 +653,18 @@ class SubprocessWorkload(Workload):
         # still land in the window. Both helpers are fail-soft and
         # share ``_TIER3_STATE`` with the pre-snapshot above so the
         # one-warning-per-invocation contract holds.
+        #
+        # Skipped when the subprocess never launched (exec-time Popen
+        # failure -- ENOENT / EACCES / ENOEXEC): a command-not-found
+        # trial did no GPU work, so the post-snapshot + dmesg scan add
+        # only overhead and permission noise, and any amdgpu/kernel
+        # message in the window belongs to an unrelated process -- not
+        # this trial. Gating on ``launched`` keeps those events from
+        # being misattributed to a trial that never ran. (Copilot review)
         amd_smi_post: AmdSmiSnapshot | None = None
         dmesg_text: str | None = None
         fired_kernel_ids: list[str] = []
-        if tier3_enabled:
+        if tier3_enabled and launched:
             amd_smi_post = poll_amd_smi(_TIER3_STATE)
             try:
                 fired_kernel_ids = scan_dmesg(

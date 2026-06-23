@@ -830,6 +830,48 @@ def test_tier3_probes_run_when_not_disabled(tmp_path, monkeypatch):
     assert calls["dmesg"] >= 1
 
 
+def test_tier3_probes_skipped_when_not_launched(tmp_path, monkeypatch):
+    """Copilot #234 review: an exec-time Popen failure (the subprocess
+    never launched) must skip the Tier-3 *post*-snapshot + dmesg scan.
+
+    A command-not-found trial did no GPU work, so running those probes only
+    adds overhead / permission noise and risks misattributing an unrelated
+    host kernel/GPU event to a trial that never ran. The pre-snapshot still
+    fires once -- it happens before the Popen attempt, so ``launched`` is
+    not yet known -- but the post-launch collection is gated on ``launched``.
+    """
+    from aorta.workloads import _subprocess as workload_mod
+
+    calls = {"poll": 0, "dmesg": 0}
+
+    def _spy_poll(_state):
+        calls["poll"] += 1
+        return None
+
+    def _spy_dmesg(_state, **_kw):
+        calls["dmesg"] += 1
+        return []
+
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", _spy_poll)
+    monkeypatch.setattr(workload_mod, "scan_dmesg", _spy_dmesg)
+
+    # Tier 3 stays enabled: the gate under test is the unlaunched flag, not
+    # an operator disable (covered by test_disable_tier3_skips_probes).
+    wl = _make_workload(tmp_path, ["definitely-not-a-real-binary-9d8f7s6"])
+    wl.setup()
+    wl.run()
+    doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
+    assert doc["exit_code"] == 127  # exec-time (ENOENT) failure path
+    assert calls["poll"] == 1, (
+        "expected only the pre-snapshot to run; the post-snapshot must be "
+        "skipped when the subprocess never launched"
+    )
+    assert calls["dmesg"] == 0, (
+        "scan_dmesg ran for a subprocess that never launched; an unrelated "
+        "kernel event could be misattributed to a command-not-found trial"
+    )
+
+
 def test_hang_grace_zero_survives_runtime_extraction(tmp_path, monkeypatch):
     """Regression for PR #197 review: ``probe_extras["hang_grace_period_at_start"]
     == 0.0`` is a validated "no grace, fire as soon as the window
