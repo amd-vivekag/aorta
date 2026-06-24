@@ -80,6 +80,10 @@ _PROBE_TOP_LEVEL = frozenset(
         # Disable Tier-3 pre/post VRAM delta for opaque docker wrappers
         # where GPU allocation is expected, not a leak signal.
         "tier3_vram_growth",
+        # Issue #229: operator detector-disable knobs. Accepted only in
+        # mode: probe (triage-mode check below rejects them otherwise).
+        "disable_detectors",
+        "disable_detector_tiers",
         # Phase 3 (issue #188): redaction block for aorta bundle.
         "redaction",
     }

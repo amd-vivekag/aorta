@@ -12,6 +12,12 @@ import dataclasses
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
+from aorta.probe.classifier.disables import (
+    DetectorSpecError,
+    normalize_detector_ids,
+    normalize_tiers,
+)
+
 if TYPE_CHECKING:
     from aorta.triage.recipe import Recipe
 
@@ -151,6 +157,16 @@ def parse_env_passthrough_mode(value: str) -> Literal["inherit", "file"]:
     return value  # type: ignore[return-value]
 
 
+def parse_env_passthrough_mode_opt(value: str | None) -> Literal["inherit", "file"] | None:
+    """Parse ``--env-passthrough-mode`` preserving the "flag omitted" signal.
+
+    ``None`` in -> ``None`` out so :func:`apply_recipe_overrides` can tell
+    "user passed the flag" from "user omitted it" (FR 1.10 precedence).
+    Keeps the Click handler a thin shim by hosting the None-guard here.
+    """
+    return None if value is None else parse_env_passthrough_mode(value)
+
+
 def validate_trailing_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
     """Reject an empty / clearly-misparsed trailing-argv list.
 
@@ -183,14 +199,22 @@ def apply_recipe_overrides(
     *,
     ticket: str | None,
     cli_passthrough_mode: Literal["inherit", "file"] | None,
+    cli_disable_detectors: tuple[str, ...] = (),
 ) -> Recipe:
     """Layer CLI flags on top of a loaded probe-mode ``Recipe``.
 
-    Two overlays today:
+    Overlays today:
 
     * ``--ticket`` -- when set, replaces ``recipe.ticket``;
     * ``--env-passthrough-mode`` -- when set (i.e. the user actually
-      passed the flag), replaces ``recipe.probe_extras.env_passthrough_mode``.
+      passed the flag), replaces ``recipe.probe_extras.env_passthrough_mode``;
+    * ``--disable-detector`` -- when passed (repeatable), each token is
+      a whole-tier name (``tier3``) or a ``<tier>:<id>`` detector id
+      (``tier2:hang``). Tokens are validated + classified here and
+      UNIONed onto whatever the recipe already disables, so the CLI is
+      additive rather than a replacement (an operator silencing one
+      more detector on top of a recipe shouldn't have to restate the
+      recipe's list).
 
     The caller must verify ``recipe.probe_extras is not None`` before
     invoking this helper (probe-mode discriminator is the CLI's
@@ -206,10 +230,39 @@ def apply_recipe_overrides(
         recipe = dataclasses.replace(
             recipe,
             probe_extras=dataclasses.replace(
-                probe_extras, env_passthrough_mode=cli_passthrough_mode
+                recipe.probe_extras, env_passthrough_mode=cli_passthrough_mode
             ),
         )
+    if cli_disable_detectors:
+        recipe = _overlay_disable_detectors(recipe, cli_disable_detectors)
     return recipe
+
+
+def _overlay_disable_detectors(recipe: Recipe, tokens: tuple[str, ...]) -> Recipe:
+    """Classify ``--disable-detector`` tokens and union them onto the recipe.
+
+    A token with a ``:`` is a detector id (``tier2:hang``); a bare
+    token is a whole-tier name (``tier3``). Invalid tokens raise
+    :class:`ProbeUsageError` so the CLI surfaces a friendly message
+    rather than a stack trace.
+    """
+    probe_extras = recipe.probe_extras
+    assert probe_extras is not None
+    tier_tokens = [t for t in tokens if ":" not in t]
+    id_tokens = [t for t in tokens if ":" in t]
+    try:
+        new_ids = normalize_detector_ids(list(probe_extras.disable_detectors) + id_tokens)
+        new_tiers = normalize_tiers(list(probe_extras.disable_detector_tiers) + tier_tokens)
+    except DetectorSpecError as exc:
+        raise ProbeUsageError(f"--disable-detector: {exc}") from exc
+    return dataclasses.replace(
+        recipe,
+        probe_extras=dataclasses.replace(
+            probe_extras,
+            disable_detectors=new_ids,
+            disable_detector_tiers=new_tiers,
+        ),
+    )
 
 
 def format_dry_run_line(
@@ -234,6 +287,7 @@ __all__ = [
     "format_dry_run_line",
     "help_token_in_option_zone",
     "parse_env_passthrough_mode",
+    "parse_env_passthrough_mode_opt",
     "reject_flag_shaped_value",
     "require_double_dash_separator",
     "validate_trailing_argv",
