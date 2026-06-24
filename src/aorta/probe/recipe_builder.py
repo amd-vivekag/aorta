@@ -330,7 +330,13 @@ def build_probe_recipe_from_dict(
         disable_detectors = normalize_detector_ids(data.get("disable_detectors"))
         disable_detector_tiers = normalize_tiers(data.get("disable_detector_tiers"))
     except DetectorSpecError as exc:
-        raise RecipeSchemaError(f"recipe.{exc}") from exc
+        # ``DetectorSpecError`` messages either already carry a field prefix
+        # (e.g. ``disable_detectors: ...``) or are a bare token diagnostic
+        # (e.g. ``unknown tier 'tier9'``). ``recipe: {exc}`` reads cleanly for
+        # both, whereas ``recipe.{exc}`` produced ``recipe.unknown tier`` for
+        # the bare case. Mirrors the ``recipe:`` prefix used in the triage
+        # loader (aorta.triage.recipe).
+        raise RecipeSchemaError(f"recipe: {exc}") from exc
     # Use ``in`` rather than ``.get(...) is not None`` so an explicit
     # ``redaction: null`` is treated as present-but-invalid (parse_redaction
     # rejects None) instead of being silently conflated with "no redaction

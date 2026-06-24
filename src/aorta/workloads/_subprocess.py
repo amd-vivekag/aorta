@@ -960,8 +960,8 @@ def _coerce_disable_tokens(raw: object, key: str) -> frozenset[str]:
         return frozenset()
     if isinstance(raw, str) or not isinstance(raw, (list, tuple, set, frozenset)):
         raise TypeError(
-            f"probe_extras[{key!r}] must be a list/tuple/set of string tokens "
-            f"(a non-string sequence), got {type(raw).__name__} ({raw!r})"
+            f"probe_extras[{key!r}] must be a list/tuple/set/frozenset of string "
+            f"tokens (a non-string sequence), got {type(raw).__name__} ({raw!r})"
         )
     tokens: list[str] = []
     for tok in raw:
