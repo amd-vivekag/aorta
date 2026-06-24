@@ -196,25 +196,25 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
     # resolver expects) so no ``custom:*`` id can fire.
     if "tier5" in disabled_tiers:
         custom_result = tier5_custom.CustomScanResult()
-        custom_required_patterns: tuple[CompiledPattern, ...] = ()
+        active_custom_patterns: tuple[CompiledPattern, ...] = ()
     else:
         # Unlike Tiers 1-4 (cheap, side-effect-free scans we can filter
         # post-hoc), a custom detector's scan runs its sandbox
         # ``condition`` and populates ``capture``. Filtering disabled ids
         # out *before* the scan keeps "disabled == not evaluated" honest:
         # no condition runs and no capture surfaces for a silenced
-        # detector, and the same filtered tuple feeds the resolver so a
-        # disabled ``required_for_pass`` pattern can't synthesise
-        # ``meta:missing_pass_signal``.
+        # detector. The same disable-filtered set also seeds the resolver's
+        # required-pattern subset below, so a disabled ``required_for_pass``
+        # pattern can't synthesise ``meta:missing_pass_signal``.
         if disabled_detectors:
-            custom_required_patterns = tuple(
+            active_custom_patterns = tuple(
                 p for p in ctx.custom_patterns if p.detector_id not in disabled_detectors
             )
         else:
-            custom_required_patterns = ctx.custom_patterns
+            active_custom_patterns = ctx.custom_patterns
         custom_result = tier5_custom.scan(
             ctx.log_text,
-            custom_required_patterns,
+            active_custom_patterns,
             exit_code=ctx.exit_code,
             walltime_sec=ctx.walltime_sec,
             peak_vram_mib=ctx.peak_vram_mib,
@@ -235,7 +235,15 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
             tier4=tier4,
             tier3_warn=tier3_warn,
             custom_result=custom_result,
-            custom_required_patterns=custom_required_patterns,
+            # ``VerdictInputs.custom_required_patterns`` is contractually the
+            # ``required_for_pass=True`` subset (the resolver only inspects
+            # those). Narrow here rather than handing over the full active
+            # set so the field matches its documented meaning. Derived from
+            # the disable-filtered ``active_custom_patterns``, so a disabled
+            # required pattern stays excluded.
+            custom_required_patterns=tuple(
+                p for p in active_custom_patterns if p.required_for_pass
+            ),
         )
     )
     return verdict, tier_durations_ms

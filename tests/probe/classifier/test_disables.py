@@ -326,3 +326,51 @@ def test_disable_required_custom_pattern_does_not_synthesize_missing_signal(
     )
     assert verdict.verdict == "pass"
     assert all("missing_pass_signal" not in d for d in verdict.failure_detectors_fired)
+
+
+def test_classify_trial_passes_only_required_patterns_to_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Contract guard: ``VerdictInputs.custom_required_patterns`` is documented
+    # to carry only ``required_for_pass=True`` patterns. ``classify_trial``
+    # must narrow to that subset before building ``VerdictInputs`` -- even
+    # though ``resolve`` re-filters -- so the API contract can't silently
+    # drift back to the full active set.
+    import aorta.probe.classifier as classifier_mod
+
+    required = CompiledPattern(
+        detector_id="custom:must_see",
+        regex=re.compile("seen"),
+        condition_code=None,
+        condition_source=None,
+        on_match="fail",
+        required_for_pass=True,
+    )
+    optional = CompiledPattern(
+        detector_id="custom:maybe",
+        regex=re.compile("maybe"),
+        condition_code=None,
+        condition_source=None,
+        on_match="warn",
+        required_for_pass=False,
+    )
+
+    captured: dict[str, tuple[CompiledPattern, ...]] = {}
+    real_resolve = classifier_mod.resolve
+
+    def _spy_resolve(inputs):  # type: ignore[no-untyped-def]
+        captured["required"] = inputs.custom_required_patterns
+        return real_resolve(inputs)
+
+    # raising=True (the default, explicit here): if ``resolve`` is ever
+    # renamed/removed this guard should fail loudly rather than no-op.
+    monkeypatch.setattr(classifier_mod, "resolve", _spy_resolve, raising=True)
+
+    classify_trial(
+        _ctx(tmp_path, log_text="seen\n", custom_patterns=(required, optional))
+    )
+
+    captured_required = captured.get("required")
+    assert captured_required is not None, "resolve() was not invoked"
+    assert {p.detector_id for p in captured_required} == {"custom:must_see"}
+    assert all(p.required_for_pass for p in captured_required)
