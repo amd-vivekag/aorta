@@ -67,6 +67,10 @@ class TrialContext:
     log_text: str
     custom_patterns: tuple[CompiledPattern, ...] = ()
     hang_detected: bool = False
+    # Exec-time ``Popen`` failure -- the wrapped command never launched.
+    # Routed to ``tier1:exec_failed`` (an error detector, issue #230) so
+    # a command-not-found resolves to ``error``, not ``fail``.
+    exec_failed: bool = False
     peak_vram_mib: int | None = None
     dmesg_text: str | None = None
     tier3_state: Tier3State | None = None
@@ -137,6 +141,7 @@ def classify_trial(ctx: TrialContext) -> tuple[Verdict, dict[str, float]]:
                     exit_code=ctx.exit_code,
                     timed_out=ctx.timed_out,
                     trial_dir=ctx.trial_dir,
+                    exec_failed=ctx.exec_failed,
                 )
             )
         )

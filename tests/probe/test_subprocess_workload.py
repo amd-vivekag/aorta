@@ -19,7 +19,40 @@ from aorta.workloads._subprocess import (
     CONFIG_KEY_SUBPROCESS_ARGV,
     SubprocessWorkload,
     _coerce_disable_tokens,
+    _tier1_only_fallback_verdict,
 )
+
+# ---- Issue #230: classifier-crash fallback honours exec_failed ----------
+
+
+def test_fallback_verdict_exec_failed_resolves_to_error(tmp_path):
+    # When the full classifier crashes AND the command never launched,
+    # the Tier-1-only fallback must emit tier1:exec_failed -> error
+    # (not exit_nonzero -> fail) from the synthetic 127 exit code.
+    verdict, _ = _tier1_only_fallback_verdict(
+        exit_code=127,
+        timed_out=False,
+        trial_dir=tmp_path,
+        exec_failed=True,
+        classifier_exc=RuntimeError("boom"),
+    )
+    assert verdict.verdict == "error"
+    assert "tier1:exec_failed" in verdict.error_detectors_fired
+    assert "tier1:exit_nonzero" not in verdict.failure_detectors_fired
+
+
+def test_fallback_verdict_nonzero_exit_resolves_to_fail(tmp_path):
+    # A genuine non-zero child exit (launched) still resolves to fail.
+    verdict, _ = _tier1_only_fallback_verdict(
+        exit_code=1,
+        timed_out=False,
+        trial_dir=tmp_path,
+        exec_failed=False,
+        classifier_exc=RuntimeError("boom"),
+    )
+    assert verdict.verdict == "fail"
+    assert "tier1:exit_nonzero" in verdict.failure_detectors_fired
+
 
 # ---- Issue #229: disable-token payload coercion --------------------------
 
@@ -169,19 +202,37 @@ def test_env_file_failure_result_includes_env(tmp_path):
     wl.setup()
     wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    # Issue #230: a rejected probe.env is an infra/config error (no valid
+    # observation), not a fail.
+    assert doc["verdict"] == "error"
     assert doc["failure_type"] == "env_file_validation_failed"
     assert doc["env"] == {"BAD_VALUE": "line1\nline2"}
+    # Schema parity with the normal probe path: the failure artifact carries
+    # the same detector/capture/tier-timing/vram keys (empty, but present) so
+    # downstream parsers never special-case env-file errors.
+    for key in ("warn_detectors_fired", "capture", "tier_durations_ms", "peak_vram_mib"):
+        assert key in doc, f"env-file failure result.json missing {key!r}"
+    assert doc["warn_detectors_fired"] == []
+    assert doc["capture"] == {}
+    assert doc["tier_durations_ms"] == {}
+    assert doc["peak_vram_mib"] is None
 
 
-def test_missing_executable_yields_fail(tmp_path):
-    """argv[0] not found surfaces as a Tier-1 fail with exit_code=127."""
+def test_missing_executable_yields_error(tmp_path):
+    """argv[0] not found surfaces as an ``error`` verdict (issue #230).
+
+    A command-not-found never launched, so it produced no valid
+    observation -- ``tier1:exec_failed`` -> ``error`` (not ``fail``). The
+    synthetic exit_code 127 is still recorded for the operator.
+    """
     wl = _make_workload(tmp_path, ["definitely-not-a-real-binary-9d8f7s6"])
     wl.setup()
     result = wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     assert doc["exit_code"] == 127
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
+    assert doc["failure_detectors_fired"] == []
     assert result.passed is False
 
 
@@ -193,21 +244,26 @@ def test_missing_executable_yields_fail(tmp_path):
     ],
 )
 def test_disabled_tier1_does_not_pass_unlaunched_command(tmp_path, extras):
-    """A command that never launches must fail even if Tier 1 is disabled.
+    """A command that never launches must not pass even if Tier 1 is disabled.
 
     Regression for oyazdanb's #234 review: honouring a Tier-1 disable on
     the exec-failure path would let a command-not-found resolve to a green
     verdict -- a run that did no real work yet looks like a pass. The
     workload forces Tier 1 back on for the unlaunched path; the disable
     still applies to launched trials (asserted in the sibling test).
+
+    With the three-way verdict (#230) the unlaunched path fires
+    ``tier1:exec_failed`` -> ``error`` (not ``exit_nonzero`` -> ``fail``),
+    so the guard now asserts a non-green ``error`` verdict.
     """
     wl = _make_workload(tmp_path, ["definitely-not-a-real-binary-9d8f7s6"], **extras)
     wl.setup()
     result = wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     assert doc["exit_code"] == 127
-    assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
+    assert "tier1:exit_nonzero" not in doc["failure_detectors_fired"]
     assert result.passed is False
     # Capture must echo the *effective* disabled set the classifier honoured,
     # not the requested one -- else the artifact would claim tier1 was
@@ -334,10 +390,10 @@ def test_failure_detail_type_is_timeout_when_timed_out(tmp_path):
     assert result.failure_details[0]["type"] == "subprocess_timeout"
 
 
-def test_non_executable_script_yields_fail(tmp_path):
+def test_non_executable_script_yields_error(tmp_path):
     """A user command pointing at a file without the +x bit must land
-    as a Tier-1 fail (exit_code=126), NOT escape to the dispatcher as
-    ``infrastructure_failed``.
+    as an ``error`` verdict (exit_code=126; issue #230), NOT escape to
+    the dispatcher as ``infrastructure_failed``.
 
     Regression for PR #194 review: previously only ``FileNotFoundError``
     was caught. ``PermissionError`` (EACCES, raised by ``Popen`` when
@@ -357,8 +413,9 @@ def test_non_executable_script_yields_fail(tmp_path):
         "captured as a Tier-1 fail (regression of PR #194 review fix)"
     )
     doc = json.loads(result_path.read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     assert doc["exit_code"] == 126
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
     assert result.passed is False
     # stderr.log should carry the diagnostic so the operator knows
     # which exec-time error fired.
@@ -366,11 +423,11 @@ def test_non_executable_script_yields_fail(tmp_path):
     assert "Permission" in stderr_text or "permitted" in stderr_text.lower()
 
 
-def test_popen_oserror_yields_fail(tmp_path, monkeypatch):
+def test_popen_oserror_yields_error(tmp_path, monkeypatch):
     """A generic ``OSError`` from ``Popen`` (e.g. ENOEXEC "Exec format
-    error" for a shebang-less script) also lands as a Tier-1 fail
-    with the artifact tree intact, rather than escaping to the
-    dispatcher.
+    error" for a shebang-less script) also lands as an ``error`` verdict
+    (issue #230) with the artifact tree intact, rather than escaping to
+    the dispatcher.
 
     Regression for PR #194 review: only ``FileNotFoundError`` and
     ``PermissionError`` were named explicitly in the previous handler;
@@ -390,9 +447,10 @@ def test_popen_oserror_yields_fail(tmp_path, monkeypatch):
         "result.json missing: bare OSError escaped instead of being " "captured as a Tier-1 fail"
     )
     doc = json.loads(result_path.read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    assert doc["verdict"] == "error"
     # Exit code falls back to 1 for non-{FileNotFound,Permission} OSError.
     assert doc["exit_code"] == 1
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
     assert result.passed is False
     stderr_text = (tmp_path / "trial_0" / "stderr.log").read_text(encoding="utf-8")
     assert "Exec format error" in stderr_text
@@ -413,6 +471,14 @@ def test_timeout_kill_race_does_not_crash(tmp_path, monkeypatch):
     when the child has already exited).
     """
     import subprocess as _subprocess
+
+    from aorta.workloads import _subprocess as workload_mod
+
+    # The amd-smi pre/post snapshots in run() shell out via subprocess.run
+    # (which uses ``with Popen(...)``). Neutralise the Tier-3 poll so the
+    # global Popen patch below only governs the workload's own child launch
+    # -- the fake Popen has no context-manager protocol.
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", lambda _state: None)
 
     real_popen = _subprocess.Popen
 
@@ -452,7 +518,12 @@ def test_timeout_kill_race_does_not_crash(tmp_path, monkeypatch):
     # proc.kill() would propagate ProcessLookupError out of run().
     result = wl.run()
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
+    # Issue #230: a timeout with no recognised hang is an ``error`` (the
+    # trial never produced a valid observation), not a ``fail``. A timeout
+    # the hang monitor DOES latch co-fires tier2:hang and stays ``fail``
+    # (see test_timed_out_keeps_latched_hang_flag).
+    assert doc["verdict"] == "error"
+    assert "tier1:timeout" in doc["error_detectors_fired"]
     assert doc["timed_out"] is True
     assert doc["exit_code"] == -1
     assert result.passed is False
@@ -654,6 +725,7 @@ def test_keyboard_interrupt_reaps_tree_and_reraises(tmp_path, monkeypatch):
     def _spy_teardown(proc, grace_sec=workload_mod._TERMINATE_GRACE_SEC):
         torn_down.append(proc)
 
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", lambda _state: None)
     monkeypatch.setattr(workload_mod.subprocess, "Popen", _InterruptingPopen)
     monkeypatch.setattr(workload_mod, "_terminate_process_tree", _spy_teardown)
 
@@ -706,6 +778,7 @@ def test_keyboard_interrupt_during_monitor_start_reaps_tree(tmp_path, monkeypatc
     def _spy_teardown(proc, grace_sec=workload_mod._TERMINATE_GRACE_SEC):
         torn_down.append(proc)
 
+    monkeypatch.setattr(workload_mod, "poll_amd_smi", lambda _state: None)
     monkeypatch.setattr(workload_mod.subprocess, "Popen", _OkPopen)
     monkeypatch.setattr(workload_mod, "HangMonitor", _InterruptingMonitor)
     monkeypatch.setattr(workload_mod, "_terminate_process_tree", _spy_teardown)
@@ -1052,11 +1125,13 @@ def test_classifier_crash_fallback_honours_tier1_disable(tmp_path, monkeypatch):
 def test_classifier_crash_fallback_still_fails_unlaunched_with_tier1_disabled(
     tmp_path, monkeypatch
 ):
-    """A command that never launches must fail in the crash fallback too.
+    """A command that never launches must not pass in the crash fallback too.
 
     The exec-failure path forces Tier 1 back on (the ``effective_*`` set),
     and that same set feeds the fallback, so a command-not-found can't
     resolve green even when Tier 1 is disabled and the classifier crashed.
+    With the three-way verdict (#230) the fallback fires
+    ``tier1:exec_failed`` -> ``error`` for the unlaunched path.
     """
     from aorta.workloads import _subprocess as workload_mod
 
@@ -1073,8 +1148,8 @@ def test_classifier_crash_fallback_still_fails_unlaunched_with_tier1_disabled(
     result = wl.run()
 
     doc = json.loads((tmp_path / "trial_0" / "result.json").read_text(encoding="utf-8"))
-    assert doc["verdict"] == "fail"
-    assert "tier1:exit_nonzero" in doc["failure_detectors_fired"]
+    assert doc["verdict"] == "error"
+    assert "tier1:exec_failed" in doc["error_detectors_fired"]
     assert result.passed is False
 
 

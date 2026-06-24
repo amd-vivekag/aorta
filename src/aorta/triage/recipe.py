@@ -53,6 +53,8 @@ _TRIAGE_TOP_LEVEL = frozenset(
         "cells",
         "workload_config",
         "save_logs",
+        # Issue #232: collect-until-N stopping rule (valid in both modes).
+        "stop_after",
     }
 )
 _PROBE_TOP_LEVEL = frozenset(
@@ -80,6 +82,8 @@ _PROBE_TOP_LEVEL = frozenset(
         # Disable Tier-3 pre/post VRAM delta for opaque docker wrappers
         # where GPU allocation is expected, not a leak signal.
         "tier3_vram_growth",
+        # Issue #232: collect-until-N stopping rule (valid in both modes).
+        "stop_after",
         # Issue #229: operator detector-disable knobs. Accepted only in
         # mode: probe (triage-mode check below rejects them otherwise).
         "disable_detectors",
@@ -164,6 +168,36 @@ class ConfoundCfg:
 
     threshold: float = 1.15
     baseline_cell: str | None = None
+
+
+# Verdicts that may be counted as a ``stop_after`` event. The three-way
+# verdict (#230) wired ``error`` through the classifier and the shared
+# ``aorta.run.results.trial_verdict`` predicate, so all three outcomes are
+# now countable (e.g. ``event_verdict: error`` to stop a flaky-infra sweep
+# early once enough trials have errored).
+_STOP_AFTER_EVENT_VERDICTS = frozenset({"fail", "pass", "error"})
+
+
+@dataclass(frozen=True)
+class StopAfter:
+    """Collect-until-N stopping rule for a cell's trial loop (issue #232).
+
+    A cell runs until ``events`` qualifying verdicts are observed OR
+    ``max_trials`` trials have run, whichever comes first. ``max_trials``
+    is mandatory so the loop is never unbounded. ``event_verdict`` selects
+    which classifier outcome counts (default ``fail`` -- "the bug
+    reproduced").
+
+    When trials run in batches of width W the count is checked at the
+    batch boundary, so the realised event count may overshoot ``events``
+    by up to W-1; the engine records the *actual* count rather than the
+    target (today's loop is sequential, so W == 1 and there is no
+    overshoot).
+    """
+
+    events: int
+    max_trials: int
+    event_verdict: str = "fail"
 
 
 @dataclass(frozen=True)
@@ -289,6 +323,11 @@ class Recipe:
     source_sha256: str | None = None
     workload_config: dict[str, Any] = field(default_factory=dict)
     save_logs: bool = False
+    # Issue #232: collect-until-N stopping rule applied per cell. ``None``
+    # preserves the legacy fixed-``trials`` behaviour. When set, the cell
+    # runs up to ``stop_after.max_trials`` trials, stopping early once
+    # ``stop_after.events`` qualifying verdicts are seen.
+    stop_after: StopAfter | None = None
     # Probe-mode (issue #188) extras attached to the recipe so the
     # runner can branch on layout / resume / env-passthrough without
     # re-parsing the YAML. ``None`` for every triage-mode recipe;
@@ -348,6 +387,67 @@ def _parse_confound(path_hint: str, raw: Any) -> ConfoundCfg:
             f"{path_hint}.confound.baseline_cell: must be a string, got {type(baseline).__name__}"
         )
     return ConfoundCfg(threshold=float(threshold), baseline_cell=baseline)
+
+
+_VALID_STOP_AFTER_KEYS = frozenset({"events", "max_trials", "event_verdict"})
+
+
+def _parse_stop_after(path_hint: str, raw: Any) -> StopAfter | None:
+    """Parse + validate the ``stop_after`` block (issue #232).
+
+    ``None`` / missing -> ``None`` (legacy fixed-``trials`` behaviour).
+    ``events`` and ``max_trials`` must be positive ints with
+    ``max_trials >= events`` (``max_trials`` is the always-honored cap,
+    so a cap below the target would be unreachable). ``event_verdict``
+    defaults to ``fail`` and must be one of
+    :data:`_STOP_AFTER_EVENT_VERDICTS`.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RecipeSchemaError(
+            f"{path_hint}.stop_after: must be a mapping, got {type(raw).__name__}"
+        )
+    unknown = set(raw) - _VALID_STOP_AFTER_KEYS
+    if unknown:
+        raise RecipeSchemaError(
+            f"{path_hint}.stop_after: unknown keys {sorted(unknown)}; "
+            f"allowed: {sorted(_VALID_STOP_AFTER_KEYS)}"
+        )
+    if "events" not in raw:
+        raise RecipeSchemaError(f"{path_hint}.stop_after: missing required key 'events'")
+    # ``max_trials`` is mandatory whenever ``events`` is set -- never an
+    # unbounded loop (acceptance criterion).
+    if "max_trials" not in raw:
+        raise RecipeSchemaError(
+            f"{path_hint}.stop_after: 'max_trials' is required when 'events' is set "
+            "(the loop must always have a hard cap)"
+        )
+    events = _parse_positive_int(f"{path_hint}.stop_after.events", raw["events"])
+    max_trials = _parse_positive_int(f"{path_hint}.stop_after.max_trials", raw["max_trials"])
+    if max_trials < events:
+        raise RecipeSchemaError(
+            f"{path_hint}.stop_after: max_trials ({max_trials}) must be >= "
+            f"events ({events}); the cap is always honored, so a smaller cap "
+            "could never reach the target"
+        )
+    event_verdict = raw.get("event_verdict", "fail")
+    if event_verdict not in _STOP_AFTER_EVENT_VERDICTS:
+        raise RecipeSchemaError(
+            f"{path_hint}.stop_after.event_verdict: must be one of "
+            f"{sorted(_STOP_AFTER_EVENT_VERDICTS)}, got {event_verdict!r}"
+        )
+    return StopAfter(events=events, max_trials=max_trials, event_verdict=event_verdict)
+
+
+def _parse_positive_int(path_hint: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RecipeSchemaError(
+            f"{path_hint}: must be an integer, got {type(value).__name__} ({value!r})"
+        )
+    if value < 1:
+        raise RecipeSchemaError(f"{path_hint}: must be >= 1, got {value}")
+    return value
 
 
 def _parse_environment(path_hint: str, raw: Any, inline_envs: dict[str, InlineEnv]) -> str:
@@ -831,6 +931,7 @@ def _build_recipe(
 
     confound = _parse_confound("recipe", data.get("confound"))
     workload_config = _parse_workload_config("recipe", data.get("workload_config"))
+    stop_after = _parse_stop_after("recipe", data.get("stop_after"))
 
     raw_save_logs = data.get("save_logs", False)
     if not isinstance(raw_save_logs, bool):
@@ -846,6 +947,23 @@ def _build_recipe(
     cells = [_parse_cell(i, c, inline_envs) for i, c in enumerate(raw_cells)]
     _validate_unique_cell_names(cells)
     cells_tuple = tuple(cells)
+
+    # Issue #232: when ``stop_after`` is active the per-cell trial budget is
+    # ``stop_after.max_trials`` (see ``runner._run_one_cell``, which sets
+    # ``cap`` from ``max_trials`` and ignores ``cell.effective_trials``). A
+    # per-cell ``trials:`` override would therefore be silently dropped and a
+    # cell could run far more trials than configured. Reject the combination at
+    # load time rather than surprise the operator with an expensive run.
+    if stop_after is not None:
+        overridden = [c.name for c in cells_tuple if c.trials is not None]
+        if overridden:
+            raise RecipeSchemaError(
+                "recipe.stop_after is incompatible with per-cell 'trials' "
+                f"overrides (cells: {overridden}); when stop_after is set, "
+                "stop_after.max_trials is the per-cell cap, so a cell-level "
+                "'trials' would be silently ignored. Drop the per-cell "
+                "'trials' or remove stop_after."
+            )
 
     _validate_names_resolve(cells_tuple, inline_envs, sidecar_files)
     _validate_no_mitigation_collisions(cells_tuple, sidecar_files)
@@ -872,6 +990,7 @@ def _build_recipe(
         source_sha256=source_sha256,
         workload_config=workload_config,
         save_logs=raw_save_logs,
+        stop_after=stop_after,
     )
 
 

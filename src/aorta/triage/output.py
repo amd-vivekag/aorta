@@ -48,7 +48,7 @@ import yaml
 
 from aorta.registry import get_environment
 from aorta.triage.confound import CONFOUND_DID_NOT_RUN, ConfoundTag
-from aorta.triage.matrix import CellStats
+from aorta.triage.matrix import UNRELIABLE_ERROR_RATE_THRESHOLD, CellStats
 from aorta.triage.recipe import Recipe
 
 log = logging.getLogger(__name__)
@@ -396,16 +396,47 @@ def _format_failure_rate(cell: CellStats) -> str:
 
 
 def _format_failures(cell: CellStats) -> str:
-    """Render the Failures column as ``failed / trials`` (e.g. ``3 / 8``).
+    """Render the Failures column as ``failed / valid`` (e.g. ``3 / 8``).
+
+    The denominator is the count of *valid* trials (``passed + failed``)
+    so the column matches the ``Failure rate`` percentage exactly --
+    error trials are excluded from both (issue #230). For a cell with no
+    error trials ``passed + failed == trials``, so the rendering is
+    byte-identical to the pre-#230 ``failed / trials`` form.
 
     Both numerator and denominator are spelled out so the column header
-    ("Failures") and the value together read as "3 failures out of 8 trials"
-    -- the previous "Trials" header on this same value confused readers
-    into reading 3/8 as a trial-count column (issue #160 review round 6).
+    ("Failures") and the value together read as "3 failures out of 8 valid
+    trials" -- the previous "Trials" header on this same value confused
+    readers into reading 3/8 as a trial-count column (issue #160 review
+    round 6).
+
+    When every trial errored (no whole-cell ``error`` but zero valid
+    trials), a bare ``0 / 0`` reads as a degenerate count, so the column
+    is annotated ``0 / 0 (no valid trials)`` to make clear there was no
+    valid observation to compute a failure rate over (issue #230 review).
     """
     if cell.error is not None:
         return "n/a"
-    return f"{cell.failed_count} / {cell.trials}"
+    valid = cell.passed_count + cell.failed_count
+    if valid == 0:
+        return "0 / 0 (no valid trials)"
+    return f"{cell.failed_count} / {valid}"
+
+
+def _format_errors(cell: CellStats) -> str:
+    """Render the Errors column as ``error / trials`` (issue #230).
+
+    Appended with ``(unreliable)`` when the cell's error rate crosses the
+    advisory threshold -- the event rate is computed over too few valid
+    trials to trust. Whole-cell error rows render ``n/a`` (their numerics
+    are already n/a).
+    """
+    if cell.error is not None:
+        return "n/a"
+    base = f"{cell.error_count} / {cell.trials}"
+    if cell.is_unreliable:
+        return f"{base} (unreliable)"
+    return base
 
 
 def _format_step_ms(cell: CellStats) -> str:
@@ -540,7 +571,16 @@ def write_matrix_md(
     else:
         recipe_line += "(flag-mode; in-memory)"
     lines.append(recipe_line + "  ")
-    lines.append(f"**Trials per cell**: {recipe.trials}  ")
+    # With a ``stop_after`` rule the per-cell budget is the hard cap
+    # (``max_trials``), not ``recipe.trials`` (often ``1`` on probe
+    # recipes); render it as "up to N" so the header matches the real
+    # budget. Legacy runs with no rule stay byte-equivalent.
+    trial_budget = (
+        f"up to {recipe.stop_after.max_trials}"
+        if recipe.stop_after is not None
+        else str(recipe.trials)
+    )
+    lines.append(f"**Trials per cell**: {trial_budget}  ")
     lines.append(f"**Steps per trial**: {recipe.steps}  ")
     lines.append(f"**Run timestamp**: {run_timestamp}  ")
     baseline_step = (
@@ -577,6 +617,21 @@ def write_matrix_md(
     # matrix.md layout is byte-equivalent.
     show_top_failure = any(c.top_failure_detector_id for c in cell_stats)
     show_top_warn = any(c.top_warn_detector_id for c in cell_stats)
+    # Issue #232: the "Stop after" column appears whenever the recipe
+    # carries a stop_after rule, so legacy / fixed-trials runs stay
+    # byte-equivalent. It distinguishes "stopped early" from "cap reached".
+    # Gate on the recipe (configuration) rather than on any cell's
+    # ``stop_after_note``: the note is only populated for cells that ran
+    # cleanly (``error is None``), so an all-errored run would otherwise
+    # hide the column even though the rule was active (and matrix.json
+    # still carries ``stop_after``). Errored cells render "—" in the
+    # column.
+    show_stop_after = recipe.stop_after is not None
+    # Issue #230: the "Errors" column appears only when at least one cell
+    # had an infra-error trial, so legacy / error-free runs stay
+    # byte-equivalent. It surfaces error trials excluded from the failure
+    # rate and flags cells whose error rate makes the rate untrustworthy.
+    show_errors = any(c.error_count for c in cell_stats)
     header_cells: list[str] = [
         "Cell",
         "Mitigations",
@@ -585,10 +640,14 @@ def write_matrix_md(
     if show_config:
         header_cells.append("Config")
     header_cells.extend(["Failure rate", "Failures"])
+    if show_errors:
+        header_cells.append("Errors")
     if show_top_failure:
         header_cells.append("Top failure")
     if show_top_warn:
         header_cells.append("Top warn")
+    if show_stop_after:
+        header_cells.append("Stop after")
     if show_iters:
         header_cells.append("Iters")
     header_cells.extend(["Mean step (ms)", "Confound"])
@@ -604,10 +663,14 @@ def write_matrix_md(
         if show_config:
             row.append(_format_workload_config(cell, varying_config_keys))
         row.extend([_format_failure_rate(cell), _format_failures(cell)])
+        if show_errors:
+            row.append(_format_errors(cell))
         if show_top_failure:
             row.append(cell.top_failure_detector_id or "—")
         if show_top_warn:
             row.append(cell.top_warn_detector_id or "—")
+        if show_stop_after:
+            row.append(cell.stop_after_note or "—")
         if show_iters:
             row.append(cell.iters_display)
         row.extend([_format_step_ms(cell), _format_confound(tag)])
@@ -697,16 +760,32 @@ def write_matrix_md(
             "when no cell sets `workload_config`, or when every cell agrees on every key."
         )
     lines.append(
-        "- `Failures` is `failed_count / trial_count` (e.g. `3 / 8` = three failed out "
-        "of eight). `Failure rate` is the same data as a percentage and counts every "
-        "trial whose `exit_status != ok` or whose `WorkloadResult.passed` is False; "
-        "neither is NaN-specific. Use `matrix.json::cells[*].exit_status_counts` to "
-        "break failures down by mode: `workload_failed` (run() reported "
-        "passed=False), `workload_setup_failed` (setup() raised, so the "
-        "workload never reached the measurement -- a 100% setup-fail row is "
-        "NOT a 100% reproduction), `infrastructure_failed` (construction or "
-        "run() itself raised), `unknown`, etc."
+        "- `Failures` is `failed_count / valid_trials` where `valid_trials = "
+        "passed + failed` (e.g. `3 / 8` = three failed out of eight valid trials). "
+        "`Failure rate` is the same data as a percentage. Both **exclude `error` "
+        "trials** -- trials that never validly ran (infra crash, launch failure, "
+        "timeout with no recognised hang) -- from the denominator so an infra "
+        "flake can't make the bug look rarer or more reproducible than it is "
+        "(issue #230). Neither is NaN-specific. Use "
+        "`matrix.json::cells[*].exit_status_counts` to break failures down by "
+        "mode: `workload_failed` (run() reported passed=False), "
+        "`workload_setup_failed` (setup() raised, so the workload never reached "
+        "the measurement -- a 100% setup-fail row is NOT a 100% reproduction), "
+        "`infrastructure_failed` (construction or run() itself raised), "
+        "`unknown`, etc."
     )
+    if show_errors:
+        lines.append(
+            "- `Errors` is `error_count / trial_count` -- trials that produced no "
+            "valid observation of the thing under test (a probe `error` verdict: "
+            "launch failure or a timeout with no recognised hang; or a triage "
+            "`infrastructure_failed` / `workload_setup_failed`). Error trials are "
+            "excluded from `Failure rate`. A cell tagged `(unreliable)` had an "
+            f"error rate \u2265 {int(round(UNRELIABLE_ERROR_RATE_THRESHOLD * 100))}% "
+            "-- its failure rate rests on too few valid trials to trust; inspect "
+            "the per-trial JSON before drawing conclusions. The column is hidden "
+            "entirely when no cell had an error trial."
+        )
     lines.append(
         "- Only `mean step (ms)` is shown here. Per-cell `std`, `min`, `max`, "
         "`p50`, `p90`, `p99`, raw step-time arrays, exit-status histogram, and "
@@ -747,7 +826,16 @@ def write_matrix_json(
         "schema_version": 1,
         "workload": recipe.workload,
         "ticket": recipe.ticket,
-        "trials_per_cell": recipe.trials,
+        # The per-cell trial budget. With a ``stop_after`` rule the budget is
+        # the cap (``max_trials``) -- which cells may stop short of -- not the
+        # fixed ``recipe.trials`` (often ``1`` on probe recipes), so report the
+        # cap to keep the summary truthful. Per-cell ``trials:`` overrides and
+        # realised counts live on each cell entry's ``trials`` field.
+        "trials_per_cell": (
+            recipe.stop_after.max_trials
+            if recipe.stop_after is not None
+            else recipe.trials
+        ),
         "steps_per_trial": recipe.steps,
         "run_timestamp": run_timestamp,
         "baseline_cell": baseline_name,
@@ -755,6 +843,18 @@ def write_matrix_json(
             "threshold": recipe.confound.threshold,
             "baseline_cell_configured": recipe.confound.baseline_cell,
         },
+        # Issue #232: the collect-until-N rule in force for this run (None
+        # for legacy fixed-trials runs). Per-cell realised outcomes live on
+        # each cell's ``stop_after_note`` / ``trials`` fields.
+        "stop_after": (
+            {
+                "events": recipe.stop_after.events,
+                "max_trials": recipe.stop_after.max_trials,
+                "event_verdict": recipe.stop_after.event_verdict,
+            }
+            if recipe.stop_after is not None
+            else None
+        ),
         "warnings": list(warnings),
         "recipe_source": {
             "path": str(recipe.source_path) if recipe.source_path else None,
@@ -765,7 +865,13 @@ def write_matrix_json(
     for cell in cell_stats:
         tag, ratio = confound_tags.get(cell.name, ("-", None))
         entry = asdict(cell)
+        # ``failure_rate`` is the event rate (failed / valid trials, errors
+        # excluded -- issue #230); ``error_rate`` and ``unreliable`` surface
+        # the error share and the advisory flag. ``error_count`` is a
+        # dataclass field so ``asdict`` already included it.
         entry["failure_rate"] = cell.failure_rate
+        entry["error_rate"] = cell.error_rate
+        entry["unreliable"] = cell.is_unreliable
         entry["confound"] = tag
         entry["step_time_ratio"] = ratio
         try:
@@ -801,6 +907,10 @@ def write_resolved_recipe(
     Per-cell debug expansions (the ``Environment`` descriptor and the unioned
     mitigation env-var bundle) live in ``matrix.json`` instead, where they
     belong as run-time state.
+
+    An active ``stop_after`` rule (issue #232) is re-emitted so a rerun from
+    the resolved YAML preserves the stopping behaviour rather than silently
+    reverting to fixed ``trials``.
 
     For runs that used ``--mitigations-file``, the resolved YAML still
     references those mitigation/environment names by name -- it is **not**
@@ -865,6 +975,15 @@ def write_resolved_recipe(
         "threshold": recipe.confound.threshold,
         "baseline_cell": recipe.confound.baseline_cell,
     }
+    if recipe.stop_after is not None:
+        # Re-emit the active stop_after rule so a rerun from this resolved
+        # YAML preserves the stopping behaviour. Without it the rerun would
+        # silently fall back to fixed ``trials`` (often 1 in probe mode).
+        doc["stop_after"] = {
+            "events": recipe.stop_after.events,
+            "max_trials": recipe.stop_after.max_trials,
+            "event_verdict": recipe.stop_after.event_verdict,
+        }
     doc["cells"] = resolved_cells
 
     path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")

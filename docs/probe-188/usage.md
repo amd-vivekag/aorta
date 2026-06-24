@@ -85,6 +85,29 @@ custom_patterns:                   # Tier 5 user-defined patterns
     required_for_pass: false          # only valid with on_match: fail
 ```
 
+Collect-until-N stopping rule (issue #232) replaces a fixed trial count
+with an event-count target plus a hard cap -- the right primitive for an
+intermittent bug:
+
+```yaml
+stop_after:
+  events: 3            # stop this cell once 3 trials match the event verdict
+  max_trials: 160      # hard cap -- always honored, required when events is set
+  event_verdict: fail  # which verdict counts: fail (default) | pass | error
+```
+
+A cell runs until `events` qualifying verdicts are observed **or**
+`max_trials` trials have run, whichever comes first. The matrix records
+both the realised event count and the trials actually run, so the rate is
+`events / trials_run`; `matrix.md` gains a **Stop after** column showing
+"stopped early" vs "cap reached", and `matrix.json` carries the rule plus
+each cell's `stop_after_note`. Resume is rule-aware: a cell whose on-disk
+prefix already satisfies the rule is skipped. CLI escape hatch:
+`--stop-after-events K --max-trials N` (unioned over the recipe's block).
+`event_verdict: error` (issue #230) counts *error* trials -- handy to bail
+out of a sweep that's mostly flaking on infrastructure rather than
+reproducing the bug.
+
 Detector-disable knobs (issue #229) silence detectors that fire on
 benign, workload-specific behaviour:
 
@@ -166,6 +189,17 @@ of the three built-ins above) when copy-pasting this template.
   (the per-trial coordinate would have to round-trip through the dispatcher
   and the dispatcher currently writes its own `trial_<N>.json` set
   unconditionally).
+* When the recipe carries a `stop_after` rule the skip test is
+  rule-aware instead of counting against `trials`: the runner walks the
+  **contiguous** on-disk trial prefix from `trial_0` and skips the cell
+  only when that prefix already satisfies the stopping rule -- i.e. it
+  has accumulated `stop_after.events` qualifying verdicts **or** reached
+  `stop_after.max_trials`. A cell that legitimately stopped early
+  therefore resumes as a skip even though it has fewer than `max_trials`
+  trials on disk. If the contiguous prefix has neither hit the event
+  target nor reached the cap (or a trial in it is missing/malformed), the
+  **whole cell** re-runs from `trial_0`; the re-run is bounded because the
+  dispatcher applies the same early-stop.
 
 ## 5. CLI / recipe interaction
 
@@ -199,6 +233,7 @@ forward-compatible:
   "cell_name": "none-none",
   "trial_index": 0,
   "failure_detectors_fired": ["tier1:exit_nonzero", "tier4:hip_error"],
+  "error_detectors_fired": [],
   "warn_detectors_fired": ["custom:slow_iter"],
   "capture": {"loss": "nan"},
   "tier_durations_ms": {"tier1": 0.4, "tier2": 0.1, "tier3": 12.1, "tier4": 1.8, "tier5": 0.3},
@@ -214,6 +249,8 @@ forward-compatible:
 * **Phase-2 additions** (new in this PR, never replaced or removed):
   `failure_detectors_fired`, `warn_detectors_fired`, `capture`,
   `tier_durations_ms`.
+* **Issue #230 addition**: `error_detectors_fired` — the infra-error
+  signals (separate from genuine failures) that drive the `error` verdict.
 
 `peak_vram_mib` is a coarse high-water mark sampled from two
 `amd-smi` snapshots (pre- and post-Popen). It may be `null` when
@@ -221,13 +258,18 @@ forward-compatible:
 that reference it bind `null -> 0` inside `aorta.probe.sandbox.evaluate`
 so they stay deterministic.
 
-The verdict comes from `aorta.probe.classifier`:
+The verdict is three-way (`pass` / `fail` / `error`; issue #230) and comes
+from `aorta.probe.classifier`, with precedence **fail > error > pass**:
 
-1. Any `tier1:*` / `tier2:*` / `tier3:*` / `tier4:*` detector fires
-   OR any `custom_patterns[*]` with `on_match: fail` fires →
-   `verdict = "fail"`.
-2. `required_for_pass: true` patterns that don't fire add
-   `meta:missing_pass_signal` and flip the verdict.
+1. Any `tier1:*` / `tier2:*` / `tier3:*` / `tier4:*` detector (other than
+   the error detectors below) fires OR any `custom_patterns[*]` with
+   `on_match: fail` fires → `verdict = "fail"`. `required_for_pass: true`
+   patterns that don't fire add `meta:missing_pass_signal` (a fail).
+2. Else, if only an error detector fired — `tier1:timeout` with no
+   recognised hang, `tier1:exec_failed` (the command never launched), or a
+   rejected `probe.env` — → `verdict = "error"`. An `error` trial produced
+   no valid observation and is excluded from the matrix event-rate
+   denominator.
 3. Otherwise → `verdict = "pass"`.
 
 Full ordering rules + per-tier detector IDs:

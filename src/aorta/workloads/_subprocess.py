@@ -69,7 +69,11 @@ from aorta.probe.classifier.tier3_kernel import (
     poll_amd_smi,
     scan_dmesg,
 )
-from aorta.probe.classifier.verdict import Verdict
+from aorta.probe.classifier.verdict import (
+    Verdict,
+    partition_detectors,
+    verdict_from_detectors,
+)
 from aorta.workloads._base import Workload, WorkloadResult
 
 log = logging.getLogger(__name__)
@@ -726,6 +730,7 @@ class SubprocessWorkload(Workload):
                     log_text=log_text,
                     custom_patterns=custom_patterns,
                     hang_detected=hang_detected,
+                    exec_failed=not launched,
                     peak_vram_mib=peak_vram_mib,
                     dmesg_text=dmesg_text,
                     amd_smi_pre=amd_smi_pre,
@@ -742,6 +747,7 @@ class SubprocessWorkload(Workload):
                 exit_code=exit_code,
                 timed_out=timed_out,
                 trial_dir=trial_dir,
+                exec_failed=not launched,
                 classifier_exc=classifier_exc,
                 disabled_tiers=effective_disabled_tiers,
                 disabled_detectors=effective_disabled_detectors,
@@ -756,6 +762,10 @@ class SubprocessWorkload(Workload):
             "cell_name": probe_extras.get("cell_name", "_unknown_"),
             "trial_index": self._trial_index,
             "failure_detectors_fired": list(verdict_obj.failure_detectors_fired),
+            # Issue #230: infra-error signals (timeout-without-hang,
+            # exec-failed) kept separate from genuine failures so the
+            # matrix can exclude them from the event-rate denominator.
+            "error_detectors_fired": list(verdict_obj.error_detectors_fired),
             "warn_detectors_fired": list(verdict_obj.warn_detectors_fired),
             "capture": dict(verdict_obj.capture),
             "tier_durations_ms": dict(tier_durations_ms),
@@ -837,6 +847,7 @@ class SubprocessWorkload(Workload):
                 "exit_code": exit_code,
                 "result_json_path": str(result_path),
                 "failure_detectors_fired": list(verdict_obj.failure_detectors_fired),
+                "error_detectors_fired": list(verdict_obj.error_detectors_fired),
                 "warn_detectors_fired": list(verdict_obj.warn_detectors_fired),
             },
         )
@@ -853,7 +864,7 @@ class SubprocessWorkload(Workload):
         env_mode: str,
         cell_env_snapshot: dict[str, str],
     ) -> WorkloadResult:
-        """Persist a Tier-1 ``fail`` artifact when probe.env validation rejects.
+        """Persist an ``error``-verdict artifact when probe.env validation rejects.
 
         Mirrors the exec-failed bookkeeping in :meth:`run` so the per-trial
         directory always contains both ``stderr.log`` (with the validation
@@ -862,13 +873,14 @@ class SubprocessWorkload(Workload):
         and re-runs the same broken cell on every subsequent
         ``aorta probe`` invocation.
 
-        Also unlinks ``probe.env`` (best-effort) before writing the fail
-        result so the trial directory cannot leave behind a misleading
-        artifact: ``_write_env_file`` is now validation-first
-        (atomic-on-failure), but a stale probe.env from a PRIOR run of
-        the same ``trial_<n>/`` directory (resume + flat_resume reuse
-        the same dir) would otherwise survive the validation rejection
-        and contradict ``result.json::failure_type==env_file_validation_failed``.
+        Also unlinks ``probe.env`` (best-effort) before writing the
+        ``error``-verdict result so the trial directory cannot leave
+        behind a misleading artifact: ``_write_env_file`` is now
+        validation-first (atomic-on-failure), but a stale probe.env from
+        a PRIOR run of the same ``trial_<n>/`` directory (resume +
+        flat_resume reuse the same dir) would otherwise survive the
+        validation rejection and contradict
+        ``result.json::failure_type==env_file_validation_failed``.
         """
         env_file_path.unlink(missing_ok=True)
         try:
@@ -876,7 +888,13 @@ class SubprocessWorkload(Workload):
         except OSError:
             pass
         result_doc: dict[str, Any] = {
-            "verdict": "fail",
+            # Issue #230: a rejected probe.env is an infrastructure/config
+            # failure -- the subprocess never launched, so the trial made
+            # no valid observation of the thing under test. It resolves to
+            # ``error`` (excluded from the matrix event-rate denominator),
+            # not ``fail``. ``meta:env_file_validation_failed`` names the
+            # error reason in the dedicated error list.
+            "verdict": "error",
             # Exit-code 2 mirrors the ``_setup_validation`` convention used
             # elsewhere in the codebase for "config rejected before
             # subprocess could start" -- distinct from 126/127 which we
@@ -888,9 +906,22 @@ class SubprocessWorkload(Workload):
             # matrix's step-time aggregates from being polluted by a
             # cell that never produced step times.
             "walltime_sec": 0.0,
+            # No subprocess and no Tier-3 amd-smi probe ran, so VRAM was
+            # never measured -- ``None`` (the normal path's "unavailable"
+            # value), not 0.
+            "peak_vram_mib": None,
             "argv": list(argv),
             "cell_name": probe_extras.get("cell_name", "_unknown_"),
             "trial_index": self._trial_index,
+            "failure_detectors_fired": [],
+            "error_detectors_fired": ["meta:env_file_validation_failed"],
+            # The remaining detector / capture / tier-timing keys are empty
+            # here but PRESENT so this error artifact is schema-identical to
+            # the normal probe path -- downstream parsers (and the documented
+            # result.json schema) never have to special-case env-file errors.
+            "warn_detectors_fired": [],
+            "capture": {},
+            "tier_durations_ms": {},
             "env_passthrough_mode": env_mode,
             "timed_out": False,
             # Mirror the normal-path result.json so every trial's env is
@@ -923,9 +954,12 @@ class SubprocessWorkload(Workload):
             configured_iterations=1,
             elapsed_sec=0.0,
             metrics={
-                "verdict": "fail",
+                "verdict": "error",
                 "exit_code": 2,
                 "result_json_path": str(result_path),
+                "failure_detectors_fired": [],
+                "error_detectors_fired": ["meta:env_file_validation_failed"],
+                "warn_detectors_fired": [],
             },
         )
 
@@ -1083,6 +1117,7 @@ def _tier1_only_fallback_verdict(
     exit_code: int,
     timed_out: bool,
     trial_dir: Path,
+    exec_failed: bool,
     classifier_exc: BaseException,
     disabled_tiers: frozenset[str] = frozenset(),
     disabled_detectors: frozenset[str] = frozenset(),
@@ -1107,10 +1142,18 @@ def _tier1_only_fallback_verdict(
     the *effective* set (Tier 1 forced back on for an exec-failure trial)
     so a command-not-found still fails even with Tier 1 disabled.
 
-    Verdict rule: any (non-disabled) Tier 1 detector fires -> ``fail``;
-    else ``pass``. Matches the existing Phase-1 fallback shape so
-    downstream tooling that already parses ``failure_detectors_fired``
-    keeps working.
+    Verdict rule: the same fail > error > pass precedence the full
+    resolver applies (issue #230) -- a Tier-1 ``tier1:timeout`` with
+    no recognised hang or a ``tier1:exec_failed`` resolves to
+    ``error``, a genuine Tier-1 signal to ``fail``, nothing to
+    ``pass``. Matches the resolver so a classifier crash doesn't
+    silently flip an infra error back into a fail.
+
+    ``exec_failed`` (the workload's ``not launched`` flag) is
+    forwarded into :class:`Tier1Context` so the fallback can still
+    emit ``tier1:exec_failed`` (and suppress the misleading
+    ``exit_nonzero`` from the synthetic 127/126/1 exit code) even
+    when the full classifier is the thing that crashed.
     """
     if "tier1" in disabled_tiers:
         fired: list[str] = []
@@ -1122,19 +1165,21 @@ def _tier1_only_fallback_verdict(
                     exit_code=exit_code,
                     timed_out=timed_out,
                     trial_dir=trial_dir,
+                    exec_failed=exec_failed,
                 )
             )
             if d not in disabled_detectors
         ]
-    verdict_str = "fail" if fired else "pass"
+    failures, errors = partition_detectors(list(fired))
     capture: dict[str, str | float | int] = {
         "classifier_error": f"{type(classifier_exc).__name__}: {classifier_exc}",
     }
     verdict = Verdict(
-        verdict=verdict_str,
-        failure_detectors_fired=list(fired),
+        verdict=verdict_from_detectors(failures, errors),
+        failure_detectors_fired=failures,
         warn_detectors_fired=[],
         capture=capture,
+        error_detectors_fired=errors,
     )
     # Per-tier durations: Tier 1 ran, everything else was skipped.
     tier_durations_ms = {

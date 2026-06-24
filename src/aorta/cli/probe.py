@@ -290,6 +290,30 @@ class _ProbeCommand(click.Command):
     ),
 )
 @click.option(
+    "--stop-after-events",
+    type=int,
+    default=None,
+    metavar="K",
+    help=(
+        "Stop each cell once K trials match the event verdict (default "
+        "verdict: fail), instead of running a fixed count. The loop needs "
+        "a hard cap: pass --max-trials unless the recipe's 'stop_after:' "
+        "block already supplies one. Overlays that block (#232)."
+    ),
+)
+@click.option(
+    "--max-trials",
+    type=int,
+    default=None,
+    metavar="N",
+    help=(
+        "Hard cap on trials per cell when stop-after is active (always "
+        "honored). Pair with --stop-after-events; either flag may be "
+        "omitted when the recipe's 'stop_after:' block already supplies "
+        "that half (so --max-trials alone overrides just the recipe's cap)."
+    ),
+)
+@click.option(
     "--disable-detector",
     "disable_detectors",
     multiple=True,
@@ -317,6 +341,8 @@ def probe(
     ticket: str | None,
     dry_run: bool,
     env_passthrough_mode: str | None,
+    stop_after_events: int | None,
+    max_trials: int | None,
     disable_detectors: tuple[str, ...],
     mitigation_files: tuple[Path, ...],
     verbose: int,
@@ -356,6 +382,7 @@ def probe(
             )
         r = apply_recipe_overrides(
             r, ticket=ticket, cli_passthrough_mode=cli_passthrough_mode,
+            cli_stop_after_events=stop_after_events, cli_max_trials=max_trials,
             cli_disable_detectors=disable_detectors,
         )
     except (ProbeUsageError, RecipeSchemaError, RecipeCellError, RegistryError, LookupError) as exc:
