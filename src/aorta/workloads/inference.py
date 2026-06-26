@@ -145,7 +145,8 @@ class ModelSpec:
         # ``enabled`` is accepted (silently ignored) — the issue/#239 recipe
         # shape includes ``model.moe.enabled``; topology is driven by kind only.
         _reject_unknown(moe, {"num_experts", "enabled"}, "model.moe")
-        spec = cls(**{k: v for k, v in d.items() if k in known})
+        _INT_FIELDS = {"hidden_size", "num_layers", "num_heads", "ffn_size", "vocab_size", "num_experts"}
+        spec = cls(**{k: (int(v) if k in _INT_FIELDS else v) for k, v in d.items() if k in known})
         if "num_experts" in moe:
             spec.num_experts = int(moe["num_experts"])
         if spec.kind not in _VALID_MODEL_KINDS:
@@ -247,7 +248,12 @@ class InferenceConfig:
         serving = ServingSpec.from_dict(d.get("serving", {}))
         checks = ChecksSpec.from_dict(d.get("checks", {}))
         scalar_keys = {"mode", "seed", "device", "dtype", "warmup_steps", "steps"}
-        _reject_unknown(d, scalar_keys | {"request", "model", "serving", "checks"}, "inference")
+        _reject_unknown(
+            d,
+            scalar_keys | {"request", "model", "serving", "checks"},
+            "inference",
+            reserved=frozenset({"steps"}),
+        )
         cfg = cls(
             request=request,
             model=model,
@@ -310,18 +316,25 @@ def _require_bool(value: Any, field: str) -> bool:
     return value
 
 
-def _reject_unknown(d: dict[str, Any], known: set[str], section: str) -> None:
-    """Raise ``ValueError`` for any key not in *known* (excluding dispatcher-reserved keys).
+def _reject_unknown(
+    d: dict[str, Any],
+    known: set[str],
+    section: str,
+    *,
+    reserved: frozenset[str] = frozenset(),
+) -> None:
+    """Raise ``ValueError`` for any key not in *known* (excluding reserved keys).
 
     Keys starting with ``_aorta_`` are platform-injected metadata and are
-    silently accepted. ``steps`` is consumed by the launcher (not the workload)
-    and is also exempted. Any other unrecognised key is most likely a recipe
-    typo (e.g. ``requst.batch_size``, ``serving.kvcache``) that would otherwise
-    silently fall back to defaults and produce a false-green result.
+    always silently accepted. *reserved* holds additional exempted keys — used
+    only at the top level to pass ``frozenset({"steps"})``, which the dispatcher
+    injects into the top-level workload config. Nested sections (request, model,
+    serving, checks) do NOT exempt ``steps`` so a typo like
+    ``request.steps`` is correctly rejected.
     """
     unknown = sorted(
         k for k in d
-        if k not in known and k != "steps" and not k.startswith("_aorta_")
+        if k not in known and k not in reserved and not k.startswith("_aorta_")
     )
     if unknown:
         raise ValueError(f"unknown {section} key(s): {unknown}")
@@ -746,11 +759,15 @@ class InferenceWorkload(Workload):
         remaining_queued = len(queue)
         remaining_requests = remaining_active + remaining_queued
         if remaining_requests:
+            # Attribute to the last valid tick (cfg.steps - 1) so
+            # first_failure_iteration stays within 0..total_iterations-1,
+            # consistent with training.py and other workloads.
+            last_tick = cfg.steps - 1
             if first_failure is None:
-                first_failure = cfg.steps
+                first_failure = last_tick
             failures.append(
                 {
-                    "step": cfg.steps,
+                    "step": last_tick,
                     "problems": ["incomplete_requests"],
                     "requests_completed": completed,
                     "remaining_active": remaining_active,
