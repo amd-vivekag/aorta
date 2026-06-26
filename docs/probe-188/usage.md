@@ -134,6 +134,52 @@ built-in `tier1`-`tier4` id that isn't in that tier's catalogue ->
 (repeatable) is **unioned onto** the recipe's set, so an operator can
 silence one more detector without restating the recipe's list.
 
+Verdict-keyed artifact retention (issue #231) keeps the **heavy** per-trial
+output (profiler traces, per-layer dumps -- hundreds of MB each) only for
+the trials where it has diagnostic value, so a big sweep doesn't fill the
+disk with passing-run data:
+
+```yaml
+retain:
+  on_fail:  full       # keep everything (log + summary + heavy artifacts)
+  on_pass:  summary    # keep small summary artifacts; delete heavy ones
+  on_error: log        # keep the trial log only; drop summary + heavy
+```
+
+Levels form a ladder, each keeping everything the one below it keeps:
+`none` (the trial record only) < `log` (+ `stdout.log` / `stderr.log` /
+`probe.env`) < `summary` (+ small collector roll-ups) < `full` (+ heavy
+collector outputs; the default). Each of `on_fail` / `on_pass` / `on_error`
+is optional and defaults to `full`, so **omitting `retain` keeps everything
+exactly as before**. Deletion only ever touches *artifact files* -- the
+per-trial `result.json` (the matrix / rate bookkeeping and the probe resume
+marker) is **never** deleted, at any level. Pairs naturally with
+`stop_after`: "collect N fails with full artifacts, summary-only for the
+clean trials along the way."
+
+When a `retain` policy runs, the applied level and the list of pruned
+artifacts are written back into that trial's `result.json` under
+`capture.retention` (`{"level": ..., "deleted": [...], "freed_bytes": N}`).
+A reader of a bundled or resumed run can then tell a missing heavy artifact
+was *pruned by policy* rather than never produced.
+
+Collectors declare which of their outputs are heavy vs summary via an
+optional `artifacts.json` manifest in the trial directory
+(`{"artifacts": [{"path": "trace.pb", "class": "heavy"}, ...]}`); absent a
+manifest, a file is classified by convention (`*.summary.*` is a summary,
+the known logs are `log`, anything else is `heavy`).
+
+**Reading `matrix.md` (probe runs).** The reproduction-summary table
+splits the cell's two recipe axes into their own columns -- `Mitigation`
+and `Diagnostic` -- instead of a fused `<mitigation>-<diagnostic>`
+identifier, and ends with a `Directory` column giving the per-cell
+artifact path relative to `matrix.md` (e.g. `tf32_off-none/`). The folder
+name on disk is still `<mitigation>-<diagnostic>` (it stays the stable
+join key for tooling and resume); only the table presentation changed, so
+an unused diagnostic axis reads as `Diagnostic = none` rather than a
+confusing trailing `-none` (issue #229). Triage-mode runs keep the
+original `Cell` / `Mitigations` columns.
+
 Phase 3 keys (`redaction`, top-level `condition`) are still **rejected
 at load time** with a "deferred to Phase 3" error message.
 
@@ -251,6 +297,9 @@ forward-compatible:
   `tier_durations_ms`.
 * **Issue #230 addition**: `error_detectors_fired` — the infra-error
   signals (separate from genuine failures) that drive the `error` verdict.
+* **Issue #231 addition**: `capture.retention` — present only when a
+  `retain` policy ran; records the applied `level`, the `deleted` artifact
+  list, and `freed_bytes` so pruning is auditable from the trial record.
 
 `peak_vram_mib` is a coarse high-water mark sampled from two
 `amd-smi` snapshots (pre- and post-Popen). It may be `null` when

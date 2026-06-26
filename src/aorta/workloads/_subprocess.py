@@ -74,6 +74,7 @@ from aorta.probe.classifier.verdict import (
     partition_detectors,
     verdict_from_detectors,
 )
+from aorta.run.retention import RetentionOutcome, apply_retention
 from aorta.workloads._base import Workload, WorkloadResult
 
 log = logging.getLogger(__name__)
@@ -808,6 +809,22 @@ class SubprocessWorkload(Workload):
             encoding="utf-8",
         )
 
+        # Issue #231: prune heavy per-trial artifacts now that the verdict
+        # is known, keeping the level mapped from this trial's verdict.
+        # Runs AFTER result.json is written so the trial record (which
+        # retention never deletes) always survives for resume + the matrix.
+        # When retention ran, stamp its outcome back into result.json so the
+        # applied level + pruned-artifact list are auditable (oyazdanb).
+        retention_outcome = self._apply_retention(
+            trial_dir, verdict_obj.verdict, probe_extras
+        )
+        if retention_outcome is not None:
+            self._record_retention(result_doc, retention_outcome)
+            result_path.write_text(
+                json.dumps(result_doc, indent=2, sort_keys=False),
+                encoding="utf-8",
+            )
+
         # ``main_work_started`` / ``executed_iterations`` mirror
         # whether ``Popen`` actually launched a child. A normal
         # non-zero child exit is still ``launched=True`` (the
@@ -935,6 +952,20 @@ class SubprocessWorkload(Workload):
             json.dumps(result_doc, indent=2, sort_keys=False),
             encoding="utf-8",
         )
+        # Issue #231: honor ``retain.on_error`` for this infra-error trial
+        # too (mirrors the main run() path). The probe.env was already
+        # unlinked above; this prunes any other heavy artifacts a prior
+        # resume left in the reused trial dir. Stamp the outcome back into
+        # result.json so the applied level is auditable here too (oyazdanb).
+        retention_outcome = self._apply_retention(
+            result_path.parent, "error", probe_extras
+        )
+        if retention_outcome is not None:
+            self._record_retention(result_doc, retention_outcome)
+            result_path.write_text(
+                json.dumps(result_doc, indent=2, sort_keys=False),
+                encoding="utf-8",
+            )
         return WorkloadResult(
             passed=False,
             failure_count=1,
@@ -962,6 +993,78 @@ class SubprocessWorkload(Workload):
                 "warn_detectors_fired": [],
             },
         )
+
+    def _apply_retention(
+        self, trial_dir: Path, verdict: str, probe_extras: dict[str, Any]
+    ) -> RetentionOutcome | None:
+        """Prune this trial's heavy artifacts per ``retain`` (issue #231).
+
+        Returns the :class:`~aorta.run.retention.RetentionOutcome` so the
+        caller can record the applied level + deleted-artifact list into
+        ``result.json`` for post-hoc auditability (a reader of a bundled or
+        resumed run can tell a heavy artifact was *pruned* rather than never
+        produced). Returns ``None`` when retention did not run -- the recipe
+        omits ``retain`` (keep-everything default), the payload is malformed,
+        or the engine raised (best-effort: a retention error must never sink
+        an already-classified trial).
+
+        ``aorta.run.retention`` never deletes the trial record
+        (``result.json``), so resume and the matrix are unaffected
+        regardless of level.
+        """
+        retain = probe_extras.get("retain")
+        if not retain:
+            return None
+        # Retention is documented best-effort -- a malformed payload (e.g. a
+        # string or RetainPolicy passed via programmatic config) must not
+        # sink the trial with an AttributeError. Mirror the isinstance(dict)
+        # guard in _capture_cell_env and warn+skip when it isn't a mapping.
+        if not isinstance(retain, dict):
+            log.warning(
+                "retention: probe_extras['retain'] is %s, expected a mapping; "
+                "skipping retention for %s",
+                type(retain).__name__,
+                trial_dir,
+            )
+            return None
+        level = retain.get(f"on_{verdict}", "full")
+        try:
+            outcome = apply_retention(trial_dir, level)
+        except Exception as exc:  # noqa: BLE001 -- retention is best-effort
+            log.warning(
+                "retention: pruning %s at level %r failed (%s); artifacts kept",
+                trial_dir,
+                level,
+                exc,
+            )
+            return None
+        if outcome.deleted:
+            log.info(
+                "retention[%s]: pruned %d artifact(s) (~%d bytes) from %s",
+                level,
+                len(outcome.deleted),
+                outcome.freed_bytes,
+                trial_dir,
+            )
+        return outcome
+
+    @staticmethod
+    def _record_retention(result_doc: dict[str, Any], outcome: RetentionOutcome) -> None:
+        """Stamp the retention outcome into ``result_doc["capture"]``.
+
+        Makes the applied level + pruned-artifact list auditable from the
+        trial record alone, so a reader of a bundled/resumed run can tell a
+        missing heavy artifact was *pruned by policy* rather than never
+        produced (oyazdanb review). The trial record is itself never pruned
+        by retention, so this stays readable at every level.
+        """
+        capture = result_doc.setdefault("capture", {})
+        if isinstance(capture, dict):
+            capture["retention"] = {
+                "level": outcome.level,
+                "deleted": list(outcome.deleted),
+                "freed_bytes": outcome.freed_bytes,
+            }
 
     def _capture_cell_env(self, probe_extras: dict[str, Any]) -> dict[str, str]:
         """Compute the cell's mitigation+diagnostic env-var bundle.

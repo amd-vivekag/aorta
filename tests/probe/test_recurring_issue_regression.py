@@ -8,9 +8,13 @@ behind the cluster of ``aorta probe`` bugs filed against this platform:
 * ``aorta`` #223 / #224 / aorta-internal #53 -- false-positive
   ``tier2:hang`` on a wrapper-delegated (docker/sudo) command that exits 0.
 * ``aorta`` #222 -- orphaned child process tree on interrupt/timeout.
-* aorta-internal #55 -- re-verification of #53 *plus* two still-open
-  defects: a ``failure_details[].type`` that contradicts ``exit_code``,
-  and an ambiguous ``<mitigation>-<diagnostic>`` cell name (``none-none``).
+* aorta-internal #55 -- re-verification of #53. Item 2 (a
+  ``failure_details[].type`` that contradicted ``exit_code``) is now fixed:
+  the type is derived from the actual process outcome, so a clean exit
+  failed by a non-Tier-1 detector is ``detector_failure``. The fused
+  ``<mitigation>-<diagnostic>`` cell-name ambiguity (item 3) is fixed:
+  matrix.md now renders the two axes as separate columns plus a
+  ``Directory`` path, keeping the folder name as the agent's join key.
 * aorta-internal #58 -- the matrix has no ``error`` verdict, so an infra
   crash is silently miscounted as ``pass``/``fail``.
 * aorta-internal #56 / #57 -- verdict-keyed artifact retention and the
@@ -185,22 +189,20 @@ def test_timed_out_with_latched_hang_stays_a_failure(tmp_path, monkeypatch):
 
 # ==========================================================================
 # GROUP B -- failure_details[].type must agree with exit_code (#55 item 2)
-# OPEN on this branch: the type is hard-stamped "subprocess_nonzero_exit"
-# whenever the child launched, regardless of the actual exit status.
+# FIXED on main: aorta `#229` (merged via `#233`) routed the type through
+# `_subprocess._failure_detail_type`, which derives it from the actual
+# (launched, timed_out, exit_code) outcome instead of hard-stamping
+# "subprocess_nonzero_exit" whenever the child launched. A clean exit failed
+# by a non-Tier-1 detector is now "detector_failure". Promoted from
+# xfail(strict) to a permanent guard per this module's CONVENTIONS.
 # ==========================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="aorta-internal #55 item 2: failure_details[].type is stamped "
-    "'subprocess_nonzero_exit' even when exit_code == 0 (failure came from a "
-    "non-Tier-1 detector). Remove this marker when the type is derived from "
-    "the actual exit/verdict.",
-)
 def test_failure_detail_type_consistent_with_zero_exit(tmp_path):
     """A trial that exits 0 but fails on a log-pattern (Tier 4) must not be
     labelled ``subprocess_nonzero_exit`` -- that string is self-contradictory
-    with ``exit_code == 0`` and misleads anyone reading the per-trial JSON."""
+    with ``exit_code == 0`` and misleads anyone reading the per-trial JSON.
+    The clean-exit-but-detector-failed case is stamped ``detector_failure``."""
     wl = _make_workload(tmp_path, ["bash", "-c", "echo 'loss is NaN'; exit 0"])
     wl.setup()
     result = wl.run()
@@ -209,28 +211,118 @@ def test_failure_detail_type_consistent_with_zero_exit(tmp_path):
     assert doc["verdict"] == "fail"  # tier4:nan_signature fired
     assert result.failure_details, "a failing trial must carry a failure_detail"
     detail_type = result.failure_details[0]["type"]
-    assert detail_type != "subprocess_nonzero_exit", (
-        f"failure_details[].type={detail_type!r} contradicts exit_code=0"
+    assert detail_type == "detector_failure", (
+        f"failure_details[].type={detail_type!r} must be 'detector_failure' "
+        "for a clean exit failed by a non-Tier-1 detector (not "
+        "'subprocess_nonzero_exit', which contradicts exit_code=0)"
     )
 
 
 # ==========================================================================
-# GROUP C -- cell-name disambiguation (#55 item 3)
-# OPEN on this branch: cell names are "<mit>-<diag>", rendering a confusing
-# bare trailing "-none" when the diagnostic axis is unused, with no way to
-# tell which token is the mitigation and which is the diagnostic.
+# GROUP C -- cell-name disambiguation (#55 item 3) [FIXED]
+# Probe runs still write cell artifacts to a "<mit>-<diag>" folder (the
+# agent's stable join key), but matrix.md no longer surfaces that fused name
+# as an identifier: it renders the two recipe axes as separate "Mitigation"
+# and "Diagnostic" columns plus a "Directory" column carrying the path. The
+# bare trailing "-none" stutter is gone from the table. These must stay green.
 # ==========================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="aorta-internal #55 item 3: an unused diagnostic axis renders an "
-    "ambiguous trailing '-none' (e.g. 'tf32_off-none'). Remove this marker "
-    "when cell names disambiguate mitigation vs diagnostic.",
-)
-def test_unused_diagnostic_axis_does_not_render_ambiguous_cell_name(tmp_path):
-    """With ``diagnostic_axis: [none]`` the cell name must not be a bare
-    ``<mitigation>-none`` that reads as a stutter and hides the axis roles."""
+def _probe_matrix_md(tmp_path, *, mitigation_axis, diagnostic_axis) -> str:
+    """Load a probe recipe and render its matrix.md, returning the text.
+
+    Builds one minimal :class:`CellStats` per synthesised cell so the test
+    exercises the real :func:`write_matrix_md` probe-mode column layout
+    (``flat_resume``, matching ``aorta probe``).
+    """
+    from aorta.triage.matrix import CellStats
+    from aorta.triage.output import write_matrix_md
+    from aorta.triage.recipe import load_recipe
+
+    # Emit axis values as a double-quoted YAML flow sequence (json.dumps gives
+    # exactly that) so YAML 1.1 boolean coercion of tokens like ``on``/``off``/
+    # ``yes``/``no`` can't silently rewrite an axis name into ``True``/``False``.
+    body = (
+        "schema_version: 1\n"
+        "mode: probe\n"
+        "trials: 1\n"
+        f"mitigation_axis: {json.dumps(list(mitigation_axis))}\n"
+        f"diagnostic_axis: {json.dumps(list(diagnostic_axis))}\n"
+    )
+    p = tmp_path / "r.yaml"
+    p.write_text(body, encoding="utf-8")
+    recipe = load_recipe(p)
+
+    stats = [
+        CellStats(
+            name=c.name,
+            mitigations=c.mitigations,
+            environment=c.environment,
+            extra_env={},
+            resolved_env_vars={},
+            trials=1,
+            passed_count=1,
+            failed_count=0,
+            mean_step_time_ms=10.0,
+            std_step_time_ms=0.0,
+            min_step_time_ms=10.0,
+            max_step_time_ms=10.0,
+            p50_step_time_ms=10.0,
+            p90_step_time_ms=10.0,
+            p99_step_time_ms=10.0,
+            mean_wall_clock_sec=1.0,
+            step_time_source="per_step",
+        )
+        for c in recipe.cells
+    ]
+    out = tmp_path / "matrix.md"
+    write_matrix_md(
+        out,
+        recipe,
+        stats,
+        baseline=stats[0],
+        confound_tags={s.name: ("(baseline)", None) for s in stats},
+        warnings=[],
+        run_timestamp="2026-01-01T00:00:00Z",
+        layout="flat_resume",
+    )
+    return out.read_text(encoding="utf-8")
+
+
+def test_unused_diagnostic_axis_renders_split_axis_columns(tmp_path):
+    """With ``diagnostic_axis: [none]`` matrix.md must show the mitigation and
+    diagnostic as separate columns (not a fused ``<mit>-none`` identifier),
+    with the folder path in its own ``Directory`` column (#55 item 3)."""
+    text = _probe_matrix_md(
+        tmp_path, mitigation_axis=["none", "tf32_off"], diagnostic_axis=["none"]
+    )
+    header = next(line for line in text.splitlines() if line.lstrip().startswith("| Mitigation"))
+    # The axes get their own columns; the fused triage-mode "Cell" column is gone.
+    assert "| Mitigation " in header
+    assert "| Diagnostic " in header
+    assert "| Directory " in header
+    assert "| Cell " not in header
+    # The mitigation value stands alone in its column -- never a "tf32_off-none"
+    # stutter presented as the row identifier.
+    assert "tf32_off-none" not in header
+    body_rows = [
+        line
+        for line in text.splitlines()
+        if line.startswith("|") and "tf32_off" in line and "Mitigation" not in line
+    ]
+    assert body_rows, "expected a row for the tf32_off cell"
+    row = body_rows[0]
+    cols = [c.strip() for c in row.strip().strip("|").split("|")]
+    assert cols[0] == "tf32_off", f"Mitigation column should be the bare axis value: {row!r}"
+    assert cols[1] == "none", f"Diagnostic column should be the bare axis value: {row!r}"
+    # The fused name survives only as the artifact directory path (last column).
+    assert cols[-1] == "tf32_off-none/", f"Directory column should carry the folder: {row!r}"
+
+
+def test_legacy_cell_name_still_exists_as_folder_join_key(tmp_path):
+    """The fix is presentational: the on-disk folder name stays
+    ``<mitigation>-<diagnostic>`` so the agent's baseline-parse join key is
+    untouched -- only the matrix.md *table* stopped surfacing it as an ID."""
     from aorta.triage.recipe import load_recipe
 
     recipe_text = (
@@ -243,14 +335,14 @@ def test_unused_diagnostic_axis_does_not_render_ambiguous_cell_name(tmp_path):
     p = tmp_path / "r.yaml"
     p.write_text(recipe_text, encoding="utf-8")
     r = load_recipe(p)
-    names = sorted(c.name for c in r.cells)
-    # The mitigation-only cell should read as a clean baseline, and the
-    # tf32_off cell should not carry a meaningless '-none' suffix.
-    for name in names:
-        assert not name.endswith("-none"), (
-            f"cell name {name!r} carries an ambiguous trailing '-none' when the "
-            "diagnostic axis is unused"
-        )
+    by_name = {c.name: c for c in r.cells}
+    # The folder/join key is deliberately the fused "<mit>-<diag>" string --
+    # the agent's baseline-parse logic depends on it. The disambiguation moved
+    # to matrix.md's columns (see test above), NOT to the on-disk name.
+    assert set(by_name) == {"none-none", "tf32_off-none"}
+    # And each cell still carries both axes as a (mitigation, diagnostic) pair
+    # so the renderer can split them into their own columns.
+    assert by_name["tf32_off-none"].mitigations == ("tf32_off", "none")
 
 
 # ==========================================================================
@@ -298,16 +390,17 @@ def test_stop_after_can_key_on_the_error_verdict():
 
 # ==========================================================================
 # GROUP E -- recipe knobs the operator-facing tasks add (#56, #57)
-# OPEN: retention + stop_after are not yet parsed onto the probe recipe.
+# FIXED: stop_after (#57/#232, run-level Recipe.stop_after) and verdict-keyed
+# retention (#56/#231, ProbeExtras.retain) both parse + validate on the probe
+# recipe now. These are permanent guards.
 # ==========================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="aorta-internal #56: verdict-keyed artifact retention not yet on "
-    "the probe recipe. Remove when ProbeExtras carries a retention policy.",
-)
 def test_recipe_accepts_verdict_keyed_retention():
+    """#56/#231 (FIXED): the probe recipe accepts a verdict-keyed ``retain``
+    block, surfaced on ``ProbeExtras.retain``. The deletion engine
+    (``aorta.run.retention``) keeps the heavy artifact only for the verdict
+    whose level is ``full`` and never drops the trial record."""
     from aorta.probe.recipe_builder import build_probe_recipe_from_dict
 
     r = build_probe_recipe_from_dict(
@@ -318,9 +411,11 @@ def test_recipe_accepts_verdict_keyed_retention():
             "mitigation_axis": ["none"],
             "diagnostic_axis": ["none"],
             "retain": {"on_fail": "full", "on_pass": "summary", "on_error": "log"},
-        }
+        },
+        [],
     )
     assert r.probe_extras.retain is not None  # type: ignore[attr-defined]
+    assert r.probe_extras.retain.level_for("fail") == "full"  # type: ignore[attr-defined]
 
 
 def test_recipe_accepts_stop_after_rule():
