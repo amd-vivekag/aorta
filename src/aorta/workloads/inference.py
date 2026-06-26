@@ -109,8 +109,10 @@ class RequestSpec:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RequestSpec":
+        d = dict(d or {})
         known = set(cls.__dataclass_fields__)
-        spec = cls(**{k: int(v) for k, v in (d or {}).items() if k in known})
+        _reject_unknown(d, known, "request")
+        spec = cls(**{k: int(v) for k, v in d.items() if k in known})
         if spec.batch_size < 1:
             raise ValueError(f"request.batch_size must be >= 1, got {spec.batch_size}")
         if spec.prompt_len < 1:
@@ -139,6 +141,10 @@ class ModelSpec:
         d = dict(d or {})
         moe = dict(d.pop("moe", {}) or {})
         known = set(cls.__dataclass_fields__)
+        _reject_unknown(d, known, "model")
+        # ``enabled`` is accepted (silently ignored) — the issue/#239 recipe
+        # shape includes ``model.moe.enabled``; topology is driven by kind only.
+        _reject_unknown(moe, {"num_experts", "enabled"}, "model.moe")
         spec = cls(**{k: v for k, v in d.items() if k in known})
         if "num_experts" in moe:
             spec.num_experts = int(moe["num_experts"])
@@ -171,6 +177,7 @@ class ContinuousBatchSpec:
     def from_dict(cls, d: dict[str, Any]) -> "ContinuousBatchSpec":
         d = dict(d or {})
         known = set(cls.__dataclass_fields__)
+        _reject_unknown(d, known, "serving.continuous_batch")
         spec = cls(**{k: v for k, v in d.items() if k in known})
         spec.enabled = _require_bool(spec.enabled, "serving.continuous_batch.enabled")
         spec.max_active_requests = int(spec.max_active_requests)
@@ -197,6 +204,7 @@ class ServingSpec:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ServingSpec":
         d = dict(d or {})
+        _reject_unknown(d, {"kv_cache", "continuous_batch"}, "serving")
         cb = ContinuousBatchSpec.from_dict(d.get("continuous_batch", {}))
         kv = _require_bool(d.get("kv_cache", True), "serving.kv_cache")
         return cls(kv_cache=kv, continuous_batch=cb)
@@ -212,6 +220,7 @@ class ChecksSpec:
     def from_dict(cls, d: dict[str, Any]) -> "ChecksSpec":
         d = dict(d or {})
         known = set(cls.__dataclass_fields__)
+        _reject_unknown(d, known, "checks")
         return cls(**{k: _require_bool(v, f"checks.{k}") for k, v in d.items() if k in known})
 
 
@@ -238,6 +247,7 @@ class InferenceConfig:
         serving = ServingSpec.from_dict(d.get("serving", {}))
         checks = ChecksSpec.from_dict(d.get("checks", {}))
         scalar_keys = {"mode", "seed", "device", "dtype", "warmup_steps", "steps"}
+        _reject_unknown(d, scalar_keys | {"request", "model", "serving", "checks"}, "inference")
         cfg = cls(
             request=request,
             model=model,
@@ -298,6 +308,23 @@ def _require_bool(value: Any, field: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a bool, got {type(value).__name__}: {value!r}")
     return value
+
+
+def _reject_unknown(d: dict[str, Any], known: set[str], section: str) -> None:
+    """Raise ``ValueError`` for any key not in *known* (excluding dispatcher-reserved keys).
+
+    Keys starting with ``_aorta_`` are platform-injected metadata and are
+    silently accepted. ``steps`` is consumed by the launcher (not the workload)
+    and is also exempted. Any other unrecognised key is most likely a recipe
+    typo (e.g. ``requst.batch_size``, ``serving.kvcache``) that would otherwise
+    silently fall back to defaults and produce a false-green result.
+    """
+    unknown = sorted(
+        k for k in d
+        if k not in known and k != "steps" and not k.startswith("_aorta_")
+    )
+    if unknown:
+        raise ValueError(f"unknown {section} key(s): {unknown}")
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -711,6 +738,25 @@ class InferenceWorkload(Workload):
                     first_failure = step
                 failures.append({"step": step, "problems": problems})
                 log.error("inference numeric check failed at tick %d: %s", step, problems)
+
+        # After all ticks: any requests still active or queued were not served
+        # within the configured step budget. This would otherwise produce a
+        # misleading passed=True with a low requests_completed count.
+        remaining_active = len(active)
+        remaining_queued = len(queue)
+        remaining_requests = remaining_active + remaining_queued
+        if remaining_requests:
+            if first_failure is None:
+                first_failure = cfg.steps
+            failures.append(
+                {
+                    "step": cfg.steps,
+                    "problems": ["incomplete_requests"],
+                    "requests_completed": completed,
+                    "remaining_active": remaining_active,
+                    "remaining_queued": remaining_queued,
+                }
+            )
 
         elapsed = time.perf_counter() - t0
         passed = not failures

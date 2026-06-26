@@ -66,9 +66,17 @@ def test_moe_driven_by_num_experts() -> None:
     assert cfg.model.num_experts == 4
 
 
-def test_config_ignores_unknown_keys() -> None:
-    cfg = InferenceConfig.from_dict({"seed": 5, "_aorta_environment": {"x": 1}, "bogus": 1})
+def test_config_rejects_unknown_keys() -> None:
+    # Dispatcher-reserved / platform keys are silently accepted.
+    cfg = InferenceConfig.from_dict({"seed": 5, "_aorta_environment": {"x": 1}})
     assert cfg.seed == 5
+    # True typos (e.g. missing underscore, misspelled section) must raise.
+    with pytest.raises(ValueError, match="unknown inference key"):
+        InferenceConfig.from_dict({"seed": 5, "bogus": 1})
+    with pytest.raises(ValueError, match="unknown request key"):
+        InferenceConfig.from_dict({"request": {"requst_batch": 4}})
+    with pytest.raises(ValueError, match="unknown serving key"):
+        InferenceConfig.from_dict({"serving": {"kvcache": True}})
 
 
 @pytest.mark.parametrize(
