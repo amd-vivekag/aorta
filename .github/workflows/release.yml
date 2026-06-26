@@ -1,8 +1,8 @@
 name: Release
 
-# Build the wheel + sdist and publish them as GitHub Release assets so customers
-# can `pip install` AORTA straight from the release page. The release version is
-# always read from pyproject.toml (never hard-coded here).
+# Build the wheel + sdist once, attach them to a GitHub Release, and publish the
+# same artifacts to PyPI (so customers can `pip install amd-aorta`). The release
+# version is always read from pyproject.toml (never hard-coded here).
 #
 # Two ways to cut a release:
 #   * push a version tag:  git tag vX.Y.Z && git push origin vX.Y.Z
@@ -100,32 +100,24 @@ jobs:
             echo "::error::project.version in pyproject.toml is empty."
             exit 1
           fi
-          # The version becomes the git tag (v${version}); reject anything that
-          # isn't MAJOR.MINOR.PATCH (+ optional PEP 440 suffix) up front so a
-          # hand-edited / non-semver value fails here with a clear message
-          # instead of deep in `gh api` / tag creation.
-          if ! printf '%s' "${pkg_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.+a-zA-Z0-9-]*)?$'; then
-            echo "::error::project.version '${pkg_version}' is not a valid release version (expected MAJOR.MINOR.PATCH with an optional suffix); refusing to form tag v${pkg_version}."
+          # release.yml is the STABLE channel: it marks the GitHub Release
+          # "Latest" and publishes to PyPI. Pre-release / rc builds
+          # (X.Y.ZrcYYYYMMDD) belong to nightly.yml's rolling dev-wheels channel.
+          # Reject any suffixed / non-MAJOR.MINOR.PATCH version up front --
+          # otherwise an rc value would pass validation here and ship as a stable
+          # release, collapsing the stable-vs-nightly split this automation adds.
+          if ! printf '%s' "${pkg_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::project.version '${pkg_version}' is not a stable MAJOR.MINOR.PATCH release; use nightly.yml for pre-release rc builds."
             exit 1
           fi
           tag="v${pkg_version}"
-          # The semver regex still permits values that are not valid git ref
-          # names (e.g. a suffix with '..', a trailing '.', or '.lock'). Let git
-          # itself be the source of truth so such a version fails fast here
-          # rather than later at tag creation/push.
+          # Defensive backstop: a MAJOR.MINOR.PATCH value always yields a valid
+          # git ref, but let git be the source of truth so the tag is rejected
+          # here rather than later at tag creation/push if the check above is ever
+          # loosened.
           if ! git check-ref-format "refs/tags/${tag}"; then
             echo "::error::project.version '${pkg_version}' yields an invalid git tag '${tag}' (rejected by git check-ref-format); choose a tag-safe version."
             exit 1
-          fi
-          # Only a strict X.Y.Z release becomes "Latest"; a PEP 440 pre-release
-          # suffix (e.g. 0.3.0rc1) is published as a prerelease and never marked
-          # Latest, so customers pinning the release page see the last stable cut.
-          if printf '%s' "${pkg_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "make_latest=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "make_latest=false" >> "$GITHUB_OUTPUT"
           fi
           echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
@@ -177,6 +169,15 @@ jobs:
           git tag "${tag}"
           git push origin "${tag}"
 
+      # Share the built artifacts with the publish job so PyPI gets the exact
+      # same wheel + sdist that were attached to the GitHub Release (build once).
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
       - name: Create GitHub Release with artifacts
         uses: softprops/action-gh-release@v3
         with:
@@ -185,7 +186,33 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-          # Strict X.Y.Z -> Latest; a pre-release suffix -> prerelease, not Latest.
-          prerelease: ${{ steps.version.outputs.prerelease }}
-          make_latest: ${{ steps.version.outputs.make_latest }}
+          make_latest: "true"  # mark this the "Latest" release
           generate_release_notes: true
+
+  # Publish the same artifacts to PyPI via Trusted Publishing (OIDC) so customers
+  # can `pip install amd-aorta`. Requires a one-time PyPI trusted-publisher setup for
+  # this repo + workflow + the `pypi` environment (see docs/releasing.md).
+  publish-pypi:
+    needs: build-and-release
+    # Trusted Publishing is scoped to the canonical repo + `pypi` environment, so
+    # this job can only succeed on ROCm/aorta. Skip it on forks to avoid noisy
+    # OIDC failures (the GitHub Release job above still runs everywhere).
+    if: github.repository == 'ROCm/aorta'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/amd-aorta
+    permissions:
+      id-token: write  # OIDC token for Trusted Publishing; no API token stored
+      contents: read   # let download-artifact fetch the dist bundle under the restricted token
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
