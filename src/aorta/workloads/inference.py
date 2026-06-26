@@ -624,6 +624,9 @@ class InferenceWorkload(Workload):
         """
         assert self._cfg is not None
         cfg = self._cfg
+        # Skip _finite_flags() (which forces a CUDA .item() sync) entirely when
+        # no numeric check is enabled — avoids skewing latency/throughput metrics.
+        checks_enabled = cfg.checks.fail_on_nan_logits or cfg.checks.fail_on_nonfinite_output
         all_finite = True
         any_nan = False
         any_inf = False
@@ -637,10 +640,11 @@ class InferenceWorkload(Workload):
             self._sync()
             if record is not None:
                 record["prefill_ms"].append((time.perf_counter() - p0) * 1000.0)
-            fin, nan, inf = self._finite_flags(logits)
-            all_finite &= fin
-            any_nan |= nan
-            any_inf |= inf
+            if checks_enabled:
+                fin, nan, inf = self._finite_flags(logits)
+                all_finite &= fin
+                any_nan |= nan
+                any_inf |= inf
             last_logits = logits
 
             if cfg.is_autoregressive and req.generate_tokens > 0:
@@ -664,10 +668,11 @@ class InferenceWorkload(Workload):
                     self._sync()
                     if record is not None:
                         record["decode_ms"].append((time.perf_counter() - d0) * 1000.0)
-                    fin, nan, inf = self._finite_flags(step_logits)
-                    all_finite &= fin
-                    any_nan |= nan
-                    any_inf |= inf
+                    if checks_enabled:
+                        fin, nan, inf = self._finite_flags(step_logits)
+                        all_finite &= fin
+                        any_nan |= nan
+                        any_inf |= inf
                     next_tok = step_logits[:, -1:, :].argmax(dim=-1)
                     last_logits = step_logits
 
@@ -853,7 +858,12 @@ class InferenceWorkload(Workload):
             if self._cfg.checks.compare_logits_checksum:
                 record["checksum"] = tensor_checksum(logits)
 
-        fin, nan, inf = self._finite_flags(logits)
+        # Skip _finite_flags() (CUDA .item() sync) when no numeric check is
+        # enabled so disabling checks removes the per-tick overhead entirely.
+        checks_enabled = (
+            self._cfg.checks.fail_on_nan_logits or self._cfg.checks.fail_on_nonfinite_output
+        )
+        fin, nan, inf = self._finite_flags(logits) if checks_enabled else (True, False, False)
 
         next_tok = logits[:, -1:, :].argmax(dim=-1)
         still_active = []
